@@ -343,8 +343,25 @@ public:
     struct ICacheEntry {                        // 32 bytes (LSL #5); 64 bytes (LSL #6) under DIRECTPATCH
         u32 key0; u32 key1; u32 epoch; u32 _pad;
         u64 ptr0; u64 ptr1;
+#ifdef LITEV_JIT_DIRECTPATCH
+        // DIRECTPATCH per-site state, disjoint from the 2-way fields above so the
+        // dispatcher's fill path never touches it. patchOff is set at COMPILE time
+        // by EmitBlockExit (RX offset of the exit `B dispatcher`); hitCount/promoted
+        // are runtime (consecutive-slot0 streak + promotion flag). Widens the entry to
+        // 64B -> the dispatcher indexes with LSL #6 (ICacheEntryShift) when ON.
+        u32 patchOff;   // RX offset of this exit site's patchable `B` (0 = none)
+        u32 hitCount;   // consecutive icHit0 (same-target) hits since last streak break
+        u32 promoted;   // 1 = exit-B patched to a guard stub
+        u32 stubOff;    // RX offset of the emitted guard stub (debug/leak-until-reset)
+        u64 _dp0; u64 _dp1;   // pad to 64B for the LSL #6 index
+#endif
     };
+#ifdef LITEV_JIT_DIRECTPATCH
+    static constexpr int ICacheEntryShift = 6;  // sizeof(ICacheEntry)==64 -> LSL #6
+    static constexpr u32 DirectPatchThreshold = 8;  // consecutive same-target hits before promotion
+#else
     static constexpr int ICacheEntryShift = 5;  // sizeof(ICacheEntry)==32 -> LSL #5 (byte-identical)
+#endif
     ICacheEntry* ICacheTable[2] = { nullptr, nullptr };  // per-CPU, allocated once
     u32 ICacheNextSite = 1;                     // next site index to hand out (0 reserved)
     void ICacheAllocOnce();                     // allocate the per-CPU tables (idempotent)
@@ -353,6 +370,24 @@ public:
     u32 ICacheAssignSite() { return (ICacheNextSite < ICacheSites) ? ICacheNextSite++ : 0; }
 #endif
 
+#ifdef LITEV_JIT_DIRECTPATCH
+    // Rewrite the 4-byte unconditional B at RX offset rxOffset to target targetRxOffset
+    // + flush that word (same encoding/discipline as PatchLinkSite, but independent of
+    // LITEV_JIT_LINK). Caller owns the JitEnableWrite/Execute bracket.
+    void DirectPatchWriteBranch(u32 rxOffset, u32 targetRxOffset);
+    // DIRECTPATCH: emit a per-site guard stub (reproduces the dispatcher commit (a-d)
+    // + an instrAddr==guestTarget guard, then a DIRECT B to hostEntry) and patch the
+    // exit site's `B dispatcher` to it. Called from the dispatcher's icHit0 tail via
+    // LiteV_DirectPatchPromote once a site has resolved to the same target N times.
+    void DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEntry);
+    // Revert a single promoted site's exit-B back to the dispatcher (guard turned
+    // permanently wrong). Called from the dispatcher writeback via LiteV_DirectPatchDemote.
+    void DirectPatchDemote(u32 num, u32 site);
+    // Revert EVERY live promotion back to the dispatcher (called on any block
+    // invalidation): RX is append-only within an epoch, so this is the sound backstop
+    // against a patched direct edge outliving its target block.
+    void DirectPatchRevertAll();
+#endif
 #endif
 
 #ifdef LITEV_JIT_LINK

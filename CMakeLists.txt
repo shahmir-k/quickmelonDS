@@ -288,6 +288,29 @@ if (LITEV_JIT_ICACHE)
     endif()
 endif()
 
+# DIRECTPATCH: monomorphic indirect-branch exit-site promotion. Builds ON TOP of
+# LITEV_JIT_ICACHE (piggybacks its per-site slot + the dispatcher's inline-cache
+# hit path). When a dynamic exit site resolves to the SAME target for N consecutive
+# ICACHE hits (measured MONOMORPHIC), the site's exit `B dispatcher` is runtime-
+# patched to a tiny per-site GUARD STUB that reproduces the dispatcher's per-hop
+# commit (a-d) + a single instrAddr==expected guard, then a DIRECT B into the target
+# block's host entry -- turning the dispatcher's shared, poorly-predicted indirect BR
+# into a perfectly-predicted direct branch and skipping the 2-way load/epoch chain.
+# The guard keeps correctness identical to the ICACHE key check (a wrong target falls
+# back to the dispatcher); every block invalidation reverts all live patches (RX is
+# append-only within an epoch, so a stale direct edge can never survive). Pure host
+# dispatch mechanics with byte-identical guest cycle accounting -> BIT-EXACT / MP-safe.
+# Default OFF -> flag-off byte-identical (all code behind #ifdef LITEV_JIT_DIRECTPATCH,
+# incl. the ICACHE entry stays 32B / LSL#5 when OFF).
+option(LITEV_JIT_DIRECTPATCH "Promote MONOMORPHIC dynamic exit sites to direct guard-stub branches (needs ICACHE)" OFF)
+if (LITEV_JIT_DIRECTPATCH)
+    if (LITEV_JIT_DISPATCH AND LITEV_JIT_ICACHE AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_DIRECTPATCH=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_DIRECTPATCH requires LITEV_JIT_DISPATCH, LITEV_JIT_ICACHE and an AArch64 target.")
+    endif()
+endif()
+
 # Unit 5 (M2.1): event-true scheduler slices. When ON, each scheduler iteration
 # runs the CPUs to the TRUE next deadline (next scheduled event / frame end /
 # next timer overflow) instead of the fixed kMaxIterationCycles cap, so the CPUs

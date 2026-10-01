@@ -496,6 +496,10 @@ int main(int argc, char** argv)
                        idleCandidates=0, idleAccepted=0, idleRejWriteMem=0,
                        idleRejCoproc=0, idleRejBranch=0, idleRejRegDep=0,
                        memBlock9HelperCalls=0, memRead9U32HelperCalls=0;
+#ifdef LITEV_JIT_DIRECTPATCH
+             uint64_t directGuardHits=0, directGuardMisses=0, directPromotions=0,
+                       directDemotions=0, directReverts=0;
+#endif
              } profTotals;
     uint64_t schedByType[32] = {0};
     // Frames actually folded into profTotals. When --bench-window is set we
@@ -544,6 +548,13 @@ int main(int argc, char** argv)
             profTotals.dispatcherMisses+= g_Frame.DispatcherMisses.load(std::memory_order_relaxed);
             profTotals.dispatcherHits  += g_Frame.DispatcherHits.load(std::memory_order_relaxed);
             profTotals.icacheHits      += g_Frame.ICacheHits.load(std::memory_order_relaxed);
+#ifdef LITEV_JIT_DIRECTPATCH
+            profTotals.directGuardHits   += g_Frame.DirectGuardHits.load(std::memory_order_relaxed);
+            profTotals.directGuardMisses += g_Frame.DirectGuardMisses.load(std::memory_order_relaxed);
+            profTotals.directPromotions  += g_Frame.DirectPromotions.load(std::memory_order_relaxed);
+            profTotals.directDemotions   += g_Frame.DirectDemotions.load(std::memory_order_relaxed);
+            profTotals.directReverts     += g_Frame.DirectReverts.load(std::memory_order_relaxed);
+#endif
             profTotals.linkSitesEmitted += g_Frame.LinkSitesEmitted.load(std::memory_order_relaxed);
             profTotals.dispatchOnlyExits+= g_Frame.DispatchOnlyExits.load(std::memory_order_relaxed);
             profTotals.schedIterations  += g_Frame.SchedulerIterations.load(std::memory_order_relaxed);
@@ -664,6 +675,19 @@ int main(int argc, char** argv)
         if (tot) printf("icache_hit_rate: %.2f%% (of %llu region-resolved hops)\n",
                         100.0 * (double)ic / (double)tot, tot);
     }
+#ifdef LITEV_JIT_DIRECTPATCH
+    printf("direct_promotions:  %llu\n", (unsigned long long)profTotals.directPromotions);
+    printf("direct_guard_hits:  %llu\n", (unsigned long long)profTotals.directGuardHits);
+    printf("direct_guard_misses:%llu\n", (unsigned long long)profTotals.directGuardMisses);
+    printf("direct_demotions:   %llu\n", (unsigned long long)profTotals.directDemotions);
+    printf("direct_reverts:     %llu\n", (unsigned long long)profTotals.directReverts);
+    {
+        unsigned long long gh = profTotals.directGuardHits, gm = profTotals.directGuardMisses;
+        unsigned long long gt = gh + gm;
+        if (gt) printf("direct_guard_hit_rate: %.2f%% (of %llu guard-stub hops)\n",
+                       100.0 * (double)gh / (double)gt, gt);
+    }
+#endif
     printf("mem_block9_helper_calls:    %llu\n", (unsigned long long)profTotals.memBlock9HelperCalls);
     printf("mem_read9_u32_helper_calls: %llu\n", (unsigned long long)profTotals.memRead9U32HelperCalls);
     printf("link_sites_emitted:  %llu\n", (unsigned long long)profTotals.linkSitesEmitted);

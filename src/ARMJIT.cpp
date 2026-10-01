@@ -1148,6 +1148,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
     u32 mask = 1 << ((localAddr & 0x1FF) / 16);
 
     range->Code = 0;
+#ifdef LITEV_JIT_DIRECTPATCH
+    bool dpAnyInval = false;
+#endif
     for (int i = 0; i < range->Blocks.Length;)
     {
         JitBlock* block = range->Blocks[i];
@@ -1232,6 +1235,12 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
         NDS.ARM9.ICacheEpoch++;
         NDS.ARM7.ICacheEpoch++;
 #endif
+#ifdef LITEV_JIT_DIRECTPATCH
+        // A block just left FastBlockLookup. Its RX is preserved until ResetBlockCache,
+        // but any promoted direct edge into it (or out of a co-invalidated source) must
+        // be neutralised BEFORE it can execute. Revert-all once after the loop.
+        dpAnyInval = true;
+#endif
         if (block->Num == 0)
             JitBlocks9.erase(block->StartAddr);
         else
@@ -1247,6 +1256,11 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
         }
     }
 
+#ifdef LITEV_JIT_DIRECTPATCH
+    // Neutralise every live promotion once, after all block removals for this address.
+    if (dpAnyInval)
+        JITCompiler.DirectPatchRevertAll();
+#endif
 
 #if defined(LITEV_JIT_LINK) && defined(LITEV_SHADOW_ASSERT)
     // Prove every surviving link site still holds a B to the dispatcher or a live

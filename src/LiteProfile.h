@@ -125,6 +125,14 @@ struct FrameCounters
     std::atomic<uint64_t> CommitStubEntries{0};  // commit-stub entries (runtime, emitted in the stub)
     std::atomic<uint64_t> DispatchOnlyExits{0};  // ineligible exit sites (plain dispatcher)
     std::atomic<uint64_t> ICacheHits{0};         // per-site inline-cache hits (runtime, LITEV_JIT_ICACHE)
+#ifdef LITEV_JIT_DIRECTPATCH
+    // --- DIRECTPATCH: monomorphic exit-site promotion (LITEV_JIT_DIRECTPATCH) ---
+    std::atomic<uint64_t> DirectGuardHits{0};    // promoted guard stub hits -> DIRECT B to target (runtime)
+    std::atomic<uint64_t> DirectGuardMisses{0};  // promoted guard misses (target changed) -> fell to dispatcher
+    std::atomic<uint64_t> DirectPromotions{0};   // sites promoted (guard stub emitted + exit-B patched)
+    std::atomic<uint64_t> DirectDemotions{0};    // sites demoted (guard permanently missed -> reverted)
+    std::atomic<uint64_t> DirectReverts{0};      // patches reverted wholesale on block invalidation
+#endif
 
     // --- DraStic tile renderer async attribution (LITEV_SOFT3D_DRASTIC) ---
     std::atomic<uint64_t> TileGetLineCalls{0};   // 2D-consumer GetLine calls
@@ -177,6 +185,13 @@ struct FrameCounters
         CommitStubEntries.store(0, std::memory_order_relaxed);
         DispatchOnlyExits.store(0, std::memory_order_relaxed);
         ICacheHits.store(0, std::memory_order_relaxed);
+#ifdef LITEV_JIT_DIRECTPATCH
+        DirectGuardHits.store(0, std::memory_order_relaxed);
+        DirectGuardMisses.store(0, std::memory_order_relaxed);
+        DirectPromotions.store(0, std::memory_order_relaxed);
+        DirectDemotions.store(0, std::memory_order_relaxed);
+        DirectReverts.store(0, std::memory_order_relaxed);
+#endif
         TimeInJitNs.store(0, std::memory_order_relaxed);
         TimeInCppNs.store(0, std::memory_order_relaxed);
         MemBlock9HelperCalls.store(0, std::memory_order_relaxed);

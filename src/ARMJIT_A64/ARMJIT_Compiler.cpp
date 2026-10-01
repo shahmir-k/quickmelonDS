@@ -948,6 +948,12 @@ bool Compiler::CanCompile(bool thumb, u16 kind)
 //   (d) region miss / lookup miss -> exit (Timestamp already advanced, Cycles 0).
 //   (e) hit -> commit CPSR, br straight into the next block.
 // All exit edges go to ARM_Ret (commits Cycles/CPSR, pops the callee frame).
+#ifdef LITEV_JIT_DIRECTPATCH
+// C-ABI trampolines the dispatcher BLs into (baked Compiler* as arg0). Defined after
+// the Compiler methods below; forward-declared so Gen_Dispatcher can take their address.
+static void LiteV_DirectPatchPromote(Compiler* c, u32 num, u32 site, u32 guestTarget, u64 hostEntry);
+static void LiteV_DirectPatchDemote(Compiler* c, u32 num, u32 site);
+#endif
 void* Compiler::Gen_Dispatcher(u32 num)
 {
     AlignCode16();
@@ -1083,6 +1089,28 @@ void* Compiler::Gen_Dispatcher(u32 num)
     ADD(X5, X5, 1);
     STR(INDEX_UNSIGNED, X5, X4, 0);
   #endif
+#ifdef LITEV_JIT_DIRECTPATCH
+    // A writeback == this site did NOT hit slot0 -> break its consecutive-slot0 streak.
+    // If it is nonetheless PROMOTED, its guard permanently missed (primary target
+    // changed) and we are re-resolving in the dispatcher -> DEMOTE (revert the exit-B).
+    // W9 = site (0 = no cache); X6 = host entry (preserved across the demote call).
+    {
+        FixupBranch dpNoCache = CBZ(W9);
+        MOVP2R(X2, (void*)ICacheTable[num]);
+        ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICacheEntryShift));
+        STR(INDEX_UNSIGNED, WZR, X2, offsetof(ICacheEntry, hitCount));   // streak reset
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, promoted));
+        FixupBranch dpNotPromoted = CBZ(W3);
+        ABI_PushRegisters({6});                       // preserve X6 (host entry)
+        MOV(W2, W9);                                  // arg2 = site
+        MOVI2R(W1, num);                              // arg1 = num
+        MOVP2R(X0, (void*)this);                      // arg0 = Compiler*
+        QuickCallFunction(X16, (void*)&LiteV_DirectPatchDemote);
+        ABI_PopRegisters({6});
+        SetJumpTarget(dpNotPromoted);
+        SetJumpTarget(dpNoCache);
+    }
+#endif
     BR(X6);
 #else
     ADD(X0, X3, W7, ArithOption(W7));                 // add x0, x3, w7, uxtw
@@ -1112,6 +1140,35 @@ void* Compiler::Gen_Dispatcher(u32 num)
     ADD(X3, X3, 1);
     STR(INDEX_UNSIGNED, X3, X4, 0);
   #endif
+#ifdef LITEV_JIT_DIRECTPATCH
+    // A slot0 hit is a consecutive-same-target (monomorphic) resolve. Bump this site's
+    // streak; at DirectPatchThreshold, PROMOTE (emit a per-site guard stub + patch the
+    // exit-B to it) via a C++ helper. A promoted site never re-enters here (its guard
+    // takes the target directly), so this counter only runs for not-yet-promoted sites.
+    // Live: X2=&entry, W0=instrAddr(guest target), W9=site, X5=host entry (ptr0).
+    {
+        // An ALREADY-promoted site can land here on a guard-miss fallback whose
+        // target matches key0 (bimodal site). Skip the streak/promote work entirely:
+        // the C++ promote call would be a useless round-trip (idempotent early-out).
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, promoted));
+        FixupBranch dpProm = CBNZ(W3);
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, hitCount));
+        ADD(W3, W3, 1);
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, hitCount));
+        CMP(W3, DirectPatchThreshold);
+        FixupBranch dpBelow = B(CC_LT);
+        ABI_PushRegisters({5});                       // preserve X5 (host entry) across the call
+        MOV(W3, W0);                                  // arg3 = guestTarget (from W0=instrAddr)
+        MOV(X4, X5);                                  // arg4 = hostEntry
+        MOV(W2, W9);                                  // arg2 = site
+        MOVI2R(W1, num);                              // arg1 = num
+        MOVP2R(X0, (void*)this);                      // arg0 = Compiler*
+        QuickCallFunction(X16, (void*)&LiteV_DirectPatchPromote);
+        ABI_PopRegisters({5});
+        SetJumpTarget(dpBelow);
+        SetJumpTarget(dpProm);
+    }
+#endif
     BR(X5);
     SetJumpTarget(icHit1);
   #ifndef LITEV_JIT_LAZYFLAGS
@@ -1124,6 +1181,10 @@ void* Compiler::Gen_Dispatcher(u32 num)
     ADD(X3, X3, 1);
     STR(INDEX_UNSIGNED, X3, X4, 0);
   #endif
+#ifdef LITEV_JIT_DIRECTPATCH
+    // A slot1 hit breaks the consecutive-slot0 streak (site is bimodal, not monomorphic).
+    STR(INDEX_UNSIGNED, WZR, X2, offsetof(ICacheEntry, hitCount));
+#endif
     BR(X5);
 #endif
 
@@ -1158,7 +1219,17 @@ void Compiler::EmitBlockExit()
     // Hand this dynamic exit its own per-site cache slot; the dispatcher (d.5-ICACHE)
     // reads W9 to index / fill the 2-way entry. Index 0 (assigned on table overflow)
     // disables caching for this site. Compile-time constant -> baked immediate.
+#ifdef LITEV_JIT_DIRECTPATCH
+    u32 dpSite = ICacheAssignSite();
+    MOVI2R(W9, dpSite);
+    // Record the RX offset of the patchable exit `B` so DIRECTPATCH can later rewrite
+    // it to a guard stub. Compile-time; survives until the next ICacheReset (which
+    // zeroes the whole table, incl. patchOff/hitCount/promoted). Site 0 = no cache.
+    if (dpSite != 0 && ICacheTable[Num])
+        ICacheTable[Num][dpSite].patchOff = (u32)((u8*)GetRXPtr() - GetRXBase());
+#else
     MOVI2R(W9, ICacheAssignSite());
+#endif
 #endif
     B(DispatcherEntry[Num]);
 }
@@ -1245,6 +1316,196 @@ void Compiler::PatchLinkSite(u32 rxOffset, u32 targetRxOffset)
 
     u8* rxptr = GetRXBase() + rxOffset;
     __builtin___clear_cache((char*)rxptr, (char*)rxptr + 4);
+}
+#endif
+
+#ifdef LITEV_JIT_DIRECTPATCH
+void Compiler::DirectPatchWriteBranch(u32 rxOffset, u32 targetRxOffset)
+{
+    ptrdiff_t delta = (ptrdiff_t)targetRxOffset - (ptrdiff_t)rxOffset;
+    // A64 unconditional B reaches +-128MB; a code slice is 32MB, so exit-site->stub,
+    // stub->target and stub->dispatcher are all trivially in range.
+    assert(delta >= -(1 << 27) && delta < (1 << 27));
+    u32 instr = 0x14000000u | ((u32)((delta >> 2)) & 0x03FFFFFFu);
+
+    u8* rwbase = GetWriteableRWPtr() - GetCodeOffset();   // m_rwbase
+    *(u32*)(rwbase + rxOffset) = instr;
+
+    u8* rxptr = GetRXBase() + rxOffset;
+    __builtin___clear_cache((char*)rxptr, (char*)rxptr + 4);
+}
+
+// Promote a monomorphic exit site. Emits a per-site GUARD STUB and rewrites the exit
+// `B dispatcher` to it. The stub reproduces the dispatcher's per-hop commit (a-d) EXACTLY
+// (same ops/order -> identical Timestamp/budget/event schedule -> trace bit-exact), then
+// a single guard `instrAddr == guestTarget`:
+//   match  -> a DIRECT (statically-predicted) B into hostEntry -- skips the 2-way
+//             epoch/key load chain AND the shared, mispredicted indirect BR;
+//   miss / StopExecution / slice-end -> fall to the dispatcher, which re-commits as a
+//             no-op (RCycles was zeroed by the stub) and resolves via ICACHE exactly as
+//             before. W9 = site is still live at stub entry (the exit site set it and the
+//             stub's (a-d) never touch W9), so the dispatcher gets it for its bookkeeping.
+// Runs on the emu thread only (single JIT thread); the JitEnableWrite/Execute bracket
+// keeps the whole write window in C++ text (Apple W^X-safe), a no-op on Android RWX.
+void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEntry)
+{
+    if (site == 0 || site >= ICacheSites || !ICacheTable[num])
+        return;
+    ICacheEntry& e = ICacheTable[num][site];
+    if (e.promoted) return;                              // idempotent
+    if (e.patchOff == 0) { e.hitCount = 0; return; }     // no exit-site recorded
+    // Never emit past the main region (CompileBlock resets at <16KB; keep a stub's
+    // headroom). Back off (reset streak, retry later) rather than promote when tight.
+    if ((ptrdiff_t)JitMemMainSize - GetCodeOffset() < 4096) { e.hitCount = 0; return; }
+
+    NDS.JIT.JitEnableWrite();
+
+    // --- emit the guard stub at the main high-water (append; advances m_code) ---
+    AlignCode16();
+    u32 stubOff = (u32)((u8*)GetRXPtr() - GetRXBase());
+
+    void* dispatcher = DispatcherEntry[num];
+    void* tsPtr = (num == 0) ? (void*)&NDS.ARM9Timestamp : (void*)&NDS.ARM7Timestamp;
+
+    // (a) StopExecution -> dispatcher (bounce to C++, block K's Cycles intact).
+    LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
+    FixupBranch toDispStop = CBNZ(W2);
+
+    // (b) commit block K: Timestamp += Cycles; budget -= Cycles; Cycles = 0.
+    MOVP2R(X4, tsPtr);
+    LDR(INDEX_UNSIGNED, X5, X4, 0);
+    ADD(X5, X5, RCycles, ArithOption(RCycles));
+    STR(INDEX_UNSIGNED, X5, X4, 0);
+    LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CyclesBudget));
+    SUB(W1, W1, RCycles);
+    STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CyclesBudget));
+    MOVI2R(RCycles, 0);
+
+    // (c) slice over? budget <= 0 -> dispatcher (re-commit no-op, then exits).
+    CMP(W1, 0);
+    FixupBranch toDispBudget = B(CC_LE);
+
+    // (d) instrAddr = R[15] - ((CPSR&0x20)?2:4)  (== dispatcher step (d), byte for byte).
+    LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
+#ifdef LITEV_JIT_LAZYFLAGS
+    LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, CPSR));
+    UBFX(W3, W3, 5, 1);
+#else
+    UBFX(W3, RCPSR, 5, 1);
+#endif
+    SUB(W0, W0, 4);
+    ADD(W0, W0, W3, ArithOption(W3, ST_LSL, 1));         // W0 = instrAddr
+
+    // guard: does the ACTUAL guest target still equal the promoted target?
+    MOVI2R(W3, guestTarget);
+    CMP(W0, W3);
+    FixupBranch guardMiss = B(CC_NEQ);
+
+    // hit: under LAZYFLAGS ARM::CPSR is already canonical (dispatcher step (g) no-op);
+    // otherwise commit the live RCPSR exactly as the plain hit path does.
+#ifndef LITEV_JIT_LAZYFLAGS
+    STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+#endif
+#if LITEV_PROFILE
+    MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.DirectGuardHits);
+    LDR(INDEX_UNSIGNED, X5, X4, 0);
+    ADD(X5, X5, 1);
+    STR(INDEX_UNSIGNED, X5, X4, 0);
+#endif
+    B((const void*)hostEntry);            // DIRECT, statically-predicted hop into the target
+
+    // guard miss: the guest target changed -> count (PROFILE only), fall to the
+    // dispatcher, whose writeback path will DEMOTE this site. X4/X5 are dispatcher
+    // scratch; W9 = site stays live (the counter bump must not touch it). The stop /
+    // budget exits land PAST the counter (they are not guard misses).
+    SetJumpTarget(guardMiss);
+#if LITEV_PROFILE
+    MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.DirectGuardMisses);
+    LDR(INDEX_UNSIGNED, X5, X4, 0);
+    ADD(X5, X5, 1);
+    STR(INDEX_UNSIGNED, X5, X4, 0);
+#endif
+    SetJumpTarget(toDispStop);
+    SetJumpTarget(toDispBudget);
+    B(dispatcher);
+
+    FlushIcache();                        // covers the align padding + the whole stub
+
+    // --- patch the exit-site B -> the stub, then flip back to executable ---
+    DirectPatchWriteBranch(e.patchOff, stubOff);
+
+    NDS.JIT.JitEnableExecute();
+
+    e.stubOff = stubOff;
+    e.promoted = 1;
+#if LITEV_PROFILE
+    melonDS::LiteProfile::g_Frame.DirectPromotions.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
+// Demote a promoted site: revert its exit `B stub` back to `B dispatcher`. Called from
+// the dispatcher writeback when a promoted site re-resolves (its guard permanently
+// missed). The leaked stub is reclaimed at the next ResetBlockCache.
+void Compiler::DirectPatchDemote(u32 num, u32 site)
+{
+    if (site == 0 || site >= ICacheSites || !ICacheTable[num]) return;
+    ICacheEntry& e = ICacheTable[num][site];
+    if (!e.promoted) return;
+
+    NDS.JIT.JitEnableWrite();
+    u32 dispOff = (u32)((u8*)DispatcherEntry[num] - GetRXBase());
+    DirectPatchWriteBranch(e.patchOff, dispOff);
+    NDS.JIT.JitEnableExecute();
+
+    e.promoted = 0;
+    e.hitCount = 0;
+#if LITEV_PROFILE
+    melonDS::LiteProfile::g_Frame.DirectDemotions.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
+// Revert EVERY live promotion back to the dispatcher. The sound backstop for block
+// invalidation: RX is append-only within a cache epoch, so a promoted site's direct B
+// could otherwise outlive its (retired-but-RX-preserved) target block. Cheap and rare
+// (single-block invalidations ~4/3400f); over-reverting is harmless (sites re-promote).
+void Compiler::DirectPatchRevertAll()
+{
+    bool any = false;
+    NDS.JIT.JitEnableWrite();
+    for (u32 num = 0; num < 2; num++)
+    {
+        if (!ICacheTable[num]) continue;
+        u32 dispOff = (u32)((u8*)DispatcherEntry[num] - GetRXBase());
+        u32 n = ICacheNextSite;   // only [1, ICacheNextSite) were ever handed out
+        if (n > ICacheSites) n = ICacheSites;
+        for (u32 s = 1; s < n; s++)
+        {
+            ICacheEntry& e = ICacheTable[num][s];
+            if (e.promoted)
+            {
+                DirectPatchWriteBranch(e.patchOff, dispOff);
+                e.promoted = 0;
+                e.hitCount = 0;
+                any = true;
+            }
+        }
+    }
+    NDS.JIT.JitEnableExecute();
+#if LITEV_PROFILE
+    if (any) melonDS::LiteProfile::g_Frame.DirectReverts.fetch_add(1, std::memory_order_relaxed);
+#else
+    (void)any;
+#endif
+}
+
+static void LiteV_DirectPatchPromote(Compiler* c, u32 num, u32 site, u32 guestTarget, u64 hostEntry)
+{
+    c->DirectPatchPromote(num, site, guestTarget, hostEntry);
+}
+
+static void LiteV_DirectPatchDemote(Compiler* c, u32 num, u32 site)
+{
+    c->DirectPatchDemote(num, site);
 }
 #endif
 
