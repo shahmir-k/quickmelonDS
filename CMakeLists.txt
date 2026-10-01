@@ -137,6 +137,10 @@ option(LITEV_IO_DISPATCH_TABLE "liteV: O(1) offset-indexed dispatch for ARM9 32-
 if (LITEV_IO_DISPATCH_TABLE)
     add_compile_definitions(LITEV_IO_DISPATCH_TABLE=1)
 endif()
+option(LITEV_POLY_RADIX "liteV: allocation-free stable radix Y-sort for the VBlank polygon sort" OFF)
+if (LITEV_POLY_RADIX)
+    add_compile_definitions(LITEV_POLY_RADIX=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

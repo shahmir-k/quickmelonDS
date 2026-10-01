@@ -319,6 +319,11 @@ public:
     u32 CurRAMBank = 0;
 
     std::array<Polygon*,2048> RenderPolygonRAM {};
+#ifdef LITEV_POLY_RADIX
+    // Radix scratch for the VBlank Y-sort (see GPU3D.cpp). Transient host-side
+    // working memory — never serialized, never read outside the sort.
+    std::array<Polygon*,2048> PolySortScratch {};
+#endif
     u32 RenderNumPolygons = 0;
 
     u32 FlushRequest = 0;

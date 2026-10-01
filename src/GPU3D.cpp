@@ -3381,9 +3381,33 @@ void GPU3D::VBlank() noexcept
 
                     // apply Y-sorting
 
+#ifdef LITEV_POLY_RADIX
+                    // 4-pass LSD radix on the u32 SortKey: each pass is a stable counting
+                    // scatter, so the final permutation is IDENTICAL to
+                    // std::stable_sort(YSort) (same single-key order; equal keys keep
+                    // submission order) — but with zero per-frame allocation and linear
+                    // scatters instead of merge memcpys. stable_sort here was the #2
+                    // emu-thread backend-stall source (~13%, attribution 2026-07-17).
+                    {
+                        const u32 n = (FlushAttributes & 0x1) ? NumOpaquePolygons : NumPolygons;
+                        Polygon** src = RenderPolygonRAM.data();
+                        Polygon** dst = PolySortScratch.data();
+                        for (int shift = 0; shift < 32; shift += 8)
+                        {
+                            u32 cnt[257] = {};
+                            for (u32 i = 0; i < n; i++) cnt[((src[i]->SortKey >> shift) & 0xFF) + 1]++;
+                            for (int b = 0; b < 256; b++) cnt[b + 1] += cnt[b];
+                            for (u32 i = 0; i < n; i++) dst[cnt[(src[i]->SortKey >> shift) & 0xFF]++] = src[i];
+                            std::swap(src, dst);
+                        }
+                        // 4 passes (even count) -> the sorted order is back in
+                        // RenderPolygonRAM[0..n); entries >= n were never touched.
+                    }
+#else
                     std::stable_sort(RenderPolygonRAM.begin(),
                         RenderPolygonRAM.begin() + ((FlushAttributes & 0x1) ? NumOpaquePolygons : NumPolygons),
                         YSort);
+#endif
                 }
 
                 RenderNumPolygons = NumPolygons;
