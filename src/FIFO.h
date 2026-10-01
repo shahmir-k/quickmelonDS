@@ -54,9 +54,17 @@ public:
 
         Entries[WritePos] = val;
 
-        WritePos++;
-        if (WritePos >= NumEntries)
-            WritePos = 0;
+        // Power-of-two sizes (the GX FIFOs: CmdFIFO=256, CmdPIPE=4, CmdStallQueue=64) wrap with a
+        // branchless mask that is byte-identical to the compare-and-reset. Non-pow2 instantiations
+        // keep the original branch (if constexpr => zero runtime cost, chosen at compile time).
+        if constexpr ((NumEntries & (NumEntries - 1)) == 0)
+            WritePos = (WritePos + 1) & (NumEntries - 1);
+        else
+        {
+            WritePos++;
+            if (WritePos >= NumEntries)
+                WritePos = 0;
+        }
 
         NumOccupied++;
     }
@@ -68,9 +76,14 @@ public:
 
         T ret = Entries[ReadPos];
 
-        ReadPos++;
-        if (ReadPos >= NumEntries)
-            ReadPos = 0;
+        if constexpr ((NumEntries & (NumEntries - 1)) == 0)
+            ReadPos = (ReadPos + 1) & (NumEntries - 1);
+        else
+        {
+            ReadPos++;
+            if (ReadPos >= NumEntries)
+                ReadPos = 0;
+        }
 
         NumOccupied--;
         return ret;
