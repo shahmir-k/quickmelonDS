@@ -516,6 +516,18 @@ set(LITEV_SPU_BATCH_N "8" CACHE STRING "SPU batch factor (samples generated per 
 if (LITEV_SPU_BATCH)
     add_compile_definitions(LITEV_SPU_BATCH=1 LITEV_SPU_BATCH_N=${LITEV_SPU_BATCH_N})
 endif()
+
+# DraStic-style inert-tick RTC coarsening: the 32768Hz RTC oscillator schedules
+# ~548 events/frame just to bump a counter. When no periodic INT1 frequency /
+# INT2 alarm is armed (the common gameplay case), the periodic ProcessIRQ(1) is a
+# no-op, so ClockTimer hops straight to the next 1024-tick boundary in one event
+# instead of ~1024 per-tick events -- removing essentially the whole RTC flood.
+# Reverts to the exact per-tick path the moment a game arms an RTC IRQ. FPS-first,
+# default OFF. (Known: HANGS at --frameskip 99; real gameplay runs frameskip 0.)
+option(LITEV_COARSE_RTC "DraStic: skip inert 32768Hz RTC ticks when no periodic RTC IRQ is armed" OFF)
+if (LITEV_COARSE_RTC)
+    add_compile_definitions(LITEV_COARSE_RTC=1)
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

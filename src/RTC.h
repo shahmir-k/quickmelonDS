@@ -86,6 +86,9 @@ private:
 
     void ResetState();
     void ScheduleTimer(bool first);
+#ifdef LITEV_COARSE_RTC
+    void ScheduleTimerCoarse(u32 ticks);
+#endif
 
     u8 BCD(u8 val) const;
     u8 FromBCD(u8 val) const;

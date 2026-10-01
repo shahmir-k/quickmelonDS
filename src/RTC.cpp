@@ -523,8 +523,50 @@ void RTC::ScheduleTimer(bool first)
     NDS.ScheduleEvent(Event_RTC, !first, delay, 0, 0);
 }
 
+#ifdef LITEV_COARSE_RTC
+// Coarse reschedule that advances the 32768Hz oscillator by `ticks` cycles in a
+// single scheduled event (accumulating the sub-cycle TimerError over the whole
+// batch), used when the periodic ProcessIRQ(1) would be inert.
+void RTC::ScheduleTimerCoarse(u32 ticks)
+{
+    s64 sysclock = (s64)33513982 * (s64)ticks + (s64)TimerError;
+    s32 delay = (s32)(sysclock >> 15);
+    TimerError = (s32)(sysclock & 0x7FFF);
+
+    NDS.ScheduleEvent(Event_RTC, true, delay, 0, 0);
+}
+#endif
+
 void RTC::ClockTimer(u32 param)
 {
+#ifdef LITEV_COARSE_RTC
+    // DraStic-style inert-tick coarsening: when no periodic INT1 frequency is
+    // selected (StatusReg2 low nibble == 0, i.e. NOT the 32KHz-output default
+    // case), no INT2 alarm is armed, and no minute-carry clear is pending, the
+    // periodic ProcessIRQ(1) is a pure no-op. In that case the only per-tick
+    // work is ClockCount bookkeeping + second counting, so we hop straight to
+    // the next 1024-tick boundary (the finest granularity any selected-frequency
+    // mode observes) in ONE event instead of ~1024 per-tick events. This removes
+    // essentially the entire RTC event flood (548/frame). As soon as a game arms
+    // a periodic/alarm IRQ (checked every event), we fall back to the exact
+    // per-tick path (max ~31ms arm latency). Flag default OFF.
+    if (((State.StatusReg2 & 0x0F) == 0b0000)
+        && !(State.StatusReg2 & (1<<6))
+        && !(State.IRQFlag & 0x01))
+    {
+        u32 hop = 0x400 - (ClockCount & 0x3FF); // 1..1024, lands on a 1024 boundary
+        ClockCount += hop;
+
+        if (!(ClockCount & 0x7FFF))
+            CountSecond();
+
+        // ProcessIRQ(1) is inert here (nibble 0 / no INT2), so it is skipped.
+
+        ScheduleTimerCoarse(hop);
+        return;
+    }
+#endif
+
     ClockCount++;
 
     if (!(ClockCount & 0x7FFF))
