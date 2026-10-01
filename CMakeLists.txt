@@ -162,6 +162,22 @@ if (LITEV_JIT_CONDFOLD)
     endif()
 endif()
 
+# Stage 1 of the fixed-register / CPSR-in-NZCV JIT rearchitecture (DraStic teardown
+# 01 §6.1). An UNCONDITIONAL flag-setting ADD/SUB/RSB/CMP/CMN leaves its guest NZCV
+# resident in the host PSTATE instead of extracting it into the emulated RCPSR flag
+# word; the word is reconstructed lazily (bit-exact CSET/BFI) only at consumers /
+# host-NZCV clobbers / block boundaries, and CheckCondition then evaluates the guest
+# condition natively on the resident host flags. Pure codegen change: cycle counts,
+# timing and the register cache are untouched. Default OFF; flag-off is byte-identical.
+option(LITEV_JIT_FIXEDREG "Stage 1: keep guest CPSR flags in host NZCV on the ALU hot path (AArch64)" OFF)
+if (LITEV_JIT_FIXEDREG)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_FIXEDREG=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_FIXEDREG requires an AArch64 target.")
+    endif()
+endif()
+
 # Unit 4: direct block linking (patch, don't dispatch). Builds ON TOP of the
 # Unit 3 dispatcher: an eligible block exit whose next PC is a compile-time
 # constant emits a per-hop-commit guard followed by a patchable `B` (initially to

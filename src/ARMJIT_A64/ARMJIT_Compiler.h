@@ -196,6 +196,45 @@ public:
 
     void Comp_RetriveFlags(bool retriveCV);
 
+#ifdef LITEV_JIT_FIXEDREG
+    // liteDS-v2 Stage 1 (DraStic teardown 01 §6.1: guest CPSR flags = host NZCV).
+    // An UNCONDITIONAL flag-setting ADD/SUB/RSB/CMP/CMN leaves its guest NZCV in
+    // the host PSTATE (the SUBS/ADDS already computed them there) instead of
+    // extracting them into the RCPSR word. NZCVDeferred records which flag bits
+    // (encoded like CurInstr.SetFlags: N=8,Z=4,C=2,V=1) are currently resident in
+    // host NZCV and NOT yet written back to RCPSR. Comp_MaterializeFlags re-runs
+    // the exact deferred extraction (byte-identical CSET/BFI sequence to
+    // Comp_RetriveFlags) at every consumer / host-NZCV-clobber / block boundary;
+    // it does NOT touch host PSTATE, so a CheckCondition can still branch on the
+    // resident flags immediately afterwards.
+    u8 NZCVDeferred = 0;
+    // liteDS-v2 Stage 2a: the deferred set widened beyond full-NZCV arithmetic to
+    // LOGICAL producers (AND/EOR/ORR/BIC/TST/TEQ), whose host op leaves ONLY guest
+    // N,Z resident in PSTATE (the AArch64 logical op zeroes host C,V; guest C is in
+    // RCPSR from the barrel shifter, guest V is preserved in RCPSR). For those the
+    // host NZCV is NOT a valid full guest-condition source. NZCVCondValid records
+    // whether the CURRENTLY-deferred flags represent the COMPLETE guest NZCV in host
+    // PSTATE (true for arithmetic ADD/SUB/RSB/ADC/SBC/CMP/CMN, false for logical):
+    // only then may a consumer evaluate the guest condition natively via B.<cc>.
+    // Otherwise the consumer materializes N,Z into RCPSR and uses the RCPSR path.
+    bool NZCVCondValid = false;
+    void Comp_MaterializeFlags();
+
+    // liteDS-v2 Stage 2b: host NZCV as the SOLE canonical block-wide flag store.
+    // Instead of spilling the resident flags into RCPSR before EVERY next instruction
+    // body (the conservative Stage-1/2a reconcile), Comp_ReconcileFlags classifies the
+    // upcoming body and spills ONLY when it must: when the body READS a currently-
+    // deferred guest flag, or CLOBBERS host NZCV without fully re-establishing the
+    // guest condition there (partial producers, register-specified-shift scratch CMPs,
+    // memory stub BLs, helpers). A full-NZCV arithmetic producer (SUBS/ADDS/CMP/CMN)
+    // and a flag-transparent body keep the flags resident with no RCPSR round trip.
+    // Comp_BodyIsNZCVTransparent is the hand classifier the Stage-2a handoff required
+    // (Info.WriteFlags/ReadFlags cannot express the shift-helper's scratch clobber).
+    void Comp_ReconcileFlags();
+    bool Comp_BodyIsNZCVTransparent(u16 kind, u8 writeFlags, u8 readFlags);
+
+#endif
+
     Arm64Gen::FixupBranch CheckCondition(u32 cond);
 
     void Comp_JumpTo(Arm64Gen::ARM64Reg addr, bool switchThumb, bool restoreCPSR = false);

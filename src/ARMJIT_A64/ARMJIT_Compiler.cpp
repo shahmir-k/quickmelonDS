@@ -527,6 +527,12 @@ void Compiler::LoadCPSR()
 
 void Compiler::SaveCPSR(bool markClean)
 {
+#ifdef LITEV_JIT_FIXEDREG
+    // Reconcile any host-NZCV-resident guest flags into the canonical CPSR store before a
+    // C escape / block boundary (mode switch, exception, interpreter fallback). Under
+    // LAZYFLAGS this flushes host NZCV into the JitNZCV slot.
+    Comp_MaterializeFlags();
+#endif
     if (CPSRDirty)
     {
         STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
@@ -536,6 +542,29 @@ void Compiler::SaveCPSR(bool markClean)
 
 FixupBranch Compiler::CheckCondition(u32 cond)
 {
+#ifdef LITEV_JIT_FIXEDREG
+    if (NZCVDeferred)
+    {
+        // Guest flags are resident in host NZCV. Reconcile them into RCPSR (so the
+        // conditionally-skipped body still observes a canonical CPSR word).
+        // Comp_MaterializeFlags leaves PSTATE untouched.
+        bool condValid = NZCVCondValid;
+        Comp_MaterializeFlags();
+        if (condValid)
+        {
+            // Full guest NZCV resident (arithmetic producer): evaluate the guest
+            // condition NATIVELY on the still-live host NZCV. CCFlags == the ARM
+            // cond field and (cond ^ 1) is the AArch64 inversion, so we branch
+            // (skip the body) exactly when the guest condition is false. Valid for
+            // every cond 0..13 (CheckCondition is only called for cond < 0xE).
+            return B((CCFlags)(cond ^ 1));
+        }
+        // Only N,Z were host-resident (logical producer); host C,V are invalid.
+        // The materialize above wrote N,Z into the canonical CPSR store (C,V were
+        // already there), so fall through to the standard word path — which under
+        // LAZYFLAGS reloads the full guest CPSR from ARM::CPSR memory.
+    }
+#endif
     if (cond >= 0x8)
     {
 #ifdef LITEV_JIT_CONDFOLD
@@ -976,6 +1005,10 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     ConstantCycles = 0;
     RegCache = RegisterCache<Compiler, ARM64Reg>(this, instrs, instrsCount, true);
     CPSRDirty = false;
+#ifdef LITEV_JIT_FIXEDREG
+    NZCVDeferred = 0;
+    NZCVCondValid = false;
+#endif
 
 #ifdef LITEV_JIT_LINK
     NumLinkExits = 0;
@@ -1034,6 +1067,14 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
         if (Thumb)
         {
+#ifdef LITEV_JIT_FIXEDREG
+            // Thumb instructions carry no per-instruction main-loop CheckCondition, so
+            // reconcile any deferred host flags before the body. Stage 2b: spill ONLY
+            // when this body forces it (reads a deferred flag, or clobbers host NZCV
+            // without being a full producer); a transparent Thumb body keeps the flags
+            // resident in host PSTATE across it.
+            Comp_ReconcileFlags();
+#endif
             if (comp == NULL)
             {
                 MOV(X0, RCPU);
@@ -1049,6 +1090,9 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
             u32 cond = CurInstr.Cond();
             if (CurInstr.Info.Kind == ARMInstrInfo::ak_BLX_IMM)
             {
+#ifdef LITEV_JIT_FIXEDREG
+                Comp_MaterializeFlags();
+#endif
                 if (comp)
                     (this->*comp)();
                 else
@@ -1059,6 +1103,9 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
             }
             else if (cond == 0xF)
             {
+#ifdef LITEV_JIT_FIXEDREG
+                Comp_MaterializeFlags();
+#endif
                 Comp_AddCycles_C();
             }
             else
@@ -1068,6 +1115,13 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
                 FixupBranch skipExecute;
                 if (cond < 0xE)
                     skipExecute = CheckCondition(cond);
+#ifdef LITEV_JIT_FIXEDREG
+                else
+                    // Unconditional (AL) body: no CheckCondition ran. Stage 2b: keep
+                    // the resident flags alive across the body unless it reads a
+                    // deferred flag or clobbers host NZCV without being a full producer.
+                    Comp_ReconcileFlags();
+#endif
 
                 if (comp == NULL)
                 {
@@ -1119,6 +1173,12 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     }
 
     RegCache.Flush();
+#ifdef LITEV_JIT_FIXEDREG
+    // Block ends with the last instruction's flags possibly still resident in host
+    // NZCV (e.g. a trailing unconditional CMP). The dispatcher / ARM_Ret stores the
+    // live RCPSR at runtime, so reconcile now.
+    Comp_MaterializeFlags();
+#endif
 
     if (ConstantCycles)
         ADD(RCycles, RCycles, ConstantCycles);

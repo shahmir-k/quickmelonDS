@@ -189,6 +189,139 @@ void Compiler::Comp_RetriveFlags(bool retriveCV)
     }
 }
 
+#ifdef LITEV_JIT_FIXEDREG
+void Compiler::Comp_MaterializeFlags()
+{
+    // Flush guest flags resident in host NZCV back into the RCPSR word. This is
+    // the deferred half of Comp_RetriveFlags(true): the SAME CSET/BFI per live
+    // flag bit reading the SAME host NZCV, so the resulting RCPSR is bit-exact to
+    // what the producer would have extracted in place. CSET/BFI do not modify host
+    // PSTATE, so callers (e.g. CheckCondition) may still branch natively on the
+    // resident flags after materializing.
+    if (!NZCVDeferred)
+        return;
+
+    u8 m = NZCVDeferred;
+    NZCVDeferred = 0;
+    CPSRDirty = true;
+
+    if (m & 0x4) { CSET(W0, CC_EQ); BFI(RCPSR, W0, 30, 1); } // Z
+    if (m & 0x8) { CSET(W0, CC_MI); BFI(RCPSR, W0, 31, 1); } // N
+    if (m & 0x2) { CSET(W0, CC_CS); BFI(RCPSR, W0, 29, 1); } // C
+    if (m & 0x1) { CSET(W0, CC_VS); BFI(RCPSR, W0, 28, 1); } // V
+}
+
+
+// liteDS-v2 Stage 2b: is the CURRENT instruction body flag-transparent, i.e. does it
+// leave host PSTATE NZCV completely untouched AND read no guest CPSR flag? Only such
+// bodies may run with the resident flags kept alive in host NZCV. This is the hand
+// classifier the Stage-2a handoff flagged as required: Info.WriteFlags/ReadFlags
+// alone cannot express the shift-helper's scratch CMP (a non-S `LSL rd,rn,rs` writes
+// ZERO guest flags yet Comp_RegShiftReg emits a `CMP` that clobbers host NZCV) --
+// exactly the hazard armwrestler/rockwrestler torture.
+//
+// The check is conservatively FALSE (spill) for anything not proven transparent.
+bool Compiler::Comp_BodyIsNZCVTransparent(u16 kind, u8 writeFlags, u8 readFlags)
+{
+    using namespace ARMInstrInfo;
+
+    // A transparent body neither produces guest flags nor reads them. (A body that
+    // sets flags necessarily writes host NZCV; a body that reads flags needs a
+    // canonical RCPSR.) This is necessary but not sufficient -- WriteFlags==0 bodies
+    // can still scratch-clobber host NZCV, filtered per-kind below.
+    if (writeFlags != 0 || readFlags != 0)
+        return false;
+
+    if (Thumb)
+    {
+        // The only WriteFlags==0/ReadFlags==0 Thumb bodies that touch NEITHER host
+        // NZCV nor memory (no scratch CMP, no stub BL) are the non-flag hi-reg / SP /
+        // PC-relative address forms. Everything else with no flags is a load/store or
+        // a branch -> spill.
+        switch (kind)
+        {
+        case tk_ADD_HIREG: case tk_MOV_HIREG:
+        case tk_ADD_PCREL: case tk_ADD_SPREL: case tk_ADD_SP:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    // ARM. Data-processing ALU ops occupy [ak_AND_REG_LSL_IMM .. ak_MVN_IMM_S], 18
+    // kinds per op in the fixed ak_ALU() order: op-relative 0..3 = immediate-shifted
+    // register, 4..7 = REGISTER-specified shift, 8 = immediate, 9..17 = the S forms.
+    // A register-specified shift amount routes op2 through Comp_RegShiftReg, whose
+    // `CMP W1,32/31` clobbers host NZCV even when the instruction is non-S -- so only
+    // the immediate / immediate-shift forms (rel 0,1,2,3,8) are transparent. The RRX
+    // form (rel 3, ROR #0) reads guest C and is already excluded by readFlags!=0.
+    if (kind <= ak_MVN_IMM_S)
+    {
+        u32 rel = kind % 18;
+        return rel == 0 || rel == 1 || rel == 2 || rel == 3 || rel == 8;
+    }
+
+    // CLZ writes only a GPR. The non-S long/short multiplies (MUL..SMLAL; WriteFlags
+    // is 0 here, so the S-form with its host TST is already excluded) write only GPRs
+    // on ARM9, or a GPR via CLS/CLZ on ARM7 -- host NZCV is untouched. The SMLAxy /
+    // SMLAWy family (> ak_SMLAL) emits `ADDS` and is deliberately NOT included.
+    if (kind == ak_CLZ)
+        return true;
+    if (kind >= ak_MUL && kind <= ak_SMLAL)
+        return true;
+
+    // Memory, SMLAxy family, QADD/QSUB, MSR/MRS, branches, coprocessor, unknown: any
+    // of these may clobber host PSTATE (stub BL, scratch ADDS, CPSR write) -> spill.
+    return false;
+}
+
+// liteDS-v2 Stage 2b reconcile: called before each unconditional / Thumb instruction
+// body in place of the Stage-1 unconditional Comp_MaterializeFlags. Spills the flags
+// resident in host NZCV to RCPSR ONLY when the upcoming body forces it; otherwise the
+// flags stay canonical in host PSTATE across the body (the block-wide-NZCV win).
+void Compiler::Comp_ReconcileFlags()
+{
+    if (!NZCVDeferred)
+        return;
+
+    const u8 read = CurInstr.Info.ReadFlags;
+    const u8 wf   = CurInstr.Info.WriteFlags;
+    const u16 kind = CurInstr.Info.Kind;
+
+    // (A) body reads a guest flag that is currently deferred -> RCPSR must be canonical
+    // for that read (e.g. ADC/SBC/RSC read C, RRX reads C, MRS reads all).
+    if (read & NZCVDeferred)
+    {
+        Comp_MaterializeFlags();
+        return;
+    }
+
+    // (B) full-NZCV arithmetic producer: the host SUBS/ADDS/CMP/CMN sets N,Z,C,V ALWAYS
+    // (low nibble of WriteFlags == 0xF, only arithmetic compares/add/sub reach this),
+    // wholesale overwriting host NZCV and re-establishing the guest condition. The
+    // resident flags -- which (A) proved this body does not read -- are thereby dead
+    // (a real consumer would have read them via (A) first). Let the producer run; it
+    // re-defers / re-extracts a complete, self-consistent flag state. No spill.
+    if ((wf & 0x0F) == 0x0F)
+        return;
+
+    // (C)/(D): keep resident iff the body is flag-transparent, else spill before it
+    // clobbers host NZCV (partial producers, register-shift scratch CMP, stubs, ...).
+    if (Comp_BodyIsNZCVTransparent(kind, wf, read))
+        return;
+
+    // V3 item 1(a) NOTE — "skip a materialize flush whose deferred bits are all DEAD":
+    // this is already achieved UPSTREAM, not here. Every producer defers only LIVE bits
+    // (Comp_Logical/Arithmetic/Compare set `NZCVDeferred = CurInstr.SetFlags & mask`, and
+    // SetFlags is FloodFillSetFlags' exact backward liveness). So within a block
+    // NZCVDeferred can never contain a dead flag, and a "discard the flush if all deferred
+    // bits are dead" test here is provably unreachable (verified: a gated discard counted
+    // 0 on shrek-race/armwrestler/rockwrestler). The dead-flag elimination the prompt asks
+    // for is therefore complete in V2; nothing to add at the flush site.
+    Comp_MaterializeFlags();
+}
+#endif
+
 void Compiler::Comp_Logical(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2)
 {
     if (S && !CurInstr.SetFlags)
@@ -247,7 +380,27 @@ void Compiler::Comp_Logical(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2)
     }
 
     if (S)
-        Comp_RetriveFlags(false);
+    {
+#ifdef LITEV_JIT_FIXEDREG
+        // liteDS-v2 Stage 2a: logical S-op. The AArch64 logical op (ANDS/BICS, or
+        // TST after EOR/ORR) leaves guest N,Z LIVE in host PSTATE but ZEROES host
+        // C,V. Guest C is already in RCPSR (barrel-shifter carry, written by
+        // A_Comp_GetOp2 / Comp_RegShift*) and guest V is preserved in RCPSR, so
+        // only N,Z are host-resident. For an UNCONDITIONAL op (single path) defer
+        // exactly those bits (SetFlags & 0xC == what Comp_RetriveFlags(false) would
+        // extract). Host C,V are NOT valid guest flags -> NZCVCondValid = false, so
+        // a consumer materializes N,Z and evaluates its condition from RCPSR. Only
+        // take this when N,Z are actually live (mask != 0); otherwise the baseline
+        // Comp_RetriveFlags(false) still runs (it sets CPSRDirty for a C-only op).
+        if ((Thumb || CurInstr.Cond() == 0xE) && (CurInstr.SetFlags & 0xC))
+        {
+            NZCVDeferred = CurInstr.SetFlags & 0xC;
+            NZCVCondValid = false;
+        }
+        else
+#endif
+            Comp_RetriveFlags(false);
+    }
 }
 
 void Compiler::Comp_Arithmetic(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2)
@@ -428,7 +581,29 @@ void Compiler::Comp_Arithmetic(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2
             BFI(RCPSR, W2, 29, 1);
             BFI(RCPSR, W3, 28, 1);
         }
-        Comp_RetriveFlags(!CVInGPR);
+        else
+        {
+#ifdef LITEV_JIT_FIXEDREG
+            // Reaching this (non-CVInGPR) branch MEANS the host op left the full
+            // guest NZCV in host PSTATE: SUB/RSB/ADD via SUBS/ADDS, and the
+            // register-operand ADC/SBC via `CMP Wc,1; ADCS/SBCS` (which seed host
+            // carry-in from guest C, so host N,Z,C,V == full guest NZCV). Stage 2a
+            // widens the deferral from {SUB,RSB,ADD} to that whole class
+            // (op 0x2..0x6; RSC/0x7 always takes the CVInGPR path above, never here).
+            // For an UNCONDITIONAL instruction (always executes, so host NZCV is
+            // unambiguously current on the single path) keep the flags resident and
+            // skip the RCPSR extraction. Conditional producers must stay on the
+            // extract path: the host op runs only on the taken side, so a compile-
+            // time "resident" claim would be wrong on the skipped side.
+            if (op >= 0x2 && op <= 0x6 && (Thumb || CurInstr.Cond() == 0xE))
+            {
+                NZCVDeferred = CurInstr.SetFlags & 0xF;
+                NZCVCondValid = true; // full guest NZCV lives in host PSTATE
+            }
+            else
+#endif
+                Comp_RetriveFlags(true);
+        }
     }
 }
 
@@ -469,6 +644,25 @@ void Compiler::Comp_Compare(int op, ARM64Reg rn, Op2 op2)
         break;
     }
 
+#ifdef LITEV_JIT_FIXEDREG
+    // CMP/CMN (arithmetic compares) set host NZCV == full guest NZCV. Defer when
+    // unconditional; TST/TEQ (logical, op 8/9) fall through to Comp_Compare's tail
+    // below which keeps the logical (N,Z-only) extraction.
+    if ((op == 0xA || op == 0xB) && (Thumb || CurInstr.Cond() == 0xE))
+    {
+        NZCVDeferred = CurInstr.SetFlags & 0xF;
+        NZCVCondValid = true; // full guest NZCV lives in host PSTATE
+        return;
+    }
+    // TST/TEQ (op 8/9): logical compares — host N,Z live, host C,V zeroed, guest C
+    // in RCPSR (shifter), guest V preserved. Defer N,Z only (same as Comp_Logical).
+    if ((Thumb || CurInstr.Cond() == 0xE) && (CurInstr.SetFlags & 0xC))
+    {
+        NZCVDeferred = CurInstr.SetFlags & 0xC;
+        NZCVCondValid = false;
+        return;
+    }
+#endif
     Comp_RetriveFlags(op >= 0xA);
 }
 

@@ -39,6 +39,9 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
     // it's not completely safe to assume stuff like, which instructions to preload
     // we'll see how it works out
 
+#ifdef LITEV_JIT_FIXEDREG
+    Comp_MaterializeFlags();
+#endif
     IrregularCycles = true;
 
     u32 newPC;
@@ -299,6 +302,12 @@ void* Compiler::Gen_JumpTo7(int kind)
 
 void Compiler::Comp_JumpTo(Arm64Gen::ARM64Reg addr, bool switchThumb, bool restoreCPSR)
 {
+#ifdef LITEV_JIT_FIXEDREG
+    // A same-instruction branch (Rd=PC ALU op) can follow an unconditional deferring
+    // producer; reconcile before the branch stub BL clobbers host NZCV / before the
+    // CPSR is saved-restored.
+    Comp_MaterializeFlags();
+#endif
     IrregularCycles = true;
 
     if (!restoreCPSR)
