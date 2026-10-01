@@ -993,6 +993,31 @@ void* Compiler::Gen_Dispatcher(u32 num)
     SUB(W0, W0, 4);
     ADD(W0, W0, W3, ArithOption(W3, ST_LSL, 1));      // W0 = clean instrAddr
 
+#ifdef LITEV_JIT_ICACHE
+    // (d.5-ICACHE) per-site 2-way inline cache. W9 = site index (set by the exiting
+    // block; 0 == "no cache", e.g. an unlinked EmitLinkExit hop). W0 = instrAddr is
+    // PRESERVED (steps e/f/writeback below also rely on it). A hit requires the entry
+    // epoch to match the live ARM::ICacheEpoch (O(1) invalidation) AND key0/key1 ==
+    // instrAddr, then branches straight to the cached host block — skipping the region
+    // bounds + the cache-cold FastBlockLookup gather. The commit (a)(b)(c) is already
+    // done and the CPSR store is byte-identical to step (g), so a hit is timing-exact.
+    FixupBranch icNoCache = CBZ(W9);
+    MOVP2R(X2, (void*)ICacheTable[num]);
+    ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICacheEntryShift)); // &ICacheTable[num][W9]
+    LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+    LDR(INDEX_UNSIGNED, W4, RCPU, offsetof(ARM, ICacheEpoch));
+    CMP(W3, W4);
+    FixupBranch icEpochMiss = B(CC_NEQ);
+    LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key0));
+    CMP(W3, W0);
+    FixupBranch icHit0 = B(CC_EQ);
+    LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));
+    CMP(W3, W0);
+    FixupBranch icHit1 = B(CC_EQ);
+    SetJumpTarget(icEpochMiss);
+    SetJumpTarget(icNoCache);
+    // miss -> fall through to the region-bounds + tag lookup, which WRITES BACK below.
+#endif
 
     // (e) region bounds: offset = instrAddr - FastBlockLookupStart, exit if >= Size (unsigned;
     //     a single compare also catches instrAddr < Start via wraparound)
@@ -1033,6 +1058,33 @@ void* Compiler::Gen_Dispatcher(u32 num)
     // low 32 bits of the entry (W7) are the sub-entry offset into the RX region; baked RXBase
     // == GetRXBase() (stable rebased base, the same one SubEntryOffset subtracts).
     MOVI2R(X3, (u64)GetRXBase());
+#ifdef LITEV_JIT_ICACHE
+    // Compute host addr into X6 (keep W0 = instrAddr for the cache key), fill this
+    // site's 2-way entry (LRU: demote slot0->slot1, new -> slot0) stamped with the
+    // live epoch, then branch. W9 == 0 means the exiting site opted out of caching.
+    ADD(X6, X3, W7, ArithOption(W7));                 // X6 = absolute host block entry
+    {
+        FixupBranch wbSkip = CBZ(W9);
+        MOVP2R(X2, (void*)ICacheTable[num]);
+        ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICacheEntryShift));
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key0));
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));   // key1 = old key0
+        LDR(INDEX_UNSIGNED, X4, X2, offsetof(ICacheEntry, ptr0));
+        STR(INDEX_UNSIGNED, X4, X2, offsetof(ICacheEntry, ptr1));   // ptr1 = old ptr0
+        STR(INDEX_UNSIGNED, W0, X2, offsetof(ICacheEntry, key0));   // key0 = instrAddr
+        STR(INDEX_UNSIGNED, X6, X2, offsetof(ICacheEntry, ptr0));   // ptr0 = host entry
+        LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, ICacheEpoch));
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        SetJumpTarget(wbSkip);
+    }
+  #if LITEV_PROFILE
+    MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.DispatcherHits);
+    LDR(INDEX_UNSIGNED, X5, X4, 0);
+    ADD(X5, X5, 1);
+    STR(INDEX_UNSIGNED, X5, X4, 0);
+  #endif
+    BR(X6);
+#else
     ADD(X0, X3, W7, ArithOption(W7));                 // add x0, x3, w7, uxtw
 #if LITEV_PROFILE
     // Runtime dispatcher-resolved chain hops (compare to CommitStubEntries = linked hops -> the
@@ -1043,7 +1095,37 @@ void* Compiler::Gen_Dispatcher(u32 num)
     STR(INDEX_UNSIGNED, X5, X4, 0);
 #endif
     BR(X0);
+#endif
 
+#ifdef LITEV_JIT_ICACHE
+    // ICACHE hit tails (reached from (d.5-ICACHE); X2 still holds the entry pointer).
+    // Under LAZYFLAGS ARM::CPSR is already canonical (as at step (g)); otherwise commit
+    // the live RCPSR exactly as the plain hit path does.
+    SetJumpTarget(icHit0);
+  #ifndef LITEV_JIT_LAZYFLAGS
+    STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+  #endif
+    LDR(INDEX_UNSIGNED, X5, X2, offsetof(ICacheEntry, ptr0));
+  #if LITEV_PROFILE
+    MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.ICacheHits);
+    LDR(INDEX_UNSIGNED, X3, X4, 0);
+    ADD(X3, X3, 1);
+    STR(INDEX_UNSIGNED, X3, X4, 0);
+  #endif
+    BR(X5);
+    SetJumpTarget(icHit1);
+  #ifndef LITEV_JIT_LAZYFLAGS
+    STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+  #endif
+    LDR(INDEX_UNSIGNED, X5, X2, offsetof(ICacheEntry, ptr1));
+  #if LITEV_PROFILE
+    MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.ICacheHits);
+    LDR(INDEX_UNSIGNED, X3, X4, 0);
+    ADD(X3, X3, 1);
+    STR(INDEX_UNSIGNED, X3, X4, 0);
+  #endif
+    BR(X5);
+#endif
 
     SetJumpTarget(exitStop);
     SetJumpTarget(exitBudget);
@@ -1072,6 +1154,12 @@ void Compiler::EmitBlockExit()
     Comp_MaterializeFlags();
 #endif
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.DispatchOnlyExits);
+#ifdef LITEV_JIT_ICACHE
+    // Hand this dynamic exit its own per-site cache slot; the dispatcher (d.5-ICACHE)
+    // reads W9 to index / fill the 2-way entry. Index 0 (assigned on table overflow)
+    // disables caching for this site. Compile-time constant -> baked immediate.
+    MOVI2R(W9, ICacheAssignSite());
+#endif
     B(DispatcherEntry[Num]);
 }
 #endif
@@ -1126,6 +1214,9 @@ void Compiler::EmitLinkExit(u32 targetAddr)
     STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
 #endif
     // LAZYFLAGS: ARM::CPSR already canonical in memory at the linkable exit; W27 = guest r7.
+#ifdef LITEV_JIT_ICACHE
+    MOVI2R(W9, 0);   // a linkable exit opts out of the per-site cache (0 = no cache)
+#endif
     u32 patchOffset = (u32)((u8*)GetRXPtr() - GetRXBase());
     B(DispatcherEntry[Num]);   // the patch slot (unlinked state)
 
@@ -1513,9 +1604,42 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     return res;
 }
 
+#ifdef LITEV_JIT_ICACHE
+void Compiler::ICacheAllocOnce()
+{
+    for (int c = 0; c < 2; c++)
+        if (!ICacheTable[c])
+            ICacheTable[c] = (ICacheEntry*)calloc(ICacheSites, sizeof(ICacheEntry));
+}
+
+void Compiler::ICacheReset()
+{
+    // Wholesale block-cache reset: every host block is gone, so every cached
+    // (guest-PC -> host-ptr) pair is stale. Zeroing the tables makes key0/key1 == 0
+    // (an impossible even instrAddr only if 0 is never a real block start; the epoch
+    // guard is the real safety net regardless). Reset the site counter and bump the
+    // per-CPU epoch so any in-flight entry (there are none post-reset, but be robust)
+    // is rejected. NextSite starts at 1 (0 reserved for "no cache").
+    for (int c = 0; c < 2; c++)
+    {
+        if (ICacheTable[c]) memset(ICacheTable[c], 0, (size_t)ICacheSites * sizeof(ICacheEntry));
+    }
+    ICacheNextSite = 1;
+    NDS.ARM9.ICacheEpoch++;
+    NDS.ARM7.ICacheEpoch++;
+}
+#endif
+
 void Compiler::Reset()
 {
     LoadStorePatches.clear();
+
+#ifdef LITEV_JIT_ICACHE
+    // Allocate the per-CPU inline-cache tables BEFORE Gen_Dispatcher bakes their base
+    // address, then clear them + bump the epoch for this new cache epoch.
+    ICacheAllocOnce();
+    ICacheReset();
+#endif
 
     SetCodePtr(0);
     OtherCodeRegion = JitMemMainSize;

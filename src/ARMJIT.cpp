@@ -1224,6 +1224,14 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
 #endif
 
         FastBlockLookupRegions[block->StartAddrLocal >> 27][(block->StartAddrLocal & 0x7FFFFFF) / 2] = (u64)UINT32_MAX << 32;
+#ifdef LITEV_JIT_ICACHE
+        // Same hazard for the per-site inline cache: a block just left FastBlockLookup, so any
+        // per-site entry caching a host pointer into it is now stale. Bump the per-CPU epoch ->
+        // every existing entry fails its epoch compare in the dispatcher and re-resolves. O(1)
+        // whole-cache invalidation (single-block invalidations are ~4/3400f in steady state).
+        NDS.ARM9.ICacheEpoch++;
+        NDS.ARM7.ICacheEpoch++;
+#endif
         if (block->Num == 0)
             JitBlocks9.erase(block->StartAddr);
         else

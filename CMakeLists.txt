@@ -266,6 +266,28 @@ if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     endif()
 endif()
 
+# Per-site block inline cache (ICACHE). An earlier single-entry return-target cache
+# caught only ~6.5% because it keyed on a GLOBAL last-target; the dispatcher target stream is instead
+# strongly PER-SITE monomorphic/bimodal (offline replay of the shrek-race 3400f
+# stream: 76.7% of lookups at sites with <=2 distinct targets; per-site N=2 covers
+# 93.6% vs global-N1 15%). ICACHE gives each dynamic exit site its own 2-way
+# (guest-PC -> host-block-ptr) cache, checked in the dispatcher AFTER instrAddr is
+# computed but BEFORE the region-bounds + cache-cold FastBlockLookup gather -> a hit
+# skips the multi-MB indexed load. Entries are filled ONLY from a dispatcher
+# region-hit resolve (Option A; the C++-reentry fill added <2%) and EPOCH-GUARDED:
+# every block invalidation / cache reset bumps ARM::ICacheEpoch, so all entries go
+# stale in O(1) (single-block invalidations are ~4/3400f in steady state). Pure
+# predictor (same block runs, same cycle accounting as the plain hit path) -> BIT-EXACT /
+# MP-safe. Default OFF -> flag-off byte-identical (all code behind #ifdef).
+option(LITEV_JIT_ICACHE "Per-site 2-way block inline cache in the dispatcher (guest-PC->host-ptr), epoch-guarded" OFF)
+if (LITEV_JIT_ICACHE)
+    if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_ICACHE=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_ICACHE requires LITEV_JIT_DISPATCH and an AArch64 target.")
+    endif()
+endif()
+
 # Unit 5 (M2.1): event-true scheduler slices. When ON, each scheduler iteration
 # runs the CPUs to the TRUE next deadline (next scheduled event / frame end /
 # next timer overflow) instead of the fixed kMaxIterationCycles cap, so the CPUs

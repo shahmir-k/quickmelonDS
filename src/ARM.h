@@ -231,6 +231,20 @@ public:
     u32 JitNZCV = 0;
 #endif
 
+#ifdef LITEV_JIT_ICACHE
+    // Per-site block inline-cache epoch (LITEV_JIT_ICACHE). The dispatcher's per-site
+    // 2-way (guest-PC -> host-ptr) cache lives in Compiler::ICacheTable[]; each entry
+    // carries the epoch it was filled under. This counter is bumped on EVERY block
+    // invalidation (InvalidateByAddr) and cache reset (ResetBlockCache), so an entry
+    // filled before the bump fails its epoch compare in the dispatcher hit path and
+    // falls back to the authoritative FastBlockLookup -> a cached host pointer can
+    // never be stale (O(1) whole-cache invalidation). Read by the emitted dispatcher
+    // via offsetof(ARM, ICacheEpoch). Placed AFTER every offset-critical / static-
+    // asserted hot field (Cycles/StopExecution/CPSR/CyclesBudget/FastBlockLookup*/
+    // JitNZCV) so it disturbs no baked offset; transient -> never serialized.
+    u32 ICacheEpoch = 0;
+#endif
+
     static const u32 ConditionTable[16];
 #ifdef GDBSTUB_ENABLED
     Gdb::GdbStub GdbStub;

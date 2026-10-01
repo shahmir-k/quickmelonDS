@@ -333,6 +333,25 @@ public:
     void EmitBlockExit();
     void* DispatcherEntry[2] = { nullptr, nullptr };
 
+#ifdef LITEV_JIT_ICACHE
+    // Per-site 2-way block inline cache. Each dynamic exit site (assigned a compact
+    // index 1..ICacheSites-1 at compile time; 0 = "no cache") gets a 2-way entry the
+    // dispatcher checks after computing instrAddr and before the region-bounds +
+    // FastBlockLookup gather. Filled from a dispatcher region-hit resolve; epoch-
+    // guarded (ARM::ICacheEpoch) for O(1) invalidation. See CMake LITEV_JIT_ICACHE.
+    static constexpr u32 ICacheSites = 16384;   // per-CPU site slots (idx 0 reserved)
+    struct ICacheEntry {                        // 32 bytes (LSL #5); 64 bytes (LSL #6) under DIRECTPATCH
+        u32 key0; u32 key1; u32 epoch; u32 _pad;
+        u64 ptr0; u64 ptr1;
+    };
+    static constexpr int ICacheEntryShift = 5;  // sizeof(ICacheEntry)==32 -> LSL #5 (byte-identical)
+    ICacheEntry* ICacheTable[2] = { nullptr, nullptr };  // per-CPU, allocated once
+    u32 ICacheNextSite = 1;                     // next site index to hand out (0 reserved)
+    void ICacheAllocOnce();                     // allocate the per-CPU tables (idempotent)
+    void ICacheReset();                         // zero tables + reset counter (on ResetBlockCache)
+    // Assign the next compile-time site index for a dynamic exit (0 on overflow).
+    u32 ICacheAssignSite() { return (ICacheNextSite < ICacheSites) ? ICacheNextSite++ : 0; }
+#endif
 
 #endif
 
