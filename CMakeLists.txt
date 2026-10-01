@@ -528,6 +528,21 @@ option(LITEV_COARSE_RTC "DraStic: skip inert 32768Hz RTC ticks when no periodic 
 if (LITEV_COARSE_RTC)
     add_compile_definitions(LITEV_COARSE_RTC=1)
 endif()
+
+# DraStic-style "baked" timer deadline (attacks the run_system bucket). Under
+# LITEV_EVENT_SLICES, NextTarget() recomputes NextTimerDeadline() on every one of
+# the ~1957 scheduler iterations/frame -- an 8-timer scan whose result is provably
+# INVARIANT between timer overflows/reloads and control writes (RunTimer advances
+# Counter by cycles<<shift while TimerTimestamp advances by cycles, leaving the
+# absolute soonest-overflow SysTimestamp unchanged). This caches the deadline and
+# recomputes only when a timer actually overflows/reloads (HandleTimerOverflow) or
+# its control/prescaler/start state is written (TimerStart); savestate-load and
+# reset invalidate it. EXACT (no accuracy tradeoff) -- pure recompute elision.
+# Default OFF.
+option(LITEV_TIMER_FAST "DraStic: cache NextTimerDeadline, recompute only on timer overflow/control write" OFF)
+if (LITEV_TIMER_FAST)
+    add_compile_definitions(LITEV_TIMER_FAST=1)
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

@@ -522,6 +522,10 @@ void NDS::Reset()
     TimerCheckMask[1] = 0;
     TimerTimestamp[0] = 0;
     TimerTimestamp[1] = 0;
+#if defined(LITEV_TIMER_FAST)
+    CachedTimerDeadline = UINT64_MAX;
+    TimerDeadlineDirty = true;
+#endif
 
     for (i = 0; i < 8; i++) DMAs[i].Reset();
     memset(DMA9Fill, 0, 4*4);
@@ -696,6 +700,11 @@ bool NDS::DoSavestate(Savestate* file)
     }
     file->VarArray(TimerCheckMask, 2*sizeof(u8));
     file->VarArray(TimerTimestamp, 2*sizeof(u64));
+#if defined(LITEV_TIMER_FAST)
+    // Timer state just changed wholesale (on load); force a recompute. Harmless
+    // on save. Keeps the cache out of the savestate format (version-compatible).
+    TimerDeadlineDirty = true;
+#endif
 
     file->VarArray(DMA9Fill, 4*sizeof(u32));
 
@@ -850,7 +859,17 @@ u64 NDS::NextTarget()
         minEvent = SysTimestamp + 560190;
     }
 
+#if defined(LITEV_TIMER_FAST)
+    // Use the baked deadline; recompute only when a timer event dirtied it.
+    if (TimerDeadlineDirty)
+    {
+        CachedTimerDeadline = NextTimerDeadline();
+        TimerDeadlineDirty = false;
+    }
+    u64 timerDeadline = CachedTimerDeadline;
+#else
     u64 timerDeadline = NextTimerDeadline();
+#endif
     if (timerDeadline < minEvent)
         minEvent = timerDeadline;
 
@@ -1778,6 +1797,10 @@ void NDS::MonitorARM9Jump(u32 addr)
 
 void NDS::HandleTimerOverflow(u32 tid)
 {
+#if defined(LITEV_TIMER_FAST)
+    // A reload changes Counter -> the soonest-overflow deadline moves.
+    TimerDeadlineDirty = true;
+#endif
     Timer* timer = &Timers[tid];
 
     timer->Counter += (timer->Reload << 10);
@@ -1864,6 +1887,12 @@ void NDS::TimerStart(u32 id, u16 cnt)
     {
         timer->Counter = timer->Reload << 10;
     }
+
+#if defined(LITEV_TIMER_FAST)
+    // Control/prescaler/start/Counter and TimerCheckMask below all move the
+    // deadline (or arm/disarm a timer). Recompute on next NextTarget.
+    TimerDeadlineDirty = true;
+#endif
 
     if ((cnt & 0x84) == 0x80)
         TimerCheckMask[id>>2] |= 0x01 << (id&0x3);

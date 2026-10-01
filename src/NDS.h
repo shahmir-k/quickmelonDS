@@ -519,6 +519,18 @@ protected:
     u16 WifiWaitCnt;
     u8 TimerCheckMask[2];
     u64 TimerTimestamp[2];
+#if defined(LITEV_TIMER_FAST)
+    // LITEV_TIMER_FAST: cached NextTimerDeadline (DraStic "baked deadline").
+    // The soonest-overflow SysTimestamp is INVARIANT as timers advance between
+    // overflows (RunTimer bumps Counter by cycles<<shift while TimerTimestamp
+    // bumps by cycles, so the absolute deadline term is unchanged -- exact, see
+    // NextTimerDeadline). It only changes when a timer overflows/reloads
+    // (HandleTimerOverflow) or its control/prescaler/start state is written
+    // (TimerStart). Recompute lazily on those events instead of every one of the
+    // ~1957 scheduler iterations/frame.
+    u64 CachedTimerDeadline;
+    bool TimerDeadlineDirty;
+#endif
     DMA DMAs[8];
     u32 DMA9Fill[4];
     u16 IPCSync9, IPCSync7;
