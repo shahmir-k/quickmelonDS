@@ -505,6 +505,17 @@ option(LITEV_INSTANT_DIVSQRT "Instant ARM9 divider/sqrt: compute on write, skip 
 if (LITEV_INSTANT_DIVSQRT)
     add_compile_definitions(LITEV_INSTANT_DIVSQRT=1)
 endif()
+
+# DraStic batched audio ring (teardown doc 11): SPU::Mix generates N samples per
+# scheduled Event_SPU instead of one, cutting the SPU scheduler-event flood
+# (547/frame) by ~N x. Sample generation is bit-identical per iteration; only
+# scheduler granularity + SPU-IRQ/capture latency coarsen (FPS-first). N is the
+# batch factor (default 8 -> 547/frame -> ~68/frame). Default OFF.
+option(LITEV_SPU_BATCH "DraStic #11: batch N audio samples per Event_SPU (coarsen SPU event flood)" OFF)
+set(LITEV_SPU_BATCH_N "8" CACHE STRING "SPU batch factor (samples generated per scheduled Event_SPU)")
+if (LITEV_SPU_BATCH)
+    add_compile_definitions(LITEV_SPU_BATCH=1 LITEV_SPU_BATCH_N=${LITEV_SPU_BATCH_N})
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

@@ -863,6 +863,18 @@ void SPU::Mix(u32 spucycles)
     LITE_PROFILE_SCOPE(spuTimer, melonDS::LiteProfile::g_Frame.SPUMixNs);
 
 
+#ifdef LITEV_SPU_BATCH
+    // DraStic batched audio ring (teardown doc 11): generate LITEV_SPU_BATCH_N
+    // samples per scheduled Event_SPU instead of one, cutting the SPU event
+    // flood ~N x (547/frame -> ~547/N). Each loop iteration is bit-identical to
+    // a standalone Mix() at param=spucycles (same channel advance, same blip
+    // deltas, same BufferAudio thresholds); only the scheduler granularity is
+    // coarsened. The ARM cores do not run between the batched samples, so SPU
+    // IRQs / sound-capture writeback land up to (N-1) samples late -- a
+    // deliberate FPS-first timing relaxation (flag default OFF).
+    for (u32 _spubatch = 0; _spubatch < (u32)(LITEV_SPU_BATCH_N); _spubatch++)
+    {
+#endif
     s32 left = 0, right = 0;
     s32 leftoutput = 0, rightoutput = 0;
 
@@ -1024,7 +1036,12 @@ void SPU::Mix(u32 spucycles)
     if (BlipTimer >= 512 * 128)
         BufferAudio();
 
+#ifdef LITEV_SPU_BATCH
+    }
+    NDS.ScheduleEvent(Event_SPU, true, MixInterval * (LITEV_SPU_BATCH_N), 0, MixInterval >> 1);
+#else
     NDS.ScheduleEvent(Event_SPU, true, MixInterval, 0, MixInterval >> 1);
+#endif
 }
 
 void SPU::BufferAudio()
