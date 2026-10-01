@@ -1129,12 +1129,23 @@ void NDS::Reschedule(u64 target)
     if (CurCPU == 0)
     {
         if (target < (ARM9Target >> ARM9ClockShift))
+        {
             ARM9Target = (target << ARM9ClockShift);
+            // liteDS-v2 Unit 2 (shadow): the running CPU's Target just moved earlier
+            // (an event was scheduled before the current slice end). Zero the budget
+            // so Unit 3's dispatcher exits at the new deadline. This is also what
+            // keeps the shadow-assert exact: mid-slice Target only ever moves earlier,
+            // always through this path, so a positive budget proves Target unchanged.
+            ARM9.ForceExecutionExit();
+        }
     }
     else
     {
         if (target < ARM7Target)
+        {
             ARM7Target = target;
+            ARM7.ForceExecutionExit();
+        }
     }
 }
 
@@ -1443,6 +1454,13 @@ void NDS::UpdateIRQ(u32 cpu)
     {
         arm.IRQ = 0;
     }
+
+    // liteDS-v2 Unit 2 (shadow, inert): an IRQ raised mid-slice must force the CPU
+    // out of generated code so it can be delivered at the C++ boundary. Redundant
+    // with StopExecution today; consumed by Unit 3's dispatcher.
+    if (arm.IRQ)
+        arm.ForceExecutionExit();
+
 }
 
 void NDS::SetIRQ(u32 cpu, u32 irq)
@@ -1502,11 +1520,13 @@ void NDS::StopCPU(u32 cpu, u32 mask)
     {
         CPUStop |= (mask << 16);
         ARM7.Halt(2);
+        ARM7.ForceExecutionExit(); // liteDS-v2 Unit 2 (shadow): DMA start CPUStop bit
     }
     else
     {
         CPUStop |= mask;
         ARM9.Halt(2);
+        ARM9.ForceExecutionExit(); // liteDS-v2 Unit 2 (shadow): DMA start CPUStop bit
     }
 }
 
@@ -1521,6 +1541,10 @@ void NDS::GXFIFOStall()
     if (CPUStop & CPUStop_GXStall) return;
 
     CPUStop |= CPUStop_GXStall;
+
+    // liteDS-v2 Unit 2 (shadow): GXFIFO stall halts ARM9 progress; force it out of
+    // generated code regardless of which CPU triggered the stall.
+    ARM9.ForceExecutionExit();
 
     if (CurCPU == 1) ARM9.Halt(2);
     else
@@ -1548,6 +1572,7 @@ void NDS::EnterSleepMode()
 
     CPUStop |= CPUStop_Sleep;
     ARM7.Halt(2);
+    ARM7.ForceExecutionExit(); // liteDS-v2 Unit 2 (shadow): sleep-mode halt
 }
 
 u32 NDS::GetPC(u32 cpu) const
@@ -3961,7 +3986,8 @@ void NDS::ARM7IOWrite8(u32 addr, u8 val)
     case 0x04000301:
         val &= 0xC0;
         if      (val == 0x40) Stop(StopReason::GBAModeNotSupported);
-        else if (val == 0x80) ARM7.Halt(1);
+        // liteDS-v2 Unit 2 (shadow): HALTCNT halt-for-IRQ on ARM7.
+        else if (val == 0x80) { ARM7.Halt(1); ARM7.ForceExecutionExit(); }
         else if (val == 0xC0) EnterSleepMode();
         return;
     }

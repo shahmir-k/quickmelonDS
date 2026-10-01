@@ -85,6 +85,14 @@ public:
         Halted = halt;
     }
 
+    // liteDS-v2 Unit 2 (shadow mode): force the current execution slice to end
+    // as soon as the emitted dispatcher (Unit 3) checks the budget. Zeroing the
+    // budget is the exact equivalent of "ARM9Timestamp/ARM7Timestamp has already
+    // reached its Target" because CyclesBudget is maintained in the same unit as
+    // Cycles (see ARM.cpp Execute<JIT>). This is INERT this unit: nothing reads
+    // CyclesBudget for control flow yet.
+    void ForceExecutionExit() { CyclesBudget = 0; }
+
     void NocashPrint(u32 addr) noexcept;
 
     bool CheckCondition(u32 code) const
@@ -189,6 +197,16 @@ public:
     u32 FastBlockLookupStart, FastBlockLookupSize;
     u64* FastBlockLookup;
 #endif
+
+    // liteDS-v2 Unit 2 (shadow mode): per-slice execution budget, in the same
+    // core-cycle unit as Cycles (i.e. Timestamp units: the code anchors this with
+    // `Timestamp += Cycles`). 0 => exit ASAP. Placed AFTER every hot field whose
+    // offset is hard-coded in ARMJIT_x64/ARMJIT_Offsets.h (Cycles 0xc,
+    // StopExecution 0x10, CPSR 0x64) so it cannot disturb them; its own offset
+    // (ARM_CyclesBudget_offset) is proven by static_assert in the JIT compilers.
+    // Transient (recomputed every slice) -> never serialized in DoSavestate.
+    s32 CyclesBudget = 0;
+
 
     static const u32 ConditionTable[16];
 #ifdef GDBSTUB_ENABLED

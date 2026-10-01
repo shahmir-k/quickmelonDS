@@ -601,7 +601,9 @@ void ARMv5::CP15Write(u32 id, u32 val)
 
     case 0x704:
     case 0x782:
+        // liteDS-v2 Unit 2 (shadow): CP15 wait-for-interrupt halt on ARM9.
         Halt(1);
+        ForceExecutionExit();
         return;
 
 

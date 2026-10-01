@@ -120,6 +120,12 @@ option(LITEV_SOFTPROF "liteV: software-render phase profiler (thread names + pha
 if (LITEV_SOFTPROF)
     add_compile_definitions(LITEV_SOFTPROF=1)
 endif()
+# Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
+# implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
+option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)
+if (LITEV_SHADOW_ASSERT)
+    add_compile_definitions(LITEV_SHADOW_ASSERT=1)
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

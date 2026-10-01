@@ -35,6 +35,62 @@ namespace melonDS
 using Platform::Log;
 using Platform::LogLevel;
 
+#if defined(LITEV_SHADOW_ASSERT)
+// liteDS-v2 Unit 2 shadow-mode equivalence check.
+//
+// Called right after each ARM_Dispatch/CompileBlock returns, while <timestamp> is
+// still the PRE-increment value (the loop does `Timestamp += Cycles` immediately
+// after). It proves that the not-yet-active budget mechanism (Unit 3) would make
+// the exact same "is this slice over?" decision as the current timestamp/target
+// compare.
+//
+// Anchoring / units: the loop's identity is `Timestamp += Cycles`, so <cycles> is,
+// by construction, in Timestamp units (for ARM9 that is bus-clock << ARM9ClockShift;
+// for ARM7 it is bus-clock, no shift). The budget is captured before dispatch as
+// `min(Target - Timestamp, INT32_MAX)`, i.e. in those same units. Hence
+// algebraically  (Cycles >= budget)  ==  (Timestamp + Cycles >= Target).
+//
+// Invariant handling of the two edge conditions:
+//  * budget == 0  => ForceExecutionExit() fired mid-block. The dispatch loop only
+//    ever enters with Timestamp < Target, so the budget captured before dispatch
+//    was strictly > 0; a 0 here therefore MUST be a forced exit. Unit 3's dispatcher
+//    treats budget<=cycles as "exit", which is trivially true (Cycles >= 0), so the
+//    forced exit is always honoured. There is no timestamp-side obligation in this
+//    case (the forcing event -- reschedule/IRQ/halt/DMA/GXstall -- may or may not
+//    have advanced Timestamp past Target), so we do not compare. This is the ONLY
+//    case where the two sides may legitimately differ.
+//  * budget > 0  => no ForceExecutionExit fired. Mid-slice, Target only ever moves
+//    EARLIER (NDS::Reschedule), and that path zeroes the budget; so a positive
+//    budget also proves Target is unchanged since capture. The equivalence is then
+//    exact and asserted. (If the pre-dispatch difference exceeded INT32_MAX the
+//    budget is clamped, but a single block never consumes ~2^31 cycles, so both
+//    sides read false and still agree -- benign, and it does not occur in the suite.)
+static void LiteV_ShadowAssertBudget(const char* who, s32 cycles, s32 budget,
+                                     s64 timestamp, s64 target)
+{
+    if (budget <= 0)
+        return; // forced exit (budget zeroed) or slice already consumed; no timestamp
+                // obligation. Non-dispatch builds never make the budget negative, so this
+                // is identical to `== 0` there; the Unit 3 dispatcher maintains the budget
+                // as `budget -= Cycles` per chained block, which can drive a
+                // ForceExecutionExit()-zeroed budget below zero.
+
+    bool budgetExit = (cycles >= budget);
+    bool tsExit = (timestamp + (s64)cycles >= target);
+    if (budgetExit != tsExit)
+    {
+        fprintf(stderr,
+            "[LITEV_SHADOW_ASSERT] %s budget<->timestamp divergence: "
+            "cycles=%d budget=%d timestamp=%lld target=%lld "
+            "(budgetExit=%d tsExit=%d)\n",
+            who, cycles, budget, (long long)timestamp, (long long)target,
+            (int)budgetExit, (int)tsExit);
+        fflush(stderr);
+        abort();
+    }
+}
+#endif
+
 #ifdef GDBSTUB_ENABLED
 void ARM::GdbCheckA()
 {
@@ -530,6 +586,10 @@ void ARM::TriggerIRQ()
     if (CPSR & 0x80)
         return;
 
+    // liteDS-v2 Unit 2 (shadow, inert): an IRQ being delivered forces the slice to
+    // end so the dispatcher re-enters C++. Currently redundant with StopExecution.
+    ForceExecutionExit();
+
     u32 oldcpsr = CPSR;
     CPSR &= ~0xFF;
     CPSR |= 0xD2;
@@ -632,10 +692,22 @@ void ARMv5::Execute()
 
             JitBlockEntry block = NDS.JIT.LookUpBlock(0, FastBlockLookup,
                 instrAddr - FastBlockLookupStart, instrAddr);
+
+            // liteDS-v2 Unit 2 (shadow): maintain the slice budget in the exact same
+            // unit as Cycles. The loop guarantees ARM9Timestamp < ARM9Target here, so
+            // this is strictly positive before dispatch (a 0 later => forced exit).
+            CyclesBudget = (s32)std::min<s64>((s64)(NDS.ARM9Target - NDS.ARM9Timestamp), INT32_MAX);
+
             if (block)
                 ARM_Dispatch(this, block);
             else
                 NDS.JIT.CompileBlock(this);
+
+#if defined(LITEV_SHADOW_ASSERT)
+            LiteV_ShadowAssertBudget("ARM9", Cycles, CyclesBudget,
+                                     (s64)NDS.ARM9Timestamp, (s64)NDS.ARM9Target);
+#endif
+
 
             if (StopExecution)
             {
@@ -776,10 +848,21 @@ void ARMv4::Execute()
 
             JitBlockEntry block = NDS.JIT.LookUpBlock(1, FastBlockLookup,
                 instrAddr - FastBlockLookupStart, instrAddr);
+
+            // liteDS-v2 Unit 2 (shadow): ARM7 analog. ARM7 timestamps carry no clock
+            // shift, so budget = ARM7Target - ARM7Timestamp is already in Cycles units.
+            CyclesBudget = (s32)std::min<s64>((s64)(NDS.ARM7Target - NDS.ARM7Timestamp), INT32_MAX);
+
             if (block)
                 ARM_Dispatch(this, block);
             else
                 NDS.JIT.CompileBlock(this);
+
+#if defined(LITEV_SHADOW_ASSERT)
+            LiteV_ShadowAssertBudget("ARM7", Cycles, CyclesBudget,
+                                     (s64)NDS.ARM7Timestamp, (s64)NDS.ARM7Target);
+#endif
+
 
             if (StopExecution)
             {

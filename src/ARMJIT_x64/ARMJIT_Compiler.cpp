@@ -22,9 +22,11 @@
 #include "../ARMInterpreter.h"
 #include "../NDS.h"
 #include "../ARMJIT_Global.h"
+#include "ARMJIT_Offsets.h"
 
 #include <assert.h>
 #include <stdarg.h>
+#include <cstddef>
 
 #include "../dolphin/CommonFuncs.h"
 
@@ -35,6 +37,22 @@ extern "C" void ARM_Ret();
 
 namespace melonDS
 {
+
+// liteDS-v2 Unit 2: prove the hand-maintained ARMJIT_Offsets.h values against the
+// real ARM struct layout (see the matching block in the A64 compiler). These
+// offsets are baked as immediates in the x64 linkage/dispatch code, so a silent
+// layout shift must fail the build, not the emulation. Guarded to the x64 target
+// to mirror where the offsets are consumed.
+#if defined(__x86_64__) || defined(_M_X64)
+static_assert(offsetof(ARM, Cycles) == ARM_Cycles_offset,
+    "ARM_Cycles_offset out of sync with ARM::Cycles");
+static_assert(offsetof(ARM, StopExecution) == ARM_StopExecution_offset,
+    "ARM_StopExecution_offset out of sync with ARM::StopExecution");
+static_assert(offsetof(ARM, CPSR) == ARM_CPSR_offset,
+    "ARM_CPSR_offset out of sync with ARM::CPSR");
+static_assert(offsetof(ARM, CyclesBudget) == ARM_CyclesBudget_offset,
+    "ARM_CyclesBudget_offset out of sync with ARM::CyclesBudget");
+#endif
 template <>
 const X64Reg RegisterCache<Compiler, X64Reg>::NativeRegAllocOrder[] =
 {
