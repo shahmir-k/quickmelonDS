@@ -292,11 +292,19 @@ u32 DMA::UnitTimings9_32(bool burststart)
     u32 src_rgn = NDS.ARM9Regions[src_id];
     u32 dst_rgn = NDS.ARM9Regions[dst_id];
 
+    // LITEV_DMA_TIMING_LAZY (default OFF): the 4 ARM9MemTimings[][6/7] loads are only used on
+    // SOME paths — the hot geometry-DMA path (src=MainRAM, SrcAddrInc>0, MRAM burst table) uses
+    // dst_n/dst_s only when the burst table is (re)selected, and never uses src_n/src_s. Defer
+    // each load into the branch that actually reads it. BIT-EXACT: same values (ARM9MemTimings
+    // is invariant within one call — no guest code runs mid-function), just loaded on demand;
+    // MP-safe (no change to the returned timing, only when the host issues the load).
     u32 src_n, src_s, dst_n, dst_s;
+#ifndef LITEV_DMA_TIMING_LAZY
     src_n = NDS.ARM9MemTimings[src_id][6];
     src_s = NDS.ARM9MemTimings[src_id][7];
     dst_n = NDS.ARM9MemTimings[dst_id][6];
     dst_s = NDS.ARM9MemTimings[dst_id][7];
+#endif
 
     if (src_rgn == Mem9_MainRAM)
     {
@@ -308,7 +316,10 @@ u32 DMA::UnitTimings9_32(bool burststart)
             if (burststart || MRAMBurstTable[MRAMBurstCount] == 0)
             {
                 MRAMBurstCount = 0;
-
+#ifdef LITEV_DMA_TIMING_LAZY
+                dst_n = NDS.ARM9MemTimings[dst_id][6];
+                dst_s = NDS.ARM9MemTimings[dst_id][7];
+#endif
                 if (dst_rgn == Mem9_GBAROM)
                 {
                     if (dst_s == 8)
@@ -327,6 +338,10 @@ u32 DMA::UnitTimings9_32(bool burststart)
         }
         else
         {
+#ifdef LITEV_DMA_TIMING_LAZY
+            dst_n = NDS.ARM9MemTimings[dst_id][6];
+            dst_s = NDS.ARM9MemTimings[dst_id][7];
+#endif
             // TODO: not quite right for GBA slot
             return (((CurSrcAddr & 0x1F) == 0x1C) ? (dst_n==2 ? 7:8) : 9) +
                    (burststart ? dst_n : dst_s);
@@ -339,7 +354,10 @@ u32 DMA::UnitTimings9_32(bool burststart)
             if (burststart || MRAMBurstTable[MRAMBurstCount] == 0)
             {
                 MRAMBurstCount = 0;
-
+#ifdef LITEV_DMA_TIMING_LAZY
+                src_n = NDS.ARM9MemTimings[src_id][6];
+                src_s = NDS.ARM9MemTimings[src_id][7];
+#endif
                 if (src_rgn == Mem9_GBAROM)
                 {
                     if (src_s == 8)
@@ -358,15 +376,29 @@ u32 DMA::UnitTimings9_32(bool burststart)
         }
         else
         {
+#ifdef LITEV_DMA_TIMING_LAZY
+            src_n = NDS.ARM9MemTimings[src_id][6];
+            src_s = NDS.ARM9MemTimings[src_id][7];
+#endif
             return (burststart ? src_n : src_s) + 8;
         }
     }
     else if (src_rgn & dst_rgn)
     {
+#ifdef LITEV_DMA_TIMING_LAZY
+        src_n = NDS.ARM9MemTimings[src_id][6];
+        dst_n = NDS.ARM9MemTimings[dst_id][6];
+#endif
         return src_n + dst_n + 1;
     }
     else
     {
+#ifdef LITEV_DMA_TIMING_LAZY
+        src_n = NDS.ARM9MemTimings[src_id][6];
+        src_s = NDS.ARM9MemTimings[src_id][7];
+        dst_n = NDS.ARM9MemTimings[dst_id][6];
+        dst_s = NDS.ARM9MemTimings[dst_id][7];
+#endif
         if (burststart)
             return src_n + dst_n;
         else

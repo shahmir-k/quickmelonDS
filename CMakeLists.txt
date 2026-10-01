@@ -529,6 +529,15 @@ if (LITEV_COARSE_RTC)
     add_compile_definitions(LITEV_COARSE_RTC=1)
 endif()
 
+# Lazy-load the ARM9 32-bit DMA-unit memory timings (DMA::UnitTimings9_32, ~1.5% of the emu
+# thread): defer the 4 ARM9MemTimings[][6/7] loads into the branch that reads them so the hot
+# geometry-DMA burst path (which uses none on a non-refresh unit) skips them. BIT-EXACT (same
+# timing value; ARM9MemTimings is invariant within one call), MP-safe. Default OFF.
+option(LITEV_DMA_TIMING_LAZY "Lazy-load ARM9 32-bit DMA unit-timing region lookups (bit-exact)" OFF)
+if (LITEV_DMA_TIMING_LAZY)
+    add_compile_definitions(LITEV_DMA_TIMING_LAZY=1)
+endif()
+
 # DraStic-style aggressive idle-loop recognition (teardown doc 01 item 6). Stock
 # melonDS's IsIdleLoop (ARMJIT.cpp) rejects any loop with a cross-iteration
 # register recurrence (a register read before it is rewritten in the iteration --
