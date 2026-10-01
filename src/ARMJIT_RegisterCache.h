@@ -52,9 +52,32 @@ public:
             : (1 << 15));
     }
 
+#ifdef LITEV_JIT_GLOBALREG
+    // GLOBALREG (DraStic teardown 01 §6.1): globally-pinned guest regs kept live
+    // in fixed host regs ACROSS block boundaries. They are loaded once at
+    // ARM_Dispatch and spilled once at ARM_Ret; the per-block cache must never
+    // spill/free them at a block boundary (that would reintroduce the very
+    // boundary traffic this eliminates). Explicit file coherence for the
+    // interpreter fallback is handled by the compiler (spill-before/reload-after).
+    u16 PinnedRegs = 0;
+    void PinRegister(int reg, Reg nativeReg)
+    {
+        Mapping[reg] = nativeReg;
+        LoadedRegs |= (1 << reg);
+        NativeRegsUsed |= 1 << (int)nativeReg;
+        PinnedRegs |= (1 << reg);
+    }
+#endif
+
     void UnloadRegister(int reg)
     {
         assert(Mapping[reg] != -1);
+#ifdef LITEV_JIT_GLOBALREG
+        // Pinned: never spilled/freed at a block boundary — stays resident in its
+        // fixed host reg across the whole JIT slice.
+        if (PinnedRegs & (1 << reg))
+            return;
+#endif
 
         if (DirtyRegs & (1 << reg))
             Compiler->SaveReg(reg, Mapping[reg]);
@@ -108,7 +131,15 @@ public:
     {
         BitSet16 dirtyRegs(DirtyRegs);
         for (int reg : dirtyRegs)
+        {
+#ifdef LITEV_JIT_GLOBALREG
+            // Pinned regs stay live in their fixed host reg across the exit edge
+            // (the linked / not-taken successor block reads the same host reg).
+            if (PinnedRegs & (1 << reg))
+                continue;
+#endif
             Compiler->SaveReg(reg, Mapping[reg]);
+        }
     }
 
     void Flush()
@@ -160,6 +191,13 @@ public:
                 int rank = 1000;
                 for (int reg : loadedSet)
                 {
+#ifdef LITEV_JIT_GLOBALREG
+                    // A pinned reg cannot be evicted (UnloadRegister no-ops it),
+                    // so it must never be chosen as the victim — otherwise the
+                    // surrounding while-loop would never make progress.
+                    if (PinnedRegs & (1 << reg))
+                        continue;
+#endif
                     if (!((1 << reg) & necessaryRegs) && ranking[reg] < rank)
                     {
                         leastReg = reg;

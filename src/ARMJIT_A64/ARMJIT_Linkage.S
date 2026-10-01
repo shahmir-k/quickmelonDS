@@ -44,6 +44,23 @@ ARM_Dispatch:
     ldr RCycles, [RCPU, ARM_Cycles_offset]
     ldr RCPSR, [RCPU, ARM_CPSR_offset]
 
+#ifdef LITEV_JIT_GLOBALREG
+    // GLOBALREG: load the globally-pinned never-banked guest regs into their
+    // fixed callee-saved host regs ONCE per JIT slice entry. They then stay live
+    // across every block / the emitted dispatcher / linked chains (callee-saved
+    // => preserved for free), so blocks never reload them at boundaries. Pins
+    // guest r0..r6 -> w19..w25, in lockstep with the compiler's GlobalRegPins set.
+    // The prologue above already saved the caller's x19..x25 on the stack, and
+    // ARM_Ret restores them after spilling the guest values.
+    ldr w19, [RCPU, ARM_R_offset]
+    ldr w20, [RCPU, ARM_R_offset + 4]
+    ldr w21, [RCPU, ARM_R_offset + 8]
+    ldr w22, [RCPU, ARM_R_offset + 12]
+    ldr w23, [RCPU, ARM_R_offset + 16]
+    ldr w24, [RCPU, ARM_R_offset + 20]
+    ldr w25, [RCPU, ARM_R_offset + 24]
+#endif
+
     br x1
 
 .p2align 4,,15
@@ -54,6 +71,20 @@ _ARM_Ret:
 #else
 .global ARM_Ret
 ARM_Ret:
+#endif
+#ifdef LITEV_JIT_GLOBALREG
+    // GLOBALREG: spill the globally-pinned guest regs from their fixed host regs
+    // back to the register file ONCE per JIT slice exit, so the C world (IRQ /
+    // exception / scheduler / savestate / next dispatch's instrAddr recompute)
+    // sees the authoritative guest state. Mirrors the ARM_Dispatch load; the
+    // ldp below then restores the caller's original x19..x25.
+    str w19, [RCPU, ARM_R_offset]
+    str w20, [RCPU, ARM_R_offset + 4]
+    str w21, [RCPU, ARM_R_offset + 8]
+    str w22, [RCPU, ARM_R_offset + 12]
+    str w23, [RCPU, ARM_R_offset + 16]
+    str w24, [RCPU, ARM_R_offset + 20]
+    str w25, [RCPU, ARM_R_offset + 24]
 #endif
     str RCycles, [RCPU, ARM_Cycles_offset]
     str RCPSR, [RCPU, ARM_CPSR_offset]

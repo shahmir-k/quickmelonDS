@@ -19,6 +19,12 @@
 #define ARM_CPSR_offset 0x64
 #define ARM_Cycles_offset 0xc
 #define ARM_StopExecution_offset 0x10
+// liteDS-v2 GLOBALREG (LITEV_JIT_GLOBALREG): base of the guest register file
+// ARM::R[16]. R[16] sits immediately before CPSR (0x64), so R[0] == 0x64 - 16*4
+// == 0x24; guest reg N is at ARM_R_offset + N*4. The A64 ARM_Dispatch/ARM_Ret
+// linkage loads/spills the globally-pinned guest regs at this offset. Proven by
+// static_assert in ARMJIT_A64/ARMJIT_Compiler.cpp.
+#define ARM_R_offset 0x24
 // liteDS-v2 Unit 2: slice-budget slot. Hand-maintained like the offsets above;
 // proven equal to offsetof(ARM, CyclesBudget) by static_assert in the JIT
 // compiler TUs (ARMJIT_A64/ARMJIT_Compiler.cpp, ARMJIT_x64/ARMJIT_Compiler.cpp).

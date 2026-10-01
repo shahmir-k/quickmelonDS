@@ -178,6 +178,30 @@ if (LITEV_JIT_FIXEDREG)
     endif()
 endif()
 
+# GLOBALREG (DraStic teardown 01 §6.1 — global cross-block fixed register
+# allocation). Builds ON TOP of LITEV_JIT_FIXEDREG + LITEV_JIT_DISPATCH. Pins a
+# SUBSET of the never-banked guest GP registers (r0..r7) to fixed callee-saved
+# host registers (W19..) GLOBALLY: they are loaded ONCE at ARM_Dispatch (JIT
+# slice entry), spilled ONCE at ARM_Ret (slice exit), and kept LIVE across block
+# boundaries / the emitted dispatcher / linked chains (callee-saved => preserved
+# for free across the dispatcher and any C helper). The per-block RegisterCache
+# no longer reload-on-first-use or spill-at-block-end the pinned regs, removing
+# the block-boundary register traffic DraStic eliminates. Pinning only r0..r7
+# (never mode-banked) keeps mode/exception switches transparent; the sole
+# file-coherence point is the interpreter fallback, which is bracketed with an
+# explicit spill-before / reload-after. Codegen-only: cycles/timing/register-file
+# semantics unchanged, so flag-ON must stay bit-exact on the exact-timing +
+# torture goldens. Default OFF -> emission-identical to the FIXEDREG tree.
+# AArch64 only (the x64 JIT keeps the upstream dynamic per-block register cache).
+option(LITEV_JIT_GLOBALREG "GLOBALREG: globally pin never-banked guest regs to fixed host regs across block boundaries (AArch64)" OFF)
+if (LITEV_JIT_GLOBALREG)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_GLOBALREG=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_GLOBALREG requires an AArch64 target.")
+    endif()
+endif()
+
 # Unit 4: direct block linking (patch, don't dispatch). Builds ON TOP of the
 # Unit 3 dispatcher: an eligible block exit whose next PC is a compile-time
 # constant emits a per-hop-commit guard followed by a patchable `B` (initially to
