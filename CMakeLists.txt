@@ -496,6 +496,18 @@ if (LITEV_JIT_FLAGMERGE)
 endif()
 option(LITEV_SPU_FAST_INTERP "Replace SPU channel interpolation with cheap linear interp" OFF)
 
+# M6.11 step 3: flag-gated integer-NEON of the GPU3D geometry engine's hot
+# per-vertex / per-command fixed-point math (SubmitVertex position + texcoord
+# transforms, MatrixMult4x4). Default OFF -> byte-identical scalar behaviour.
+# The option is host-agnostic: the source guards every NEON block with
+# `#if defined(__ARM_NEON)` and falls back to the scalar reference elsewhere, so
+# all configs build on both aarch64 (NEON active) and x86_64 (scalar). Set via
+# add_compile_definitions so the LITEV_* re-export loop below carries it PUBLIC.
+option(LITEV_NEON_GEOMETRY "M6.11: integer-NEON GPU3D geometry math (AArch64 active, scalar fallback elsewhere)" OFF)
+if (LITEV_NEON_GEOMETRY)
+    add_compile_definitions(LITEV_NEON_GEOMETRY=1)
+endif()
+
 # Instant ARM9 hardware divider/sqrt: compute the DIV/SQRT result at register-
 # write time and skip the scheduled completion event. In-race profiling showed
 # Event_Div is the single largest scheduler load (~1233 dispatches/frame, 42% of

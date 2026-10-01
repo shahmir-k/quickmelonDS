@@ -42,11 +42,75 @@ static int litevGxPropDefault(const char* name, int def) {
 }
 #endif
 
+#if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 
 namespace melonDS
 {
 using Platform::Log;
 using Platform::LogLevel;
+
+#if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
+// M6.11 step 3 — integer-NEON kernels for the GPU3D geometry engine's hot
+// fixed-point math. These reproduce the scalar results BIT-EXACTLY, not
+// approximately:
+//   * each element product is a widening 32x32->64 multiply (vmull/vmlal_n_s32),
+//     which equals the scalar `(s64)a * b` because both operands fit in s32
+//     (vertex coords are s16, matrix entries s32);
+//   * accumulation is in 64-bit lanes. 64-bit two's-complement addition is
+//     associative and commutative, so the fold order does not matter — the sum
+//     equals the scalar left-to-right sum modulo 2^64 even in the (content-
+//     unreachable) overflow case, and the DS math is modular anyway;
+//   * `>> Shift` is an arithmetic 64-bit shift (vshrq_n_s64), matching the
+//     scalar `>>` on a signed s64; Shift is a template arg because the intrinsic
+//     needs a compile-time count;
+//   * the final store to an s32/s16 field truncates the low bits identically to
+//     the scalar narrowing assignment.
+
+// out[0..3] = ( v0*M[0..3] + v1*M[4..7] + v2*M[8..11] + v3*M[12..15] ) >> Shift
+// M is four contiguous 4-wide s32 rows. When out aliases M's storage the caller
+// must snapshot the rows first (MatrixMult4x4 copies into tmp).
+template <int Shift>
+static inline void NeonMat4Vec4_s64(s32* out, const s32* M,
+                                    s32 v0, s32 v1, s32 v2, s32 v3)
+{
+    int32x4_t r0 = vld1q_s32(M);
+    int32x4_t r1 = vld1q_s32(M + 4);
+    int32x4_t r2 = vld1q_s32(M + 8);
+    int32x4_t r3 = vld1q_s32(M + 12);
+
+    int64x2_t lo = vmull_n_s32(vget_low_s32(r0),  v0);
+    int64x2_t hi = vmull_n_s32(vget_high_s32(r0), v0);
+    lo = vmlal_n_s32(lo, vget_low_s32(r1),  v1);
+    hi = vmlal_n_s32(hi, vget_high_s32(r1), v1);
+    lo = vmlal_n_s32(lo, vget_low_s32(r2),  v2);
+    hi = vmlal_n_s32(hi, vget_high_s32(r2), v2);
+    lo = vmlal_n_s32(lo, vget_low_s32(r3),  v3);
+    hi = vmlal_n_s32(hi, vget_high_s32(r3), v3);
+
+    lo = vshrq_n_s64(lo, Shift);
+    hi = vshrq_n_s64(hi, Shift);
+
+    out[0] = (s32)vgetq_lane_s64(lo, 0);
+    out[1] = (s32)vgetq_lane_s64(lo, 1);
+    out[2] = (s32)vgetq_lane_s64(hi, 0);
+    out[3] = (s32)vgetq_lane_s64(hi, 1);
+}
+
+// returns { (v0*M[0]+v1*M[4]+v2*M[8])>>Shift , (v0*M[1]+v1*M[5]+v2*M[9])>>Shift }
+// i.e. the 3-term, 2-output texcoord transform (the two low lanes of each row).
+template <int Shift>
+static inline int64x2_t NeonTex2_s64(const s32* M, s32 v0, s32 v1, s32 v2)
+{
+    int64x2_t acc = vmull_n_s32(vld1_s32(M + 0), v0);
+    acc = vmlal_n_s32(acc, vld1_s32(M + 4), v1);
+    acc = vmlal_n_s32(acc, vld1_s32(M + 8), v2);
+    return vshrq_n_s64(acc, Shift);
+}
+
+#endif
 
 // 3D engine notes
 //
@@ -598,6 +662,16 @@ void MatrixMult4x4(s32* m, s32* s)
 {
     s32 tmp[16];
     memcpy(tmp, m, 16*4);
+
+#if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
+    // m = s*m, one output row per call. Row i of s is the vector; tmp holds the
+    // (snapshotted) matrix rows the transform consumes column-wise.
+    NeonMat4Vec4_s64<12>(m + 0,  tmp, s[0],  s[1],  s[2],  s[3]);
+    NeonMat4Vec4_s64<12>(m + 4,  tmp, s[4],  s[5],  s[6],  s[7]);
+    NeonMat4Vec4_s64<12>(m + 8,  tmp, s[8],  s[9],  s[10], s[11]);
+    NeonMat4Vec4_s64<12>(m + 12, tmp, s[12], s[13], s[14], s[15]);
+    return;
+#endif
 
     // m = s*m
     m[0] = ((s64)s[0]*tmp[0] + (s64)s[1]*tmp[4] + (s64)s[2]*tmp[8] + (s64)s[3]*tmp[12]) >> 12;
@@ -1401,10 +1475,17 @@ void GPU3D::SubmitVertex() noexcept
     Vertex* vertextrans = &TempVertexBuffer[VertexNumInPoly];
 
     UpdateClipMatrix();
+#if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
+    // vertex[] components fit in s32 (CurVertex is s16, w = 0x1000), so the
+    // widening 32x32->64 NEON multiply matches the scalar s64 products exactly.
+    NeonMat4Vec4_s64<12>(vertextrans->Position, ClipMatrix,
+                         (s32)vertex[0], (s32)vertex[1], (s32)vertex[2], (s32)vertex[3]);
+#else
     vertextrans->Position[0] = (vertex[0]*ClipMatrix[0] + vertex[1]*ClipMatrix[4] + vertex[2]*ClipMatrix[8] + vertex[3]*ClipMatrix[12]) >> 12;
     vertextrans->Position[1] = (vertex[0]*ClipMatrix[1] + vertex[1]*ClipMatrix[5] + vertex[2]*ClipMatrix[9] + vertex[3]*ClipMatrix[13]) >> 12;
     vertextrans->Position[2] = (vertex[0]*ClipMatrix[2] + vertex[1]*ClipMatrix[6] + vertex[2]*ClipMatrix[10] + vertex[3]*ClipMatrix[14]) >> 12;
     vertextrans->Position[3] = (vertex[0]*ClipMatrix[3] + vertex[1]*ClipMatrix[7] + vertex[2]*ClipMatrix[11] + vertex[3]*ClipMatrix[15]) >> 12;
+#endif
 
     // this probably shouldn't be.
     // the way color is handled during clipping needs investigation. TODO
@@ -1414,8 +1495,14 @@ void GPU3D::SubmitVertex() noexcept
 
     if ((TexParam >> 30) == 3)
     {
+#if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
+        int64x2_t tc = NeonTex2_s64<24>(TexMatrix, (s32)vertex[0], (s32)vertex[1], (s32)vertex[2]);
+        vertextrans->TexCoords[0] = (s32)vgetq_lane_s64(tc, 0) + RawTexCoords[0];
+        vertextrans->TexCoords[1] = (s32)vgetq_lane_s64(tc, 1) + RawTexCoords[1];
+#else
         vertextrans->TexCoords[0] = ((vertex[0]*TexMatrix[0] + vertex[1]*TexMatrix[4] + vertex[2]*TexMatrix[8]) >> 24) + RawTexCoords[0];
         vertextrans->TexCoords[1] = ((vertex[0]*TexMatrix[1] + vertex[1]*TexMatrix[5] + vertex[2]*TexMatrix[9]) >> 24) + RawTexCoords[1];
+#endif
     }
     else
     {
@@ -1499,14 +1586,38 @@ void GPU3D::CalculateLighting() noexcept
 
     if ((TexParam >> 30) == 2)
     {
+#if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
+        // Same 3-term/2-output, 64-bit, >>21 shape as the position texcoord gen.
+        int64x2_t tc = NeonTex2_s64<21>(TexMatrix, (s32)Normal[0], (s32)Normal[1], (s32)Normal[2]);
+        TexCoords[0] = RawTexCoords[0] + (s32)vgetq_lane_s64(tc, 0);
+        TexCoords[1] = RawTexCoords[1] + (s32)vgetq_lane_s64(tc, 1);
+#else
         TexCoords[0] = RawTexCoords[0] + (((s64)Normal[0]*TexMatrix[0] + (s64)Normal[1]*TexMatrix[4] + (s64)Normal[2]*TexMatrix[8]) >> 21);
         TexCoords[1] = RawTexCoords[1] + (((s64)Normal[0]*TexMatrix[1] + (s64)Normal[1]*TexMatrix[5] + (s64)Normal[2]*TexMatrix[9]) >> 21);
+#endif
     }
 
     s32 normaltrans[3]; // should be 1 bit sign 10 bits frac
+#if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
+    // 32-bit math (no s64 cast in the scalar reference): the products and the
+    // 3-term sum are computed modulo 2^32, then << 9 (modular) and >> 21
+    // (arithmetic). vmulq_n_s32/vmlaq_n_s32 keep the low 32 bits per lane, and
+    // vshlq/vshrq_n_s32 match the scalar shift semantics exactly. Lane 3 is
+    // computed from VecMatrix[3/7/11] but discarded.
+    {
+        int32x4_t nt = vmulq_n_s32(vld1q_s32(VecMatrix + 0), (s32)Normal[0]);
+        nt = vmlaq_n_s32(nt, vld1q_s32(VecMatrix + 4), (s32)Normal[1]);
+        nt = vmlaq_n_s32(nt, vld1q_s32(VecMatrix + 8), (s32)Normal[2]);
+        nt = vshrq_n_s32(vshlq_n_s32(nt, 9), 21);
+        normaltrans[0] = vgetq_lane_s32(nt, 0);
+        normaltrans[1] = vgetq_lane_s32(nt, 1);
+        normaltrans[2] = vgetq_lane_s32(nt, 2);
+    }
+#else
     normaltrans[0] = ((Normal[0]*VecMatrix[0] + Normal[1]*VecMatrix[4] + Normal[2]*VecMatrix[8]) << 9) >> 21;
     normaltrans[1] = ((Normal[0]*VecMatrix[1] + Normal[1]*VecMatrix[5] + Normal[2]*VecMatrix[9]) << 9) >> 21;
     normaltrans[2] = ((Normal[0]*VecMatrix[2] + Normal[1]*VecMatrix[6] + Normal[2]*VecMatrix[10]) << 9) >> 21;
+#endif
 
     s32 c = 0;
     u32 vtxbuff[3] =
