@@ -195,8 +195,36 @@ bool CompilerShader(GLuint& id, const std::string& source, const std::string& na
         return false;
     }
 
+#if defined(__ANDROID__)
+    // liteDS-v2-android: the embedded shaders are desktop GLSL "#version 140".
+    // Rewrite the version directive to GLES and inject default precision
+    // qualifiers (required by GLSL ES). The MRT output locations are handled
+    // in-shader via the GL_ES-guarded FRAGLOC macro.
+    std::string patched;
+    {
+        static const char* kEsPreamble =
+            "#version 320 es\n"
+            "precision highp float;\n"
+            "precision highp int;\n"
+            "precision highp sampler2D;\n"
+            "precision highp sampler2DArray;\n"
+            "precision highp isampler2D;\n"
+            "precision highp usampler2D;\n"
+            "precision highp isampler2DArray;\n"
+            "precision highp usampler2DArray;\n";
+        size_t vpos = source.find("#version");
+        size_t eol = (vpos == std::string::npos) ? std::string::npos : source.find('\n', vpos);
+        if (eol != std::string::npos)
+            patched = std::string(kEsPreamble) + source.substr(eol + 1);
+        else
+            patched = std::string(kEsPreamble) + source;
+    }
+    const char* sourceC = patched.c_str();
+    int len = patched.length();
+#else
     const char* sourceC = source.c_str();
     int len = source.length();
+#endif
     glShaderSource(id, 1, &sourceC, &len);
 
     glCompileShader(id);

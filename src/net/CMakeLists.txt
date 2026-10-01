@@ -28,6 +28,10 @@ endif()
 if (USE_VCPKG)
     find_package(unofficial-enet CONFIG REQUIRED)
     target_link_libraries(net-utils PRIVATE unofficial::enet::enet)
+elseif (ANDROID)
+    # liteDS-v2-android: the melonDS-android frontend provides enet as a CMake
+    # subdirectory target (no pkg-config on Android). Link it directly.
+    target_link_libraries(net-utils PUBLIC enet)
 else()
     pkg_check_modules(ENet REQUIRED IMPORTED_TARGET libenet)
     fix_interface_includes(PkgConfig::ENet)

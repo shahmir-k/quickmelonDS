@@ -1,4 +1,9 @@
 #version 140
+#ifdef GL_ES
+#define FRAGLOC(loc) layout(location = loc)
+#else
+#define FRAGLOC(loc)
+#endif
 
 uniform usampler2DArray CurTexture;
 uniform sampler2DArray Capture128Texture;
@@ -26,8 +31,8 @@ flat in ivec3 fPolygonAttr;
 smooth in float fZ;
 #endif
 
-out vec4 oColor;
-out vec4 oAttr;
+FRAGLOC(0) out vec4 oColor;
+FRAGLOC(1) out vec4 oAttr;
 
 vec4 FinalColor()
 {
@@ -40,7 +45,7 @@ vec4 FinalColor()
         if ((uDispCnt & (1<<1)) == 0)
         {
             // toon
-            vec3 tooncolor = uToonColors[int(vcol.r * 31)].rgb;
+            vec3 tooncolor = uToonColors[int(vcol.r * 31.0)].rgb;
             vcol.rgb = tooncolor;
         }
         else
@@ -83,12 +88,19 @@ vec4 FinalColor()
     {
         if ((uDispCnt & (1<<1)) != 0)
         {
-            vec3 tooncolor = uToonColors[int(vcol.r * 31)].rgb;
+            vec3 tooncolor = uToonColors[int(vcol.r * 31.0)].rgb;
             col.rgb = min(col.rgb + tooncolor, 1.0);
         }
     }
 
+#ifdef GL_ES
+    // Mali/Android GLES: the 3D layer reaches the display with R/B swapped
+    // relative to the (correct) 2D compositor output, so the whole 3D layer must
+    // be emitted in BGRA (matching the v1 GLES renderer). Desktop keeps RGBA.
+    return col.bgra;
+#else
     return col.rgba;
+#endif
 }
 
 void main()
@@ -103,21 +115,21 @@ void main()
         if (uRenderMode == 0)
         {
             // opaque pixels
-            if (col.a < 30.5/31) discard;
+            if (col.a < 30.5/31.0) discard;
 
             oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
-            oAttr.g = 0;
+            oAttr.g = 0.0;
             oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
-            oAttr.a = 1;
+            oAttr.a = 1.0;
         }
         else
         {
             // translucent pixels
-            if (col.a < 0.5/31) discard;
-            if (col.a >= 30.5/31) discard;
+            if (col.a < 0.5/31.0) discard;
+            if (col.a >= 30.5/31.0) discard;
 
-            oAttr.b = 0;
-            oAttr.a = 1;
+            oAttr.b = 0.0;
+            oAttr.a = 1.0;
         }
 
         oColor = col;

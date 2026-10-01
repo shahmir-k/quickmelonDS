@@ -13,4 +13,10 @@
 
 #include MELONDS_GL_HEADER
 
+// liteDS-v2-android: on Android the GL header is GLES3; pull in the shims that
+// provide the desktop-only entry points/enums the renderer relies on.
+#if defined(__ANDROID__)
+#include "GLES_Compat.h"
+#endif
+
 #endif

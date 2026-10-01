@@ -1,4 +1,9 @@
 #version 140
+#ifdef GL_ES
+#define FRAGLOC(loc) layout(location = loc)
+#else
+#define FRAGLOC(loc)
+#endif
 
 uniform sampler2D MainInputTexA;
 uniform sampler2D MainInputTexB;
@@ -20,8 +25,8 @@ layout(std140) uniform ubFinalPassConfig
 
 smooth in vec3 fTexcoord;
 
-out vec4 oTopColor;
-out vec4 oBottomColor;
+FRAGLOC(0) out vec4 oTopColor;
+FRAGLOC(1) out vec4 oBottomColor;
 
 ivec3 MasterBrightness(ivec3 color, int brightmode, int evy)
 {
@@ -41,8 +46,8 @@ ivec3 MasterBrightness(ivec3 color, int brightmode, int evy)
 
 void main()
 {
-    ivec4 col_main = ivec4(texture(MainInputTexA, fTexcoord.xy, 0) * 255.0) >> 2;
-    ivec4 col_sub = ivec4(texture(MainInputTexB, fTexcoord.xy, 0) * 255.0) >> 2;
+    ivec4 col_main = ivec4(texture(MainInputTexA, fTexcoord.xy, 0.0) * 255.0) >> 2;
+    ivec4 col_sub = ivec4(texture(MainInputTexB, fTexcoord.xy, 0.0) * 255.0) >> 2;
 
     ivec3 output_main, output_sub;
 
@@ -81,7 +86,7 @@ void main()
     output_main = (output_main << 2) | (output_main >> 6);
     output_sub = (output_sub << 2) | (output_sub >> 6);
 
-    int line = int(fTexcoord.y * 192);
+    int line = int(fTexcoord.y * 192.0);
     bool swapbit = uScreenSwap[line>>2][line&0x3];
 
     if (!swapbit)

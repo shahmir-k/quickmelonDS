@@ -255,7 +255,14 @@ bool GLRenderer3D::Init()
     glEnableVertexAttribArray(2); // texcoords
     glVertexAttribIPointer(2, 2, GL_SHORT, 7*4, (void*)(3*4));
     glEnableVertexAttribArray(3); // attrib
-    glVertexAttribIPointer(3, 3, GL_UNSIGNED_INT, 7*4, (void*)(4*4));
+    // NB: the shader declares vPolygonAttr as a *signed* ivec3, and the texcache
+    // encodes the "normal texture" sentinel as 0xFFFF0000 in vPolygonAttr.y
+    // (bit 31 set). Feeding that via GL_UNSIGNED_INT into a signed attribute is a
+    // signedness mismatch: desktop GL delivers the raw bits, but the Mali-G52
+    // GLES driver mangles values >= 2^31, collapsing the low 16 bits to 0xFFFF so
+    // every polygon is misrouted as untextured (white/untextured 3D models).
+    // Match the attribute type to the signed shader declaration.
+    glVertexAttribIPointer(3, 3, GL_INT, 7*4, (void*)(4*4));
 
     glGenBuffers(1, &IndexBufferID);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, IndexBufferID);
