@@ -112,6 +112,13 @@ if (LITEV_PROFILE)
     # (e.g. the Unit 3 dispatcher re-entry counters in ARM.cpp) are compiled in.
     add_compile_definitions(LITEV_PROFILE=1)
 endif()
+# Software-render phase profiler: names every render thread and logs a per-60-frame
+# decomposition (emu barrier / snapshot, 3D clear/raster/final + per-band, 2D wall +
+# per-band GetLine block, whole render critical path). Diagnostic only; default OFF.
+option(LITEV_SOFTPROF "liteV: software-render phase profiler (thread names + phase ms)" OFF)
+if (LITEV_SOFTPROF)
+    add_compile_definitions(LITEV_SOFTPROF=1)
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

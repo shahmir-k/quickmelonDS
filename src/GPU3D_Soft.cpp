@@ -23,6 +23,8 @@
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
+#include "LitevSoftProf.h"
+
 
 namespace melonDS
 {
@@ -1740,7 +1742,20 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
 void SoftRenderer3D::FinishRendering()
 {
     if (RenderThreadRunning.load(std::memory_order_relaxed) && !GPU3D.AbortFrame)
+    {
+        // THE emu-thread render barrier: blocks until the 3D render thread has
+        // finished the WHOLE frame.
+        const double _t0 = LSP_NOW();
+#ifdef LITEV_SOFTPROF
+        {
+            LitevSP::S.NFinish.fetch_add(1, std::memory_order_relaxed);
+            double post = LitevSP::S.T3DPost.load(std::memory_order_relaxed);
+            if (post > 0.0) LSP_ADD(EmuWindow, _t0 - post);
+        }
+#endif
         Platform::Semaphore_Wait(Sema_RenderDone);
+        LSP_ADD(Emu3DBarrier, LSP_NOW() - _t0);
+    }
 }
 
 void SoftRenderer3D::RenderFrame()
@@ -1755,6 +1770,10 @@ void SoftRenderer3D::RenderFrame()
 
     if (RenderThreadRunning.load(std::memory_order_relaxed))
     {
+#ifdef LITEV_SOFTPROF
+        LitevSP::S.T3DPost.store(LitevSP::NowMs(), std::memory_order_relaxed);
+        LitevSP::S.NPost.fetch_add(1, std::memory_order_relaxed);
+#endif
         // "Render thread, you're up! Get moving."
         Platform::Semaphore_Post(Sema_RenderStart);
     }
@@ -1773,11 +1792,20 @@ void SoftRenderer3D::RestartFrame()
 
 void SoftRenderer3D::RenderThreadFunc()
 {
+    LSP_NAME("s3d-rt");
     for (;;)
     {
         // Wait for a notice from the main thread to start rendering (or to stop entirely).
         Platform::Semaphore_Wait(Sema_RenderStart);
         if (!RenderThreadRunning) return;
+#ifdef LITEV_SOFTPROF
+        {
+            double now = LitevSP::NowMs();
+            LitevSP::S.T3DStart.store(now, std::memory_order_relaxed);
+            double post = LitevSP::S.T3DPost.load(std::memory_order_relaxed);
+            if (post > 0.0) LSP_ADD(S3DWake, now - post);
+        }
+#endif
 
         // Protect the GPU state from the main thread.
         // Some melonDS frontends (though not ours)
@@ -1788,14 +1816,28 @@ void SoftRenderer3D::RenderThreadFunc()
         RenderThreadRendering = true;
         if (FrameIdentical)
         { // If no rendering is needed, just say we're done.
+#ifdef LITEV_SOFTPROF
+            LitevSP::S.NIdent.fetch_add(1, std::memory_order_relaxed);
+#endif
             Platform::Semaphore_Post(Sema_ScanlineCount, 192);
         }
         else
         {
+#ifdef LITEV_SOFTPROF
+            LitevSP::S.NRender.fetch_add(1, std::memory_order_relaxed);
+#endif
+            const double _tc0 = LSP_NOW();
             ClearBuffers();
+            LSP_ADD(S3DClear, LSP_NOW() - _tc0);
             RenderPolygons(true, &GPU3D.RenderPolygonRAM[0], GPU3D.RenderNumPolygons);
         }
 
+#ifdef LITEV_SOFTPROF
+        {
+            double post = LitevSP::S.T3DPost.load(std::memory_order_relaxed);
+            if (post > 0.0) LSP_ADD(S3DTotal, LitevSP::NowMs() - post);
+        }
+#endif
         // Tell the main thread that we're done rendering
         // and that it's safe to access the GPU state again.
         Platform::Semaphore_Post(Sema_RenderDone);

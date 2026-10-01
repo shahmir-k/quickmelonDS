@@ -41,6 +41,8 @@ add_library(core STATIC
     GPU3D_Soft.cpp
     GPU3D_Texcache.cpp
     GPU3D_Texcache.h
+    LitevSoftProf.cpp
+    LitevSoftProf.h
     Mic.cpp
     NDS.cpp
     NDSCart.cpp
