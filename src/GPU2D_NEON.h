@@ -67,6 +67,18 @@ void ColorCompositeLine(u32* dst, const u32* bgobj, const u8* windowMask,
                         u32 blendCnt, u32 eva, u32 evb, u32 evy) noexcept;
 #endif
 
+#ifdef LITEV_SOFT2D_BG3DNEON
+// NEON port of SoftRenderer2D::DrawBG_3D's per-pixel 3D-layer compositor loop.
+// For each of the 256 pixels, when the 3D pixel is opaque ((c>>24)!=0) AND the
+// window layer-0 bit is set, it shifts the current top BGOBJLine pixel into the
+// backing slot (bgobj[i+256] = bgobj[i]) and writes the 3D colour tagged with
+// 0x40000000 (bgobj[i] = c | 0x40000000). 4 px/iter, fully branchless via NEON
+// masks/selects. Bit-exact with the scalar DrawBG_3D loop. 256 is a multiple of 4.
+//   bgobj[0..255]   = top-layer values; bgobj[256..511] = backing/bottom layer
+//   out3d[0..255]   = per-line 3D output (Cur3DLine)
+//   windowMask      = per-pixel window mask byte (bit 0 = layer-0 visible)
+void DrawBG3DLine(u32* bgobj, const u32* out3d, const u8* windowMask) noexcept;
+#endif
 
 } // namespace GPU2DNeon
 } // namespace melonDS

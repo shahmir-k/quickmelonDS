@@ -181,6 +181,19 @@ option(LITEV_SOFT2D_OBJNEON "liteV: NEON reject-scan for the 2D sprite interleav
 if (LITEV_SOFT2D_OBJNEON)
     add_compile_definitions(LITEV_SOFT2D_OBJNEON=1)
 endif()
+# 4-wide NEON port of the per-pixel 3D-layer 2D compositor (SoftRenderer2D::
+# DrawBG_3D, inlined into DrawScanlineBGMode<0> and called once per scanline in a
+# 3D game where BG0 is the 3D layer). The scalar loop is 1 px/iter with two
+# per-pixel branches (opaque-alpha test + window test) and a shift-down RMW into
+# BGOBJLine. This lever replaces it with a branchless NEON mask/select kernel
+# doing 4 px/iter. Profiled as the top scalar non-vectorized 2D loop once
+# LITEV_SOFT2D_NEON (ColorComposite) + LITEV_SOFT2D_OBJNEON (sprite reject-scan)
+# are ON. Bit-exact (final_top/bot/audio hashes ON==OFF); all changes behind
+# #ifdef LITEV_SOFT2D_BG3DNEON; flag-OFF is byte-identical. AArch64 only.
+option(LITEV_SOFT2D_BG3DNEON "liteV: 4-wide NEON 2D 3D-layer compositor (DrawBG_3D)" OFF)
+if (LITEV_SOFT2D_BG3DNEON)
+    add_compile_definitions(LITEV_SOFT2D_BG3DNEON=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

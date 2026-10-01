@@ -574,6 +574,9 @@ void SoftRenderer2D::DrawBG_3D()
 #else
     const u32* out3d = Parent.Output3D;
 #endif
+#if defined(LITEV_SOFT2D_BG3DNEON) && defined(__ARM_NEON)
+    GPU2DNeon::DrawBG3DLine(BGOBJLine, out3d, WindowMask);
+#else
     for (int i = 0; i < 256; i++)
     {
         u32 c = out3d[i];
@@ -584,6 +587,7 @@ void SoftRenderer2D::DrawBG_3D()
         BGOBJLine[i+256] = BGOBJLine[i];
         BGOBJLine[i] = c | 0x40000000;
     }
+#endif
 }
 
 template<bool mosaic>

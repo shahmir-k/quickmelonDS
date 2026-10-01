@@ -552,6 +552,40 @@ void ColorCompositeLine(u32* dst, const u32* bgobj, const u8* windowMask,
 // scalar loop is 1 px/iter with two per-pixel branches. 4 px/iter, branchless.
 // Bit-exact with the scalar loop.
 // ─────────────────────────────────────────────────────────────────────────────
+#ifdef LITEV_SOFT2D_BG3DNEON
+#if defined(__ARM_NEON)
+
+void DrawBG3DLine(u32* bgobj, const u32* out3d, const u8* windowMask) noexcept
+{
+    const uint32x4_t opaque = vdupq_n_u32(0xFF000000);
+    const uint32x4_t win0   = vdupq_n_u32(0x01);
+    const uint32x4_t tag    = vdupq_n_u32(0x40000000);
+
+    for (int i = 0; i < 256; i += 4)
+    {
+        // Load 4 window bytes safely (WindowMask is exactly 256 B; no over-read).
+        u32 wbits;
+        __builtin_memcpy(&wbits, windowMask + i, 4);
+        uint8x8_t  wm8  = vreinterpret_u8_u32(vdup_n_u32(wbits));
+        uint32x4_t wm32 = vmovl_u16(vget_low_u16(vmovl_u8(wm8)));
+        uint32x4_t wmask = vtstq_u32(wm32, win0);            // window layer-0 bit
+
+        uint32x4_t c     = vld1q_u32(out3d + i);
+        uint32x4_t amask = vtstq_u32(c, opaque);             // (c>>24) != 0
+        uint32x4_t m     = vandq_u32(amask, wmask);
+
+        uint32x4_t oldlow  = vld1q_u32(bgobj + i);
+        uint32x4_t oldhigh = vld1q_u32(bgobj + i + 256);
+        uint32x4_t newval  = vorrq_u32(c, tag);
+
+        // where m: bgobj[i+256]=oldlow, bgobj[i]=c|0x40000000; else unchanged.
+        vst1q_u32(bgobj + i + 256, vbslq_u32(m, oldlow, oldhigh));
+        vst1q_u32(bgobj + i,       vbslq_u32(m, newval, oldlow));
+    }
+}
+
+#endif // __ARM_NEON
+#endif // LITEV_SOFT2D_BG3DNEON
 
 } // namespace GPU2DNeon
 } // namespace melonDS
