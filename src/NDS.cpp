@@ -831,13 +831,83 @@ u64 NDS::NextTarget()
         mask >>= 1;
     }
 
+#if defined(LITEV_EVENT_SLICES)
+    // Unit 5 (M2.1): event-true slices. Drop the fixed kMaxIterationCycles cap and
+    // run straight to the next scheduled event. Mid-slice actions that create an
+    // earlier deadline already exit the CPU via Reschedule -> ForceExecutionExit
+    // (Units 2-4), so no fixed cap is needed to catch them.
+    //
+    // The one thing the old cap protected that is NOT event-scheduled is the timer
+    // subsystem: RunTimers()/RunTimer() are POLLED once per iteration (see RunFrame),
+    // so with an uncapped slice a running timer's overflow IRQ would be deferred to
+    // the end of the (now much longer) slice. Bound the target by the soonest
+    // cycle-clocked timer overflow to keep timer IRQ latency tight -- in fact exact
+    // to the overflow cycle, i.e. strictly tighter than the old <=64-cycle cap.
+    if (minEvent == UINT64_MAX)
+    {
+        // No scheduled events at all (degenerate; the LCD event is normally always
+        // live during an active frame). Fall back to a one-frame bound.
+        minEvent = SysTimestamp + 560190;
+    }
+
+    u64 timerDeadline = NextTimerDeadline();
+    if (timerDeadline < minEvent)
+        minEvent = timerDeadline;
+
+    // Never emit a zero-length (or backwards) slice: it would spin the scheduler
+    // loop forever without advancing time.
+    if (minEvent <= SysTimestamp)
+        minEvent = SysTimestamp + 1;
+
+    return minEvent;
+#else
     u64 max = SysTimestamp + kMaxIterationCycles;
 
     if (minEvent < max + kIterationCycleMargin)
         return minEvent;
 
     return max;
+#endif
 }
+
+#if defined(LITEV_EVENT_SLICES)
+u64 NDS::NextTimerDeadline()
+{
+    u64 deadline = UINT64_MAX;
+
+    // Both ARM9 and ARM7 DS timers tick in the shared 33MHz system-clock domain
+    // (RunTimers derives its cycle delta as (ARM9Timestamp>>ARM9ClockShift) or
+    // ARM7Timestamp minus TimerTimestamp[cpu], all SysTimestamp-domain), so no
+    // clock-domain conversion is needed: the returned deadline is directly a
+    // SysTimestamp value. Only timers flagged in TimerCheckMask are cycle-clocked
+    // (enabled and not count-up/cascade) -- exactly the ones RunTimers advances.
+    for (u32 cpu = 0; cpu < 2; cpu++)
+    {
+        u32 mask = TimerCheckMask[cpu];
+        if (!mask) continue;
+
+        for (u32 t = 0; t < 4; t++)
+        {
+            if (!(mask & (1u << t))) continue;
+
+            const Timer& tm = Timers[(cpu << 2) + t];
+
+            // Counter overflows when it reaches 1<<26; each SysTimestamp cycle adds
+            // (1 << CycleShift). Between iterations Counter < 1<<26.
+            u64 counter = tm.Counter;
+            u64 rem = (counter < (1ull << 26)) ? ((1ull << 26) - counter) : 0;
+            u32 shift = tm.CycleShift;
+            u64 cyc = (rem + ((1ull << shift) - 1)) >> shift; // ceil(rem / 2^shift)
+            if (cyc < 1) cyc = 1;
+
+            u64 d = TimerTimestamp[cpu] + cyc;
+            if (d < deadline) deadline = d;
+        }
+    }
+
+    return deadline;
+}
+#endif
 
 void NDS::RunSystem(u64 timestamp)
 {

@@ -539,6 +539,12 @@ protected:
     u64 LastSysClockCycles;
     u64 FrameStartTimestamp;
     u64 NextTarget();
+#if defined(LITEV_EVENT_SLICES)
+    // Unit 5: soonest cycle-clocked timer overflow (SysTimestamp domain), or
+    // UINT64_MAX if no timer is running. Bounds the uncapped event-true slice so a
+    // per-iteration-polled timer IRQ still fires at (or before) its true deadline.
+    u64 NextTimerDeadline();
+#endif
     u64 NextTargetSleep();
     void CheckKeyIRQ(u32 cpu, u32 oldkey, u32 newkey);
     void Reschedule(u64 target);
