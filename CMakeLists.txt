@@ -274,6 +274,25 @@ if (LITEV_JIT_PERFMAP)
     endif()
 endif()
 
+# ---------------------------------------------------------------------------
+# Fetch-stall lever B: LITEV_LINKOPT — cut the link-time L1I share (measured
+# ~6% of L1I refills: @plt trampolines 3.48%, linker64 1.23%, tlsdesc 1.23%).
+#   * -fno-plt (compile, arm64 clang): call external functions straight through
+#     the GOT instead of executing a lazy `bl func@plt` stub -> removes the @plt
+#     trampoline instructions from the I-stream. Applied at DIRECTORY scope here
+#     so every `core` TU (added at add_subdirectory(src) below) picks it up; the
+#     final SHARED .so (melonDS-android-frontend, linked in the app's
+#     app/CMakeLists.txt) mirrors -fno-plt + the -Wl,-Bsymbolic-functions LINK
+#     flag there (link flags on this STATIC `core` are inert -- see that file).
+# (Initial-exec TLS on NDS::Current was tried here too and removed: bionic rejects
+# the IE model for a dlopen'd library's own TLS.) Link flags cannot change guest
+# semantics -> emulation stays bit-exact. Default OFF.
+option(LITEV_LINKOPT "Kill the @plt/linker L1I share: -fno-plt (compile) + -Wl,-Bsymbolic-functions (final .so link, in app/CMakeLists.txt)" OFF)
+if (LITEV_LINKOPT)
+    add_compile_definitions(LITEV_LINKOPT=1)
+    add_compile_options(-fno-plt)
+endif()
+
 # Unit 4: direct block linking (patch, don't dispatch). Builds ON TOP of the
 # Unit 3 dispatcher: an eligible block exit whose next PC is a compile-time
 # constant emits a per-hop-commit guard followed by a patchable `B` (initially to
