@@ -22,6 +22,11 @@
 #include "DMA.h"
 #include "GPU.h"
 #include "GPU3D.h"
+#ifdef LITEV_GXFIFO_DMA_INLINE
+// pulls in the always-inline WriteToGXFIFO_Inline so the geometry-DMA loop below inlines the
+// whole GXFIFO producer path (no per-word cross-TU bl to WriteToGXFIFO/CmdFIFOWrite).
+#include "GPU3D_GXFIFO_inl.h"
+#endif
 #include "DMA_Timings.h"
 #include "Platform.h"
 
@@ -665,6 +670,18 @@ void DMA::Run9()
         static int _gxfifotiming = 1;
         static int _gxtiminginline = 0;
 #endif
+#ifdef LITEV_GXFIFO_DMA_INLINE
+        // Inline the whole GXFIFO producer path into this burst loop so the packed-command decode
+        // state + FIFO pointers stay in registers across the burst (no per-word cross-TU bl to
+        // WriteToGXFIFO/CmdFIFOWrite). Byte-exact + cycle-exact — per-word accounting is untouched.
+        // Hoisted prop read (debug.litev.gxinline) so it's not re-checked per word; default ON when
+        // the flag is compiled in, so the compiled build is the fast path unless explicitly disabled.
+#if defined(__ANDROID__)
+        static int _gxinline = litevDmaPropDefaultOn("debug.litev.gxinline") ? 1 : 0;
+#else
+        static int _gxinline = 1;
+#endif
+#endif
         if (_gxtiminginline && _gxfifotiming && SrcAddrInc > 0)
         {
             while (IterCount > 0 && !Stall)
@@ -684,7 +701,12 @@ void DMA::Run9()
                 u32 val = *(u32*)&NDS.MainRAM[CurSrcAddr & NDS.MainRAMMask];
                 if (gpu3d.GeometryEnabled)
                 {
+#ifdef LITEV_GXFIFO_DMA_INLINE
+                    if (_gxinline) gpu3d.WriteToGXFIFO_Inline(val);
+                    else           gpu3d.WriteToGXFIFO(val);
+#else
                     gpu3d.WriteToGXFIFO(val);
+#endif
                 }
 
                 CurSrcAddr += SrcAddrInc<<2;
@@ -705,7 +727,12 @@ void DMA::Run9()
             u32 val = *(u32*)&NDS.MainRAM[CurSrcAddr & NDS.MainRAMMask];
             if (gpu3d.GeometryEnabled)
             {
+#ifdef LITEV_GXFIFO_DMA_INLINE
+                if (_gxinline) gpu3d.WriteToGXFIFO_Inline(val);
+                else           gpu3d.WriteToGXFIFO(val);
+#else
                 gpu3d.WriteToGXFIFO(val);
+#endif
             }
 
             CurSrcAddr += SrcAddrInc<<2;

@@ -558,6 +558,11 @@ if (LITEV_DMA_GXFIFO_FAST)
     add_compile_definitions(LITEV_DMA_GXFIFO_FAST=1)
 endif()
 
+option(LITEV_GXFIFO_DMA_INLINE "liteV: inline the GXFIFO producer path (WriteToGXFIFO+CmdFIFOWrite) into DMA::Run9's per-word geometry-DMA loop; byte/cycle-exact, no per-word cross-TU call (needs LTO otherwise off for .dev). Runtime toggle debug.litev.gxinline (default ON)" OFF)
+if (LITEV_GXFIFO_DMA_INLINE)
+    add_compile_definitions(LITEV_GXFIFO_DMA_INLINE=1)
+endif()
+
 # Lazy-load the ARM9 32-bit DMA-unit memory timings (DMA::UnitTimings9_32, ~1.5% of the emu
 # thread): defer the 4 ARM9MemTimings[][6/7] loads into the branch that reads them so the hot
 # geometry-DMA burst path (which uses none on a non-refresh unit) skips them. BIT-EXACT (same

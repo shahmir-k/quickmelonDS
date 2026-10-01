@@ -109,6 +109,10 @@ public:
     [[nodiscard]] u16 GetRenderXPos() const noexcept { return RenderXPos; }
 
     void WriteToGXFIFO(u32 val) noexcept;
+    // LITEV_GXFIFO_DMA_INLINE: always-inline twin of WriteToGXFIFO (body in GPU3D_GXFIFO_inl.h)
+    // so DMA::Run9's per-word geometry-DMA loop can inline the whole producer path. Public because
+    // DMA.cpp calls it; byte-exact with WriteToGXFIFO (single source — the public fn delegates here).
+    void WriteToGXFIFO_Inline(u32 val) noexcept;
 
     u8 Read8(u32 addr) noexcept;
     u16 Read16(u32 addr) noexcept;
@@ -142,6 +146,9 @@ private:
     void PosTest() noexcept;
     void VecTest(u32 param) noexcept;
     void CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept;
+    // LITEV_GXFIFO_DMA_INLINE: always-inline twin of CmdFIFOWrite (body in GPU3D_GXFIFO_inl.h);
+    // private (takes the private CmdFIFOEntry) — only WriteToGXFIFO_Inline calls it.
+    void CmdFIFOWrite_Inline(const CmdFIFOEntry& entry) noexcept;
     CmdFIFOEntry CmdFIFORead() noexcept;
     void FinishWork(s32 cycles) noexcept;
     void VertexPipelineSubmitCmd() noexcept

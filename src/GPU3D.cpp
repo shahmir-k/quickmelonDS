@@ -26,6 +26,11 @@
 #include "Platform.h"
 #include "GPU3D.h"
 #include "LiteProfile.h"
+// LITEV_GXFIFO_DMA_INLINE: single-source inline bodies for the GXFIFO producer path. Included here
+// so the public WriteToGXFIFO/CmdFIFOWrite delegate to the SAME code DMA.cpp inlines (no duplication).
+// The extern decl inside also gives CmdNumParams (defined below) external linkage for other TUs.
+#include "GPU3D_GXFIFO_inl.h"
+
 
 namespace melonDS
 {
@@ -1667,38 +1672,8 @@ void GPU3D::VecTest(u32 param) noexcept
 
 void GPU3D::CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept
 {
-    if (CmdFIFO.IsEmpty() && !CmdPIPE.IsFull())
-    {
-        CmdPIPE.Write(entry);
-    }
-    else
-    {
-        if (CmdFIFO.IsFull())
-        {
-            // store it to the stall queue. stall the system.
-            // worst case is if a STMxx opcode causes this, which is why our stall queue
-            // has 64 entries. this is less complicated than trying to make STMxx stall-able.
-
-            CmdStallQueue.Write(entry);
-            NDS.GXFIFOStall();
-            return;
-        }
-
-        CmdFIFO.Write(entry);
-    }
-
-    GXStat |= (1<<27);
-
-    if (entry.Command == 0x11 || entry.Command == 0x12)
-    {
-        GXStat |= (1<<14); // push/pop matrix
-        NumPushPopCommands++;
-    }
-    else if (entry.Command == 0x70 || entry.Command == 0x71 || entry.Command == 0x72)
-    {
-        GXStat |= (1<<0); // box/pos/vec test
-        NumTestCommands++;
-    }
+    // Single source of truth: the body lives in GPU3D_GXFIFO_inl.h so DMA.cpp can inline it.
+    CmdFIFOWrite_Inline(entry);
 }
 
 GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
@@ -3121,40 +3096,8 @@ void GPU3D::SetRenderXPos(u16 xpos, u16 mask) noexcept
 
 void GPU3D::WriteToGXFIFO(u32 val) noexcept
 {
-    if (NumCommands == 0)
-    {
-        NumCommands = 4;
-        CurCommand = val;
-        ParamCount = 0;
-        TotalParams = CmdNumParams[CurCommand & 0xFF];
-
-        if (TotalParams > 0) return;
-    }
-    else
-        ParamCount++;
-
-    for (;;)
-    {
-        if ((CurCommand & 0xFF) || (NumCommands == 4 && CurCommand == 0))
-        {
-            CmdFIFOEntry entry;
-            entry.Command = CurCommand & 0xFF;
-            entry.Param = val;
-            CmdFIFOWrite(entry);
-        }
-
-        if (ParamCount >= TotalParams)
-        {
-            CurCommand >>= 8;
-            NumCommands--;
-            if (NumCommands == 0) break;
-
-            ParamCount = 0;
-            TotalParams = CmdNumParams[CurCommand & 0xFF];
-        }
-        if (ParamCount < TotalParams)
-            break;
-    }
+    // Single source of truth: the body lives in GPU3D_GXFIFO_inl.h so DMA.cpp can inline it.
+    WriteToGXFIFO_Inline(val);
 }
 
 
