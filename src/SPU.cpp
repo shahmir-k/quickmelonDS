@@ -29,6 +29,10 @@
 
 #include "blip-buf/blip_buf.h"
 
+#ifdef LITEV_SPU_MIX_NEON
+#include <arm_neon.h>
+#endif
+
 #define INTERNAL_SAMPLE_RATE 16756991.f
 
 namespace melonDS
@@ -678,6 +682,11 @@ s32 SPUChannel::Run(u32 cycles)
         if (!(Cnt & (1<<31))) break;
     }
 
+    // Volume-0 skip: the channel already decoded (position/finish advanced above), but its output is
+    // CurSample*Volume = 0, so the interpolation below is wasted work. Return 0 now. Bit-exact (the
+    // original returns 0 too) -> no audio change, MP-safe.
+    if (Volume == 0) return 0;
+
     s32 val = (s32)CurSample;
 
     // interpolation (emulation improvement, not a hardware feature)
@@ -887,30 +896,54 @@ void SPU::Mix(u32 spucycles)
     for (u32 _spubatch = 0; _spubatch < (u32)(LITEV_SPU_BATCH_N); _spubatch++)
     {
 #endif
+
     s32 left = 0, right = 0;
     s32 leftoutput = 0, rightoutput = 0;
 
     if (Cnt & (1<<15))
     {
-        s32 ch0 = Channels[0].DoRun(spucycles);
-        s32 ch1 = Channels[1].DoRun(spucycles);
-        s32 ch2 = Channels[2].DoRun(spucycles);
-        s32 ch3 = Channels[3].DoRun(spucycles);
+        // Decode all 16 channels first (sequential; each advances its own position/finish exactly),
+        // then accumulate the pan mix. Channel order is unchanged (0..15).
+        s32 cv[16];
+        for (int i = 0; i < 16; i++) cv[i] = Channels[i].DoRun(spucycles);
+        const s32 ch1 = cv[1], ch3 = cv[3];   // raw values for the routing switch below
 
-        // TODO: addition from capture registers
-        Channels[0].PanOutput(ch0, left, right);
-        Channels[2].PanOutput(ch2, left, right);
+        // Channels 1 and 3 are conditionally muted from the MAIN mix (Cnt bits 12/13). Zero their
+        // mix contribution (PanOutput of 0 == skipping it); the routing switch still uses raw ch1/ch3.
+        s32 mv[16];
+        for (int i = 0; i < 16; i++) mv[i] = cv[i];
+        if (Cnt & (1<<12)) mv[1] = 0;
+        if (Cnt & (1<<13)) mv[3] = 0;
 
-        if (!(Cnt & (1<<12))) Channels[1].PanOutput(ch1, left, right);
-        if (!(Cnt & (1<<13))) Channels[3].PanOutput(ch3, left, right);
-
-        for (int i = 4; i < 16; i++)
+#ifdef LITEV_SPU_MIX_NEON
+        // Vectorized 16-channel pan-accumulate. Per channel PanOutput is
+        //   left  += ((s64)in * (128-pan)) >> 10;   right += ((s64)in * pan) >> 10;
+        // Integer NEON, BIT-EXACT: widen s32*s32->s64 (vmull_s32), shift each term >>10, sum. DS
+        // channel values (|in| < ~7e7) and 16-term sums stay < 2^31, so s64 accumulation narrowed
+        // once == the scalar per-term s32 accumulation (no overflow, no wrap).
+        s32 pn[16];
+        for (int i = 0; i < 16; i++) pn[i] = Channels[i].Pan;
+        int64x2_t lacc = vdupq_n_s64(0), racc = vdupq_n_s64(0);
+        for (int i = 0; i < 16; i += 4)
         {
-            SPUChannel* chan = &Channels[i];
-
-            s32 channel = chan->DoRun(spucycles);
-            chan->PanOutput(channel, left, right);
+            int32x4_t v    = vld1q_s32(&mv[i]);
+            int32x4_t p    = vld1q_s32(&pn[i]);
+            int32x4_t invp = vsubq_s32(vdupq_n_s32(128), p);
+            lacc = vaddq_s64(lacc, vshrq_n_s64(vmull_s32(vget_low_s32(v),  vget_low_s32(invp)),  10));
+            lacc = vaddq_s64(lacc, vshrq_n_s64(vmull_s32(vget_high_s32(v), vget_high_s32(invp)), 10));
+            racc = vaddq_s64(racc, vshrq_n_s64(vmull_s32(vget_low_s32(v),  vget_low_s32(p)),  10));
+            racc = vaddq_s64(racc, vshrq_n_s64(vmull_s32(vget_high_s32(v), vget_high_s32(p)), 10));
         }
+        left  = (s32)(vgetq_lane_s64(lacc, 0) + vgetq_lane_s64(lacc, 1));
+        right = (s32)(vgetq_lane_s64(racc, 0) + vgetq_lane_s64(racc, 1));
+#else
+        for (int i = 0; i < 16; i++)
+        {
+            const s32 pan = Channels[i].Pan;
+            left  += ((s64)mv[i] * (128 - pan)) >> 10;
+            right += ((s64)mv[i] * pan) >> 10;
+        }
+#endif
 
         // sound capture
         // TODO: other sound capture sources, along with their bugs

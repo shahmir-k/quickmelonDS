@@ -518,6 +518,17 @@ if (LITEV_SPU_BATCH)
     add_compile_definitions(LITEV_SPU_BATCH=1 LITEV_SPU_BATCH_N=${LITEV_SPU_BATCH_N})
 endif()
 
+# Integer-NEON vectorization of the SPU 16-channel pan-accumulate in SPU::Mix.
+# BIT-EXACT with the scalar path: each PanOutput term is ((s64)in*(128-pan))>>10;
+# |in|<=2^26, |term|<=2^23, 16-term sum <=2^27 (<< 2^31) so s64-accumulate-then-
+# narrow == the scalar per-term s32 accumulation with no overflow for ANY DS game.
+# Emu-core lever (does NOT move work off-core -> unaffected by the 4-core wall).
+# Default OFF -> byte-identical scalar behaviour. ARM64-only (guarded by include).
+option(LITEV_SPU_MIX_NEON "Vectorize the SPU 16-channel pan-accumulate with integer NEON (bit-exact)" OFF)
+if (LITEV_SPU_MIX_NEON)
+    add_compile_definitions(LITEV_SPU_MIX_NEON=1)
+endif()
+
 # DraStic-style inert-tick RTC coarsening: the 32768Hz RTC oscillator schedules
 # ~548 events/frame just to bump a counter. When no periodic INT1 frequency /
 # INT2 alarm is armed (the common gameplay case), the periodic ProcessIRQ(1) is a
