@@ -105,7 +105,39 @@ endif()
 
 option(BUILD_QT_SDL "Build Qt/SDL frontend" ON)
 
+# liteDS-v2 additions (all default OFF -> upstream-identical build with no flags).
 add_subdirectory(src)
+
+# --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---
+# The LITEV_* feature macros above are set with add_compile_definitions(), which is
+# DIRECTORY-scoped: it configures core's own sources (and core's in-tree subdirectory
+# consumers: the Qt/SDL frontend and the headless harness) but is NOT part of `core`'s
+# exported usage requirements. Several of these macros change the LAYOUT of core public
+# types that downstream code allocates and constructs:
+#   * LITEV_JIT_DISPATCH -> Compiler::DispatcherEntry[]  (Compiler is embedded in ARMJIT)
+#   * LITEV_JIT_LINK     -> ARMJIT::PendingLinks9/7 + Compiler link fields
+# and `melonDS::ARMJIT JIT` is the FIRST member of NDS, so any of these shifts every
+# later NDS member and grows sizeof(NDS).
+#
+# An OUT-OF-TREE dependent that links `core` and includes its public headers (e.g. the
+# Android JNI frontend target `melonDS-android-frontend`, whose MelonInstance.cpp does
+# `new NDS(...)`) lives in a DIFFERENT directory scope and therefore does NOT inherit
+# these directory definitions. It would then size `operator new(sizeof(NDS))` for a
+# SMALLER layout than NDS::NDS (compiled in core with the flags) constructs, so a late
+# member write (a FIFO past the JIT member) runs off the end of the undersized heap
+# block -> SIGSEGV/SEGV_ACCERR into the allocator guard page during construction.
+#
+# Re-export every LITEV_* directory definition as a PUBLIC compile definition of `core`
+# so ALL dependents (in-tree and out-of-tree) compile against one identical ABI. This
+# adds nothing new to core's own sources (they already have the macros via the
+# directory scope, so the in-tree/headless build stays byte-identical); it only makes
+# the same macros flow across the `target_link_libraries(... core ...)` boundary.
+get_directory_property(_litev_dir_defs COMPILE_DEFINITIONS)
+foreach(_litev_def IN LISTS _litev_dir_defs)
+    if(_litev_def MATCHES "^LITEV_")
+        target_compile_definitions(core PUBLIC ${_litev_def})
+    endif()
+endforeach()
 
 if (BUILD_QT_SDL)
     add_subdirectory(src/frontend/qt_sdl)
