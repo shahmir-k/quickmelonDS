@@ -386,6 +386,23 @@ if (LITEV_MEM_DTCM_BLOCK OR LITEV_MEM_MAINRAM_LOAD)
     endif()
 endif()
 
+# 2026-09-16 (DTCM-engagement drill): map the DTCM region into the fastmem window so DTCM guest
+# accesses inline via fastmem instead of faulting -> slow helper. Upstream's MapAtAddress hole-punch
+# is not guarded against the DTCM region itself, so it maps NOTHING for DTCM (marks MappedRW over an
+# unmapped hole) -> every DTCM fastmem access SIGSEGVs and is patched to the slow helper. DTCM is
+# 84-99% of all slow-mem calls (the stack). Byte+cycle-exact: DTCM backing = MemoryBase+DTCMOffset =
+# exactly what SlowRead9/Write9 use; DTCM is non-executable so writes need no JIT invalidation.
+# Runtime prop debug.litev.dtcmfastmem (read once at init; when unset it defaults ON/1 -- see
+# ARMJIT_Memory.cpp DTCMFastmem init) for a single-binary A/B.
+option(LITEV_MEM_DTCM_FASTMEM "DTCM-engagement drill: map DTCM into the fastmem window (AArch64)" OFF)
+if (LITEV_MEM_DTCM_FASTMEM)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_MEM_DTCM_FASTMEM=1)
+    else()
+        message(FATAL_ERROR "LITEV_MEM_DTCM_FASTMEM requires an AArch64 target.")
+    endif()
+endif()
+
 # DraStic LDM/STM block-transfer match (docs/drastic-teardown/01-cpu-recompiler.md
 # §7.1): DraStic translates every LDM/STM to a single BL into a hand-written
 # straight-line stub, one per register count (arm64_load_block1..16 /

@@ -41,6 +41,13 @@
 #include "ARMJIT_Compiler.h"
 #include "ARMJIT_Global.h"
 
+#ifdef LITEV_MEM_DTCM_FASTMEM
+#include <cstdlib>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#endif
+
 #include "DSi.h"
 #include "GPU.h"
 #include "GPU3D.h"
@@ -472,6 +479,9 @@ void ARMJIT_Memory::Mapping::Unmap(int region, melonDS::NDS& nds) noexcept
 #ifndef __SWITCH__
     u32 dtcmEnd = dtcmStart + dtcmSize;
     if (Num == 0
+        // LITEV_MEM_DTCM_FASTMEM: symmetric to MapAtAddress — a DTCM-region mapping is a full range
+        // (not hole-punched), so unmap it in full via the else branch (UnmapFromRange the whole size).
+        && !(nds.JIT.Memory.DTCMFastmem && region == memregion_DTCM)
         && dtcmEnd >= Addr
         && dtcmStart < Addr + Size)
     {
@@ -654,6 +664,11 @@ bool ARMJIT_Memory::MapAtAddress(u32 addr) noexcept
     u32 dtcmEnd = dtcmStart + dtcmSize;
 #ifndef __SWITCH__
     if (num == 0
+        // LITEV_MEM_DTCM_FASTMEM: when mapping the DTCM region ITSELF, skip the hole-punch (which
+        // maps nothing for it — start==mirrorStart && end==mirrorStart+size) and fall to the normal
+        // MapIntoRange below, so DTCM is actually served by fastmem. Other regions still hole-punch
+        // around DTCM as before.
+        && !(DTCMFastmem && region == memregion_DTCM)
         && dtcmEnd >= mirrorStart
         && dtcmStart < mirrorStart + mirrorSize)
     {
@@ -844,6 +859,15 @@ bool ARMJIT_Memory::FaultHandler(FaultDescription& faultDesc, melonDS::NDS& nds)
 ARMJIT_Memory::ARMJIT_Memory(melonDS::NDS& nds, bool fastmem) : NDS(nds)
 {
     ARMJIT_Global::Init();
+#ifdef LITEV_MEM_DTCM_FASTMEM
+    // read-once: default ON when compiled in (validated byte-exact + ~-3.3% instr); the prop
+    // debug.litev.dtcmfastmem can force it OFF (=0) for a drift-free single-binary A/B.
+#if defined(__ANDROID__)
+    { char b[8] = {0}; int n = __system_property_get("debug.litev.dtcmfastmem", b); DTCMFastmem = (n > 0) ? (atoi(b) != 0) : true; }
+#else
+    { const char* e = getenv("debug.litev.dtcmfastmem"); DTCMFastmem = e ? (atoi(e) != 0) : true; }
+#endif
+#endif
 #if defined(__SWITCH__)
     MemoryBase = (u8*)aligned_alloc(0x1000, MemoryTotalSize);
     virtmemLock();

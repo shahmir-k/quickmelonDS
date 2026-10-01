@@ -153,6 +153,10 @@ public:
     static u32 PageShift;
 private:
     bool FastMemHandlerActive = false;
+    // LITEV_MEM_DTCM_FASTMEM: when set, MapAtAddress/Unmap map the DTCM *region itself* into the
+    // fastmem window (instead of hole-punching it to nothing), so DTCM guest accesses inline via
+    // fastmem instead of faulting -> slow helper. Read once from debug.litev.dtcmfastmem at init.
+    bool DTCMFastmem = false;
     friend class Compiler;
     struct Mapping
     {
