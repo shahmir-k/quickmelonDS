@@ -190,6 +190,50 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 {
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.MemBlock9HelperCalls);
     addr &= ~0x3;
+#ifdef LITEV_JIT_BLOCKXFER_FAST
+    // Hoist the per-element region dispatch out of the loop for the two homogeneous,
+    // no-side-effect regions (ITCM/DTCM). The per-element SlowRead9/SlowWrite9 re-run the
+    // ITCM/DTCM/region classification for EVERY word; for a block that lies wholly inside
+    // one TCM we classify ONCE (the whole range fits in a single <=64B LDM/STM, far smaller
+    // than the TCM span, so both ends inside => all words inside) and loop directly.
+    // BIT-EXACT: identical value at each identical address; ITCM writes still
+    // CheckAndInvalidate the JIT block cache per word exactly as the scalar path does. Any
+    // block that straddles a region or hits a side-effectful region falls through to the
+    // exact per-element path below (MMIO/VRAM/palette/OAM semantics unchanged). MP-safe:
+    // no AddCycles / event / timing change — only the host classification is elided.
+    if (num)
+    {
+        const u32 bytes = num << 2;
+        const u32 last  = addr + bytes - 4;
+        if (addr + bytes <= cpu->ITCMSize)               // whole block in ITCM
+        {
+            for (u32 i = 0; i < num; i++)
+            {
+                const u32 a = addr + (i << 2);
+                if (Write)
+                {
+                    cpu->NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(a);
+                    *(u32*)&cpu->ITCM[a & 0x7FFF] = (u32)data[i];
+                }
+                else
+                    data[i] = *(u32*)&cpu->ITCM[a & 0x7FFF];
+            }
+            return;
+        }
+        if ((addr & cpu->DTCMMask) == cpu->DTCMBase
+         && (last & cpu->DTCMMask) == cpu->DTCMBase)      // whole block in DTCM
+        {
+            for (u32 i = 0; i < num; i++)
+            {
+                const u32 a = addr + (i << 2);
+                if (Write) *(u32*)&cpu->DTCM[a & 0x3FFF] = (u32)data[i];
+                else       data[i] = *(u32*)&cpu->DTCM[a & 0x3FFF];
+            }
+            return;
+        }
+    }
+#endif
+
     for (u32 i = 0; i < num; i++)
     {
         if (Write)

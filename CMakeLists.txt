@@ -412,6 +412,17 @@ if (LITEV_JIT_LDMSTM)
     endif()
 endif()
 
+# Hoist the per-element region dispatch out of SlowBlockTransfer9 for blocks that lie
+# wholly inside one no-side-effect TCM (ITCM/DTCM) — classify once and loop directly
+# instead of re-running the ITCM/DTCM/region classification per word (SlowBlockTransfer9
+# is ~2.6% of the emu thread; LDM/STM stack ops hit non-fastmem TCM). BIT-EXACT (same
+# values/addresses, ITCM writes still CheckAndInvalidate per word), MP-safe (no timing
+# change), straddling/MMIO blocks fall through to the exact per-element path. Default OFF.
+option(LITEV_JIT_BLOCKXFER_FAST "Hoist SlowBlockTransfer9's region dispatch for whole-in-TCM blocks (bit-exact)" OFF)
+if (LITEV_JIT_BLOCKXFER_FAST)
+    add_compile_definitions(LITEV_JIT_BLOCKXFER_FAST=1)
+endif()
+
 # DraStic JIT emit-quality (teardown 01, FUN_001912f0): merge the host NZCV flags into
 # guest CPSR with one MRS + masked AND/ORR (3 host instrs) instead of a per-flag CSET+BFI
 # pair (8 instrs) for full-flag arithmetic S-ops (CMP/SUBS/ADDS...). Guest CPSR N/Z/C/V
