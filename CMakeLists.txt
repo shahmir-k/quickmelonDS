@@ -147,6 +147,21 @@ option(LITEV_IO_DISPATCH_TABLE "liteV: O(1) offset-indexed dispatch for ARM9 32-
 if (LITEV_IO_DISPATCH_TABLE)
     add_compile_definitions(LITEV_IO_DISPATCH_TABLE=1)
 endif()
+# Async software 3D: let the banded raster run PAST VBlank into the next frame.
+# Stock melonDS starts the 3D raster at VCount 215 and hard-barriers the emu thread on
+# it at the next VBlank (GPU::VBlank -> Finish3DRendering), so the raster gets only
+# ~1/2 a frame of wall. MEASURED on the Shrek race (A55, software renderer): the raster
+# needs ~26 ms but is given ~15 ms, so the emu stalls ~9.4 ms EVERY frame -- that stall
+# IS the 40fps wall. The game flushes 3D geometry only every OTHER frame, so the raster
+# actually has two frames of headroom. This flag barriers the emu ONLY when VBlank is
+# about to mutate state the raster still reads (geometry re-sort / Render* regs), and
+# only flattens texture VRAM behind that same barrier. Output is unchanged (the 2D
+# compositor already paces against the raster per-scanline via Sema_ScanlineCount);
+# FBHASH-gated. Default OFF.
+option(LITEV_SOFT3D_ASYNC "liteV: soft 3D raster may span into the next frame (no VBlank barrier unless state is mutated)" OFF)
+if (LITEV_SOFT3D_ASYNC)
+    add_compile_definitions(LITEV_SOFT3D_ASYNC=1)
+endif()
 # DRASTIC: DraStic-style TILE-BASED software 3D renderer (TileRenderer3D, GPU3D_TileSoft.*).
 # Two planes per pixel (colour + packed depth|id) in 32 KB tiles that fit one core's L1D,
 # polygons bucketed per 16-line block, AA/edge/fog recomputed in a post-pass. Selected at

@@ -1758,10 +1758,31 @@ void SoftRenderer3D::FinishRendering()
     }
 }
 
+#ifdef LITEV_SOFT3D_ASYNC
+// True if the derived dirty set has any bit set (i.e. MakeVRAMFlat_* would WRITE).
+template <typename BF>
+static inline bool LitevAnyDirty(const BF& bf)
+{
+    for (u32 i = 0; i < BF::DataLength; i++)
+        if (bf.Data[i]) return true;
+    return false;
+}
+#endif
+
 void SoftRenderer3D::RenderFrame()
 {
     auto textureDirty = GPU.VRAMDirty_Texture.DeriveState(GPU.VRAMMap_Texture, GPU);
     auto texPalDirty = GPU.VRAMDirty_TexPal.DeriveState(GPU.VRAMMap_TexPal, GPU);
+
+#ifdef LITEV_SOFT3D_ASYNC
+    // The MakeVRAMFlat_* calls below WRITE the flat texture/palette buffers that an
+    // in-flight async raster is still reading. Barrier only when there is actually
+    // something to write — a frame that dirtied no texture VRAM writes nothing, so
+    // the raster is free to keep running.
+    if (RenderThreadRunning.load(std::memory_order_relaxed)
+        && (LitevAnyDirty(textureDirty) || LitevAnyDirty(texPalDirty)))
+        FinishRendering();
+#endif
 
     bool textureChanged = GPU.MakeVRAMFlat_TextureCoherent(textureDirty);
     bool texPalChanged = GPU.MakeVRAMFlat_TexPalCoherent(texPalDirty);

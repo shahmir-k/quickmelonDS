@@ -1320,7 +1320,23 @@ void GPU::StartScanline(u32 line) noexcept
         // texture memory anyway and only update it before the start
         // of the next frame.
         // So we can give the rasteriser a bit more headroom
-        Rend->Finish3DRendering();
+        {
+#ifdef LITEV_SOFT3D_ASYNC
+            // LITEV_SOFT3D_ASYNC: barrier ONLY when this VBlank is about to mutate
+            // state the in-flight raster is still reading (geometry re-sort and/or
+            // the Render* register block). Otherwise let the raster run on into the
+            // next frame — the 2D compositor already paces itself against it with
+            // the per-scanline Sema_ScanlineCount handshake.
+            //
+            // WHY: the soft 3D raster costs ~26 ms of wall on the Shrek race but the
+            // stock code gives it only the ~15 ms between Start3DRendering (VCount
+            // 215) and this barrier, so the emu stalled ~9 ms EVERY frame. The game
+            // only flushes geometry every OTHER frame, so the raster genuinely has
+            // two frames of headroom; this takes it.
+            if (GPU3D.NeedsRenderBarrier())
+#endif
+            Rend->Finish3DRendering();
+        }
 
         DispStat[0] |= (1<<0);
         DispStat[1] |= (1<<0);

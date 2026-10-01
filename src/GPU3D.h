@@ -268,6 +268,33 @@ public:
 
     bool RenderFrameIdentical = false; // not part of the hardware state, don't serialize
 
+#ifdef LITEV_SOFT3D_ASYNC
+    // LITEV_SOFT3D_ASYNC: true when the coming VBlank will MUTATE state that an
+    // in-flight 3D render is still reading (the RenderPolygonRAM re-sort and/or the
+    // Render* register/table block). Only then must the emu barrier on the render
+    // thread. On a frame that neither flushes geometry nor changes any render
+    // register, VBlank touches nothing the renderer reads, so the emu can sail past
+    // and let the raster keep running into the next frame.
+    //
+    // This is what buys the raster the time it actually has: games (e.g. the Shrek
+    // race) commonly flush 3D geometry only every OTHER frame, yet the stock code
+    // forces every render to complete inside ONE frame.
+    bool NeedsRenderBarrier() const noexcept
+    {
+        if (!GeometryEnabled || !RenderingEnabled) return false;
+        if (FlushRequest) return true;
+        return !(RenderDispCnt == DispCnt
+              && RenderAlphaRef == AlphaRef
+              && RenderClearAttr1 == ClearAttr1
+              && RenderClearAttr2 == ClearAttr2
+              && RenderFogColor == FogColor
+              && RenderFogOffset == FogOffset * 0x200
+              && memcmp(RenderEdgeTable, EdgeTable, 8*2) == 0
+              && memcmp(RenderFogDensityTable + 1, FogDensityTable, 32) == 0
+              && memcmp(RenderToonTable, ToonTable, 32*2) == 0);
+    }
+#endif
+
     u16 RenderXPos = 0;
 
     bool AbortFrame = false;

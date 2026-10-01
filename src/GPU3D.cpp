@@ -3363,6 +3363,20 @@ void GPU3D::VBlank() noexcept
     {
         if (RenderingEnabled)
         {
+#ifdef LITEV_SOFT3D_ASYNC
+        // LITEV_SOFT3D_ASYNC: if this VBlank changes nothing the renderer reads, skip
+        // the whole Render* rewrite. Every store below would be value-identical
+        // anyway (that is exactly what NeedsRenderBarrier() tested), so skipping is
+        // semantically a no-op — but it also means we touch NO renderer-visible state
+        // while an async raster is still reading it, which is what lets GPU::VBlank
+        // sail past without a barrier.
+        if (!NeedsRenderBarrier())
+        {
+            RenderFrameIdentical = true;
+        }
+        else
+#endif
+        {
             if (FlushRequest)
             {
                 if (NumPolygons)
@@ -3442,6 +3456,7 @@ void GPU3D::VBlank() noexcept
             RenderClearAttr1 = ClearAttr1;
             RenderClearAttr2 = ClearAttr2;
         }
+        }   // LITEV_SOFT3D_ASYNC: close the "renderer-visible state changes" branch
 
         if (FlushRequest)
         {
