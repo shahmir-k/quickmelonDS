@@ -589,6 +589,21 @@ option(LITEV_NEON_RENDERER "Enable NEON SIMD 2D output paths (AArch64 only)" OFF
 option(LITEV_SPU_FAST_INTERP "Replace SPU channel interpolation with cheap linear interp" OFF)
 option(LITEV_AGGRESSIVE_SKIP "Enable per-frame 2D/3D rasterization skip gate" OFF)
 
+# Adaptive frameskip that holds REAL-TIME pace on scenes that cannot sustain 60 fps. Without
+# it the limiter has no headroom to sleep, so the game runs in slow motion; with it the
+# frontend raises the rasterisation-skip target (CPU/DMA/timers keep running) just enough to
+# keep pace, and lowers it when headroom returns. A host-side UX feature, runtime-gated by a
+# user setting and OFF by default; it must stay off for performance measurements. Drives
+# GPU::SetFrameskipTarget, so it requires LITEV_AGGRESSIVE_SKIP. add_compile_definitions so
+# the LITEV_* re-export loop below carries it PUBLIC to the out-of-tree frontend.
+option(LITEV_AUTO_FRAMESKIP "Adaptive frameskip to hold real-time speed (requires LITEV_AGGRESSIVE_SKIP)" OFF)
+if (LITEV_AUTO_FRAMESKIP)
+    if (NOT LITEV_AGGRESSIVE_SKIP)
+        message(FATAL_ERROR "LITEV_AUTO_FRAMESKIP requires LITEV_AGGRESSIVE_SKIP.")
+    endif()
+    add_compile_definitions(LITEV_AUTO_FRAMESKIP=1)
+endif()
+
 # M6.11 step 3: flag-gated integer-NEON of the GPU3D geometry engine's hot
 # per-vertex / per-command fixed-point math (SubmitVertex position + texcoord
 # transforms, MatrixMult4x4). Default OFF -> byte-identical scalar behaviour.
