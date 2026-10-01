@@ -155,6 +155,19 @@ option(LITEV_POLY_RADIX "liteV: allocation-free stable radix Y-sort for the VBla
 if (LITEV_POLY_RADIX)
     add_compile_definitions(LITEV_POLY_RADIX=1)
 endif()
+# 4-wide NEON port of the per-pixel 2D BG/OBJ colour-special-effects compositor
+# (SoftRenderer2D::ColorComposite, called 256×/scanline from DrawScanline_BGOBJ).
+# The scalar version is a ~134-instruction out-of-line CALL PER PIXEL (branchy
+# blend/window/priority logic that clang does NOT auto-vectorize). This lever
+# replaces it with a branchless NEON kernel (arm masks/selects) doing 4 px/iter,
+# mirroring DraStic's NEON-vectorized 2D composite (teardown FUN_001494a4, 927
+# NEON ops). Bit-exact with the scalar path (top/bottom/audio hashes identical);
+# all changes behind #ifdef LITEV_SOFT2D_NEON; flag-OFF is byte-identical.
+# AArch64 only (scalar fallback elsewhere).
+option(LITEV_SOFT2D_NEON "liteV: 4-wide NEON 2D BG/OBJ colour-effect compositor" OFF)
+if (LITEV_SOFT2D_NEON)
+    add_compile_definitions(LITEV_SOFT2D_NEON=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

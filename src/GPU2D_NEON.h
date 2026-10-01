@@ -54,6 +54,18 @@ void BrightnessUp(u32* buf, int count, u32 factor) noexcept;
 // Bit-exact with ColorBrightnessDown(buf[i], factor, 0xF) per pixel.
 void BrightnessDown(u32* buf, int count, u32 factor) noexcept;
 
+#ifdef LITEV_SOFT2D_NEON
+// NEON port of SoftRenderer2D::ColorComposite's per-pixel BG/OBJ colour-special-
+// effects loop (the DrawScanline_BGOBJ final compositor). Processes 4 pixels per
+// iteration, branchless via NEON masks/selects.
+//   dst[i]        = composited output pixel (256 pixels)
+//   bgobj[0..255] = top-layer values (val1); bgobj[256..511] = bottom (val2)
+//   windowMask    = per-pixel window mask byte
+//   blendCnt, eva, evb, evy = GPU2D.BlendCnt / EVA / EVB / EVY
+// Bit-exact with the scalar ColorComposite loop. 256 must be a multiple of 4.
+void ColorCompositeLine(u32* dst, const u32* bgobj, const u8* windowMask,
+                        u32 blendCnt, u32 eva, u32 evb, u32 evy) noexcept;
+#endif
 
 
 } // namespace GPU2DNeon

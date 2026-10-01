@@ -19,6 +19,10 @@
 #include "GPU_Soft.h"
 #include "GPU_ColorOp.h"
 
+#if defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
+#include "GPU2D_NEON.h"
+#endif
+
 namespace melonDS
 {
 
@@ -533,6 +537,11 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
     // color special effects
     // can likely be optimized
 
+#if defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
+    // 4-wide NEON port of the per-pixel ColorComposite loop (bit-exact).
+    GPU2DNeon::ColorCompositeLine(dst, BGOBJLine, WindowMask,
+                                  GPU2D.BlendCnt, GPU2D.EVA, GPU2D.EVB, GPU2D.EVY);
+#else
     for (int i = 0; i < 256; i++)
     {
         u32 val1 = BGOBJLine[i];
@@ -540,6 +549,7 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
 
         dst[i] = ColorComposite(i, val1, val2);
     }
+#endif
 }
 
 

@@ -164,7 +164,7 @@ target_include_directories(core INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
 # ── liteDS-v2 Milestone 4 (renderer track, software-renderer scope) ──────────
 # Every flag defaults OFF; with none set the build is upstream-identical.
 
-if (LITEV_NEON_RENDERER)
+if (LITEV_NEON_RENDERER OR LITEV_SOFT2D_NEON)
     # NEON SIMD 2D output paths (LITEV_NEON_RENDERER: master-brightness/expand;
     # LITEV_SOFT2D_NEON: the BG/OBJ colour-effect compositor). Bit-exact scalar-
     # equivalent, but only meaningful on AArch64; the .cpp is compiled only there

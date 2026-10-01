@@ -293,6 +293,257 @@ void BrightnessDown(u32* buf, int count, u32 factor) noexcept
 // BG/OBJ colour-special-effects loop (see GPU2D_Soft.cpp DrawScanline_BGOBJ +
 // GPU_ColorOp.h). 4 pixels/iter, fully branchless via NEON masks. Bit-exact.
 // ─────────────────────────────────────────────────────────────────────────────
+#ifdef LITEV_SOFT2D_NEON
+#if defined(__ARM_NEON)
+
+// ColorBlend4(v1,v2,eva,evb) — per-lane eva/evb (uint32x4).
+static inline uint32x4_t Blend4_neon(uint32x4_t v1, uint32x4_t v2,
+                                     uint32x4_t eva, uint32x4_t evb) noexcept
+{
+    // Red  (bits 5:0)
+    uint32x4_t r = vaddq_u32(
+        vaddq_u32(vmulq_u32(vandq_u32(v1, vdupq_n_u32(0x00003F)), eva),
+                  vmulq_u32(vandq_u32(v2, vdupq_n_u32(0x00003F)), evb)),
+        vdupq_n_u32(0x000008));
+    r = vshrq_n_u32(r, 4);
+    r = vminq_u32(r, vdupq_n_u32(0x00003F));
+    // Green (bits 13:8)
+    uint32x4_t g = vaddq_u32(
+        vaddq_u32(vmulq_u32(vandq_u32(v1, vdupq_n_u32(0x003F00)), eva),
+                  vmulq_u32(vandq_u32(v2, vdupq_n_u32(0x003F00)), evb)),
+        vdupq_n_u32(0x000800));
+    g = vandq_u32(vshrq_n_u32(g, 4), vdupq_n_u32(0x007F00));
+    g = vminq_u32(g, vdupq_n_u32(0x003F00));
+    // Blue  (bits 21:16)
+    uint32x4_t b = vaddq_u32(
+        vaddq_u32(vmulq_u32(vandq_u32(v1, vdupq_n_u32(0x3F0000)), eva),
+                  vmulq_u32(vandq_u32(v2, vdupq_n_u32(0x3F0000)), evb)),
+        vdupq_n_u32(0x080000));
+    b = vandq_u32(vshrq_n_u32(b, 4), vdupq_n_u32(0x7F0000));
+    b = vminq_u32(b, vdupq_n_u32(0x3F0000));
+
+    return vorrq_u32(vorrq_u32(vorrq_u32(r, g), b), vdupq_n_u32(0xFF000000));
+}
+
+// ColorBlend5(v1,v2) — eva=((v1>>24)&0x1F)+1, evb=32-eva; returns v1 where eva==32.
+static inline uint32x4_t Blend5_neon(uint32x4_t v1, uint32x4_t v2) noexcept
+{
+    uint32x4_t eva = vaddq_u32(vandq_u32(vshrq_n_u32(v1, 24), vdupq_n_u32(0x1F)),
+                               vdupq_n_u32(1));
+    uint32x4_t evb = vsubq_u32(vdupq_n_u32(32), eva);
+
+    uint32x4_t r = vaddq_u32(
+        vaddq_u32(vmulq_u32(vandq_u32(v1, vdupq_n_u32(0x00003F)), eva),
+                  vmulq_u32(vandq_u32(v2, vdupq_n_u32(0x00003F)), evb)),
+        vdupq_n_u32(0x000010));
+    r = vshrq_n_u32(r, 5);
+    r = vminq_u32(r, vdupq_n_u32(0x00003F));
+    uint32x4_t g = vaddq_u32(
+        vaddq_u32(vmulq_u32(vandq_u32(v1, vdupq_n_u32(0x003F00)), eva),
+                  vmulq_u32(vandq_u32(v2, vdupq_n_u32(0x003F00)), evb)),
+        vdupq_n_u32(0x001000));
+    g = vandq_u32(vshrq_n_u32(g, 5), vdupq_n_u32(0x007F00));
+    g = vminq_u32(g, vdupq_n_u32(0x003F00));
+    uint32x4_t b = vaddq_u32(
+        vaddq_u32(vmulq_u32(vandq_u32(v1, vdupq_n_u32(0x3F0000)), eva),
+                  vmulq_u32(vandq_u32(v2, vdupq_n_u32(0x3F0000)), evb)),
+        vdupq_n_u32(0x100000));
+    b = vandq_u32(vshrq_n_u32(b, 5), vdupq_n_u32(0x7F0000));
+    b = vminq_u32(b, vdupq_n_u32(0x3F0000));
+
+    uint32x4_t res = vorrq_u32(vorrq_u32(vorrq_u32(r, g), b), vdupq_n_u32(0xFF000000));
+    // eva==32 (i.e. (v1>>24)&0x1F == 31) => return v1 unchanged.
+    uint32x4_t keep = vceqq_u32(eva, vdupq_n_u32(32));
+    return vbslq_u32(keep, v1, res);
+}
+
+// ColorBrightnessUp(v1, factor=evy, bias=8)
+static inline uint32x4_t BrightUp8_neon(uint32x4_t v1, uint32x4_t evy) noexcept
+{
+    uint32x4_t rb = vandq_u32(v1, vdupq_n_u32(0x3F003F));
+    uint32x4_t g  = vandq_u32(v1, vdupq_n_u32(0x003F00));
+    uint32x4_t drb = vandq_u32(
+        vshrq_n_u32(vaddq_u32(vmulq_u32(vsubq_u32(vdupq_n_u32(0x3F003F), rb), evy),
+                              vdupq_n_u32(8u * 0x010001u)), 4),
+        vdupq_n_u32(0x3F003F));
+    uint32x4_t dg = vandq_u32(
+        vshrq_n_u32(vaddq_u32(vmulq_u32(vsubq_u32(vdupq_n_u32(0x003F00), g), evy),
+                              vdupq_n_u32(8u * 0x000100u)), 4),
+        vdupq_n_u32(0x003F00));
+    rb = vaddq_u32(rb, drb);
+    g  = vaddq_u32(g, dg);
+    return vorrq_u32(vorrq_u32(rb, g), vdupq_n_u32(0xFF000000));
+}
+
+// ColorBrightnessDown(v1, factor=evy, bias=7)
+static inline uint32x4_t BrightDown7_neon(uint32x4_t v1, uint32x4_t evy) noexcept
+{
+    uint32x4_t rb = vandq_u32(v1, vdupq_n_u32(0x3F003F));
+    uint32x4_t g  = vandq_u32(v1, vdupq_n_u32(0x003F00));
+    uint32x4_t drb = vandq_u32(
+        vshrq_n_u32(vaddq_u32(vmulq_u32(rb, evy), vdupq_n_u32(7u * 0x010001u)), 4),
+        vdupq_n_u32(0x3F003F));
+    uint32x4_t dg = vandq_u32(
+        vshrq_n_u32(vaddq_u32(vmulq_u32(g, evy), vdupq_n_u32(7u * 0x000100u)), 4),
+        vdupq_n_u32(0x003F00));
+    rb = vsubq_u32(rb, drb);
+    g  = vsubq_u32(g, dg);
+    return vorrq_u32(vorrq_u32(rb, g), vdupq_n_u32(0xFF000000));
+}
+
+// Diagnostic A/B for the complete brightness-up line proof below. It is cached
+// at first use: this is a launch-time setting, never a per-line property read.
+static bool litevCompositeBrightUp()
+{
+#if defined(__ANDROID__)
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        char value[PROP_VALUE_MAX] = {};
+        // Shipping default is ON; explicit 0 keeps the same-binary A/B path.
+        enabled = (__system_property_get("debug.litev.compositebrightup", value) > 0) ?
+                  (atoi(value) != 0) : 1;
+    }
+    return enabled != 0;
+#else
+    return false;
+#endif
+}
+
+void ColorCompositeLine(u32* dst, const u32* bgobj, const u8* windowMask,
+                        u32 blendCnt, u32 eva_g, u32 evb_g, u32 evy) noexcept
+{
+#if defined(__ANDROID__) && defined(LITEV_SOFTPROF)
+    static const bool profileCE = [] {
+        char value[PROP_VALUE_MAX] = {};
+        // This counter is a deep diagnostic: it performs four contended atomics
+        // per compositor vector. Keep the ordinary whole-frame profiler free of
+        // that measurement perturbation.
+        return __system_property_get("debug.litev.softprof", value) > 0 && atoi(value) != 0;
+    }();
+#else
+    constexpr bool profileCE = false;
+#endif
+    const uint32x4_t vblend = vdupq_n_u32(blendCnt);
+    const uint32x4_t vEVA   = vdupq_n_u32(eva_g);
+    const uint32x4_t vEVB   = vdupq_n_u32(evb_g);
+    const uint32x4_t vEVY   = vdupq_n_u32(evy);
+    // coloreffect for the "else" (BG/backdrop) branch is a per-scanline scalar.
+    const u32 ceElse = (blendCnt >> 6) & 0x3;
+    const uint32x4_t vCeElse = vdupq_n_u32(ceElse);
+
+    // A complete, line-wide proof for the common brightness-up case. The old
+    // unconditional shortcut was wrong: sprite/3D alpha can override the
+    // BG/backdrop effect per pixel. This scan replays precisely the selector
+    // predicates (not the blend/brightness arithmetic) and only bypasses the
+    // general loop when every output lane is therefore ce==2.
+    //
+    // Do not hide the explicit CE census when a diagnostic asked for it.
+    if (!profileCE && litevCompositeBrightUp() && ceElse == 2)
+    {
+        bool allBrightUp = true;
+        for (int i = 0; i < 256; i++)
+        {
+            const u32 f1 = bgobj[i] >> 24;
+            const u32 f2 = bgobj[256 + i] >> 24;
+            const u32 target2 = (f2 & 0x80) ? 0x1000 :
+                                ((f2 & 0x40) ? 0x0100 : (f2 << 8));
+            const bool blendT2 = (blendCnt & target2) != 0;
+            const u32 flag1b = (f1 & 0x80) ? 0x10 :
+                               ((f1 & 0x40) ? 0x01 : f1);
+            if (((f1 & 0xC0) && blendT2) ||
+                !(blendCnt & flag1b) || !(windowMask[i] & 0x20))
+            {
+                allBrightUp = false;
+                break;
+            }
+        }
+        if (allBrightUp)
+        {
+            for (int i = 0; i < 256; i += 4)
+                vst1q_u32(dst + i, BrightUp8_neon(vld1q_u32(bgobj + i), vEVY));
+            return;
+        }
+    }
+
+    for (int i = 0; i < 256; i += 4)
+    {
+        uint32x4_t v1 = vld1q_u32(bgobj + i);
+        uint32x4_t v2 = vld1q_u32(bgobj + 256 + i);
+        // window mask: 4 bytes -> 4x u32
+        uint32_t wm4;
+        __builtin_memcpy(&wm4, windowMask + i, 4);
+        uint8x8_t wm8 = vreinterpret_u8_u32(vdup_n_u32(wm4));
+        uint16x8_t wm16 = vmovl_u8(wm8);
+        uint32x4_t wm = vmovl_u16(vget_low_u16(wm16));
+
+        uint32x4_t f1 = vshrq_n_u32(v1, 24);
+        uint32x4_t f2 = vshrq_n_u32(v2, 24);
+
+        // target2 = f2&0x80 ? 0x1000 : (f2&0x40 ? 0x0100 : f2<<8)
+        uint32x4_t m2_80 = vtstq_u32(f2, vdupq_n_u32(0x80));
+        uint32x4_t m2_40 = vtstq_u32(f2, vdupq_n_u32(0x40));
+        uint32x4_t target2 = vshlq_n_u32(f2, 8);
+        target2 = vbslq_u32(m2_40, vdupq_n_u32(0x0100), target2);
+        target2 = vbslq_u32(m2_80, vdupq_n_u32(0x1000), target2);
+
+        uint32x4_t blendT2 = vtstq_u32(vblend, target2);      // (blendCnt & target2)!=0
+
+        uint32x4_t m1_80 = vtstq_u32(f1, vdupq_n_u32(0x80));
+        uint32x4_t m1_40 = vtstq_u32(f1, vdupq_n_u32(0x40));
+
+        uint32x4_t condSprite = vandq_u32(m1_80, blendT2);
+        uint32x4_t cond3D     = vandq_u32(m1_40, blendT2);
+
+        // else-branch: flag1b = m1_80?0x10 : (m1_40?0x01 : f1)
+        uint32x4_t flag1b = vbslq_u32(m1_40, vdupq_n_u32(0x01), f1);
+        flag1b = vbslq_u32(m1_80, vdupq_n_u32(0x10), flag1b);
+        uint32x4_t condElse = vandq_u32(vtstq_u32(vblend, flag1b),
+                                        vtstq_u32(wm, vdupq_n_u32(0x20)));
+
+        // coloreffect (priority: else < 3D < sprite)
+        uint32x4_t ce = vdupq_n_u32(0);
+        if (ceElse != 0)
+        {
+            if (ceElse == 1)
+                ce = vbslq_u32(vandq_u32(condElse, blendT2), vdupq_n_u32(1), ce);
+            else
+                ce = vbslq_u32(condElse, vCeElse, ce);
+        }
+        ce = vbslq_u32(cond3D,     vdupq_n_u32(4), ce);
+        ce = vbslq_u32(condSprite, vdupq_n_u32(1), ce);
+
+#if defined(__ANDROID__) && defined(LITEV_SOFTPROF)
+        if (profileCE)
+        {
+            u32 lanes[4];
+            vst1q_u32(lanes, ce);
+            for (int lane = 0; lane < 4; lane++)
+                LitevSP::S.CompositeCE[lanes[lane]].fetch_add(1, std::memory_order_relaxed);
+        }
+#endif
+
+        // eva/evb for ce==1: default EVA/EVB, except sprite+alpha (m1_40) lanes.
+        uint32x4_t eva = vEVA, evb = vEVB;
+        uint32x4_t evaSp = vandq_u32(f1, vdupq_n_u32(0x1F));
+        uint32x4_t evbSp = vsubq_u32(vdupq_n_u32(16), evaSp);
+        uint32x4_t spAlpha = vandq_u32(condSprite, m1_40);
+        eva = vbslq_u32(spAlpha, evaSp, eva);
+        evb = vbslq_u32(spAlpha, evbSp, evb);
+
+        // Compute the 4 non-trivial results, select by ce (0 => v1 passthrough).
+        uint32x4_t out = v1;
+        out = vbslq_u32(vceqq_u32(ce, vdupq_n_u32(1)), Blend4_neon(v1, v2, eva, evb), out);
+        out = vbslq_u32(vceqq_u32(ce, vdupq_n_u32(2)), BrightUp8_neon(v1, vEVY), out);
+        out = vbslq_u32(vceqq_u32(ce, vdupq_n_u32(3)), BrightDown7_neon(v1, vEVY), out);
+        out = vbslq_u32(vceqq_u32(ce, vdupq_n_u32(4)), Blend5_neon(v1, v2), out);
+
+        vst1q_u32(dst + i, out);
+    }
+}
+
+#endif // __ARM_NEON
+#endif // LITEV_SOFT2D_NEON
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DrawBG3DLine — NEON port of SoftRenderer2D::DrawBG_3D's per-pixel 3D-layer
