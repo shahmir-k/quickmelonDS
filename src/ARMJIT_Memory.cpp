@@ -1409,141 +1409,146 @@ u32 WifiRead32(u32 addr)
     return (u32)Wifi::Read(addr) | ((u32)Wifi::Read(addr + 2) << 16);
 }*/
 
+// LITEV dTLB: these JIT-called region helpers are emitted as DIRECT calls; taking the
+// live CPU pointer (RCPU=X29, holds ARM*) and using cpu->NDS avoids re-resolving the
+// thread_local NDS::Current through tlsdesc_resolver on every VRAM/GPU3D/IO access —
+// that TLS walk was ~6.5% of all dTLB refills. Byte+cycle-exact (same object, same
+// semantics; the Slow{Read,Write}9 paths already do exactly this, see ARMJIT.cpp).
 template <typename T>
-void VRAMWrite(u32 addr, T val)
+void VRAMWrite(u32 addr, ARM* cpu, T val)
 {
     switch (addr & 0x00E00000)
     {
-    case 0x00000000: NDS::Current->GPU.SyncVRAM_ABG(addr, true); NDS::Current->GPU.WriteVRAM_ABG<T>(addr, val); return;
-    case 0x00200000: NDS::Current->GPU.SyncVRAM_BBG(addr, true); NDS::Current->GPU.WriteVRAM_BBG<T>(addr, val); return;
-    case 0x00400000: NDS::Current->GPU.SyncVRAM_AOBJ(addr, true); NDS::Current->GPU.WriteVRAM_AOBJ<T>(addr, val); return;
-    case 0x00600000: NDS::Current->GPU.SyncVRAM_BOBJ(addr, true); NDS::Current->GPU.WriteVRAM_BOBJ<T>(addr, val); return;
-    default: NDS::Current->GPU.SyncVRAM_LCDC(addr, true); NDS::Current->GPU.WriteVRAM_LCDC<T>(addr, val); return;
+    case 0x00000000: cpu->NDS.GPU.SyncVRAM_ABG(addr, true); cpu->NDS.GPU.WriteVRAM_ABG<T>(addr, val); return;
+    case 0x00200000: cpu->NDS.GPU.SyncVRAM_BBG(addr, true); cpu->NDS.GPU.WriteVRAM_BBG<T>(addr, val); return;
+    case 0x00400000: cpu->NDS.GPU.SyncVRAM_AOBJ(addr, true); cpu->NDS.GPU.WriteVRAM_AOBJ<T>(addr, val); return;
+    case 0x00600000: cpu->NDS.GPU.SyncVRAM_BOBJ(addr, true); cpu->NDS.GPU.WriteVRAM_BOBJ<T>(addr, val); return;
+    default: cpu->NDS.GPU.SyncVRAM_LCDC(addr, true); cpu->NDS.GPU.WriteVRAM_LCDC<T>(addr, val); return;
     }
 }
 template <typename T>
-T VRAMRead(u32 addr)
+T VRAMRead(u32 addr, ARM* cpu)
 {
     switch (addr & 0x00E00000)
     {
-    case 0x00000000: NDS::Current->GPU.SyncVRAM_ABG(addr, false); return NDS::Current->GPU.ReadVRAM_ABG<T>(addr);
-    case 0x00200000: NDS::Current->GPU.SyncVRAM_BBG(addr, false); return NDS::Current->GPU.ReadVRAM_BBG<T>(addr);
-    case 0x00400000: NDS::Current->GPU.SyncVRAM_AOBJ(addr, false); return NDS::Current->GPU.ReadVRAM_AOBJ<T>(addr);
-    case 0x00600000: NDS::Current->GPU.SyncVRAM_BOBJ(addr, false); return NDS::Current->GPU.ReadVRAM_BOBJ<T>(addr);
-    default: NDS::Current->GPU.SyncVRAM_LCDC(addr, false); return NDS::Current->GPU.ReadVRAM_LCDC<T>(addr);
+    case 0x00000000: cpu->NDS.GPU.SyncVRAM_ABG(addr, false); return cpu->NDS.GPU.ReadVRAM_ABG<T>(addr);
+    case 0x00200000: cpu->NDS.GPU.SyncVRAM_BBG(addr, false); return cpu->NDS.GPU.ReadVRAM_BBG<T>(addr);
+    case 0x00400000: cpu->NDS.GPU.SyncVRAM_AOBJ(addr, false); return cpu->NDS.GPU.ReadVRAM_AOBJ<T>(addr);
+    case 0x00600000: cpu->NDS.GPU.SyncVRAM_BOBJ(addr, false); return cpu->NDS.GPU.ReadVRAM_BOBJ<T>(addr);
+    default: cpu->NDS.GPU.SyncVRAM_LCDC(addr, false); return cpu->NDS.GPU.ReadVRAM_LCDC<T>(addr);
     }
 }
 
-static u8 GPU3D_Read8(u32 addr) noexcept
+static u8 GPU3D_Read8(u32 addr, ARM* cpu) noexcept
 {
-    return NDS::Current->GPU.GPU3D.Read8(addr);
+    return cpu->NDS.GPU.GPU3D.Read8(addr);
 }
 
-static u16 GPU3D_Read16(u32 addr) noexcept
+static u16 GPU3D_Read16(u32 addr, ARM* cpu) noexcept
 {
-    return NDS::Current->GPU.GPU3D.Read16(addr);
+    return cpu->NDS.GPU.GPU3D.Read16(addr);
 }
 
-static u32 GPU3D_Read32(u32 addr) noexcept
+static u32 GPU3D_Read32(u32 addr, ARM* cpu) noexcept
 {
-    return NDS::Current->GPU.GPU3D.Read32(addr);
+    return cpu->NDS.GPU.GPU3D.Read32(addr);
 }
 
-static void GPU3D_Write8(u32 addr, u8 val) noexcept
+static void GPU3D_Write8(u32 addr, ARM* cpu, u8 val) noexcept
 {
-    NDS::Current->GPU.GPU3D.Write8(addr, val);
+    cpu->NDS.GPU.GPU3D.Write8(addr, val);
 }
 
-static void GPU3D_Write16(u32 addr, u16 val) noexcept
+static void GPU3D_Write16(u32 addr, ARM* cpu, u16 val) noexcept
 {
-    NDS::Current->GPU.GPU3D.Write16(addr, val);
+    cpu->NDS.GPU.GPU3D.Write16(addr, val);
 }
 
-static void GPU3D_Write32(u32 addr, u32 val) noexcept
+static void GPU3D_Write32(u32 addr, ARM* cpu, u32 val) noexcept
 {
-    NDS::Current->GPU.GPU3D.Write32(addr, val);
-}
-
-template<class T>
-static T GPU_ReadVRAM_ARM7(u32 addr) noexcept
-{
-    return NDS::Current->GPU.ReadVRAM_ARM7<T>(addr);
+    cpu->NDS.GPU.GPU3D.Write32(addr, val);
 }
 
 template<class T>
-static void GPU_WriteVRAM_ARM7(u32 addr, T val) noexcept
+static T GPU_ReadVRAM_ARM7(u32 addr, ARM* cpu) noexcept
 {
-    NDS::Current->GPU.WriteVRAM_ARM7<T>(addr, val);
+    return cpu->NDS.GPU.ReadVRAM_ARM7<T>(addr);
 }
 
-u32 NDSCartSlot_ReadROMData9()
+template<class T>
+static void GPU_WriteVRAM_ARM7(u32 addr, ARM* cpu, T val) noexcept
 {
-    return NDS::Current->NDSCartSlots[0]->ReadROMData(0);
+    cpu->NDS.GPU.WriteVRAM_ARM7<T>(addr, val);
 }
 
-u32 NDSCartSlot_ReadROMData7()
+u32 NDSCartSlot_ReadROMData9(u32 addr, ARM* cpu)
 {
-    return NDS::Current->NDSCartSlots[0]->ReadROMData(1);
+    return cpu->NDS.NDSCartSlots[0]->ReadROMData(0);
 }
 
-static u8 NDS_ARM9IORead8(u32 addr)
+u32 NDSCartSlot_ReadROMData7(u32 addr, ARM* cpu)
 {
-    return NDS::Current->ARM9IORead8(addr);
+    return cpu->NDS.NDSCartSlots[0]->ReadROMData(1);
 }
 
-static u16 NDS_ARM9IORead16(u32 addr)
+static u8 NDS_ARM9IORead8(u32 addr, ARM* cpu)
 {
-    return NDS::Current->ARM9IORead16(addr);
+    return cpu->NDS.ARM9IORead8(addr);
 }
 
-static u32 NDS_ARM9IORead32(u32 addr)
+static u16 NDS_ARM9IORead16(u32 addr, ARM* cpu)
 {
-    return NDS::Current->ARM9IORead32(addr);
+    return cpu->NDS.ARM9IORead16(addr);
 }
 
-static void NDS_ARM9IOWrite8(u32 addr, u8 val)
+static u32 NDS_ARM9IORead32(u32 addr, ARM* cpu)
 {
-    NDS::Current->ARM9IOWrite8(addr, val);
+    return cpu->NDS.ARM9IORead32(addr);
 }
 
-static void NDS_ARM9IOWrite16(u32 addr, u16 val)
+static void NDS_ARM9IOWrite8(u32 addr, ARM* cpu, u8 val)
 {
-    NDS::Current->ARM9IOWrite16(addr, val);
+    cpu->NDS.ARM9IOWrite8(addr, val);
 }
 
-static void NDS_ARM9IOWrite32(u32 addr, u32 val)
+static void NDS_ARM9IOWrite16(u32 addr, ARM* cpu, u16 val)
 {
-    NDS::Current->ARM9IOWrite32(addr, val);
+    cpu->NDS.ARM9IOWrite16(addr, val);
 }
 
-static u8 NDS_ARM7IORead8(u32 addr)
+static void NDS_ARM9IOWrite32(u32 addr, ARM* cpu, u32 val)
 {
-    return NDS::Current->ARM7IORead8(addr);
+    cpu->NDS.ARM9IOWrite32(addr, val);
 }
 
-static u16 NDS_ARM7IORead16(u32 addr)
+static u8 NDS_ARM7IORead8(u32 addr, ARM* cpu)
 {
-    return NDS::Current->ARM7IORead16(addr);
+    return cpu->NDS.ARM7IORead8(addr);
 }
 
-static u32 NDS_ARM7IORead32(u32 addr)
+static u16 NDS_ARM7IORead16(u32 addr, ARM* cpu)
 {
-    return NDS::Current->ARM7IORead32(addr);
+    return cpu->NDS.ARM7IORead16(addr);
 }
 
-static void NDS_ARM7IOWrite8(u32 addr, u8 val)
+static u32 NDS_ARM7IORead32(u32 addr, ARM* cpu)
 {
-    NDS::Current->ARM7IOWrite8(addr, val);
+    return cpu->NDS.ARM7IORead32(addr);
 }
 
-static void NDS_ARM7IOWrite16(u32 addr, u16 val)
+static void NDS_ARM7IOWrite8(u32 addr, ARM* cpu, u8 val)
 {
-    NDS::Current->ARM7IOWrite16(addr, val);
+    cpu->NDS.ARM7IOWrite8(addr, val);
 }
 
-static void NDS_ARM7IOWrite32(u32 addr, u32 val)
+static void NDS_ARM7IOWrite16(u32 addr, ARM* cpu, u16 val)
 {
-    NDS::Current->ARM7IOWrite32(addr, val);
+    cpu->NDS.ARM7IOWrite16(addr, val);
+}
+
+static void NDS_ARM7IOWrite32(u32 addr, ARM* cpu, u32 val)
+{
+    cpu->NDS.ARM7IOWrite32(addr, val);
 }
 
 void* ARMJIT_Memory::GetFuncForAddr(ARM* cpu, u32 addr, bool store, int size) const noexcept

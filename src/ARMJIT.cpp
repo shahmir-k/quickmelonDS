@@ -111,12 +111,17 @@ T SlowRead9(u32 addr, ARMv5* cpu)
         val = *(T*)&cpu->ITCM[addr & 0x7FFF];
     else if ((addr & cpu->DTCMMask) == cpu->DTCMBase)
         val = *(T*)&cpu->DTCM[addr & 0x3FFF];
+    // Use the ARM back-pointer (cpu->NDS) instead of the thread_local NDS::Current:
+    // this shared-library build otherwise routes every NDS::Current read through a
+    // TLS access (emulated-TLS PLT call by default) on the hot ARM9 JIT slow path.
+    // cpu is already in a register here and cpu->NDS == NDS::Current for the running
+    // instance, so this is bit-exact and removes TLS entirely from these helpers.
     else if (std::is_same<T, u32>::value)
-        val = NDS::Current->ARM9Read32(addr);
+        val = cpu->NDS.ARM9Read32(addr);
     else if (std::is_same<T, u16>::value)
-        val = NDS::Current->ARM9Read16(addr);
+        val = cpu->NDS.ARM9Read16(addr);
     else
-        val = NDS::Current->ARM9Read8(addr);
+        val = cpu->NDS.ARM9Read8(addr);
 
     if (std::is_same<T, u32>::value)
         return ROR(val, offset << 3);
@@ -158,17 +163,19 @@ void SlowWrite9(u32 addr, ARMv5* cpu, u32 val)
     {
         *(T*)&cpu->DTCM[addr & 0x3FFF] = val;
     }
+    // cpu->NDS back-pointer instead of thread_local NDS::Current (see SlowRead9):
+    // removes the TLS access from the hot ARM9 store slow path. Bit-exact.
     else if (std::is_same<T, u32>::value)
     {
-        NDS::Current->ARM9Write32(addr, val);
+        cpu->NDS.ARM9Write32(addr, val);
     }
     else if (std::is_same<T, u16>::value)
     {
-        NDS::Current->ARM9Write16(addr, val);
+        cpu->NDS.ARM9Write16(addr, val);
     }
     else
     {
-        NDS::Current->ARM9Write8(addr, val);
+        cpu->NDS.ARM9Write8(addr, val);
     }
 }
 

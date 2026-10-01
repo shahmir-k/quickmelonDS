@@ -282,9 +282,13 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
 
         if (func)
         {
+            // LITEV dTLB: region helpers now take the live CPU pointer (2nd arg) and use
+            // cpu->NDS instead of resolving thread_local NDS::Current via tlsdesc on every
+            // call. Mirror the SlowWrite9 arg layout: W0=addr (already set), X1=cpu, W2=val.
+            MOV(X1, RCPU);
             if (flags & memop_Store)
-                MOV(W1, rdMapped);
-            QuickCallFunction(X2, (void (*)())func);
+                MOV(W2, rdMapped);
+            QuickCallFunction(X3, (void (*)())func);
 
             PopRegs(false, false);
 

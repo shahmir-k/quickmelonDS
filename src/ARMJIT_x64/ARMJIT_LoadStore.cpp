@@ -275,10 +275,13 @@ void Compiler::Comp_MemAccess(int rd, int rn, const Op2& op2, int size, int flag
         {
             AND(32, R(RSCRATCH3), Imm8(addressMask));
 
+            // Region helpers take (addr, ARM* cpu[, val]) (see ARMJIT_Memory.cpp).
+            // Load val before cpu so a guest reg living in ABI_PARAM2 is not clobbered.
+            if (flags & memop_Store)
+                MOV(32, R(ABI_PARAM3), rdMapped);
             if (ABI_PARAM1 != RSCRATCH3)
                 MOV(32, R(ABI_PARAM1), R(RSCRATCH3));
-            if (flags & memop_Store)
-                MOV(32, R(ABI_PARAM2), rdMapped);
+            MOV(64, R(ABI_PARAM2), R(RCPU));
 
             ABI_CallFunction((void (*)())func);
 
