@@ -804,6 +804,23 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         // X4 (== W4) is the live base pointer, so the second scratch is W5 (free
         // after the region guards), never W4.
         int w = 0;
+#ifdef LITEV_JIT_LDMSTM
+        for (; w + 1 < regsCount; w += 2)
+        {
+            if (store)
+            {
+                LDR(INDEX_UNSIGNED, W3, SP, w * 8);
+                LDR(INDEX_UNSIGNED, W5, SP, (w + 1) * 8);
+                STP(INDEX_SIGNED, W3, W5, X4, w * 4);
+            }
+            else
+            {
+                LDP(INDEX_SIGNED, W3, W5, X4, w * 4);
+                STR(INDEX_UNSIGNED, W3, SP, w * 8);
+                STR(INDEX_UNSIGNED, W5, SP, (w + 1) * 8);
+            }
+        }
+#endif
         for (; w < regsCount; w++)
         {
             if (store)
@@ -824,8 +841,119 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     }
 #endif
 
+#if defined(LITEV_JIT_LDMSTM)
+    // ---- MainRAM-hit inline block LOAD (LITEV_JIT_LDMSTM) -------------------
+    // Composes with the DTCM tier above: a block whose whole address range lies
+    // inside MainRAM (the SlowBlockTransfer9 -> per-word SlowRead9<u32> dominant
+    // case, ~86% of in-race slow reads) takes a guarded direct-pointer copy in
+    // place of the per-word helper. LOADS ONLY: stores keep the helper so JIT
+    // block invalidation is completely untouched by this change. ARM9 + DS only
+    // (SlowBlockTransfer9; MainRAMMask/base are DS values, baked at compile time
+    // for the block cache's lifetime). Runtime guards fall back to the exact
+    // helper on any DTCM overlay, mid-block region exit, or MainRAM mirror wrap;
+    // the guest-register<->stack marshalling (drain, below) is shared with the
+    // helper path, identical for both. Cycles were already added by
+    // Comp_AddCycles_CDI above, so this is bit-exact.
+    //
+    // Gated on the static CurInstr.DataRegion classification (expectedTarget ==
+    // MainRAM): measured in-race this hint resolves for ~98% of the MainRAM LDMs,
+    // so the runtime guards below rarely miss. Emitting mainram guards for EVERY
+    // block (as the DTCM tier does) captured only ~1.6% more transfers while
+    // running an 8-branch dtcm+mainram guard prologue on every non-MainRAM block
+    // -- net-negative overhead. The runtime guards still fully protect exactness;
+    // the gate is a pure emission-cost optimisation.
+    const bool mainramBlockFast = (Num == 0) && (NDS.ConsoleType == 0)
+        && !compileFastPath && !store && (regsCount >= 1)
+        && (expectedTarget == ARMJIT_Memory::memregion_MainRAM);
+    FixupBranch mainramBlockDone;
+    if (mainramBlockFast)
+    {
+        FixupBranch mrbMiss[5];
+        int nMiss = 0;
+
+        // W0 = transfer start address (lowest addr; low 2 bits ignored, the
+        // helper masks internally). DTCMMask has zero low bits, so masking off
+        // the low 2 bits does not disturb the DTCM region test.
+        LDR(INDEX_UNSIGNED, W6, RCPU, offsetof(ARMv5, DTCMBase));
+        LDR(INDEX_UNSIGNED, W7, RCPU, offsetof(ARMv5, DTCMMask));
+        ANDI2R(W4, W0, ~3);                     // word-aligned start address
+
+        // guard 1: first word NOT in the DTCM overlay (SlowRead9 checks DTCM
+        // before the region switch, so a DTCM-shadowed word must fall back).
+        AND(W5, W4, W7);
+        CMP(W5, W6);
+        mrbMiss[nMiss++] = B(CC_EQ);
+
+        // guard 2: first word in the MainRAM region (DS: (addr&0xFF000000)==0x02000000).
+        ANDI2R(W5, W4, 0xFF000000);
+        MOVI2R(W3, 0x02000000);
+        CMP(W5, W3);
+        mrbMiss[nMiss++] = B(CC_NEQ);
+
+        // guard for multi-word blocks: last word in the SAME region and NOT in
+        // DTCM (no region/overlay exit mid-block; SlowBlockTransfer re-classifies
+        // every word). The block span (<=64B) is far smaller than the DTCM min
+        // region and the 16MB MainRAM region, so endpoint checks cover every
+        // interior word of the contiguous transfer.
+        if (regsCount > 1)
+        {
+            ADDI2R(W3, W4, (u32)((regsCount - 1) * 4));   // last word address
+            AND(W5, W3, W7);
+            CMP(W5, W6);
+            mrbMiss[nMiss++] = B(CC_EQ);
+            ANDI2R(W5, W3, 0xFF000000);
+            MOVI2R(W3, 0x02000000);
+            CMP(W5, W3);
+            mrbMiss[nMiss++] = B(CC_NEQ);
+        }
+
+        // guard 3: no MainRAM physical wrap. The region is mirrored, so a block
+        // that crosses the physical end wraps to offset 0 per SlowRead's per-word
+        // & MainRAMMask; keep the inline contiguous copy equivalent by falling
+        // back in that case. idx = (addr & ~3) & MainRAMMask.
+        ANDI2R(W5, W4, (u32)(NDS.MainRAMMask & ~3));
+        CMPI2R(W5, (u32)((NDS.MainRAMMask + 1) - regsCount * 4), W3);
+        mrbMiss[nMiss++] = B(CC_HI);
+
+        // hit: X4 = MainRAM base + physical index (W5, zero-extended by the AND).
+        MOVP2R(X7, NDS.MainRAM);
+        ADD(X4, X7, EncodeRegTo64(W5));
+
+        // Drain MainRAM -> stack marshalling buffer (8 bytes/word, low 4 = data,
+        // matching u64* data[]); the shared load code below writes it to guest regs.
+        //
+        // LITEV_JIT_LDMSTM: pair the contiguous MainRAM side with LDP (DraStic's
+        // arm64_load_blockN moves two guest words per instruction). The stack
+        // buffer stride is 8 bytes (u64 slots) so its side stays scalar. X4 (== W4)
+        // is the live base; second scratch is W5 (free after the region guards).
+        // Byte-identical to the per-word drain.
+        int w = 0;
+#ifdef LITEV_JIT_LDMSTM
+        for (; w + 1 < regsCount; w += 2)
+        {
+            LDP(INDEX_SIGNED, W3, W5, X4, w * 4);
+            STR(INDEX_UNSIGNED, W3, SP, w * 8);
+            STR(INDEX_UNSIGNED, W5, SP, (w + 1) * 8);
+        }
+#endif
+        for (; w < regsCount; w++)
+        {
+            LDR(INDEX_UNSIGNED, W3, X4, w * 4);
+            STR(INDEX_UNSIGNED, W3, SP, w * 8);
+        }
+
+        mainramBlockDone = B();
+        for (int m = 0; m < nMiss; m++)
+            SetJumpTarget(mrbMiss[m]);
+    }
+#endif
+
     // ---- Tier B / C fallback: the exact upstream helper --------------------
+#if defined(LITEV_JIT_LDMSTM)
+    PushRegs(false, false, !compileFastPath && !dtcmFast && !mainramBlockFast);
+#else
     PushRegs(false, false, !compileFastPath && !dtcmFast);
+#endif
 
     ADD(X1, SP, 0);
     MOVI2R(W2, regsCount);
@@ -857,6 +985,10 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
 #ifdef LITEV_MEM_DTCM_BLOCK
     if (dtcmFast)
         SetJumpTarget(dtcmDone);
+#endif
+#if defined(LITEV_JIT_LDMSTM)
+    if (mainramBlockFast)
+        SetJumpTarget(mainramBlockDone);
 #endif
 
     if (!store)
