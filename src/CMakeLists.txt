@@ -161,6 +161,25 @@ endif()
 
 target_include_directories(core INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# ── liteDS-v2 Milestone 4 (renderer track, software-renderer scope) ──────────
+# Every flag defaults OFF; with none set the build is upstream-identical.
+
+if (LITEV_NEON_RENDERER)
+    # NEON SIMD 2D output paths (LITEV_NEON_RENDERER: master-brightness/expand;
+    # LITEV_SOFT2D_NEON: the BG/OBJ colour-effect compositor). Bit-exact scalar-
+    # equivalent, but only meaningful on AArch64; the .cpp is compiled only there
+    # (macOS Apple Silicon qualifies).
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        target_sources(core PRIVATE GPU2D_NEON.cpp)
+        if (LITEV_NEON_RENDERER)
+            target_compile_definitions(core PUBLIC LITEV_NEON_RENDERER)
+        endif()
+    else()
+        message(WARNING "LITEV NEON 2D paths requested but target is not AArch64; "
+                        "NEON paths disabled (scalar fallback used).")
+    endif()
+endif()
+
 if (LITEV_SPU_FAST_INTERP)
     target_compile_definitions(core PUBLIC LITEV_SPU_FAST_INTERP)
 endif()
