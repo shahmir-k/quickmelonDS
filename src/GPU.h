@@ -720,6 +720,46 @@ public:
 
     alignas(u64) u8 VRAMFlat_Texture[512*1024] {};
     alignas(u64) u8 VRAMFlat_TexPal[128*1024] {};
+
+#ifdef LITEV_SNAP_DIRTY
+    // P2-dirty (2026-07-17): incremental shadow snapshots. The flat mirrors are only ever
+    // mutated by the Make*Coherent dirty-driven copies (CopyLinearVRAM applies exactly the
+    // chunks in the caller-derived dirty set; mapping changes arrive pre-marked by
+    // DeriveState). Accumulating those same 512B-chunk dirty bits into a per-shadow-bank
+    // pending mask lets Snapshot*Shadow copy ONLY chunks that changed since that bank's
+    // last snapshot, instead of a blind full memcpy (tex 640KB/frame, BGOBJ 1.1MB/frame —
+    // measured 2026-07-17 as the #1 emu-thread backend-stall source, ~18% of stalls in
+    // __memcpy). Bit-exact by construction: shadow bytes == full-copy bytes whenever
+    // pending ⊇ chunks-changed-since-this-bank's-last-copy, which the accumulation
+    // guarantees; ResetVRAMCache re-arms a full copy. Storage: bitmasks only (~4.5KB).
+    template<size_t BYTES> struct SnapPend
+    {
+        static constexpr size_t NBITS  = BYTES / 512;
+        static constexpr size_t NWORDS = (NBITS + 63) / 64;
+        u64 bits[2][NWORDS] {};
+        void arm() noexcept { memset(bits, 0xFF, sizeof(bits)); }   // force full copy next snapshot
+        template<u32 N> void add(const NonStupidBitField<N>& d) noexcept
+        {
+            static_assert(N == NBITS, "dirty granularity mismatch");
+            for (size_t i = 0; i < NWORDS; i++) { bits[0][i] |= d.Data[i]; bits[1][i] |= d.Data[i]; }
+        }
+        void copy(int bank, u8* dst, const u8* src) noexcept
+        {
+            for (size_t w = 0; w < NWORDS; w++)
+            {
+                u64 m = bits[bank][w]; bits[bank][w] = 0;
+                while (m)
+                {
+                    const int b = __builtin_ctzll(m); m &= m - 1;
+                    const size_t off = ((w * 64) + (size_t)b) * 512;
+                    if (off < BYTES) memcpy(dst + off, src + off, (BYTES - off) < 512 ? (BYTES - off) : 512);
+                }
+            }
+        }
+    };
+#endif
+
+
 #if defined(LITEV_SOFT2D_DEPTH2)
     // Part 1b (flat-VRAM parity snapshot, 2D side): A/B parity shadow of the flat BG/OBJ/
     // ext-pal VRAM, mirroring the R4 texture shadow above. The 2D raster reads these via
@@ -745,6 +785,16 @@ public:
     u8* VRAMFlat_BBGExtPalRead = VRAMFlat_BBGExtPal;
     u8* VRAMFlat_AOBJExtPalRead = VRAMFlat_AOBJExtPal;
     u8* VRAMFlat_BOBJExtPalRead = VRAMFlat_BOBJExtPal;
+#ifdef LITEV_SNAP_DIRTY
+    SnapPend<512*1024> SnapPendABG;
+    SnapPend<128*1024> SnapPendBBG;
+    SnapPend<256*1024> SnapPendAOBJ;
+    SnapPend<128*1024> SnapPendBOBJ;
+    SnapPend<32*1024>  SnapPendABGExtPal;
+    SnapPend<32*1024>  SnapPendBBGExtPal;
+    SnapPend<8*1024>   SnapPendAOBJExtPal;
+    SnapPend<8*1024>   SnapPendBOBJExtPal;
+#endif
     void SnapshotBGOBJShadow(int bank) noexcept;
     void SetBGOBJReadShadow(bool on, int bank) noexcept
     {

@@ -98,6 +98,12 @@ GPU::~GPU() noexcept
 
 void GPU::ResetVRAMCache() noexcept
 {
+#ifdef LITEV_SNAP_DIRTY
+#if defined(LITEV_SOFT2D_DEPTH2)
+    SnapPendABG.arm(); SnapPendBBG.arm(); SnapPendAOBJ.arm(); SnapPendBOBJ.arm();
+    SnapPendABGExtPal.arm(); SnapPendBBGExtPal.arm(); SnapPendAOBJExtPal.arm(); SnapPendBOBJExtPal.arm();
+#endif
+#endif
     for (int i = 0; i < 9; i++)
         VRAMDirty[i] = NonStupidBitField<128*1024/VRAMDirtyGranularity>();
 
@@ -1530,6 +1536,16 @@ bool GPU::MakeVRAMFlat_TexPalCoherent(NonStupidBitField<128*1024/VRAMDirtyGranul
 // Written to the A/B bank the 2D render is NOT reading (see GPU.h / the depth-2 invariant).
 void GPU::SnapshotBGOBJShadow(int bank) noexcept
 {
+#ifdef LITEV_SNAP_DIRTY
+    SnapPendABG.copy(bank,  VRAMFlat_ABGShadow[bank],  VRAMFlat_ABG);
+    SnapPendBBG.copy(bank,  VRAMFlat_BBGShadow[bank],  VRAMFlat_BBG);
+    SnapPendAOBJ.copy(bank, VRAMFlat_AOBJShadow[bank], VRAMFlat_AOBJ);
+    SnapPendBOBJ.copy(bank, VRAMFlat_BOBJShadow[bank], VRAMFlat_BOBJ);
+    SnapPendABGExtPal.copy(bank,  VRAMFlat_ABGExtPalShadow[bank],  VRAMFlat_ABGExtPal);
+    SnapPendBBGExtPal.copy(bank,  VRAMFlat_BBGExtPalShadow[bank],  VRAMFlat_BBGExtPal);
+    SnapPendAOBJExtPal.copy(bank, VRAMFlat_AOBJExtPalShadow[bank], VRAMFlat_AOBJExtPal);
+    SnapPendBOBJExtPal.copy(bank, VRAMFlat_BOBJExtPalShadow[bank], VRAMFlat_BOBJExtPal);
+#else
     memcpy(VRAMFlat_ABGShadow[bank],  VRAMFlat_ABG,  sizeof(VRAMFlat_ABG));
     memcpy(VRAMFlat_BBGShadow[bank],  VRAMFlat_BBG,  sizeof(VRAMFlat_BBG));
     memcpy(VRAMFlat_AOBJShadow[bank], VRAMFlat_AOBJ, sizeof(VRAMFlat_AOBJ));
@@ -1538,42 +1554,67 @@ void GPU::SnapshotBGOBJShadow(int bank) noexcept
     memcpy(VRAMFlat_BBGExtPalShadow[bank],  VRAMFlat_BBGExtPal,  sizeof(VRAMFlat_BBGExtPal));
     memcpy(VRAMFlat_AOBJExtPalShadow[bank], VRAMFlat_AOBJExtPal, sizeof(VRAMFlat_AOBJExtPal));
     memcpy(VRAMFlat_BOBJExtPalShadow[bank], VRAMFlat_BOBJExtPal, sizeof(VRAMFlat_BOBJExtPal));
+#endif
 }
 #endif
 
 bool GPU::MakeVRAMFlat_ABGCoherent(NonStupidBitField<512*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
+#if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
+    SnapPendABG.add(dirty);
+#endif
     return CopyLinearVRAM<16*1024>(VRAMFlat_ABG, VRAMMap_ABG, dirty, &GPU::ReadVRAM_ABG<u64>);
 }
 bool GPU::MakeVRAMFlat_BBGCoherent(NonStupidBitField<128*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
+#if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
+    SnapPendBBG.add(dirty);
+#endif
     return CopyLinearVRAM<16*1024>(VRAMFlat_BBG, VRAMMap_BBG, dirty, &GPU::ReadVRAM_BBG<u64>);
 }
 
 bool GPU::MakeVRAMFlat_AOBJCoherent(NonStupidBitField<256*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
+#if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
+    SnapPendAOBJ.add(dirty);
+#endif
     return CopyLinearVRAM<16*1024>(VRAMFlat_AOBJ, VRAMMap_AOBJ, dirty, &GPU::ReadVRAM_AOBJ<u64>);
 }
 bool GPU::MakeVRAMFlat_BOBJCoherent(NonStupidBitField<128*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
+#if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
+    SnapPendBOBJ.add(dirty);
+#endif
     return CopyLinearVRAM<16*1024>(VRAMFlat_BOBJ, VRAMMap_BOBJ, dirty, &GPU::ReadVRAM_BOBJ<u64>);
 }
 
 bool GPU::MakeVRAMFlat_ABGExtPalCoherent(NonStupidBitField<32*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
+#if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
+    SnapPendABGExtPal.add(dirty);
+#endif
     return CopyLinearVRAM<8*1024>(VRAMFlat_ABGExtPal, VRAMMap_ABGExtPal, dirty, &GPU::ReadVRAM_ABGExtPal<u64>);
 }
 bool GPU::MakeVRAMFlat_BBGExtPalCoherent(NonStupidBitField<32*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
+#if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
+    SnapPendBBGExtPal.add(dirty);
+#endif
     return CopyLinearVRAM<8*1024>(VRAMFlat_BBGExtPal, VRAMMap_BBGExtPal, dirty, &GPU::ReadVRAM_BBGExtPal<u64>);
 }
 
 bool GPU::MakeVRAMFlat_AOBJExtPalCoherent(NonStupidBitField<8*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
+#if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
+    SnapPendAOBJExtPal.add(dirty);
+#endif
     return CopyLinearVRAM<8*1024>(VRAMFlat_AOBJExtPal, &VRAMMap_AOBJExtPal, dirty, &GPU::ReadVRAM_AOBJExtPal<u64>);
 }
 bool GPU::MakeVRAMFlat_BOBJExtPalCoherent(NonStupidBitField<8*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
+#if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
+    SnapPendBOBJExtPal.add(dirty);
+#endif
     return CopyLinearVRAM<8*1024>(VRAMFlat_BOBJExtPal, &VRAMMap_BOBJExtPal, dirty, &GPU::ReadVRAM_BOBJExtPal<u64>);
 }
 

@@ -183,6 +183,10 @@ option(LITEV_POLY_RADIX "liteV: allocation-free stable radix Y-sort for the VBla
 if (LITEV_POLY_RADIX)
     add_compile_definitions(LITEV_POLY_RADIX=1)
 endif()
+option(LITEV_SNAP_DIRTY "liteV: dirty-incremental shadow snapshots (tex + BGOBJ flat VRAM) instead of blind full memcpy" OFF)
+if (LITEV_SNAP_DIRTY)
+    add_compile_definitions(LITEV_SNAP_DIRTY=1)
+endif()
 # 4-wide NEON port of the per-pixel 2D BG/OBJ colour-special-effects compositor
 # (SoftRenderer2D::ColorComposite, called 256×/scanline from DrawScanline_BGOBJ).
 # The scalar version is a ~134-instruction out-of-line CALL PER PIXEL (branchy
