@@ -91,6 +91,12 @@ void TileRenderer3D::Reset()
     // NOTE: the SoftRenderer composite calls Rend3D->Reset() but never Rend3D->Init()
     // (the reference SoftRenderer3D allocates in Reset()/lazily too), so allocate the
     // per-frame compact vertex arena here or BuildFrameGeom() null-derefs on frame 1.
+#ifdef LITEV_TILE_COORD
+    // Drain the pipeline: no queued frame may reference geometry/buffers we are about to wipe.
+    if (PoolRunning.load(std::memory_order_relaxed))
+        while (FrameProduced.load(std::memory_order_acquire) != FrameConsumed.load(std::memory_order_acquire))
+            Platform::Semaphore_Wait(Sema_RingFree);
+#endif
     WaitFrameComplete();                 // no worker may be mid-frame while we wipe state
     for (int g = 0; g < NGEOM; g++) if (!VtxArena[g]) VtxArena[g] = new TileVtx[VtxArenaSlots];
     memset(ColorOut, 0, sizeof(ColorOut));
@@ -968,7 +974,11 @@ void TileRenderer3D::WorkerRender(int idx)
     const u16 (&BucketCount)[NumBlocks] = this->BucketCount[gr];
     const TilePoly (&FramePolys)[MaxPolys] = this->FramePolys[gr];
     const TileVtx* VtxArena = this->VtxArena[gr];
+#ifdef LITEV_TILE_COORD
+    const int ci = WorkerColIdx;
+#else
     const int ci = RenderIdx;
+#endif
     u32* out = ColorOut[ci];
     std::atomic<u8>* rdy = RowReady[ci];          // this frame's row-ready bank (per-buffer)
 
@@ -1111,12 +1121,32 @@ void TileRenderer3D::EnsureBandPool()
     PoolRunning.store(true, std::memory_order_relaxed);
     for (int b = 0; b < NB; b++)
         BandThreads[b] = Platform::Thread_Create([this, b]() { BandWorkerFunc(b); });
+#ifdef LITEV_TILE_COORD
+    Sema_CoordWork = Platform::Semaphore_Create();
+    Sema_RingFree  = Platform::Semaphore_Create();
+    FrameProduced.store(0, std::memory_order_relaxed);
+    FrameConsumed.store(0, std::memory_order_relaxed);
+    CoordRunning.store(true, std::memory_order_relaxed);
+    CoordThread = Platform::Thread_Create([this]() { CoordFunc(); });
+#endif
 }
 
 void TileRenderer3D::ShutdownBandPool()
 {
     if (!PoolRunning.load(std::memory_order_relaxed)) return;
 
+#ifdef LITEV_TILE_COORD
+    // Drain every queued frame, then stop the coordinator before the workers it dispatches.
+    while (FrameProduced.load(std::memory_order_acquire) != FrameConsumed.load(std::memory_order_acquire))
+        Platform::Semaphore_Wait(Sema_RingFree);
+    CoordRunning.store(false, std::memory_order_release);
+    Platform::Semaphore_Post(Sema_CoordWork);          // wake the coordinator so it observes the flag
+    Platform::Thread_Wait(CoordThread);
+    Platform::Thread_Free(CoordThread);
+    CoordThread = nullptr;
+    Platform::Semaphore_Free(Sema_CoordWork); Sema_CoordWork = nullptr;
+    Platform::Semaphore_Free(Sema_RingFree);  Sema_RingFree  = nullptr;
+#endif
     WaitFrameComplete();                              // never tear down mid-frame
     PoolRunning.store(false, std::memory_order_relaxed);
     for (int b = 0; b < NB; b++)                      // wake each worker so it observes the flag + returns
@@ -1164,7 +1194,14 @@ void TileRenderer3D::BandWorkerFunc(int idx)
         // other worker's writes (all rows composited before their fetch_subs).
         if (BandsRemaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
         {
+#ifdef LITEV_TILE_COORD
+            // The COORD workers write WorkerColIdx (set at dispatch); RenderIdx is the emu's newest,
+            // possibly-still-queued buffer. Publish the buffer THESE workers just completed so the
+            // consumer latches a fully-rasterized frame.
+            ConsumeIdx.store(WorkerColIdx, std::memory_order_release);
+#else
             ConsumeIdx.store(RenderIdx, std::memory_order_release);
+#endif
             FrameComplete.store(true, std::memory_order_release);
             Platform::Semaphore_Post(Sema_FrameDone);
             // Row-wait flush: a consumer that checked FrameComplete==false and is about to block on
@@ -1192,11 +1229,31 @@ void TileRenderer3D::WaitFrameComplete()
 void TileRenderer3D::RenderFrame()
 {
     EnsureBandPool();       // spawn the 3 pinned workers once (first frame)
+#ifndef LITEV_TILE_COORD
     WaitFrameComplete();    // the previous frame's workers must be done before we touch shared state
+#endif
 
     // VRAM-coherent bookkeeping -- mirrors SoftRenderer3D::RenderFrame (emu thread).
     auto textureDirty = GPU.VRAMDirty_Texture.DeriveState(GPU.VRAMMap_Texture, GPU);
     auto texPalDirty  = GPU.VRAMDirty_TexPal.DeriveState(GPU.VRAMMap_TexPal, GPU);
+#ifdef LITEV_TILE_COORD
+    // The coordinator may still be decoding the previous frame's textures while
+    // this emu thread reaches the next VCount-215.  Updating VRAMFlat_Texture or
+    // clearing the per-band decode caches in that window races the worker and can
+    // make host-speed changes alter only the local framebuffer. When texture input
+    // will change, drain the coordinator before mutating either shared input.
+    // Default ON: the 2,000-frame trace and settled-PPM gate are byte-exact; the
+    // property remains available for a same-binary diagnostic A/B.
+    const bool textureInputDirty = textureDirty.Begin() != textureDirty.End()
+                                || texPalDirty.Begin() != texPalDirty.End();
+    if (textureInputDirty && litevTileProp("debug.litev.texbarrier", 1))
+    {
+        const double texBarrierStart = LSP_NOW();
+        while (FrameProduced.load(std::memory_order_acquire) != FrameConsumed.load(std::memory_order_acquire))
+            Platform::Semaphore_Wait(Sema_RingFree);
+        LSP_ADD(EmuTexBarrier, LSP_NOW() - texBarrierStart);
+    }
+#endif
     bool textureChanged = GPU.MakeVRAMFlat_TextureCoherent(textureDirty);
     bool texPalChanged  = GPU.MakeVRAMFlat_TexPalCoherent(texPalDirty);
     FrameIdentical = !(textureChanged || texPalChanged) && GPU3D.RenderFrameIdentical;
@@ -1209,6 +1266,21 @@ void TileRenderer3D::RenderFrame()
     BuildFrameGeom(GeomWrite);   // compact vertex snapshot + per-block buckets (emu thread)
     ComputeClearConfig();   // clear vals + DoPost/NeedHalo + border (emu thread)
 
+#ifdef LITEV_TILE_COORD
+    // DraStic decouple: the emu HANDS OFF the built frame to the coordinator thread and returns
+    // WITHOUT waiting on the raster. Bounded to <= NCOL-1 frames in flight so a free color buffer
+    // always exists (rare wait on Sema_RingFree only when the raster falls a full frame behind).
+    const int col = (RenderIdx + 1) % NCOL;
+    while ((FrameProduced.load(std::memory_order_acquire)
+          - FrameConsumed.load(std::memory_order_acquire)) >= (u32)(NCOL - 1))
+        Platform::Semaphore_Wait(Sema_RingFree);
+    const u32 slot = FrameProduced.load(std::memory_order_relaxed);
+    PendRing[slot % NCOL] = { GeomWrite, col };
+    RenderIdx = col;
+    FrameProduced.fetch_add(1, std::memory_order_release);
+    Platform::Semaphore_Post(Sema_CoordWork);        // wake the coordinator to raster this frame
+    GeomWrite = (GeomWrite + 1) % NGEOM;             // next frame builds the other geometry buffer
+#else
     GeomRead = GeomWrite;
     RenderIdx ^= 1;         // workers write the buffer NOT currently being consumed
 
@@ -1231,8 +1303,50 @@ void TileRenderer3D::RenderFrame()
         Platform::Semaphore_Post(BandStartSema[b]);
 
     GeomWrite = (GeomWrite + 1) % NGEOM;   // next frame builds the other geometry buffer
+#endif
 }
 
+#ifdef LITEV_TILE_COORD
+// The coordinator publishes one queued frame to the 2D consumer, dispatches the 3 band workers,
+// and blocks (on THIS thread, not the emu) until they finish. Same sequence the single-frame
+// RenderFrame did — just owned by the coordinator so the emu never waits on the raster.
+void TileRenderer3D::CoordDispatch(int geomIdx, int colIdx)
+{
+    GeomRead = geomIdx;
+    WorkerColIdx = colIdx;
+    for (int y = 0; y < OutHeight; y++) RowReady[colIdx][y].store(0, std::memory_order_relaxed);
+    for (int b = 0; b < NB; b++) SeamFirstReady[b].store(0, std::memory_order_relaxed);
+    Platform::Semaphore_Reset(Sema_RowPub);
+    // Reset frame-completion state BEFORE publishing DisplayIdx. The 2D consumer (GetLine) latches
+    // DisplayIdx (acquire) and, on an unready row, ESCAPES its RowReady wait when FrameComplete is
+    // set. If DisplayIdx were published first (as it was), a consumer could latch this fresh buffer
+    // while FrameComplete was still true from the PREVIOUS frame, escape immediately, and read rows
+    // the workers have not rasterized yet -> intermittent black-bar flicker on the top screen. The
+    // DisplayIdx release store below pairs with the consumer's acquire load, so FrameComplete=false
+    // and the cleared RowReady bank are guaranteed visible before the new index is seen.
+    Platform::Semaphore_Reset(Sema_FrameDone);
+    BandsRemaining.store(NB, std::memory_order_relaxed);
+    FrameComplete.store(false, std::memory_order_relaxed);
+    DisplayIdx.store(colIdx, std::memory_order_release);   // publish LAST
+    for (int b = 0; b < NB; b++)
+        Platform::Semaphore_Post(BandStartSema[b]);
+    WaitFrameComplete();                             // block for the workers (coordinator thread)
+}
+
+void TileRenderer3D::CoordFunc()
+{
+    for (;;)
+    {
+        Platform::Semaphore_Wait(Sema_CoordWork);
+        if (!CoordRunning.load(std::memory_order_acquire)) return;
+        const u32 c = FrameConsumed.load(std::memory_order_acquire);
+        const PendFrame pf = PendRing[c % NCOL];
+        CoordDispatch(pf.geomIdx, pf.colIdx);
+        FrameConsumed.fetch_add(1, std::memory_order_release);
+        Platform::Semaphore_Post(Sema_RingFree);     // a ring slot freed -> unblock a waiting emu
+    }
+}
+#endif
 
 void TileRenderer3D::FinishRendering()
 {
@@ -1266,7 +1380,16 @@ u32* TileRenderer3D::GetLine(int line)
     // (c) DisplayIdx-changed / FrameComplete escapes cover a stale latch (boot: a consumer pass can
     // start before the first 3D kick) -- both mean no more rows are coming for this bank.
     if (line == 0)
+#ifdef LITEV_TILE_COORD
+        // Latch the last FULLY-COMPLETE 3D frame, not the in-progress buffer (DisplayIdx). The emu is
+        // already decoupled by the coordinator, so compositing a complete frame costs no emu fps and
+        // eliminates the read-ahead black-bar race: every row of ConsumeIdx is already published and
+        // its buffer is not reused for another NCOL-1 frames (~2 frames of margin vs one ~16ms pass).
+        // Boot: ConsumeIdx=0 is a black-cleared buffer until the first frame completes.
+        ConsumerPassIdx = ConsumeIdx.load(std::memory_order_acquire);
+#else
         ConsumerPassIdx = DisplayIdx.load(std::memory_order_acquire);
+#endif
     const int idx = ConsumerPassIdx;
     std::atomic<u8>& rdy = RowReady[idx][line];
 

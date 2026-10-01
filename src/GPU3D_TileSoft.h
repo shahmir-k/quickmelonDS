@@ -275,8 +275,33 @@ private:
 
     // Full-frame colour output -- the ONLY plane GetLine exposes. Double-buffered so an async-2D
     // consumer of frame N never sees frame N+1's half-written plane.
+#ifdef LITEV_TILE_COORD
+    // DraStic decouple step 2: 3 color buffers (one rastering, one displaying, one free) so the
+    // emu can run a frame ahead of the raster without the workers' target colliding with the 2D
+    // consumer's. WorkerColIdx = the buffer captured at dispatch (workers read it, NOT the live
+    // RenderIdx, which the emu advances while it builds ahead).
+    static constexpr int NCOL = 3;
+#else
     static constexpr int NCOL = 2;
+#endif
+#ifdef LITEV_TILE_COORD
+    // DraStic decouple (teardown 07): DraStic runs a dedicated 3D coordinator thread so its
+    // emu thread hands off geometry and never blocks on the raster. Step 1: double-buffer the
+    // geometry the workers read, so the emu can build frame N+1 while the workers still raster
+    // N. NGEOM=2 rotates the arena; GeomWrite = emu build target, GeomRead = the index the
+    // workers were dispatched with. (NGEOM=1 flag-OFF -> single buffer, codegen-identical.)
+    //
+    // NGEOM must cover the emu's max geometry lookahead. The color ring bounds the emu to NCOL-1
+    // frames produced-but-not-consumed (each still holding its geometry), PLUS the one the emu is
+    // building = NCOL geometry buffers. With NGEOM=2 < NCOL=3, when the emu ran 2 frames ahead (more
+    // likely at 2D pipe-depth 2) it LAPPED GeomWrite onto a buffer the workers were still reading ->
+    // tile blocks rasterized from half-overwritten geometry rendered BLACK (the horizontal-bar
+    // flicker; confirmed a worker-raster corruption, not a consumer read-ahead: GetLine logged zero
+    // unready-row reads while the output showed bars). Size it to the ring.
+    static constexpr int NGEOM = NCOL;
+#else
     static constexpr int NGEOM = 1;
+#endif
     int GeomWrite = 0;   // emu-thread: geometry buffer BuildFrameGeom writes
     int GeomRead  = 0;   // set at worker dispatch; workers read this geometry buffer
     u32 ColorOut[NCOL][OutWidth * OutHeight] = {};
@@ -395,6 +420,22 @@ private:
         Platform::Semaphore_Post(Sema_RowPub);
     }
 
+#ifdef LITEV_TILE_COORD
+    // The 3D coordinator thread (DraStic FUN_0015f2c8): owns the raster DISPATCH + the
+    // WaitFrameComplete, so the emu thread hands off a built frame and returns WITHOUT blocking
+    // on the raster. The emu is bounded to <= NCOL-1 frames in flight (Produced - Consumed),
+    // waiting on Sema_RingFree only when it would lap the display buffer (rare: raster < frame).
+    Platform::Thread*    CoordThread    = nullptr;
+    Platform::Semaphore* Sema_CoordWork = nullptr;   // emu posts per produced frame; coord waits
+    Platform::Semaphore* Sema_RingFree  = nullptr;   // coord posts when a ring slot frees; emu waits
+    std::atomic_bool     CoordRunning   { false };
+    std::atomic<u32>     FrameProduced  { 0 };
+    std::atomic<u32>     FrameConsumed  { 0 };
+    struct PendFrame { int geomIdx; int colIdx; };
+    PendFrame PendRing[NCOL];
+    void CoordFunc();        // coordinator thread body
+    void CoordDispatch(int geomIdx, int colIdx);   // reset+dispatch+wait one frame's raster
+#endif
         void EnsureBandPool();
     void ShutdownBandPool();
     void BandWorkerFunc(int idx);      // thread entry: pin, then loop { wait-start; WorkerRender; }
