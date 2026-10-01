@@ -106,6 +106,12 @@ endif()
 option(BUILD_QT_SDL "Build Qt/SDL frontend" ON)
 
 # liteDS-v2 additions (all default OFF -> upstream-identical build with no flags).
+option(LITEV_PROFILE "Enable LiteProfile frame-breakdown counters" OFF)
+if (LITEV_PROFILE)
+    # Reach the core too (not just the headless harness) so in-core call sites
+    # (e.g. the Unit 3 dispatcher re-entry counters in ARM.cpp) are compiled in.
+    add_compile_definitions(LITEV_PROFILE=1)
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

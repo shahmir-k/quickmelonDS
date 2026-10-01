@@ -31,6 +31,7 @@
 #include "ARMJIT_Memory.h"
 #include "ARMJIT_Compiler.h"
 #include "ARMJIT_Global.h"
+#include "LiteProfile.h"
 
 #include "ARMInterpreter_ALU.h"
 #include "ARMInterpreter_LoadStore.h"
@@ -95,6 +96,8 @@ u32 ARMJIT::LocaliseCodeAddress(u32 num, u32 addr) const noexcept
 template <typename T, int ConsoleType>
 T SlowRead9(u32 addr, ARMv5* cpu)
 {
+    if (std::is_same<T, u32>::value)
+        LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.MemRead9U32HelperCalls);
     u32 offset = addr & 0x3;
     addr &= ~(sizeof(T) - 1);
 
@@ -180,6 +183,7 @@ void SlowWrite7(u32 addr, u32 val)
 template <bool Write, int ConsoleType>
 void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 {
+    LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.MemBlock9HelperCalls);
     addr &= ~0x3;
     for (u32 i = 0; i < num; i++)
     {

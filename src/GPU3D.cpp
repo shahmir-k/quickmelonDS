@@ -25,6 +25,7 @@
 #include "GPU3D_Soft.h"
 #include "Platform.h"
 #include "GPU3D.h"
+#include "LiteProfile.h"
 
 namespace melonDS
 {
@@ -1437,6 +1438,8 @@ void GPU3D::SubmitVertex() noexcept
 
 void GPU3D::CalculateLighting() noexcept
 {
+    LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LightingCalls);
+
     if ((TexParam >> 30) == 2)
     {
         TexCoords[0] = RawTexCoords[0] + (((s64)Normal[0]*TexMatrix[0] + (s64)Normal[1]*TexMatrix[4] + (s64)Normal[2]*TexMatrix[8]) >> 21);
@@ -1733,6 +1736,10 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 
 void GPU3D::ExecuteCommand() noexcept
 {
+    // M6.11: count GXFIFO commands (cheap add only; GPU3DNs times the whole
+    // Run()/drain batch so per-command clock_gettime does not distort it).
+    LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.GXCommands);
+
     CmdFIFOEntry entry = CmdFIFORead();
 
     //printf("FIFO: processing %02X %08X. Levels: FIFO=%d, PIPE=%d\n", entry.Command, entry.Param, CmdFIFO->Level(), CmdPIPE->Level());

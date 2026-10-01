@@ -23,6 +23,7 @@
 #include "../ARMJIT.h"
 #include "../NDS.h"
 #include "../ARMJIT_Global.h"
+#include "../LiteProfile.h"
 
 #include <stdlib.h>
 

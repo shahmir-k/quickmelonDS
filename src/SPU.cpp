@@ -25,6 +25,7 @@
 #include "DSi.h"
 #include "DSi_I2S.h"
 #include "SPU.h"
+#include "LiteProfile.h"
 
 #include "blip-buf/blip_buf.h"
 
@@ -856,8 +857,12 @@ void SPUCaptureUnit::Run(u32 cycles, s32 sample)
 }
 
 
+
 void SPU::Mix(u32 spucycles)
 {
+    LITE_PROFILE_SCOPE(spuTimer, melonDS::LiteProfile::g_Frame.SPUMixNs);
+
+
     s32 left = 0, right = 0;
     s32 leftoutput = 0, rightoutput = 0;
 
