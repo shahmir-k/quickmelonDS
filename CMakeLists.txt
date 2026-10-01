@@ -422,6 +422,14 @@ if (LITEV_MEM_DTCM_BLOCK OR LITEV_MEM_MAINRAM_LOAD)
     endif()
 endif()
 
+# Diagnostic only (not a lever): tally each ARM9 slow-helper call by ClassifyAddress9 region and dump
+# to stderr at exit (SLOWHIST lines). Tells us whether residual slow-mem cost is fastmem-recoverable
+# (MainRAM/DTCM mispredicts) or genuinely unmapped (IO/VRAM/Palette/OAM). Never ship ON.
+option(LITEV_SLOWMEM_HIST "Diagnostic: histogram slow-helper calls by memory region" OFF)
+if (LITEV_SLOWMEM_HIST)
+    add_compile_definitions(LITEV_SLOWMEM_HIST=1)
+endif()
+
 # 2026-09-16 (DTCM-engagement drill): map the DTCM region into the fastmem window so DTCM guest
 # accesses inline via fastmem instead of faulting -> slow helper. Upstream's MapAtAddress hole-punch
 # is not guarded against the DTCM region itself, so it maps NOTHING for DTCM (marks MappedRW over an

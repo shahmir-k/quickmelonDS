@@ -98,6 +98,31 @@ u32 ARMJIT::LocaliseCodeAddress(u32 num, u32 addr) const noexcept
     return 0;
 }
 
+#ifdef LITEV_SLOWMEM_HIST
+// Diagnostic (2026-09-16 slow-mem drill): tally each slow-helper call by ClassifyAddress9 region so
+// we know whether the residual slow cost is fastmem-recoverable (MainRAM/DTCM mispredicts -> L2) or
+// genuinely unmapped (IO/VRAM/Palette/OAM -> needs region mapping). Deterministic count; dumped to
+// stderr at process exit. Behind a flag; OFF => not compiled.
+static unsigned long long g_slowHist[4][16] = {};   // [0]read [1]write [2]blockload [3]blockstore
+namespace {
+struct SlowHistDumper {
+    ~SlowHistDumper() {
+        static const char* hn[4] = {"read", "write", "blockload", "blockstore"};
+        for (int h = 0; h < 4; h++) {
+            fprintf(stderr, "SLOWHIST %s:", hn[h]);
+            for (int r = 0; r < 16; r++)
+                if (g_slowHist[h][r]) fprintf(stderr, " reg%d=%llu", r, g_slowHist[h][r]);
+            fprintf(stderr, "\n");
+        }
+    }
+};
+static SlowHistDumper g_slowHistDumper;
+}
+#define SLOWHIST(h, cpu, addr) (g_slowHist[(h)][(cpu)->NDS.JIT.Memory.ClassifyAddress9((addr)) & 15]++)
+#else
+#define SLOWHIST(h, cpu, addr) ((void)0)
+#endif
+
 template <typename T, int ConsoleType>
 T SlowRead9(u32 addr, ARMv5* cpu)
 {
@@ -105,6 +130,7 @@ T SlowRead9(u32 addr, ARMv5* cpu)
         LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.MemRead9U32HelperCalls);
     u32 offset = addr & 0x3;
     addr &= ~(sizeof(T) - 1);
+    SLOWHIST(0, cpu, addr);
 
     T val;
     if (addr < cpu->ITCMSize)
@@ -153,6 +179,7 @@ template <typename T, int ConsoleType>
 void SlowWrite9(u32 addr, ARMv5* cpu, u32 val)
 {
     addr &= ~(sizeof(T) - 1);
+    SLOWHIST(1, cpu, addr);
 
     if (addr < cpu->ITCMSize)
     {
@@ -197,6 +224,8 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
 {
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.MemBlock9HelperCalls);
     addr &= ~0x3;
+    SLOWHIST(Write ? 3 : 2, cpu, addr);
+
 #ifdef LITEV_JIT_BLOCKXFER_FAST
     // Hoist the per-element region dispatch out of the loop for the two homogeneous,
     // no-side-effect regions (ITCM/DTCM). The per-element SlowRead9/SlowWrite9 re-run the
