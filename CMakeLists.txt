@@ -231,6 +231,32 @@ if (LITEV_JIT_LAZYFLAGS)
     add_compile_definitions(LITEV_JIT_LAZYFLAGS=1)
 endif()
 
+# ---------------------------------------------------------------------------
+# Fetch-stall lever A: LITEV_JIT_PERFMAP (attribution aid, NOT a perf change).
+# The AArch64 JIT emits its blocks/stubs into one opaque anonymous-rwx blob, so
+# simpleperf attributes ~39.5% of L1I refills to a single unsplittable symbol.
+# With this option ON the JIT appends a linux-perf / simpleperf "perf-<pid>.map"
+# (one `<hexaddr> <hexsize> <name>` line per emitted region: jit_a9_/jit_a7_<guest>
+# blocks, jit_dispatcher9/7, jit_commit9/7, jit_jumpto9/7_<k>, jit_readbanked/
+# jit_writebanked, jit_pstore_/jit_pload_ patched load/store funcs) so a later
+# `simpleperf report` can split the blob per block. The emitter is PURELY
+# OBSERVATIONAL (reads GetRXPtr()/GetCodeOffset(), writes a text file, emits ZERO
+# host instructions and never advances m_code) -> flag-ON JIT output is byte-
+# identical to flag-OFF and emulation stays bit-exact / MP-timing-exact. It is
+# ALSO runtime-gated: nothing is written unless an output directory is named at
+# run time (env LITEV_PERFMAP_DIR, or on Android the `debug.litev.perfmap`
+# system property), so the flag can ship ON in a .dev build at zero file cost
+# until armed. AArch64 only (the map machinery lives in the A64 backend). Default
+# OFF -> the code is #ifdef'd out entirely (zero overhead, byte-identical binary).
+option(LITEV_JIT_PERFMAP "Emit a simpleperf perf-<pid>.map so the JIT blob can be split per block (attribution aid; runtime-gated; bit-exact)" OFF)
+if (LITEV_JIT_PERFMAP)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_PERFMAP=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_PERFMAP requires an AArch64 target (the map machinery lives in the A64 JIT backend).")
+    endif()
+endif()
+
 # Unit 4: direct block linking (patch, don't dispatch). Builds ON TOP of the
 # Unit 3 dispatcher: an eligible block exit whose next PC is a compile-time
 # constant emits a per-hop-commit guard followed by a patchable `B` (initially to

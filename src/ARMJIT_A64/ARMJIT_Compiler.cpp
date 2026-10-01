@@ -36,6 +36,143 @@ extern "C" void ARM_Ret();
 namespace melonDS
 {
 
+#ifdef LITEV_JIT_PERFMAP
+// ============================================================================
+// LITEV_JIT_PERFMAP — emit a simpleperf / linux-perf "perf-<pid>.map" so the
+// opaque anonymous-rwx JIT blob can be split per emitted region.
+//
+// PURELY OBSERVATIONAL: every function here only reads the emitter's already-
+// computed RX pointers (GetRXPtr()) and writes a text file. It emits NO host
+// instructions and never advances m_code, so flag-ON JIT codegen is byte-for-
+// byte identical to flag-OFF -> guest emulation stays bit-exact / MP-timing-
+// exact. RUNTIME-GATED: nothing is written unless an output directory is named
+// at run time, so the flag can ship ON in a .dev build at zero file cost.
+//
+// Map line format (hex, absolute runtime addresses):  <addr> <size> <name>
+// Output path resolution (first match wins; else the feature stays dormant):
+//   1. env  LITEV_PERFMAP_DIR=<dir>              -> <dir>/perf-<pid>.map   (headless)
+//   2. Android prop debug.litev.perfmap=/abs/dir -> /abs/dir/perf-<pid>.map
+//   3. Android prop debug.litev.perfmap=1|true   -> /data/data/<pkg>/perf-<pid>.map
+//      (the app's own writable data dir, read from /proc/self/cmdline; matches
+//       simpleperf's app convention -> found automatically, NO root needed)
+//
+// ResetBlockCache wholesale-frees every block, so the file is TRUNCATED and the
+// process-lifetime "static" stub regions (recorded once at Compiler construction)
+// are rewritten at each epoch, after which the regenerated dispatchers/commit
+// stubs and freshly compiled blocks append to it.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <unistd.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+
+namespace litev_perfmap
+{
+    struct Region { unsigned long long addr; unsigned long long size; std::string name; };
+
+    static std::string        g_path;
+    static FILE*              g_file  = nullptr;
+    static int                g_state = 0;   // 0=unresolved, 1=armed, -1=disabled
+    static std::vector<Region> g_static;     // process-lifetime regions, re-emitted each epoch
+    static std::vector<Region> g_dynamic;    // per-block regions, ACCUMULATED across epochs
+                                             // so a cache reset (BeginEpoch) does not wipe the
+                                             // live blocks a concurrent profile is sampling.
+                                             // Reused host addrs may collide (minor mis-attrib
+                                             // noise) but the JIT blob becomes resolvable.
+
+    // Resolve g_path once. Returns true iff an output location was named (armed).
+    static bool ResolvePath()
+    {
+        const char* dir = getenv("LITEV_PERFMAP_DIR");
+        std::string dirbuf;
+#ifdef __ANDROID__
+        char prop[PROP_VALUE_MAX] = {0};
+        if ((!dir || !dir[0]) && __system_property_get("debug.litev.perfmap", prop) > 0 && prop[0])
+        {
+            if (prop[0] == '/') { dirbuf = prop; dir = dirbuf.c_str(); }
+            else
+            {
+                // truthy-but-not-a-path -> derive the app's own writable data dir
+                // from the process name (/proc/self/cmdline == package name).
+                FILE* cf = fopen("/proc/self/cmdline", "rb");
+                if (cf)
+                {
+                    char nm[256] = {0};
+                    size_t n = fread(nm, 1, sizeof(nm) - 1, cf);
+                    fclose(cf);
+                    for (size_t i = 0; i < n; i++) { if (nm[i] == 0 || nm[i] == ':') { nm[i] = 0; break; } }
+                    if (nm[0]) { dirbuf = std::string("/data/data/") + nm; dir = dirbuf.c_str(); }
+                }
+            }
+        }
+#endif
+        if (!dir || !dir[0]) return false;   // not armed -> stay dormant
+
+        char path[600];
+        snprintf(path, sizeof(path), "%s/perf-%d.map", dir, (int)getpid());
+        g_path = path;
+        return true;
+    }
+
+    // Record a process-lifetime region (the Compiler-construction stubs). Buffered
+    // only; flushed to the file by BeginEpoch (their RX addresses never change).
+    static void AddStatic(const char* name, void* rxstart, void* rxend)
+    {
+        if ((u8*)rxend <= (u8*)rxstart) return;
+        g_static.push_back({ (unsigned long long)(uintptr_t)rxstart,
+                             (unsigned long long)((u8*)rxend - (u8*)rxstart),
+                             std::string(name) });
+    }
+
+    // Start a fresh cache epoch: (re)open the file truncated, rewrite the static
+    // regions. Called at the top of Compiler::Reset() (== every ResetBlockCache).
+    static void BeginEpoch()
+    {
+        if (g_state == 0) g_state = ResolvePath() ? 1 : -1;
+        if (g_state < 0) return;
+        if (g_file) fclose(g_file);
+        g_file = fopen(g_path.c_str(), "w");
+        if (!g_file)
+        {
+            fprintf(stderr, "[litev-perfmap] failed to open %s\n", g_path.c_str());
+            g_state = -1;
+            return;
+        }
+        fprintf(stderr, "[litev-perfmap] writing %s (%zu static + %zu dynamic regions)\n",
+                g_path.c_str(), g_static.size(), g_dynamic.size());
+        for (const Region& r : g_static)
+            fprintf(g_file, "%llx %llx %s\n", r.addr, r.size, r.name.c_str());
+        // Re-emit every per-block region compiled so far so a mid-race cache reset
+        // does not blank the map out from under a running profile.
+        for (const Region& r : g_dynamic)
+            fprintf(g_file, "%llx %llx %s\n", r.addr, r.size, r.name.c_str());
+        fflush(g_file);
+    }
+
+    // Append one epoch region (dispatchers, commit stubs, compiled blocks).
+    static void Add(const char* name, void* rxstart, void* rxend)
+    {
+        // Only accumulate/emit when ARMED (prop set) — otherwise a normal play
+        // session would grow g_dynamic unbounded per block-compile. Unarmed
+        // (g_state != 1) this is a cheap early-out.
+        if (g_state != 1 || !g_file) return;
+        if ((u8*)rxend <= (u8*)rxstart) return;
+        g_dynamic.push_back({ (unsigned long long)(uintptr_t)rxstart,
+                              (unsigned long long)((u8*)rxend - (u8*)rxstart),
+                              std::string(name) });
+        fprintf(g_file, "%llx %llx %s\n",
+                (unsigned long long)(uintptr_t)rxstart,
+                (unsigned long long)((u8*)rxend - (u8*)rxstart), name);
+        fflush(g_file);
+    }
+}
+#endif  // LITEV_JIT_PERFMAP
+
 // liteDS-v2 Unit 2: prove the hand-maintained ARMJIT_Offsets.h values against the
 // real ARM struct layout. These offsets are baked as immediates in the A64
 // linkage/dispatch code, so a silent layout shift (e.g. a field inserted before
@@ -422,7 +559,15 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
     for (int i = 0; i < 3; i++)
     {
         JumpToFuncs9[i] = Gen_JumpTo9(i);
+#ifdef LITEV_JIT_PERFMAP
+        { char nm[24]; snprintf(nm, sizeof(nm), "jit_jumpto9_%d", i);
+          litev_perfmap::AddStatic(nm, JumpToFuncs9[i], GetRXPtr()); }
+#endif
         JumpToFuncs7[i] = Gen_JumpTo7(i);
+#ifdef LITEV_JIT_PERFMAP
+        { char nm[24]; snprintf(nm, sizeof(nm), "jit_jumpto7_%d", i);
+          litev_perfmap::AddStatic(nm, JumpToFuncs7[i], GetRXPtr()); }
+#endif
     }
 
     /*
@@ -467,6 +612,9 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
         LDR(INDEX_UNSIGNED, W3, X2, offsetof(ARM, R_UND));
         RET();
     }
+#ifdef LITEV_JIT_PERFMAP
+    litev_perfmap::AddStatic("jit_readbanked", ReadBanked, GetRXPtr());
+#endif
     {
         WriteBanked = GetRXPtr();
 
@@ -509,6 +657,9 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
         MOVI2R(W4, 1);
         RET();
     }
+#ifdef LITEV_JIT_PERFMAP
+    litev_perfmap::AddStatic("jit_writebanked", WriteBanked, GetRXPtr());
+#endif
 
     for (int consoleType = 0; consoleType < 2; consoleType++)
     {
@@ -569,6 +720,11 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
                     
                     ABI_PopRegisters(BitSet32({30}) | CallerSavedPushRegs);
                     RET();
+#ifdef LITEV_JIT_PERFMAP
+                    { char nm[40]; snprintf(nm, sizeof(nm), "jit_pstore_c%dn%ds%dr%d",
+                        consoleType, num, size, reg);
+                      litev_perfmap::AddStatic(nm, PatchedStoreFuncs[consoleType][num][size][reg], GetRXPtr()); }
+#endif
 
                     for (int signextend = 0; signextend < 2; signextend++)
                     {
@@ -608,6 +764,11 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
                         else
                             UBFX(rdMapped, W0, 0, 8 << size);
                         RET();
+#ifdef LITEV_JIT_PERFMAP
+                        { char nm[44]; snprintf(nm, sizeof(nm), "jit_pload_c%dn%ds%dse%dr%d",
+                            consoleType, num, size, signextend, reg);
+                          litev_perfmap::AddStatic(nm, PatchedLoadFuncs[consoleType][num][size][signextend][reg], GetRXPtr()); }
+#endif
                     }
                 }
             }
@@ -1862,6 +2023,15 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
     FlushIcache();
 
+
+#ifdef LITEV_JIT_PERFMAP
+    {
+        char nm[24];
+        snprintf(nm, sizeof(nm), "jit_a%d_%x", Num == 0 ? 9 : 7, (unsigned)instrs[0].Addr);
+        litev_perfmap::Add(nm, (void*)res, GetRXPtr());
+    }
+#endif
+
     return res;
 }
 
@@ -1902,6 +2072,12 @@ void Compiler::Reset()
     ICacheReset();
 #endif
 
+#ifdef LITEV_JIT_PERFMAP
+    // Wholesale block-cache reset: truncate the perf map and rewrite the
+    // process-lifetime stub regions before the dispatchers/blocks re-populate it.
+    litev_perfmap::BeginEpoch();
+#endif
+
     SetCodePtr(0);
     OtherCodeRegion = JitMemMainSize;
 
@@ -1919,7 +2095,13 @@ void Compiler::Reset()
     // ResetBlockCache(), which is cheap and keeps the base bit-for-bit consistent.
     SetCodePtr(0);
     DispatcherEntry[0] = Gen_Dispatcher(0);
+#ifdef LITEV_JIT_PERFMAP
+    litev_perfmap::Add("jit_dispatcher9", DispatcherEntry[0], GetRXPtr());
+#endif
     DispatcherEntry[1] = Gen_Dispatcher(1);
+#ifdef LITEV_JIT_PERFMAP
+    litev_perfmap::Add("jit_dispatcher7", DispatcherEntry[1], GetRXPtr());
+#endif
     FlushIcache();
 #endif
 }
