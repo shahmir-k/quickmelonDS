@@ -508,6 +508,16 @@ if (LITEV_NEON_GEOMETRY)
     add_compile_definitions(LITEV_NEON_GEOMETRY=1)
 endif()
 
+# liteV wave-2 integer-NEON GPU3D geometry (the residual scalar-s64 tail left after
+# LITEV_NEON_GEOMETRY vectorized the per-vertex clip-matrix transform): per-polygon
+# backface-cull cross/dot in SubmitPolygon, MatrixMult4x3/3x3, and the BuildFrameGeom
+# vertex pack. Bit-exact by construction (integer NEON, scalar #else fallback,
+# flag-OFF byte-identical); AArch64-only (each block also guarded by __ARM_NEON).
+option(LITEV_GEOM_NEON2 "liteV wave-2 integer-NEON GPU3D geometry: per-poly cull cross/dot, MatrixMult4x3/3x3, BuildFrameGeom vertex pack (bit-exact, AArch64)" OFF)
+if (LITEV_GEOM_NEON2)
+    add_compile_definitions(LITEV_GEOM_NEON2=1)
+endif()
+
 # Instant ARM9 hardware divider/sqrt: compute the DIV/SQRT result at register-
 # write time and skip the scheduled completion event. In-race profiling showed
 # Event_Div is the single largest scheduler load (~1233 dispatches/frame, 42% of

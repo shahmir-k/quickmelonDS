@@ -42,7 +42,7 @@ static int litevGxPropDefault(const char* name, int def) {
 }
 #endif
 
-#if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
+#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2)) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 
@@ -52,7 +52,7 @@ namespace melonDS
 using Platform::Log;
 using Platform::LogLevel;
 
-#if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
+#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2)) && defined(__ARM_NEON)
 // M6.11 step 3 — integer-NEON kernels for the GPU3D geometry engine's hot
 // fixed-point math. These reproduce the scalar results BIT-EXACTLY, not
 // approximately:
@@ -110,6 +110,49 @@ static inline int64x2_t NeonTex2_s64(const s32* M, s32 v0, s32 v1, s32 v2)
     return vshrq_n_s64(acc, Shift);
 }
 
+#if defined(LITEV_GEOM_NEON2) && defined(__ARM_NEON)
+// LITEV_GEOM_NEON2 — the per-polygon backface-cull cross product in SubmitPolygon.
+// The scalar reference (using x=Position[0], y=Position[1], w=Position[3]) is:
+//   a = (v0 - v1), b = (v2 - v1)             (component subtraction in 32-bit `int`)
+//   normalX = (s64)a.y*b.w - (s64)a.w*b.y
+//   normalY = (s64)a.w*b.x - (s64)a.x*b.w
+//   normalZ = (s64)a.x*b.y - (s64)a.y*b.x    (a 3D cross product of (x,y,w) vectors)
+// BIT-EXACT because:
+//   * the two deltas are computed with vsubq_s32 — 32-bit two's-complement wrap,
+//     identical to the scalar `int` subtraction (even on the content-unreachable
+//     overflow, DS math is modular);
+//   * each product is a widening 32x32->64 vmull_s32, equal to the scalar
+//     `(s64)delta * delta` since both deltas are s32;
+//   * the per-lane 64-bit subtract equals the scalar `-`.
+// The two byte-index vectors permute a/b lanes so the 4-lane cross falls out of two
+// vmull_s32 halves; lane2 (normalZ's two products) is done with a scalar widening
+// multiply of the same permuted lanes to avoid a second, mostly-wasted vmull pair.
+// Fills n[0]=normalX, n[1]=normalY, n[2]=normalZ.
+static inline void NeonCullNormal(const s32* p0, const s32* p1, const s32* p2, s64 n[3])
+{
+    int32x4_t a = vsubq_s32(vld1q_s32(p0), vld1q_s32(p1));   // {ax, ay, az(unused), aw}
+    int32x4_t b = vsubq_s32(vld1q_s32(p2), vld1q_s32(p1));   // {bx, by, bz(unused), bw}
+
+    // lane maps: perm_p -> {1,3,0,2}, perm_q -> {3,0,1,2} (each lane = 4 source bytes).
+    const uint8x16_t perm_p = { 4,5,6,7,  12,13,14,15,  0,1,2,3,  8,9,10,11 };
+    const uint8x16_t perm_q = { 12,13,14,15,  0,1,2,3,  4,5,6,7,  8,9,10,11 };
+    int32x4_t A1 = vreinterpretq_s32_s8(vqtbl1q_s8(vreinterpretq_s8_s32(a), perm_p)); // {ay, aw, ax, az}
+    int32x4_t B1 = vreinterpretq_s32_s8(vqtbl1q_s8(vreinterpretq_s8_s32(b), perm_q)); // {bw, bx, by, bz}
+    int32x4_t A2 = vreinterpretq_s32_s8(vqtbl1q_s8(vreinterpretq_s8_s32(a), perm_q)); // {aw, ax, ay, az}
+    int32x4_t B2 = vreinterpretq_s32_s8(vqtbl1q_s8(vreinterpretq_s8_s32(b), perm_p)); // {by, bw, bx, bz}
+
+    int64x2_t p1lo = vmull_s32(vget_low_s32(A1), vget_low_s32(B1)); // {ay*bw, aw*bx}
+    int64x2_t p2lo = vmull_s32(vget_low_s32(A2), vget_low_s32(B2)); // {aw*by, ax*bw}
+    int64x2_t nlo  = vsubq_s64(p1lo, p2lo);                         // {normalX, normalY}
+
+    s64 zpos = (s64)vgetq_lane_s32(A1, 2) * vgetq_lane_s32(B1, 2);  // ax*by
+    s64 zneg = (s64)vgetq_lane_s32(A2, 2) * vgetq_lane_s32(B2, 2);  // ay*bx
+
+    n[0] = vgetq_lane_s64(nlo, 0);
+    n[1] = vgetq_lane_s64(nlo, 1);
+    n[2] = zpos - zneg;
+}
+#endif
 #endif
 
 // 3D engine notes
@@ -700,6 +743,19 @@ void MatrixMult4x3(s32* m, s32* s)
     s32 tmp[16];
     memcpy(tmp, m, 16*4);
 
+#if defined(LITEV_GEOM_NEON2) && defined(__ARM_NEON)
+    // m = s*m, one output row per NeonMat4Vec4 call. Rows 0-2 have an implicit
+    // 4th coefficient of 0 (v3=0 -> +0*tmp[12..15], harmless); row 3 uses the
+    // constant 0x1000, matching the scalar (s64)0x1000*tmp[12..15] term. tmp is
+    // the snapshotted matrix (all 16 rows valid). Bit-exact vs the scalar below
+    // (identical widen/accumulate/>>12/truncate as MatrixMult4x4).
+    NeonMat4Vec4_s64<12>(m + 0,  tmp, s[0], s[1], s[2],  0);
+    NeonMat4Vec4_s64<12>(m + 4,  tmp, s[3], s[4], s[5],  0);
+    NeonMat4Vec4_s64<12>(m + 8,  tmp, s[6], s[7], s[8],  0);
+    NeonMat4Vec4_s64<12>(m + 12, tmp, s[9], s[10], s[11], 0x1000);
+    return;
+#endif
+
     // m = s*m
     m[0] = ((s64)s[0]*tmp[0] + (s64)s[1]*tmp[4] + (s64)s[2]*tmp[8]) >> 12;
     m[1] = ((s64)s[0]*tmp[1] + (s64)s[1]*tmp[5] + (s64)s[2]*tmp[9]) >> 12;
@@ -724,8 +780,23 @@ void MatrixMult4x3(s32* m, s32* s)
 
 void MatrixMult3x3(s32* m, s32* s)
 {
-    s32 tmp[12];
+    // Single tmp[16] shared by both paths (matches MatrixMult4x3): the scalar path
+    // reads only tmp[0..11]; the NEON path also needs tmp[12..15] in-bounds for the
+    // kernel's vld1q_s32(tmp+12), zeroed below so they contribute *0.
+    s32 tmp[16];
     memcpy(tmp, m, 12*4);
+
+#if defined(LITEV_GEOM_NEON2) && defined(__ARM_NEON)
+    // 3x3 writes only m[0..11] (3 rows), each a 3-term row with implicit v3=0.
+    // tmp[12..15] are zeroed then multiplied by v3=0 -> contribute exactly 0, so
+    // the result is bit-exact vs the scalar path below (which never reads them).
+    tmp[12] = tmp[13] = tmp[14] = tmp[15] = 0;
+    NeonMat4Vec4_s64<12>(m + 0, tmp, s[0], s[1], s[2], 0);
+    NeonMat4Vec4_s64<12>(m + 4, tmp, s[3], s[4], s[5], 0);
+    NeonMat4Vec4_s64<12>(m + 8, tmp, s[6], s[7], s[8], 0);
+    return;
+#endif
+
 
     // m = s*m
     m[0] = ((s64)s[0]*tmp[0] + (s64)s[1]*tmp[4] + (s64)s[2]*tmp[8]) >> 12;
@@ -1053,12 +1124,23 @@ void GPU3D::SubmitPolygon() noexcept
     v2 = &TempVertexBuffer[2];
     v3 = &TempVertexBuffer[3];
 
+#if defined(LITEV_GEOM_NEON2) && defined(__ARM_NEON)
+    // LITEV_GEOM_NEON2: the per-polygon backface-cull normal is a (x,y,w) cross
+    // product — six s64 widening products folded into two vmull_s32 pairs + one
+    // scalar lane (see NeonCullNormal, bit-exact vs the scalar form below).
+    {
+        s64 nrm[3];
+        NeonCullNormal(v0->Position, v1->Position, v2->Position, nrm);
+        normalX = nrm[0]; normalY = nrm[1]; normalZ = nrm[2];
+    }
+#else
     normalX = ((s64)(v0->Position[1]-v1->Position[1]) * (v2->Position[3]-v1->Position[3]))
         - ((s64)(v0->Position[3]-v1->Position[3]) * (v2->Position[1]-v1->Position[1]));
     normalY = ((s64)(v0->Position[3]-v1->Position[3]) * (v2->Position[0]-v1->Position[0]))
         - ((s64)(v0->Position[0]-v1->Position[0]) * (v2->Position[3]-v1->Position[3]));
     normalZ = ((s64)(v0->Position[0]-v1->Position[0]) * (v2->Position[1]-v1->Position[1]))
         - ((s64)(v0->Position[1]-v1->Position[1]) * (v2->Position[0]-v1->Position[0]));
+#endif
 
     while ((((normalX>>31) ^ (normalX>>63)) != 0) ||
            (((normalY>>31) ^ (normalY>>63)) != 0) ||
@@ -1069,7 +1151,19 @@ void GPU3D::SubmitPolygon() noexcept
         normalZ >>= 4;
     }
 
+    // after normalization normalX/Y/Z all fit in s32 (the loop shifts until
+    // (n>>31)^(n>>63)==0), so v1coord*normal is an exact s32*s32->s64 product.
+#if defined(LITEV_GEOM_NEON2) && defined(__ARM_NEON)
+    {
+        int32x2_t vv = { v1->Position[0], v1->Position[1] };
+        int32x2_t nn = { (s32)normalX,   (s32)normalY };
+        int64x2_t dp = vmull_s32(vv, nn);   // {v1x*normalX, v1y*normalY}
+        dot = vgetq_lane_s64(dp, 0) + vgetq_lane_s64(dp, 1)
+            + ((s64)v1->Position[3] * (s32)normalZ);
+    }
+#else
     dot = ((s64)v1->Position[0] * normalX) + ((s64)v1->Position[1] * normalY) + ((s64)v1->Position[3] * normalZ);
+#endif
 
     bool facingview = (dot <= 0);
 
