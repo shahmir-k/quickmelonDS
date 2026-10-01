@@ -37,6 +37,91 @@ public:
     void VBlank() override {}
     void VBlankEnd() override {};
 
+#ifdef LITEV_SOFT2D_THREADED
+    // ---- liteV banded deferred software 2D ----
+    // Per-scanline register snapshot mirrored from the GL renderer's
+    // sScanlineConfig set (the authoritative list of per-scanline-mutable state)
+    // plus the extra fields the software raster reads live. Captured on the emu
+    // thread at each LCD scanline event; replayed off the critical path at VBlank.
+    struct S2DLineState
+    {
+        // engine gating
+        bool Enabled;
+        u8   ForcedBlank;
+        // DISPCNT + BG control
+        u32  DispCnt;
+        u8   LayerEnable;
+        u16  BGCnt[4];
+        // BG scroll (text)
+        u16  BGXPos[4];
+        u16  BGYPos[4];
+        // BG affine ref points (internal, per-scanline-advanced) + rotscale
+        s32  BGXRefInternal[2];
+        s32  BGYRefInternal[2];
+        s16  BGRotA[2];
+        s16  BGRotC[2];
+        // mosaic
+        u8   BGMosaicSize[2];
+        u8   OBJMosaicSize[2];
+        u32  BGMosaicLine;
+        // blend
+        u16  BlendCnt;
+        u8   EVA, EVB, EVY;
+        // windows (WININ/WINOUT + positions + active carry state)
+        u8   WinCnt[4];
+        u8   Win0Coords[4];
+        u8   Win1Coords[4];
+        u8   Win0Active;
+        u8   Win1Active;
+    };
+    // Sprite state captured at DrawSprites time (one scanline earlier than the
+    // BG state; OBJ mosaic + OBJ VRAM mapping are read at that distinct moment).
+    struct S2DSprState
+    {
+        bool Enabled;
+        u8   OBJEnable;
+        u32  DispCnt;
+        u32  OBJMosaicLine;
+        u8   OBJMosaicSize[2];
+    };
+
+    void SnapshotLineState(u32 line);   // emu thread; captures into LineSnap[line]
+    void SnapshotSprState(u32 line);    // emu thread; captures into SprSnap[line]
+    void LoadLineState(const S2DLineState& s);
+    void LoadSprState(const S2DSprState& s);
+
+    // Async depth-1 pipeline: at VBlank the emu thread copies the just-completed
+    // frame's per-line snapshots into the *R (render-owned) arrays, then the async
+    // render thread reads ONLY the *R copies while the emu overwrites LineSnap/
+    // SprSnap for the next frame. Avoids a per-scanline read/write race.
+    void CopyLineSnaps();
+
+    // Deferred (no per-scanline VRAM coherence; that runs once/frame at VBlank).
+    void SyncVRAM_BG();
+    void SyncVRAM_OBJ();
+    // Snapshot passed by ref so a per-band private renderer can read the shared
+    // main snapshot arrays and load into its OWN GPU2D unit.
+    void DrawSpritesDeferred(const S2DSprState& s, u32 line);
+    void DrawScanlineDeferred(const S2DLineState& s, u32 line, u32* dst);
+    u64 PipeTraceSpriteHash() const;
+
+    u32* Cur3DLine = nullptr;                  // per-line 3D output (replaces Parent.Output3D)
+    const u8* CurOAM = nullptr;                // per-line OAM base (replaces GPU.OAM)
+
+    // Per-scanline snapshots, filled on the emu thread at each LCD scanline event,
+    // consumed by the deferred (batched, later banded-threaded) render at VBlank.
+    S2DLineState LineSnap[192];
+    S2DSprState  SprSnap[192];
+    // Render-owned copies (see CopyLineSnaps): read by the async render thread.
+    S2DLineState LineSnapR[192];
+    S2DSprState  SprSnapR[192];
+#endif
+
+    // Palette base the deferred/banded draws read. Defaults to the live GPU.Palette
+    // (non-threaded/inline path); the async render points it at a per-frame snapshot
+    // (PaletteSnap) so frame N's render doesn't race the emu's palette writes in N+1.
+    const u8* CurPalette = nullptr;
+
 private:
     SoftRenderer& Parent;
 

@@ -26,7 +26,18 @@ SoftRenderer2D::SoftRenderer2D(melonDS::GPU2D& gpu2D, SoftRenderer& parent)
     : Renderer2D(gpu2D), Parent(parent)
 {
     // mosaic table is initialized at compile-time
+    // Default the render-time palette base to the live palette; the async render
+    // path overrides this per-frame with a snapshot (PaletteSnap).
+    CurPalette = GPU.Palette;
 }
+
+#ifdef LITEV_SOFT2D_THREADED
+void SoftRenderer2D::CopyLineSnaps()
+{
+    memcpy(LineSnapR, LineSnap, sizeof(LineSnap));
+    memcpy(SprSnapR,  SprSnap,  sizeof(SprSnap));
+}
+#endif
 
 SoftRenderer2D::~SoftRenderer2D()
 {
@@ -160,6 +171,172 @@ void SoftRenderer2D::DrawScanline(u32 line)
     // render BG layers and sprites
     DrawScanline_BGOBJ(line, dst);
 }
+
+#ifdef LITEV_SOFT2D_THREADED
+// ---- liteV banded deferred software 2D ----
+// Capture the per-scanline-mutable register state on the emu thread, at the exact
+// LCD scanline moment the inline path would have rendered this line — so raster
+// effects (mid-frame scroll/window/blend changes) stay bit-exact when the actual
+// raster runs later, off the critical path.
+void SoftRenderer2D::SnapshotLineState(u32 line)
+{
+    S2DLineState& s = LineSnap[line];
+    s.Enabled     = GPU2D.Enabled;
+    s.ForcedBlank = GPU2D.ForcedBlank;
+    s.DispCnt     = GPU2D.DispCnt;
+    s.LayerEnable = GPU2D.LayerEnable;
+    for (int i = 0; i < 4; i++)
+    {
+        s.BGCnt[i]  = GPU2D.BGCnt[i];
+        s.BGXPos[i] = GPU2D.BGXPos[i];
+        s.BGYPos[i] = GPU2D.BGYPos[i];
+        s.WinCnt[i]     = GPU2D.WinCnt[i];
+        s.Win0Coords[i] = GPU2D.Win0Coords[i];
+        s.Win1Coords[i] = GPU2D.Win1Coords[i];
+    }
+    for (int i = 0; i < 2; i++)
+    {
+        s.BGXRefInternal[i] = GPU2D.BGXRefInternal[i];
+        s.BGYRefInternal[i] = GPU2D.BGYRefInternal[i];
+        s.BGRotA[i] = GPU2D.BGRotA[i];
+        s.BGRotC[i] = GPU2D.BGRotC[i];
+        s.BGMosaicSize[i]  = GPU2D.BGMosaicSize[i];
+        s.OBJMosaicSize[i] = GPU2D.OBJMosaicSize[i];
+    }
+    s.BGMosaicLine = GPU2D.BGMosaicLine;
+    s.BlendCnt = GPU2D.BlendCnt;
+    s.EVA = GPU2D.EVA; s.EVB = GPU2D.EVB; s.EVY = GPU2D.EVY;
+    s.Win0Active = GPU2D.Win0Active;
+    s.Win1Active = GPU2D.Win1Active;
+}
+
+void SoftRenderer2D::LoadLineState(const S2DLineState& s)
+{
+    GPU2D.Enabled     = s.Enabled;
+    GPU2D.ForcedBlank = s.ForcedBlank;
+    GPU2D.DispCnt     = s.DispCnt;
+    GPU2D.LayerEnable = s.LayerEnable;
+    for (int i = 0; i < 4; i++)
+    {
+        GPU2D.BGCnt[i]  = s.BGCnt[i];
+        GPU2D.BGXPos[i] = s.BGXPos[i];
+        GPU2D.BGYPos[i] = s.BGYPos[i];
+        GPU2D.WinCnt[i]     = s.WinCnt[i];
+        GPU2D.Win0Coords[i] = s.Win0Coords[i];
+        GPU2D.Win1Coords[i] = s.Win1Coords[i];
+    }
+    for (int i = 0; i < 2; i++)
+    {
+        GPU2D.BGXRefInternal[i] = s.BGXRefInternal[i];
+        GPU2D.BGYRefInternal[i] = s.BGYRefInternal[i];
+        GPU2D.BGRotA[i] = s.BGRotA[i];
+        GPU2D.BGRotC[i] = s.BGRotC[i];
+        GPU2D.BGMosaicSize[i]  = s.BGMosaicSize[i];
+        GPU2D.OBJMosaicSize[i] = s.OBJMosaicSize[i];
+    }
+    GPU2D.BGMosaicLine = s.BGMosaicLine;
+    GPU2D.BlendCnt = s.BlendCnt;
+    GPU2D.EVA = s.EVA; GPU2D.EVB = s.EVB; GPU2D.EVY = s.EVY;
+    GPU2D.Win0Active = s.Win0Active;
+    GPU2D.Win1Active = s.Win1Active;
+}
+
+void SoftRenderer2D::SnapshotSprState(u32 line)
+{
+    S2DSprState& s = SprSnap[line];
+    s.Enabled   = GPU2D.Enabled;
+    s.OBJEnable = GPU2D.OBJEnable;
+    s.DispCnt   = GPU2D.DispCnt;
+    s.OBJMosaicLine = GPU2D.OBJMosaicLine;
+    s.OBJMosaicSize[0] = GPU2D.OBJMosaicSize[0];
+    s.OBJMosaicSize[1] = GPU2D.OBJMosaicSize[1];
+}
+
+void SoftRenderer2D::LoadSprState(const S2DSprState& s)
+{
+    GPU2D.Enabled   = s.Enabled;
+    GPU2D.OBJEnable = s.OBJEnable;
+    GPU2D.DispCnt   = s.DispCnt;
+    GPU2D.OBJMosaicLine = s.OBJMosaicLine;
+    GPU2D.OBJMosaicSize[0] = s.OBJMosaicSize[0];
+    GPU2D.OBJMosaicSize[1] = s.OBJMosaicSize[1];
+}
+
+// Once-per-frame VRAM coherence (the DeriveState/MakeVRAMFlat the inline path did
+// per-scanline). Run at VBlank before the deferred raster.
+void SoftRenderer2D::SyncVRAM_BG()
+{
+    if (GPU2D.Num == 0)
+    {
+        auto bgDirty = GPU.VRAMDirty_ABG.DeriveState(GPU.VRAMMap_ABG, GPU);
+        GPU.MakeVRAMFlat_ABGCoherent(bgDirty);
+        auto bgExtPalDirty = GPU.VRAMDirty_ABGExtPal.DeriveState(GPU.VRAMMap_ABGExtPal, GPU);
+        GPU.MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirty);
+        auto objExtPalDirty = GPU.VRAMDirty_AOBJExtPal.DeriveState(&GPU.VRAMMap_AOBJExtPal, GPU);
+        GPU.MakeVRAMFlat_AOBJExtPalCoherent(objExtPalDirty);
+    }
+    else
+    {
+        auto bgDirty = GPU.VRAMDirty_BBG.DeriveState(GPU.VRAMMap_BBG, GPU);
+        GPU.MakeVRAMFlat_BBGCoherent(bgDirty);
+        auto bgExtPalDirty = GPU.VRAMDirty_BBGExtPal.DeriveState(GPU.VRAMMap_BBGExtPal, GPU);
+        GPU.MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirty);
+        auto objExtPalDirty = GPU.VRAMDirty_BOBJExtPal.DeriveState(&GPU.VRAMMap_BOBJExtPal, GPU);
+        GPU.MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirty);
+    }
+}
+
+void SoftRenderer2D::SyncVRAM_OBJ()
+{
+    if (GPU2D.Num == 0)
+    {
+        auto objDirty = GPU.VRAMDirty_AOBJ.DeriveState(GPU.VRAMMap_AOBJ, GPU);
+        GPU.MakeVRAMFlat_AOBJCoherent(objDirty);
+    }
+    else
+    {
+        auto objDirty = GPU.VRAMDirty_BOBJ.DeriveState(GPU.VRAMMap_BOBJ, GPU);
+        GPU.MakeVRAMFlat_BOBJCoherent(objDirty);
+    }
+}
+
+// Deferred BG+OBJ raster for one scanline, restoring that line's snapshot first.
+// (Milestone 1: single-thread batched at VBlank, reusing DrawScanline_BGOBJ.)
+void SoftRenderer2D::DrawScanlineDeferred(const S2DLineState& s, u32 line, u32* dst)
+{
+    if (!s.Enabled)
+    {
+        u32 fillcolor = (GPU2D.Num == 0) ? 0xFF000000 : 0xFF3F3F3F;
+        for (int i = 0; i < 256; i++) dst[i] = fillcolor;
+        return;
+    }
+    if (s.ForcedBlank)
+    {
+        for (int i = 0; i < 256; i++) dst[i] = 0xFF3F3F3F;
+        return;
+    }
+
+    LoadLineState(s);
+    DrawScanline_BGOBJ(line, dst);
+}
+
+void SoftRenderer2D::DrawSpritesDeferred(const S2DSprState& s, u32 line)
+{
+    LoadSprState(s);
+    DrawSprites(line);
+}
+
+u64 SoftRenderer2D::PipeTraceSpriteHash() const
+{
+    u64 h = 1469598103934665603ULL;
+    const u8* p = (const u8*)OBJLine;
+    for (size_t i = 0; i < sizeof(OBJLine); i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    p = WindowMask;
+    for (size_t i = 0; i < sizeof(WindowMask); i++) { h ^= p[i]; h *= 1099511628211ULL; }
+    h ^= NumSprites;
+    return h * 1099511628211ULL;
+}
+#endif // LITEV_SOFT2D_THREADED
 
 #define DoDrawBG(type, line, num) \
     do \
@@ -307,9 +484,9 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
 {
     u64 backdrop;
     if (GPU2D.Num)
-        backdrop = *(u16*)&GPU.Palette[0x400];
+        backdrop = *(u16*)&CurPalette[0x400];
     else
-        backdrop = *(u16*)&GPU.Palette[0];
+        backdrop = *(u16*)&CurPalette[0];
 
     {
         u8 r = (backdrop & 0x001F) << 1;
@@ -370,9 +547,14 @@ void SoftRenderer2D::DrawPixel(u32* dst, u16 color, u32 flag)
 
 void SoftRenderer2D::DrawBG_3D()
 {
+#ifdef LITEV_SOFT2D_THREADED
+    const u32* out3d = Cur3DLine;
+#else
+    const u32* out3d = Parent.Output3D;
+#endif
     for (int i = 0; i < 256; i++)
     {
-        u32 c = Parent.Output3D[i];
+        u32 c = out3d[i];
 
         if ((c >> 24) == 0) continue;
         if (!(WindowMask[i] & 0x01)) continue;
@@ -422,14 +604,14 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
         tilesetaddr = ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0x400];
+        pal = (u16*)&CurPalette[0x400];
     }
     else
     {
         tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0];
+        pal = (u16*)&CurPalette[0];
     }
 
     // adjust Y position in tilemap
@@ -592,14 +774,14 @@ void SoftRenderer2D::DrawBG_Affine(u32 line, u32 bgnum)
         tilesetaddr = ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0x400];
+        pal = (u16*)&CurPalette[0x400];
     }
     else
     {
         tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0];
+        pal = (u16*)&CurPalette[0];
     }
 
     u16 curtile;
@@ -733,8 +915,8 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
         {
             // 256-color bitmap
 
-            if (GPU2D.Num) pal = (u16*)&GPU.Palette[0x400];
-            else           pal = (u16*)&GPU.Palette[0];
+            if (GPU2D.Num) pal = (u16*)&CurPalette[0x400];
+            else           pal = (u16*)&CurPalette[0];
 
             u8 color;
 
@@ -792,14 +974,14 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
             tilesetaddr = ((bgcnt & 0x003C) << 12);
             tilemapaddr = ((bgcnt & 0x1F00) << 3);
 
-            pal = (u16*)&GPU.Palette[0x400];
+            pal = (u16*)&CurPalette[0x400];
         }
         else
         {
             tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
             tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
 
-            pal = (u16*)&GPU.Palette[0];
+            pal = (u16*)&CurPalette[0];
         }
 
         u16 curtile;
@@ -898,8 +1080,8 @@ void SoftRenderer2D::DrawBG_Large(u32 line) // BG is always BG2
 
     // 256-color bitmap
 
-    if (GPU2D.Num) pal = (u16*)&GPU.Palette[0x400];
-    else           pal = (u16*)&GPU.Palette[0];
+    if (GPU2D.Num) pal = (u16*)&CurPalette[0x400];
+    else           pal = (u16*)&CurPalette[0];
 
     u8 color;
 
@@ -984,7 +1166,7 @@ void SoftRenderer2D::ApplySpriteMosaicX()
 void SoftRenderer2D::InterleaveSprites(u32 prio)
 {
     u32 attrmask = (prio << 16) | OBJ_IsOpaque;
-    u16* pal = (u16*)&GPU.Palette[GPU2D.Num ? 0x600 : 0x200];
+    u16* pal = (u16*)&CurPalette[GPU2D.Num ? 0x600 : 0x200];
     u16* extpal = GPU2D.GetOBJExtPal();
 
     for (u32 i = 0; i < 256; i++)
@@ -1045,7 +1227,11 @@ void SoftRenderer2D::DrawSprites(u32 line)
     if (!GPU2D.OBJEnable)
         return;
 
+#ifdef LITEV_SOFT2D_THREADED
+    u16* oam = (u16*)&CurOAM[GPU2D.Num ? 0x400 : 0];
+#else
     u16* oam = (u16*)&GPU.OAM[GPU2D.Num ? 0x400 : 0];
+#endif
 
     const s32 spritewidth[16] =
     {
@@ -1144,7 +1330,11 @@ void SoftRenderer2D::DrawSpritePixel(int color, u32 pixelattr, s32 xpos)
 template<bool window>
 void SoftRenderer2D::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight, u32 width, u32 height, s32 xpos, s32 ypos)
 {
+#ifdef LITEV_SOFT2D_THREADED
+    u16* oam = (u16*)&CurOAM[GPU2D.Num ? 0x400 : 0];
+#else
     u16* oam = (u16*)&GPU.OAM[GPU2D.Num ? 0x400 : 0];
+#endif
     u16* attrib = &oam[num * 4];
     u16* rotparams = &oam[(((attrib[1] >> 9) & 0x1F) * 16) + 3];
 
@@ -1326,7 +1516,11 @@ void SoftRenderer2D::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheigh
 template<bool window>
 void SoftRenderer2D::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos)
 {
+#ifdef LITEV_SOFT2D_THREADED
+    u16* oam = (u16*)&CurOAM[GPU2D.Num ? 0x400 : 0];
+#else
     u16* oam = (u16*)&GPU.OAM[GPU2D.Num ? 0x400 : 0];
+#endif
     u16* attrib = &oam[num * 4];
 
     u32 pixelattr = ((attrib[2] & 0x0C00) << 6) | OBJ_IsSprite | OBJ_IsOpaque;

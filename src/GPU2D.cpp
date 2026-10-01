@@ -91,6 +91,51 @@ GPU2D::GPU2D(u32 num, melonDS::GPU& gpu) : Num(num), GPU(gpu)
 {
 }
 
+#ifdef LITEV_SOFT2D_THREADED
+void GPU2D::CopyRenderState(const GPU2D& s)
+{
+    Num = s.Num;
+    Enabled = s.Enabled;
+    DispCnt = s.DispCnt;
+    memcpy(DispCntLatch, s.DispCntLatch, sizeof(DispCntLatch));
+    LayerEnable = s.LayerEnable;
+    OBJEnable = s.OBJEnable;
+    ForcedBlank = s.ForcedBlank;
+    memcpy(BGCnt, s.BGCnt, sizeof(BGCnt));
+    memcpy(BGXPos, s.BGXPos, sizeof(BGXPos));
+    memcpy(BGYPos, s.BGYPos, sizeof(BGYPos));
+    memcpy(BGXRef, s.BGXRef, sizeof(BGXRef));
+    memcpy(BGYRef, s.BGYRef, sizeof(BGYRef));
+    memcpy(BGXRefInternal, s.BGXRefInternal, sizeof(BGXRefInternal));
+    memcpy(BGYRefInternal, s.BGYRefInternal, sizeof(BGYRefInternal));
+    memcpy(BGXRefReload, s.BGXRefReload, sizeof(BGXRefReload));
+    memcpy(BGYRefReload, s.BGYRefReload, sizeof(BGYRefReload));
+    memcpy(BGRotA, s.BGRotA, sizeof(BGRotA));
+    memcpy(BGRotB, s.BGRotB, sizeof(BGRotB));
+    memcpy(BGRotC, s.BGRotC, sizeof(BGRotC));
+    memcpy(BGRotD, s.BGRotD, sizeof(BGRotD));
+    memcpy(Win0Coords, s.Win0Coords, sizeof(Win0Coords));
+    memcpy(Win1Coords, s.Win1Coords, sizeof(Win1Coords));
+    memcpy(WinCnt, s.WinCnt, sizeof(WinCnt));
+    Win0Active = s.Win0Active;
+    Win1Active = s.Win1Active;
+    memcpy(BGMosaicSize, s.BGMosaicSize, sizeof(BGMosaicSize));
+    memcpy(OBJMosaicSize, s.OBJMosaicSize, sizeof(OBJMosaicSize));
+    BGMosaicY = s.BGMosaicY;
+    BGMosaicYMax = s.BGMosaicYMax;
+    OBJMosaicY = s.OBJMosaicY;
+    BGMosaicLatch = s.BGMosaicLatch;
+    OBJMosaicLatch = s.OBJMosaicLatch;
+    BGMosaicLine = s.BGMosaicLine;
+    OBJMosaicLine = s.OBJMosaicLine;
+    BlendCnt = s.BlendCnt;
+    BlendAlpha = s.BlendAlpha;
+    EVA = s.EVA;
+    EVB = s.EVB;
+    EVY = s.EVY;
+}
+#endif
+
 void GPU2D::Reset()
 {
     Enabled = false;

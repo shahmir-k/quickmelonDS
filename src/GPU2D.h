@@ -38,6 +38,13 @@ public:
 
     void Reset();
 
+#ifdef LITEV_SOFT2D_THREADED
+    // Copy the full render-relevant register state from another unit of the same
+    // engine (the shared GPU reference is left untouched). Used to seed a per-band
+    // private unit with the frame-level state before per-line snapshot overrides.
+    void CopyRenderState(const GPU2D& s);
+#endif
+
     void DoSavestate(Savestate* file);
 
     void SetEnabled(bool enable) { Enabled = enable; }
