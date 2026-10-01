@@ -62,7 +62,14 @@ private:
     friend class SoftRenderer2D;
     friend class SoftRenderer3D;
 
+#ifdef LITEV_SOFT2D_DEPTH2
+    // Part 3: THREE framebuffers for the depth-2 flip (one rendering, one queued, one
+    // presenting). Depth-1 (pipedepth==1) uses only [0]/[1] exactly as before -> byte-
+    // identical. Allocated/freed/cleared in the ctor/dtor/Reset/Stop under the flag.
+    u32* Framebuffer[3][2];
+#else
     u32* Framebuffer[2][2];
+#endif
 
     u32* Output3D;
     alignas(8) u32 Output2D[2][256];
@@ -83,7 +90,18 @@ private:
     FrameLineSnap FrameSnap[192];
     // Render-owned copy (see async pipeline): the emu thread copies FrameSnap ->
     // FrameSnapR at VBlank, and the async render thread reads only FrameSnapR.
+#ifdef LITEV_SOFT2D_DEPTH2
+    // Part 2: parity double-buffer the render-owned 2D snapshots so a depth-2 pipeline can
+    // have the emu write frame N+1's inputs while the render reads frame N's. The emu writes
+    // slot[SnapParity] at VBlank; the render reads slot[AsyncSnapSlot] (captured at VBlank
+    // like AsyncTargetBuf). Byte-identical at depth-1 (one slot live; SnapParity==AsyncSnapSlot
+    // per frame). SnapParity/AsyncSnapSlot also key the Part-1b flat BG/OBJ shadow bank.
+    FrameLineSnap FrameSnapR[2][192];
+    int SnapParity = 0;      // emu, toggled every VBlank (2D always renders)
+    int AsyncSnapSlot = 0;   // captured at VBlank; the render/2D consumer reads this slot
+#else
     FrameLineSnap FrameSnapR[192];
+#endif
     // 3D output copied per line DURING the visible period, keeping the threaded-3D
     // GetLine semaphore consumption in lockstep with the render thread (the deferred
     // 2D batch at VBlank then reads these copies instead of re-calling GetLine, which
@@ -117,7 +135,15 @@ private:
         std::unique_ptr<GPU2D> unit[2];
         std::unique_ptr<Renderer2D> rend[2];   // SoftRenderer2D bound to unit[]
     };
+#ifdef LITEV_SOFT2D_DEPTH2
+    // Part 2/3: parity double-buffer the per-band private GPU2D units. CopyRenderState seeds
+    // the emu-mutable 2D registers into them at VBlank; under depth-2 the render for frame N
+    // uses S2DBands[AsyncSnapSlot] while the emu seeds S2DBands[SnapParity] for N+1. Byte-
+    // identical at depth-1 (SnapParity==AsyncSnapSlot per frame, one set live).
+    S2DBand S2DBands[2][S2D_NBANDS];
+#else
     S2DBand S2DBands[S2D_NBANDS];
+#endif
     bool S2DBandsInit = false;
     void InitBands();
     void RenderBand(int bi, u32 y0, u32 y1);
@@ -128,8 +154,13 @@ private:
     // seeding done there too), then SIGNALS a persistent render thread to raster
     // frame N off the critical path while the emu immediately emulates frame N+1.
     // A barrier at the NEXT VBlank waits for frame N's render before reusing state.
+#ifdef LITEV_SOFT2D_DEPTH2
+    alignas(8) u8 PaletteSnap[2][2*1024];   // [SnapParity] GPU.Palette snapshot
+    alignas(8) u8 OAMSnap[2][2*1024];       // [SnapParity] GPU.OAM snapshot
+#else
     alignas(8) u8 PaletteSnap[2*1024];   // GPU.Palette snapshot (read by async draws)
     alignas(8) u8 OAMSnap[2*1024];       // GPU.OAM snapshot (read by async draws)
+#endif
 
     Platform::Thread* AsyncThread = nullptr;
     Platform::Semaphore* AsyncStart = nullptr;   // emu -> render: "render this frame"
@@ -143,6 +174,34 @@ private:
     // not buffer 0 which the first async frame is concurrently rendering into.
     int  AsyncPresentBuf = 1;
 
+#ifdef LITEV_SOFT2D_DEPTH2
+    // Part 3: depth-2 in-flight ring. pipedepth==1 keeps the depth-1 barrier (byte-identical);
+    // pipedepth==2 lets up to 2 renders be in flight so the emu runs a frame ahead, removing
+    // the ~4.5 ms VBlank barrier bubble. Each in-flight frame captures ALL its per-frame
+    // resource keys so the render (and later present) reference the right generation:
+    //   targetBuf       -- the Framebuffer[] the render writes and the present reads
+    //   snapSlot        -- 2D snapshot + BG/OBJ-flat parity (mod-2)
+    //   consume3DParity -- 3D ColorBuffer/Depth/Attr bank (mod-3)
+    // FIFO indexed by a monotonic frame counter mod 3 (<=2 in flight + 1 draining -> 3 slots
+    // never collide). The emu writes ring[PushIdx] then posts AsyncStart (release); the 2D
+    // thread pops ring[PopIdx] after Wait(AsyncStart) (acquire) -> the write is published. The
+    // emu presents ring[PresentIdx] after Wait(AsyncDone) (the drained render is complete).
+    struct P2InFlightFrame { int targetBuf; int snapSlot; int consume3DParity; };
+    P2InFlightFrame P2Ring[3] {};
+    int P2PushIdx = 0;        // emu: next ring slot to fill (mod 3)
+    int P2PresentIdx = 0;     // emu: next ring slot to present/drain (mod 3)
+    int P2PopIdx = 0;         // 2D thread: next ring slot to consume (mod 3)
+    int P2InFlight = 0;       // emu: pushed-but-not-presented count (0..2)
+    int P2FrameBufRR = 0;     // emu: round-robin framebuffer picker (mod 3)
+    int PipeDepth = 0;        // debug.litev.pipedepth (1 or 2); 0=unread. Read ONCE at the
+                              // first VBlank and cached for the session -- a mid-run 1<->2
+                              // switch would leave the depth-1 in-flight state inconsistent
+                              // with the depth-2 ring (mixing AsyncInFlight and P2InFlight).
+    u64 PipeTrace3DHash = 0;  // async 2D thread: 3D lines consumed for the current render
+    u64 PipeTraceSpriteTopHash = 0; // top sprite intermediates before BG composite
+    u64 PipeTrace2DTopHash = 0; // async 2D thread: top BG/OBJ composite before final output
+    u64 PipeTraceTopInputHash = 0; // render-owned top 2D snapshots consumed for the render
+#endif
 
     void StartAsyncThread();              // lazy-create the persistent render thread
     void StopAsyncThread();               // flush in-flight + join (Stop/dtor)

@@ -1507,6 +1507,24 @@ bool GPU::MakeVRAMFlat_TexPalCoherent(NonStupidBitField<128*1024/VRAMDirtyGranul
     return CopyLinearVRAM<16*1024>(VRAMFlat_TexPal, VRAMMap_TexPal, dirty, &GPU::ReadVRAM_TexPal<u64>);
 }
 
+
+#if defined(LITEV_SOFT2D_DEPTH2)
+// Part 1b: snapshot the freshly-coherent flat BG/OBJ/ext-pal VRAM into the given parity
+// bank (called at VBlank after SyncVRAM_BG/OBJ). ~1.1 MB/frame (~0.3 ms on the A55).
+// Written to the A/B bank the 2D render is NOT reading (see GPU.h / the depth-2 invariant).
+void GPU::SnapshotBGOBJShadow(int bank) noexcept
+{
+    memcpy(VRAMFlat_ABGShadow[bank],  VRAMFlat_ABG,  sizeof(VRAMFlat_ABG));
+    memcpy(VRAMFlat_BBGShadow[bank],  VRAMFlat_BBG,  sizeof(VRAMFlat_BBG));
+    memcpy(VRAMFlat_AOBJShadow[bank], VRAMFlat_AOBJ, sizeof(VRAMFlat_AOBJ));
+    memcpy(VRAMFlat_BOBJShadow[bank], VRAMFlat_BOBJ, sizeof(VRAMFlat_BOBJ));
+    memcpy(VRAMFlat_ABGExtPalShadow[bank],  VRAMFlat_ABGExtPal,  sizeof(VRAMFlat_ABGExtPal));
+    memcpy(VRAMFlat_BBGExtPalShadow[bank],  VRAMFlat_BBGExtPal,  sizeof(VRAMFlat_BBGExtPal));
+    memcpy(VRAMFlat_AOBJExtPalShadow[bank], VRAMFlat_AOBJExtPal, sizeof(VRAMFlat_AOBJExtPal));
+    memcpy(VRAMFlat_BOBJExtPalShadow[bank], VRAMFlat_BOBJExtPal, sizeof(VRAMFlat_BOBJExtPal));
+}
+#endif
+
 bool GPU::MakeVRAMFlat_ABGCoherent(NonStupidBitField<512*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
     return CopyLinearVRAM<16*1024>(VRAMFlat_ABG, VRAMMap_ABG, dirty, &GPU::ReadVRAM_ABG<u64>);

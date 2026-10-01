@@ -94,7 +94,11 @@ public:
     // frame's per-line snapshots into the *R (render-owned) arrays, then the async
     // render thread reads ONLY the *R copies while the emu overwrites LineSnap/
     // SprSnap for the next frame. Avoids a per-scanline read/write race.
+#if defined(LITEV_SOFT2D_DEPTH2)
+    void CopyLineSnaps(int slot);
+#else
     void CopyLineSnaps();
+#endif
 
     // Deferred (no per-scanline VRAM coherence; that runs once/frame at VBlank).
     void SyncVRAM_BG();
@@ -113,8 +117,16 @@ public:
     S2DLineState LineSnap[192];
     S2DSprState  SprSnap[192];
     // Render-owned copies (see CopyLineSnaps): read by the async render thread.
+#if defined(LITEV_SOFT2D_DEPTH2)
+    // Part 2: parity double-buffer (see SoftRenderer::SnapParity/AsyncSnapSlot). CopyLineSnaps
+    // takes the slot; the deferred draws read LineSnapR[slot]/SprSnapR[slot]. Byte-identical
+    // at depth-1.
+    S2DLineState LineSnapR[2][192];
+    S2DSprState  SprSnapR[2][192];
+#else
     S2DLineState LineSnapR[192];
     S2DSprState  SprSnapR[192];
+#endif
 #endif
 
     // Palette base the deferred/banded draws read. Defaults to the live GPU.Palette

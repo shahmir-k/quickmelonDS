@@ -720,6 +720,44 @@ public:
 
     alignas(u64) u8 VRAMFlat_Texture[512*1024] {};
     alignas(u64) u8 VRAMFlat_TexPal[128*1024] {};
+#if defined(LITEV_SOFT2D_DEPTH2)
+    // Part 1b (flat-VRAM parity snapshot, 2D side): A/B parity shadow of the flat BG/OBJ/
+    // ext-pal VRAM, mirroring the R4 texture shadow above. The 2D raster reads these via
+    // GetBGVRAM/GetOBJVRAM/GetBGExtPal/GetOBJExtPal, redirected through the *Read pointers to
+    // the 2D CONSUMER's frame bank (SetBGOBJReadShadow, on the async 2D thread) -- INDEPENDENT
+    // of the 3D texture read pointer (which the render thread points at the 3D render bank).
+    // SnapshotBGOBJShadow copies ~1.1 MB/frame (~0.3 ms on the A55); +~2.2 MB storage.
+    // Byte-identical at depth-1 (shadow == live coherent data). Under depth-2 the emu's next-
+    // frame snapshot writes the OTHER bank -> cannot corrupt the in-flight raster's bytes.
+    u8 VRAMFlat_ABGShadow[2][512*1024] {};
+    u8 VRAMFlat_BBGShadow[2][128*1024] {};
+    u8 VRAMFlat_AOBJShadow[2][256*1024] {};
+    u8 VRAMFlat_BOBJShadow[2][128*1024] {};
+    alignas(u16) u8 VRAMFlat_ABGExtPalShadow[2][32*1024] {};
+    alignas(u16) u8 VRAMFlat_BBGExtPalShadow[2][32*1024] {};
+    alignas(u16) u8 VRAMFlat_AOBJExtPalShadow[2][8*1024] {};
+    alignas(u16) u8 VRAMFlat_BOBJExtPalShadow[2][8*1024] {};
+    u8* VRAMFlat_ABGRead = VRAMFlat_ABG;
+    u8* VRAMFlat_BBGRead = VRAMFlat_BBG;
+    u8* VRAMFlat_AOBJRead = VRAMFlat_AOBJ;
+    u8* VRAMFlat_BOBJRead = VRAMFlat_BOBJ;
+    u8* VRAMFlat_ABGExtPalRead = VRAMFlat_ABGExtPal;
+    u8* VRAMFlat_BBGExtPalRead = VRAMFlat_BBGExtPal;
+    u8* VRAMFlat_AOBJExtPalRead = VRAMFlat_AOBJExtPal;
+    u8* VRAMFlat_BOBJExtPalRead = VRAMFlat_BOBJExtPal;
+    void SnapshotBGOBJShadow(int bank) noexcept;
+    void SetBGOBJReadShadow(bool on, int bank) noexcept
+    {
+        VRAMFlat_ABGRead = on ? VRAMFlat_ABGShadow[bank] : VRAMFlat_ABG;
+        VRAMFlat_BBGRead = on ? VRAMFlat_BBGShadow[bank] : VRAMFlat_BBG;
+        VRAMFlat_AOBJRead = on ? VRAMFlat_AOBJShadow[bank] : VRAMFlat_AOBJ;
+        VRAMFlat_BOBJRead = on ? VRAMFlat_BOBJShadow[bank] : VRAMFlat_BOBJ;
+        VRAMFlat_ABGExtPalRead = on ? VRAMFlat_ABGExtPalShadow[bank] : VRAMFlat_ABGExtPal;
+        VRAMFlat_BBGExtPalRead = on ? VRAMFlat_BBGExtPalShadow[bank] : VRAMFlat_BBGExtPal;
+        VRAMFlat_AOBJExtPalRead = on ? VRAMFlat_AOBJExtPalShadow[bank] : VRAMFlat_AOBJExtPal;
+        VRAMFlat_BOBJExtPalRead = on ? VRAMFlat_BOBJExtPalShadow[bank] : VRAMFlat_BOBJExtPal;
+    }
+#endif
 
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;

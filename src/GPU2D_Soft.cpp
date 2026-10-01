@@ -32,11 +32,19 @@ SoftRenderer2D::SoftRenderer2D(melonDS::GPU2D& gpu2D, SoftRenderer& parent)
 }
 
 #ifdef LITEV_SOFT2D_THREADED
+#if defined(LITEV_SOFT2D_DEPTH2)
+void SoftRenderer2D::CopyLineSnaps(int slot)
+{
+    memcpy(LineSnapR[slot], LineSnap, sizeof(LineSnap));
+    memcpy(SprSnapR[slot],  SprSnap,  sizeof(SprSnap));
+}
+#else
 void SoftRenderer2D::CopyLineSnaps()
 {
     memcpy(LineSnapR, LineSnap, sizeof(LineSnap));
     memcpy(SprSnapR,  SprSnap,  sizeof(SprSnap));
 }
+#endif
 #endif
 
 SoftRenderer2D::~SoftRenderer2D()
