@@ -35,6 +35,24 @@ As for the rest, the interface should be pretty straightforward. If you have a q
 ## How to build
 See [BUILD.md](./BUILD.md) for build instructions.
 
+## liteDS performance options (LITEV)
+
+This fork adds compile-time `LITEV_*` options that speed up melonDS on low-end ARM64 Android
+handhelds (developed on the Anbernic RG DS: RK3566, four Cortex-A55 cores). Every option
+defaults to OFF, so a plain build behaves like upstream; the Android app enables its shipping set
+through CMake. Each option was added by one commit whose message explains what it does, why it
+works, how exact it is and what it measured.
+
+* [docs/LITEV-OPTIMIZATIONS.md](docs/LITEV-OPTIMIZATIONS.md): every option, with the same text.
+* [docs/NEGATIVE-RESULTS.md](docs/NEGATIVE-RESULTS.md): levers that were tried and dropped.
+* [docs/BUILD-METHODOLOGY.md](docs/BUILD-METHODOLOGY.md) and
+  [docs/TESTING-METHODOLOGY.md](docs/TESTING-METHODOLOGY.md): how the builds and measurements are made.
+* [docs/ANALYSIS-METHODOLOGY.md](docs/ANALYSIS-METHODOLOGY.md): how to diagnose a game that an
+  option broke (oracles, JIT-vs-interpreter A/B, gate blind spots).
+* `tools/headless`: the `liteDS-headless` benchmark and byte-exact trace harness
+  (`-DLITEV_HEADLESS=ON`).
+* `tools/measure`: on-device measurement scripts (cold-start app legs, A/A noise-floor runs).
+
 ## TODO LIST
 
  * better DSi emulation
