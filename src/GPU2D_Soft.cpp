@@ -23,6 +23,10 @@
 #include "GPU2D_NEON.h"
 #endif
 
+#if defined(LITEV_SOFT2D_OBJNEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace melonDS
 {
 
@@ -1186,6 +1190,58 @@ void SoftRenderer2D::InterleaveSprites(u32 prio)
     u32 attrmask = (prio << 16) | OBJ_IsOpaque;
     u16* pal = (u16*)&CurPalette[GPU2D.Num ? 0x600 : 0x200];
     u16* extpal = GPU2D.GetOBJExtPal();
+
+#if defined(LITEV_SOFT2D_OBJNEON) && defined(__aarch64__)
+    // NEON branchless reject-scan (LITEV_SOFT2D_OBJNEON). InterleaveSprites runs
+    // once per BG priority level (up to 4x per scanline); at any given priority
+    // most of the 256 pixels do NOT carry a matching opaque sprite, so the scalar
+    // loop above burns the bulk of its time on the (OBJLine[i] & OpaPrioMask) !=
+    // attrmask reject path. Here we test the OBJ-priority match 16 lanes at a time
+    // and skip whole 16-pixel chunks that contain zero matches. Chunks that DO
+    // contain a match fall through to the identical scalar body below (re-testing
+    // both the prio mask and the window bit), so every drawn pixel — and the
+    // per-pixel BGOBJLine/BGOBJLine+256 read-modify-write in DrawPixel — is
+    // byte-identical to the scalar path. The palette gather (pal[]/extpal[]) has
+    // no NEON equivalent on AArch64 (no gather), so only the reject scan is
+    // vectorized. 256 is an exact multiple of 16 (no tail).
+    const uint32x4_t vOpaPrio = vdupq_n_u32(OBJ_OpaPrioMask);
+    const uint32x4_t vAttr    = vdupq_n_u32(attrmask);
+    for (u32 base = 0; base < 256; base += 16)
+    {
+        uint32x4_t o0 = vld1q_u32(&OBJLine[base + 0]);
+        uint32x4_t o1 = vld1q_u32(&OBJLine[base + 4]);
+        uint32x4_t o2 = vld1q_u32(&OBJLine[base + 8]);
+        uint32x4_t o3 = vld1q_u32(&OBJLine[base + 12]);
+        uint32x4_t m0 = vceqq_u32(vandq_u32(o0, vOpaPrio), vAttr);
+        uint32x4_t m1 = vceqq_u32(vandq_u32(o1, vOpaPrio), vAttr);
+        uint32x4_t m2 = vceqq_u32(vandq_u32(o2, vOpaPrio), vAttr);
+        uint32x4_t m3 = vceqq_u32(vandq_u32(o3, vOpaPrio), vAttr);
+        uint32x4_t any = vorrq_u32(vorrq_u32(m0, m1), vorrq_u32(m2, m3));
+        if (vmaxvq_u32(any) == 0)
+            continue; // no matching opaque sprite pixel in these 16 -> skip
+
+        for (u32 i = base; i < base + 16; i++)
+        {
+            if ((OBJLine[i] & OBJ_OpaPrioMask) != attrmask)
+                continue;
+            if (!(WindowMask[i] & 0x10))
+                continue;
+
+            u16 color;
+            u32 pixel = OBJLine[i];
+
+            if (pixel & OBJ_DirectColor)
+                color = pixel & 0x7FFF;
+            else if (pixel & OBJ_StandardPal)
+                color = pal[pixel & 0xFF];
+            else
+                color = extpal[pixel & 0xFFF];
+
+            DrawPixel(&BGOBJLine[i], color, pixel & 0xFF000000);
+        }
+    }
+    return;
+#endif
 
     for (u32 i = 0; i < 256; i++)
     {

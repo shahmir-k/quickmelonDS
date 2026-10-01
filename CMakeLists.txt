@@ -168,6 +168,19 @@ option(LITEV_SOFT2D_NEON "liteV: 4-wide NEON 2D BG/OBJ colour-effect compositor"
 if (LITEV_SOFT2D_NEON)
     add_compile_definitions(LITEV_SOFT2D_NEON=1)
 endif()
+# NEON branchless reject-scan for SoftRenderer2D::InterleaveSprites (the sprite
+# priority resolver, called once per BG priority level = up to 4×/scanline). At a
+# given priority most of the 256 pixels carry no matching opaque sprite, so the
+# scalar loop is dominated by the (OBJLine[i]&OpaPrioMask)!=attrmask reject path.
+# This lever tests the prio match 16 lanes at a time and skips whole 16-pixel
+# chunks with zero matches; matching chunks fall through to the identical scalar
+# body (palette gather has no AArch64 NEON equivalent). Bit-exact: every drawn
+# pixel + DrawPixel RMW is byte-identical (final_top/bot hashes ON==OFF).
+# AArch64 only; flag-OFF is byte-identical. Default OFF.
+option(LITEV_SOFT2D_OBJNEON "liteV: NEON reject-scan for the 2D sprite interleaver" OFF)
+if (LITEV_SOFT2D_OBJNEON)
+    add_compile_definitions(LITEV_SOFT2D_OBJNEON=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)
