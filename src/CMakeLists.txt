@@ -165,6 +165,17 @@ if (LITEV_SPU_FAST_INTERP)
     target_compile_definitions(core PUBLIC LITEV_SPU_FAST_INTERP)
 endif()
 
+if (LITEV_GXFIFO_THREADED)
+    # DraStic backlog #3: batched GXFIFO threaded-code interpreter. Builds on the
+    # computed-goto jump table AND additionally
+    # hoists GPU3D::Run()'s command-drain while-loop into GPU3D::ExecuteCommand()
+    # so a whole batch of GX commands drains with ONE call (no per-command bl/ret
+    # or prologue/epilogue). Command/param side effects (CmdFIFORead ->
+    # CheckFIFODMA/CheckFIFOIRQ) still fire once per command in identical order, so
+    # geometry output + audio are byte-identical to flag-OFF. Default OFF.
+    target_compile_definitions(core PUBLIC LITEV_GXFIFO_THREADED)
+endif()
+
 set(MELONDS_VERSION_SUFFIX "$ENV{MELONDS_VERSION_SUFFIX}" CACHE STRING "Suffix to add to displayed melonDS version")
 option(MELONDS_EMBED_BUILD_INFO "Embed detailed build info into the binary" OFF)
 set(MELONDS_GIT_BRANCH "$ENV{MELONDS_GIT_BRANCH}" CACHE STRING "The Git branch used for this build")

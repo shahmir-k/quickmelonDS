@@ -582,6 +582,17 @@ option(LITEV_TIMER_FAST "DraStic: cache NextTimerDeadline, recompute only on tim
 if (LITEV_TIMER_FAST)
     add_compile_definitions(LITEV_TIMER_FAST=1)
 endif()
+
+# --- DraStic backlog #3: batched GXFIFO threaded-code interpreter ------------------------
+# Hoists GPU3D::Run()'s per-command drain loop INTO GPU3D::ExecuteCommand() as a threaded
+# internal loop: each command re-dispatches through the computed-goto jump table and falls
+# through to the next command with NO bl/ret + NO function
+# prologue/epilogue per command (DraStic docs/drastic-teardown/04-gpu3d-geometry.md §3).
+# CmdFIFORead() (and its CheckFIFODMA/CheckFIFOIRQ side effects) still runs once per command
+# in the identical order, so geometry OUTPUT and audio are byte-identical to flag-OFF.
+# Applied on `core` in src/CMakeLists.txt. Default OFF.
+option(LITEV_GXFIFO_THREADED "DraStic #3: batched GXFIFO threaded-code interpreter (no call/ret per GX command)" OFF)
+
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

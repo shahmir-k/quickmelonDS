@@ -1736,6 +1736,15 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 
 void GPU3D::ExecuteCommand() noexcept
 {
+#ifdef LITEV_GXFIFO_THREADED
+    // DraStic #3 (backlog D.7 §3): batched threaded-code interpreter. Run()'s
+    // drain loop is hoisted in here — after each command the loop-tail below
+    // jumps back to this label, so a whole batch drains with ONE call, no
+    // per-command bl/ret or prologue/epilogue. Reuses the computed-goto
+    // tables below. Bit-exact (CmdFIFORead still fires per command
+    // in identical order, keeping DMA/IRQ/audio timing).
+gxfifo_threaded_top:
+#endif
     // M6.11: count GXFIFO commands (cheap add only; GPU3DNs times the whole
     // Run()/drain batch so per-command clock_gettime does not distort it).
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.GXCommands);
@@ -1755,6 +1764,359 @@ void GPU3D::ExecuteCommand() noexcept
 
         /*printf("[GXS:%08X] 0x%02X,  0x%08X", GXStat, entry.Command, entry.Param);*/
 
+#ifdef LITEV_GXFIFO_THREADED
+        // liteDS-v2 gxfifo: DraStic-style threaded-code dispatch (teardown
+        // docs/drastic-teardown/04-gpu3d-geometry.md §3). A flat 256-entry
+        // label table indexed by the command byte replaces the switch's
+        // implicit [0x10..0x72] range-check + default fall-through: one table
+        // load + one indirect branch per command, no bounds test. The handler
+        // bodies below are statement-for-statement identical to the switch in
+        // the #else arm, so geometry output AND cycle accounting are bit-exact
+        // — only the dispatch mechanism changes.
+        {
+        static const void* const gxfFast[256] =
+        {
+            [0 ... 255] = &&gxf_default,
+            [0x10] = &&gxf_10, [0x11] = &&gxf_11, [0x12] = &&gxf_12,
+            [0x13] = &&gxf_13, [0x14] = &&gxf_14, [0x15] = &&gxf_15,
+            [0x20] = &&gxf_20, [0x21] = &&gxf_21, [0x22] = &&gxf_22,
+            [0x24] = &&gxf_24, [0x25] = &&gxf_25, [0x26] = &&gxf_26,
+            [0x27] = &&gxf_27, [0x28] = &&gxf_28, [0x29] = &&gxf_29,
+            [0x2A] = &&gxf_2A, [0x2B] = &&gxf_2B, [0x30] = &&gxf_30,
+            [0x31] = &&gxf_31, [0x32] = &&gxf_32, [0x33] = &&gxf_33,
+            [0x40] = &&gxf_40, [0x41] = &&gxf_41, [0x50] = &&gxf_50,
+            [0x60] = &&gxf_60, [0x72] = &&gxf_72,
+        };
+        goto *gxfFast[entry.Command];
+
+        gxf_10: // matrix mode
+            VertexPipelineCmdDelayed4();
+            MatrixMode = entry.Param & 0x3;
+            goto gxf_end;
+
+        gxf_11: // push matrix
+            VertexPipelineCmdDelayed4();
+            NumPushPopCommands--;
+            if (MatrixMode == 0)
+            {
+                if (ProjMatrixStackPointer > 0) GXStat |= (1<<15);
+                memcpy(ProjMatrixStack, ProjMatrix, 16*4);
+                ProjMatrixStackPointer++;
+                ProjMatrixStackPointer &= 0x1;
+            }
+            else if (MatrixMode == 3)
+            {
+                if (TexMatrixStackPointer > 0) GXStat |= (1<<15);
+                memcpy(TexMatrixStack, TexMatrix, 16*4);
+                TexMatrixStackPointer++;
+                TexMatrixStackPointer &= 0x1;
+            }
+            else
+            {
+                if (PosMatrixStackPointer > 30) GXStat |= (1<<15);
+                memcpy(PosMatrixStack[PosMatrixStackPointer & 0x1F], PosMatrix, 16*4);
+                memcpy(VecMatrixStack[PosMatrixStackPointer & 0x1F], VecMatrix, 16*4);
+                PosMatrixStackPointer++;
+                PosMatrixStackPointer &= 0x3F;
+            }
+            AddCycles(16);
+            goto gxf_end;
+
+        gxf_12: // pop matrix
+            VertexPipelineCmdDelayed4();
+            NumPushPopCommands--;
+            if (MatrixMode == 0)
+            {
+                if (ProjMatrixStackPointer == 0) GXStat |= (1<<15);
+                ProjMatrixStackPointer--;
+                ProjMatrixStackPointer &= 0x1;
+                memcpy(ProjMatrix, ProjMatrixStack, 16*4);
+                ClipMatrixDirty = true;
+                AddCycles(35);
+            }
+            else if (MatrixMode == 3)
+            {
+                if (TexMatrixStackPointer == 0) GXStat |= (1<<15);
+                TexMatrixStackPointer--;
+                TexMatrixStackPointer &= 0x1;
+                memcpy(TexMatrix, TexMatrixStack, 16*4);
+                AddCycles(17);
+            }
+            else
+            {
+                s32 offset = (s32)(entry.Param << 26) >> 26;
+                PosMatrixStackPointer -= offset;
+                PosMatrixStackPointer &= 0x3F;
+                if (PosMatrixStackPointer > 30) GXStat |= (1<<15);
+                memcpy(PosMatrix, PosMatrixStack[PosMatrixStackPointer & 0x1F], 16*4);
+                memcpy(VecMatrix, VecMatrixStack[PosMatrixStackPointer & 0x1F], 16*4);
+                ClipMatrixDirty = true;
+                AddCycles(35);
+            }
+            goto gxf_end;
+
+        gxf_13: // store matrix
+            VertexPipelineCmdDelayed4();
+            if (MatrixMode == 0)
+            {
+                memcpy(ProjMatrixStack, ProjMatrix, 16*4);
+            }
+            else if (MatrixMode == 3)
+            {
+                memcpy(TexMatrixStack, TexMatrix, 16*4);
+            }
+            else
+            {
+                u32 addr = entry.Param & 0x1F;
+                if (addr > 30) GXStat |= (1<<15);
+                memcpy(PosMatrixStack[addr], PosMatrix, 16*4);
+                memcpy(VecMatrixStack[addr], VecMatrix, 16*4);
+            }
+            AddCycles(16);
+            goto gxf_end;
+
+        gxf_14: // restore matrix
+            VertexPipelineCmdDelayed4();
+            if (MatrixMode == 0)
+            {
+                memcpy(ProjMatrix, ProjMatrixStack, 16*4);
+                ClipMatrixDirty = true;
+                AddCycles(35);
+            }
+            else if (MatrixMode == 3)
+            {
+                memcpy(TexMatrix, TexMatrixStack, 16*4);
+                AddCycles(17);
+            }
+            else
+            {
+                u32 addr = entry.Param & 0x1F;
+                if (addr > 30) GXStat |= (1<<15);
+                memcpy(PosMatrix, PosMatrixStack[addr], 16*4);
+                memcpy(VecMatrix, VecMatrixStack[addr], 16*4);
+                ClipMatrixDirty = true;
+                AddCycles(35);
+            }
+            goto gxf_end;
+
+        gxf_15: // identity
+            VertexPipelineCmdDelayed4();
+            if (MatrixMode == 0)
+            {
+                MatrixLoadIdentity(ProjMatrix);
+                ClipMatrixDirty = true;
+                AddCycles(18);
+            }
+            else if (MatrixMode == 3)
+                MatrixLoadIdentity(TexMatrix);
+            else
+            {
+                MatrixLoadIdentity(PosMatrix);
+                if (MatrixMode == 2)
+                    MatrixLoadIdentity(VecMatrix);
+                ClipMatrixDirty = true;
+                AddCycles(18);
+            }
+            goto gxf_end;
+
+        gxf_20: // vertex color
+            VertexPipelineCmdDelayed6();
+            {
+                u32 c = entry.Param;
+                u32 r = c & 0x1F;
+                u32 g = (c >> 5) & 0x1F;
+                u32 b = (c >> 10) & 0x1F;
+                VertexColor[0] = r;
+                VertexColor[1] = g;
+                VertexColor[2] = b;
+            }
+            goto gxf_end;
+
+        gxf_21: // normal
+            VertexPipelineCmdDelayed4();
+            Normal[0] = (s16)((entry.Param & 0x000003FF) << 6) >> 6;
+            Normal[1] = (s16)((entry.Param & 0x000FFC00) >> 4) >> 6;
+            Normal[2] = (s16)((entry.Param & 0x3FF00000) >> 14) >> 6;
+            CalculateLighting();
+            goto gxf_end;
+
+        gxf_22: // texcoord
+            VertexPipelineCmdDelayed4();
+            RawTexCoords[0] = entry.Param & 0xFFFF;
+            RawTexCoords[1] = entry.Param >> 16;
+            if ((TexParam >> 30) == 1)
+            {
+                TexCoords[0] = (RawTexCoords[0]*TexMatrix[0] + RawTexCoords[1]*TexMatrix[4] + TexMatrix[8] + TexMatrix[12]) >> 12;
+                TexCoords[1] = (RawTexCoords[0]*TexMatrix[1] + RawTexCoords[1]*TexMatrix[5] + TexMatrix[9] + TexMatrix[13]) >> 12;
+            }
+            else
+            {
+                TexCoords[0] = RawTexCoords[0];
+                TexCoords[1] = RawTexCoords[1];
+            }
+            goto gxf_end;
+
+        gxf_24: // 10-bit vertex
+            VertexPipelineSubmitCmd();
+            CurVertex[0] = (entry.Param & 0x000003FF) << 6;
+            CurVertex[1] = (entry.Param & 0x000FFC00) >> 4;
+            CurVertex[2] = (entry.Param & 0x3FF00000) >> 14;
+            SubmitVertex();
+            goto gxf_end;
+
+        gxf_25: // vertex XY
+            VertexPipelineSubmitCmd();
+            CurVertex[0] = entry.Param & 0xFFFF;
+            CurVertex[1] = entry.Param >> 16;
+            SubmitVertex();
+            goto gxf_end;
+
+        gxf_26: // vertex XZ
+            VertexPipelineSubmitCmd();
+            CurVertex[0] = entry.Param & 0xFFFF;
+            CurVertex[2] = entry.Param >> 16;
+            SubmitVertex();
+            goto gxf_end;
+
+        gxf_27: // vertex YZ
+            VertexPipelineSubmitCmd();
+            CurVertex[1] = entry.Param & 0xFFFF;
+            CurVertex[2] = entry.Param >> 16;
+            SubmitVertex();
+            goto gxf_end;
+
+        gxf_28: // 10-bit delta vertex
+            VertexPipelineSubmitCmd();
+            CurVertex[0] += (s16)((entry.Param & 0x000003FF) << 6) >> 6;
+            CurVertex[1] += (s16)((entry.Param & 0x000FFC00) >> 4) >> 6;
+            CurVertex[2] += (s16)((entry.Param & 0x3FF00000) >> 14) >> 6;
+            SubmitVertex();
+            goto gxf_end;
+
+        gxf_29: // polygon attributes
+            VertexPipelineCmdDelayed8();
+            PolygonAttr = entry.Param;
+            goto gxf_end;
+
+        gxf_2A: // texture param
+            VertexPipelineCmdDelayed8();
+            TexParam = entry.Param;
+            goto gxf_end;
+
+        gxf_2B: // texture palette
+            VertexPipelineCmdDelayed8();
+            TexPalette = entry.Param & 0x1FFF;
+            goto gxf_end;
+
+        gxf_30: // diffuse/ambient material
+            VertexPipelineCmdDelayed6();
+            MatDiffuse[0] = entry.Param & 0x1F;
+            MatDiffuse[1] = (entry.Param >> 5) & 0x1F;
+            MatDiffuse[2] = (entry.Param >> 10) & 0x1F;
+            MatAmbient[0] = (entry.Param >> 16) & 0x1F;
+            MatAmbient[1] = (entry.Param >> 21) & 0x1F;
+            MatAmbient[2] = (entry.Param >> 26) & 0x1F;
+            if (entry.Param & 0x8000)
+            {
+                VertexColor[0] = MatDiffuse[0];
+                VertexColor[1] = MatDiffuse[1];
+                VertexColor[2] = MatDiffuse[2];
+            }
+            AddCycles(3);
+            goto gxf_end;
+
+        gxf_31: // specular/emission material
+            VertexPipelineCmdDelayed6();
+            MatSpecular[0] = entry.Param & 0x1F;
+            MatSpecular[1] = (entry.Param >> 5) & 0x1F;
+            MatSpecular[2] = (entry.Param >> 10) & 0x1F;
+            MatEmission[0] = (entry.Param >> 16) & 0x1F;
+            MatEmission[1] = (entry.Param >> 21) & 0x1F;
+            MatEmission[2] = (entry.Param >> 26) & 0x1F;
+            UseShininessTable = (entry.Param & 0x8000) != 0;
+            AddCycles(3);
+            goto gxf_end;
+
+        gxf_32: // light direction
+            StallPolygonPipeline(8 + 1,  2); // 0x32 can run 6 cycles after a vertex
+            {
+                u32 l = entry.Param >> 30;
+                s16 dir[3];
+                dir[0] = (s16)((entry.Param & 0x000003FF) << 6) >> 6;
+                dir[1] = (s16)((entry.Param & 0x000FFC00) >> 4) >> 6;
+                dir[2] = (s16)((entry.Param & 0x3FF00000) >> 14) >> 6;
+                LightDirection[l][0] = (-((dir[0]*VecMatrix[0] + dir[1]*VecMatrix[4] + dir[2]*VecMatrix[8] ) >> 12) << 21) >> 21;
+                LightDirection[l][1] = (-((dir[0]*VecMatrix[1] + dir[1]*VecMatrix[5] + dir[2]*VecMatrix[9] ) >> 12) << 21) >> 21;
+                LightDirection[l][2] = (-((dir[0]*VecMatrix[2] + dir[1]*VecMatrix[6] + dir[2]*VecMatrix[10]) >> 12) << 21) >> 21;
+                s32 den =              -(((dir[0]*VecMatrix[2] + dir[1]*VecMatrix[6] + dir[2]*VecMatrix[10]) << 9) >> 21) + (1<<9);
+                if (den == 0) SpecRecip[l] = 0;
+                else SpecRecip[l] = (1<<18) / den;
+            }
+            AddCycles(5);
+            goto gxf_end;
+
+        gxf_33: // light color
+            VertexPipelineCmdDelayed8();
+            {
+                u32 l = entry.Param >> 30;
+                LightColor[l][0] = entry.Param & 0x1F;
+                LightColor[l][1] = (entry.Param >> 5) & 0x1F;
+                LightColor[l][2] = (entry.Param >> 10) & 0x1F;
+            }
+            AddCycles(1);
+            goto gxf_end;
+
+        gxf_40: // begin polygons
+            StallPolygonPipeline(1, 0);
+            PolygonMode = entry.Param & 0x3;
+            VertexNum = 0;
+            VertexNumInPoly = 0;
+            NumConsecutivePolygons = 0;
+            LastStripPolygon = NULL;
+            CurPolygonAttr = PolygonAttr;
+            goto gxf_end;
+
+        gxf_41: // end polygons
+            VertexPipelineCmdDelayed8();
+            goto gxf_end;
+
+        gxf_50: // flush
+            VertexPipelineCmdDelayed4();
+            FlushRequest = 1;
+            FlushAttributes = entry.Param & 0x3;
+            CycleCount = 325;
+            VertexPipeline = 0;
+            NormalPipeline = 0;
+            PolygonPipeline = 0;
+            VertexSlotCounter = 0;
+            VertexSlotsFree = 1;
+            goto gxf_end;
+
+        gxf_60: // viewport x1,y1,x2,y2
+            VertexPipelineCmdDelayed8();
+            // note: viewport Y coordinates are upside-down
+            Viewport[0] = entry.Param & 0xFF;                             // x0
+            Viewport[1] = (191 - ((entry.Param >> 8) & 0xFF)) & 0xFF;     // y0
+            Viewport[2] = (entry.Param >> 16) & 0xFF;                     // x1
+            Viewport[3] = (191 - (entry.Param >> 24)) & 0xFF;             // y1
+            Viewport[4] = (Viewport[2] - Viewport[0] + 1) & 0x1FF;          // width
+            Viewport[5] = (Viewport[1] - Viewport[3] + 1) & 0xFF;           // height
+            goto gxf_end;
+
+        gxf_72: // vec test
+            VertexPipelineCmdDelayed6();
+            NumTestCommands--;
+            VecTest(entry.Param);
+            goto gxf_end;
+
+        gxf_default:
+            VertexPipelineCmdDelayed4();
+            //printf("!! UNKNOWN GX COMMAND %02X %08X\n", entry.Command, entry.Param);
+            goto gxf_end;
+
+        gxf_end: ;
+        }
+#else
         switch (entry.Command)
         {
         case 0x10: // matrix mode
@@ -2102,6 +2464,7 @@ void GPU3D::ExecuteCommand() noexcept
             //printf("!! UNKNOWN GX COMMAND %02X %08X\n", entry.Command, entry.Param);
             break;
         }
+#endif // LITEV_GXFIFO_THREADED
     }
     else
     {
@@ -2135,6 +2498,224 @@ void GPU3D::ExecuteCommand() noexcept
 
                 ExecParamCount = 0;
 
+#ifdef LITEV_GXFIFO_THREADED
+                // liteDS-v2 gxfifo: threaded-code dispatch for the multi-param
+                // completion path (hot for VTX_16 / MTX_MULT). Statement-
+                // identical handlers to the #else switch; bit-exact.
+                {
+                static const void* const gxfFull[256] =
+                {
+                    [0 ... 255] = &&gxc_default,
+                    [0x16] = &&gxc_16, [0x17] = &&gxc_17, [0x18] = &&gxc_18,
+                    [0x19] = &&gxc_19, [0x1A] = &&gxc_1A, [0x1B] = &&gxc_1B,
+                    [0x1C] = &&gxc_1C, [0x23] = &&gxc_23, [0x34] = &&gxc_34,
+                    [0x71] = &&gxc_71, [0x70] = &&gxc_70,
+                };
+                goto *gxfFull[entry.Command];
+
+                gxc_16: // load 4x4
+                    if (MatrixMode == 0)
+                    {
+                        MatrixLoad4x4(ProjMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(18);
+                    }
+                    else if (MatrixMode == 3)
+                    {
+                        MatrixLoad4x4(TexMatrix, (s32*)ExecParams);
+                        AddCycles(10);
+                    }
+                    else
+                    {
+                        MatrixLoad4x4(PosMatrix, (s32*)ExecParams);
+                        if (MatrixMode == 2)
+                            MatrixLoad4x4(VecMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(18);
+                    }
+                    goto gxc_end;
+
+                gxc_17: // load 4x3
+                    if (MatrixMode == 0)
+                    {
+                        MatrixLoad4x3(ProjMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(18);
+                    }
+                    else if (MatrixMode == 3)
+                    {
+                        MatrixLoad4x3(TexMatrix, (s32*)ExecParams);
+                        AddCycles(7);
+                    }
+                    else
+                    {
+                        MatrixLoad4x3(PosMatrix, (s32*)ExecParams);
+                        if (MatrixMode == 2)
+                            MatrixLoad4x3(VecMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(18);
+                    }
+                    goto gxc_end;
+
+                gxc_18: // mult 4x4
+                    if (MatrixMode == 0)
+                    {
+                        MatrixMult4x4(ProjMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(35 - 16);
+                    }
+                    else if (MatrixMode == 3)
+                    {
+                        MatrixMult4x4(TexMatrix, (s32*)ExecParams);
+                        AddCycles(33 - 16);
+                    }
+                    else
+                    {
+                        MatrixMult4x4(PosMatrix, (s32*)ExecParams);
+                        if (MatrixMode == 2)
+                        {
+                            MatrixMult4x4(VecMatrix, (s32*)ExecParams);
+                            AddCycles(35 + 30 - 16);
+                        }
+                        else AddCycles(35 - 16);
+                        ClipMatrixDirty = true;
+                    }
+                    goto gxc_end;
+
+                gxc_19: // mult 4x3
+                    if (MatrixMode == 0)
+                    {
+                        MatrixMult4x3(ProjMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(35 - 12);
+                    }
+                    else if (MatrixMode == 3)
+                    {
+                        MatrixMult4x3(TexMatrix, (s32*)ExecParams);
+                        AddCycles(33 - 12);
+                    }
+                    else
+                    {
+                        MatrixMult4x3(PosMatrix, (s32*)ExecParams);
+                        if (MatrixMode == 2)
+                        {
+                            MatrixMult4x3(VecMatrix, (s32*)ExecParams);
+                            AddCycles(35 + 30 - 12);
+                        }
+                        else AddCycles(35 - 12);
+                        ClipMatrixDirty = true;
+                    }
+                    goto gxc_end;
+
+                gxc_1A: // mult 3x3
+                    if (MatrixMode == 0)
+                    {
+                        MatrixMult3x3(ProjMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(35 - 9);
+                    }
+                    else if (MatrixMode == 3)
+                    {
+                        MatrixMult3x3(TexMatrix, (s32*)ExecParams);
+                        AddCycles(33 - 9);
+                    }
+                    else
+                    {
+                        MatrixMult3x3(PosMatrix, (s32*)ExecParams);
+                        if (MatrixMode == 2)
+                        {
+                            MatrixMult3x3(VecMatrix, (s32*)ExecParams);
+                            AddCycles(35 + 30 - 9);
+                        }
+                        else AddCycles(35 - 9);
+                        ClipMatrixDirty = true;
+                    }
+                    goto gxc_end;
+
+                gxc_1B: // scale
+                    if (MatrixMode == 0)
+                    {
+                        MatrixScale(ProjMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(35 - 3);
+                    }
+                    else if (MatrixMode == 3)
+                    {
+                        MatrixScale(TexMatrix, (s32*)ExecParams);
+                        AddCycles(33 - 3);
+                    }
+                    else
+                    {
+                        MatrixScale(PosMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(35 - 3);
+                    }
+                    goto gxc_end;
+
+                gxc_1C: // translate
+                    if (MatrixMode == 0)
+                    {
+                        MatrixTranslate(ProjMatrix, (s32*)ExecParams);
+                        ClipMatrixDirty = true;
+                        AddCycles(35 - 3);
+                    }
+                    else if (MatrixMode == 3)
+                    {
+                        MatrixTranslate(TexMatrix, (s32*)ExecParams);
+                        AddCycles(33 - 3);
+                    }
+                    else
+                    {
+                        MatrixTranslate(PosMatrix, (s32*)ExecParams);
+                        if (MatrixMode == 2)
+                        {
+                            MatrixTranslate(VecMatrix, (s32*)ExecParams);
+                            AddCycles(35 + 30 - 3);
+                        }
+                        else AddCycles(35 - 3);
+                        ClipMatrixDirty = true;
+                    }
+                    goto gxc_end;
+
+                gxc_23: // full vertex
+                    CurVertex[0] = ExecParams[0] & 0xFFFF;
+                    CurVertex[1] = ExecParams[0] >> 16;
+                    CurVertex[2] = ExecParams[1] & 0xFFFF;
+                    SubmitVertex();
+                    goto gxc_end;
+
+                gxc_34: // shininess table
+                    {
+                        for (int i = 0; i < 128; i += 4)
+                        {
+                            u32 val = ExecParams[i >> 2];
+                            ShininessTable[i + 0] = val & 0xFF;
+                            ShininessTable[i + 1] = (val >> 8) & 0xFF;
+                            ShininessTable[i + 2] = (val >> 16) & 0xFF;
+                            ShininessTable[i + 3] = val >> 24;
+                        }
+                    }
+                    goto gxc_end;
+
+                gxc_71: // pos test
+                    NumTestCommands -= 2;
+                    CurVertex[0] = ExecParams[0] & 0xFFFF;
+                    CurVertex[1] = ExecParams[0] >> 16;
+                    CurVertex[2] = ExecParams[1] & 0xFFFF;
+                    PosTest();
+                    goto gxc_end;
+
+                gxc_70: // box test
+                    NumTestCommands -= 3;
+                    BoxTest(ExecParams);
+                    goto gxc_end;
+
+                gxc_default:
+                    __builtin_unreachable();
+
+                gxc_end: ;
+                }
+#else
                 switch (entry.Command)
                 {
                 case 0x16: // load 4x4
@@ -2337,9 +2918,21 @@ void GPU3D::ExecuteCommand() noexcept
                 default:
                     __builtin_unreachable();
                 }
+#endif // LITEV_GXFIFO_THREADED
             }
         }
     }
+#ifdef LITEV_GXFIFO_THREADED
+    // Threaded loop-tail: instead of returning, re-run the whole ExecuteCommand
+    // body for the next queued command (mirrors Run()'s drain-loop condition).
+    // One call drains the batch -> no per-command bl/ret or prologue/epilogue.
+    if (CycleCount <= 0 && !CmdPIPE.IsEmpty())
+    {
+        if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
+        if (NumTestCommands == 0)    GXStat &= ~(1<<0);
+        goto gxfifo_threaded_top;
+    }
+#endif
 }
 
 s32 GPU3D::CyclesToRunFor() const noexcept
@@ -2375,6 +2968,16 @@ void GPU3D::Run() noexcept
     CycleCount -= cycles;
     Timestamp = NDS.ARM9Timestamp >> NDS.ARM9ClockShift;
 
+#ifdef LITEV_GXFIFO_THREADED
+    // DraStic #3: one ExecuteCommand() call drains the whole batch via its threaded
+    // loop-tail (no per-command call/ret). Equivalent to the while loop below.
+    if (CycleCount <= 0 && !CmdPIPE.IsEmpty())
+    {
+        if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
+        if (NumTestCommands == 0)    GXStat &= ~(1<<0);
+        ExecuteCommand();
+    }
+#else
     if (CycleCount <= 0)
     {
         while (CycleCount <= 0 && !CmdPIPE.IsEmpty())
@@ -2385,6 +2988,7 @@ void GPU3D::Run() noexcept
             ExecuteCommand();
         }
     }
+#endif
 
     if (CycleCount <= 0 && CmdPIPE.IsEmpty())
     {
