@@ -58,7 +58,7 @@ public:
 
     bool GetFramebuffers(void** top, void** bottom) override;
 
-private:
+protected:
     friend class SoftRenderer2D;
     friend class SoftRenderer3D;
 
@@ -94,6 +94,7 @@ private:
         u8  ScreensEnabled;
         u8  CaptureEnable;
         u8  Valid;
+        u16 XPos3D;          // BG0HOFS as seen by the 3D layer (hybrid merge)
     };
     FrameLineSnap FrameSnap[192];
     // Render-owned copy (see async pipeline): the emu thread copies FrameSnap ->
@@ -207,6 +208,26 @@ private:
     u64 PipeTrace2DTopHash = 0; // async 2D thread: top BG/OBJ composite before final output
     u64 PipeTraceTopInputHash = 0; // render-owned top 2D snapshots consumed for the render
 #endif
+
+    // ---- Hybrid renderer support (HybridRenderer derives from this class) ----
+    // Hybrid: engine A emits descriptors (SoftRenderer2D::HybridDesc), the 3D is merged
+    // on the GPU. Per framebuffer slot b, HybFB[b] holds both screens (top, then bottom),
+    // each 192 lines of HybStride words: 3 descriptor planes of 256 + 1 control word
+    // (master brightness | display mode << 16 | 3D x-scroll in bits 24-31 and 23).
+    static constexpr int HybStride = 256*3 + 1;
+    bool Hybrid = false;
+    u32* HybFB[3] {};
+    int HybTag[3] {};              // 3D colour-ring index the slot's frame pairs with
+    u32* Hyb3D[2] {};              // capture frames: the 1x 3D read back (per snap slot)
+    bool Hyb3DValid[2] {};
+    virtual int HybridCurrentTag() { return 0; }
+    virtual void HybridReadback3D(u32* dst) {}
+    void HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32* descB, const u32* l3d);
+    // LITEV_HYBRID_CHECK (headless self-test): the software path also builds engine A's
+    // descriptor line, resolves it on the CPU with the same 3D line and counts pixels
+    // that differ from the real composite. Must stay 0.
+    bool HybridCheck = false;
+    std::atomic<u64> HybCheckBad { 0 }, HybCheckLines { 0 };
 
     void StartAsyncThread();              // lazy-create the persistent render thread
     void StopAsyncThread();               // flush in-flight + join (Stop/dtor)

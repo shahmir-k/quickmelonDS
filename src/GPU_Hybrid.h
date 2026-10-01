@@ -1,0 +1,78 @@
+/*
+    Copyright 2016-2026 melonDS team
+
+    This file is part of melonDS.
+
+    melonDS is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with melonDS. If not, see http://www.gnu.org/licenses/.
+*/
+
+#ifndef GPU_HYBRID_H
+#define GPU_HYBRID_H
+
+#include "GPU_Soft.h"
+#include "GPU3D_OpenGL.h"
+
+namespace melonDS
+{
+
+// Hybrid renderer: 3D on the GPU at Nx (GLRenderer3D), 2D on the CPU at native
+// resolution (the threaded software 2D in descriptor mode), one GPU merge pass at Nx.
+// This is classic melonDS's OpenGL mode (removed upstream in ba317e2e) on top of the
+// unified Renderer API. All GL work runs on the thread that owns the context (the emu
+// thread): the 3D at VCount 215, the merge in GetFramebuffers.
+//
+// Display capture is done on the CPU at 1x into emulated VRAM (the 3D is read back on
+// capture frames only), so every capture consumer sees plain VRAM. A captured image
+// shown again (display mode 2, BG bitmap) is therefore 1x; "OpenGL (hi-res 2D)"
+// (GLRenderer) keeps captures at Nx.
+class HybridRenderer : public SoftRenderer
+{
+public:
+    explicit HybridRenderer(melonDS::NDS& nds);
+    ~HybridRenderer() override;
+    bool Init() override;
+    void Reset() override;
+
+    void PreSavestate() override;
+    void PostSavestate() override;
+
+    void SetRenderSettings(RendererSettings& settings) override;
+
+    bool GetFramebuffers(void** top, void** bottom) override;
+
+    bool NeedsShaderCompile() override { return Rend3D->NeedsShaderCompile(); }
+    void ShaderCompileStep(int& current, int& count) override { Rend3D->ShaderCompileStep(current, count); }
+
+protected:
+    int HybridCurrentTag() override;
+    void HybridReadback3D(u32* dst) override;
+
+private:
+    GLRenderer3D* GL3D() { return static_cast<GLRenderer3D*>(Rend3D.get()); }
+    void SetScale(int scale);
+
+    int Scale = 0;
+    GLuint MergeShader = 0;
+    GLint ScaleULoc = -1;
+    GLuint EmptyVAO = 0;
+    GLuint DescTex = 0;            // 769x192x2 RGBA8UI
+    GLuint OutTex[2] {};           // Nx, 2 layers (top, bottom), like GLRenderer's FPOutputTex
+    GLuint OutFB[2] {};
+    int OutIdx = 0;
+    GLuint ReadFB = 0, DownFB = 0, DownTex = 0;   // capture readback at 1x
+    u8 ReadBuf[256 * 192 * 4];
+};
+
+}
+
+#endif // GPU_HYBRID_H

@@ -123,6 +123,9 @@ SoftRenderer::SoftRenderer(melonDS::NDS& nds)
 #ifdef LITEV_SOFT2D_THREADED
     AsyncStart = Platform::Semaphore_Create();
     AsyncDone  = Platform::Semaphore_Create();
+#ifndef __ANDROID__
+    if (const char* e = getenv("LITEV_HYBRID_CHECK")) HybridCheck = atoi(e) != 0;
+#endif
 #endif
 }
 
@@ -130,6 +133,11 @@ SoftRenderer::~SoftRenderer()
 {
 #ifdef LITEV_SOFT2D_THREADED
     StopAsyncThread();
+    if (HybridCheck)
+        fprintf(stderr, "hybrid_check: lines=%llu bad_px=%llu\n",
+                (unsigned long long)HybCheckLines.load(), (unsigned long long)HybCheckBad.load());
+    for (int i = 0; i < 3; i++) delete[] HybFB[i];
+    for (int i = 0; i < 2; i++) delete[] Hyb3D[i];
     Platform::Semaphore_Free(AsyncStart);
     Platform::Semaphore_Free(AsyncDone);
 #endif
@@ -274,6 +282,7 @@ void SoftRenderer::DrawScanline(u32 line)
         return;
     }
     // line >= 192 falls through to the original inline out-of-range path.
+    if (Hybrid) return;   // (the hybrid only presents its descriptor buffers)
 #endif
     u32 *dstA, *dstB;
     u32 dstoffset = 256 * line;
@@ -366,6 +375,7 @@ void SoftRenderer::SnapshotCompositeLine(u32 line)
     f.ScreensEnabled = GPU.ScreensEnabled;
     f.CaptureEnable = GPU.CaptureEnable;
     f.Valid = 1;
+    f.XPos3D = GPU.GPU3D.GetRenderXPos();
 }
 
 // The whole frame's 2D raster + final composite, run once at VBlank off the
@@ -384,6 +394,7 @@ void SoftRenderer::InitBands()
                 S2DBands[p][b].unit[e] = std::make_unique<GPU2D>((u32)e, GPU);
                 S2DBands[p][b].rend[e] = std::make_unique<SoftRenderer2D>(*S2DBands[p][b].unit[e], *this);
                 static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->Reset();
+                static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->HybridDesc = Hybrid && e == 0;
             }
 #else
     for (int b = 0; b < S2D_NBANDS; b++)
@@ -393,6 +404,7 @@ void SoftRenderer::InitBands()
             S2DBands[b].unit[e] = std::make_unique<GPU2D>((u32)e, GPU);
             S2DBands[b].rend[e] = std::make_unique<SoftRenderer2D>(*S2DBands[b].unit[e], *this);
             static_cast<SoftRenderer2D*>(S2DBands[b].rend[e].get())->Reset();
+            static_cast<SoftRenderer2D*>(S2DBands[b].rend[e].get())->HybridDesc = Hybrid && e == 0;
         }
     }
 #endif
@@ -441,10 +453,13 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         // skipped lines. (Single-threaded async render — S2D_NBANDS=1 — so in-order.)
         const double _lspG0 = LSP_NOW();
 #ifdef LITEV_SOFT2D_DEPTH2
-        u32* l3d = AccurateBackend ? Snap3D[_ss][line] : Rend3D->GetLine(line);
+        const int _s3 = _ss;
 #else
-        u32* l3d = AccurateBackend ? Snap3D[0][line] : Rend3D->GetLine(line);
+        const int _s3 = 0;
 #endif
+        // the hybrid's 3D lives on the GPU: never GetLine here (no GL on this thread)
+        u32* l3d = Hybrid ? (Hyb3DValid[_s3] ? &Hyb3D[_s3][line * 256] : nullptr)
+                 : AccurateBackend ? Snap3D[_s3][line] : Rend3D->GetLine(line);
         LSP_ADD(S2DBlock[bi], LSP_NOW() - _lspG0);
 #ifdef LITEV_SOFT2D_DEPTH2
         if (pipeTraceOn)
@@ -456,6 +471,67 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         // so we must NOT touch those here.
         FrameLineSnap& f = fsR[line];
         if (!f.Valid) continue;
+
+        if (Hybrid)
+        {
+            u32* fb = HybFB[AsyncTargetBuf];
+            u32* descA = &fb[((f.ScreenSwap ? 0 : 1) * 192 + line) * HybStride];
+            u32* descB = &fb[((f.ScreenSwap ? 1 : 0) * 192 + line) * HybStride];
+            for (int i = 512; i < 768; i++) { descA[i] = 0x07000000; descB[i] = 0x07000000; }
+            rA->CurOAM = oamSnap; rA->CurPalette = palSnap;
+#ifdef LITEV_SOFT2D_DEPTH2
+            rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
+            rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, descA);
+#else
+            rA->DrawSpritesDeferred(mainA->SprSnapR[line], line);
+            rA->DrawScanlineDeferred(mainA->LineSnapR[line], line, descA);
+#endif
+            rB->CurOAM = oamSnap; rB->CurPalette = palSnap;
+#ifdef LITEV_SOFT2D_DEPTH2
+            rB->DrawSpritesDeferred(mainB->SprSnapR[_ss][line], line);
+            rB->DrawScanlineDeferred(mainB->LineSnapR[_ss][line], line, descB);
+#else
+            rB->DrawSpritesDeferred(mainB->SprSnapR[line], line);
+            rB->DrawScanlineDeferred(mainB->LineSnapR[line], line, descB);
+#endif
+            HybridLine(line, f, descA, descB, l3d);
+            f.Valid = 0;
+            continue;
+        }
+
+        if (HybridCheck)
+        {
+            // self-test: descriptor + CPU resolve must equal the real composite below
+            alignas(8) u32 desc[HybStride];
+            for (int i = 512; i < 768; i++) desc[i] = 0x07000000;
+            rA->Cur3DLine = l3d; rA->CurOAM = oamSnap; rA->CurPalette = palSnap;
+            rA->HybridDesc = true;
+#ifdef LITEV_SOFT2D_DEPTH2
+            rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
+            rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, desc);
+#else
+            rA->DrawSpritesDeferred(mainA->SprSnapR[line], line);
+            rA->DrawScanlineDeferred(mainA->LineSnapR[line], line, desc);
+#endif
+            rA->HybridDesc = false;
+            u32 ref[256];
+#ifdef LITEV_SOFT2D_DEPTH2
+            rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
+            rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, ref);
+#else
+            rA->DrawSpritesDeferred(mainA->SprSnapR[line], line);
+            rA->DrawScanlineDeferred(mainA->LineSnapR[line], line, ref);
+#endif
+            u64 bad = 0;
+            for (int i = 0; i < 256; i++)
+            {
+                // GetLine already applied the x-scroll, so index the 3D line directly
+                u32 r = SoftRenderer2D::HybridResolvePixel(desc[i], desc[256+i], desc[512+i], l3d[i]);
+                if (((r ^ ref[i]) & 0x3F3F3F) || (((r >> 24) != 0) != ((ref[i] >> 24) != 0))) bad++;
+            }
+            HybCheckBad += bad;
+            HybCheckLines++;
+        }
 
         // --- BG/OBJ raster into this band's per-engine line buffers ---
         rA->Cur3DLine = l3d;
@@ -828,6 +904,20 @@ void SoftRenderer::VBlank()
 #endif
     }
 
+    if (Hybrid)
+    {
+#ifdef LITEV_SOFT2D_DEPTH2
+        const int slot = SnapParity;
+#else
+        const int slot = 0;
+#endif
+        // the 1x 3D for CPU-side display capture, only on frames that capture
+        bool cap = false;
+        for (int y = 0; y < 192 && !cap; y++) cap = FrameSnap[y].Valid && FrameSnap[y].CaptureEnable;
+        Hyb3DValid[slot] = cap;
+        if (cap) HybridReadback3D(Hyb3D[slot]);
+    }
+
     // (c) SIGNAL the render thread to raster frame N into the current back buffer.
     // Capture the buffer index now: FinishFrame will swap BackBuffer while the render
     // runs, but the render must keep writing the buffer we chose here.
@@ -845,6 +935,7 @@ void SoftRenderer::VBlank()
         // ring capture -> AsyncStart post -> (2D thread) ring pop + set keys + reads.
         int freshBuf = P2FrameBufRR;
         P2FrameBufRR = (P2FrameBufRR + 1) % 3;
+        HybTag[freshBuf] = HybridCurrentTag();
         // consume3DParity = the P2 bank the 2D-N consumer must read = the parity 3D-N was
         // rastered into. 3D-N was kicked at frame N's VCount-215 RenderFrame (which toggled
         // P2KickParity mod-3); the next toggle is N+1's VCount 215, so at THIS VBlank(N)
@@ -864,6 +955,7 @@ void SoftRenderer::VBlank()
     }
 #endif
     AsyncTargetBuf = BackBuffer;
+    HybTag[AsyncTargetBuf] = HybridCurrentTag();
     AsyncInFlight = true;
     S2DDeferActive = false;
 #ifdef LITEV_SOFT2D_DEPTH2
@@ -876,6 +968,50 @@ void SoftRenderer::VBlank()
     LitevSP::Tick();
 #endif
     // (d) return immediately — emu emulates frame N+1 while the render thread runs.
+}
+#endif
+
+#ifdef LITEV_SOFT2D_THREADED
+// Hybrid: finish one line of both screens' descriptors after the BG/OBJ raster. The CPU
+// resolves everything except the 3D pixel, master brightness and the 6->8-bit expansion,
+// which the GPU merge does per Nx pixel. l3d: the 1x 3D read back on capture frames.
+void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32* descB, const u32* l3d)
+{
+    if (f.CaptureEnable)
+    {
+        // display capture writes emulated VRAM at 1x: resolve engine A on the CPU
+        alignas(8) u32 resA[256], line3d[256];
+        u32 xpos = f.XPos3D & 0x1FF;
+        for (int i = 0; i < 256; i++)
+        {
+            int x = i + (int)xpos - ((xpos & 0x100) ? 512 : 0);
+            line3d[i] = (l3d && x >= 0 && x < 256) ? l3d[x] : 0;
+            resA[i] = SoftRenderer2D::HybridResolvePixel(descA[i], descA[256+i], descA[512+i], line3d[i]);
+        }
+        DoCapture(line, resA, line3d);
+    }
+
+    const u32 modeA = (f.DispCntA >> 16) & 0x3;
+    const u32 modeB = (f.DispCntB >> 16) & 0x1;
+    if (modeA != 1)
+    {
+        // screen off / VRAM / FIFO display: plain colour, no 3D
+        DrawScanlineA(line, descA, descA, f.DispCntA, 0);
+        for (int i = 512; i < 768; i++) descA[i] = 0x07000000;
+    }
+    if (modeB != 1)
+        DrawScanlineB(line, descB, descB, f.DispCntB, 0);
+
+    u32 ctlA = f.MasterBrightnessA | (modeA << 16) | ((f.XPos3D & 0xFF) << 24) | ((f.XPos3D & 0x100) << 15);
+    u32 ctlB = f.MasterBrightnessB | (modeB << 16);
+    if (!f.ScreensEnabled)
+    {
+        for (int i = 0; i < 256; i++) { descA[i] = 0; descB[i] = 0; }
+        for (int i = 512; i < 768; i++) { descA[i] = 0x07000000; descB[i] = 0x07000000; }
+        ctlA = ctlB = 0;   // display mode 0 in the merge: no brightness, black stays black
+    }
+    descA[768] = ctlA;
+    descB[768] = ctlB;
 }
 #endif
 

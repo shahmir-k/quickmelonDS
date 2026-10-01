@@ -541,6 +541,12 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
     // color special effects
     // can likely be optimized
 
+    if (HybridDesc && !GPU2D.Num && (GPU2D.DispCnt & 0x8))
+    {
+        HybridCompositeLine(dst);
+        return;
+    }
+
 #if defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
     // 4-wide NEON port of the per-pixel ColorComposite loop (bit-exact).
     GPU2DNeon::ColorCompositeLine(dst, BGOBJLine, WindowMask,
@@ -567,8 +573,118 @@ void SoftRenderer2D::DrawPixel(u32* dst, u16 color, u32 flag)
     *dst = r | (g << 8) | (b << 16) | flag;
 }
 
+// Hybrid descriptor composite (scalar). Same decisions as ColorComposite, with the 3D
+// pixel left symbolic: the GPU merge (or HybridResolvePixel) applies it per Nx pixel.
+void SoftRenderer2D::HybridCompositeLine(u32* dst)
+{
+    const u32 blendCnt = GPU2D.BlendCnt;
+    for (int i = 0; i < 256; i++)
+    {
+        u32 val1 = BGOBJLine[i];
+        u32 val2 = BGOBJLine[256+i];
+        u32 flag1 = val1 >> 24;
+        u32 flag2 = val2 >> 24;
+
+        if ((flag1 & 0xC0) == 0x40)
+        {
+            // 3D on top. Under it: Under3D[0] (blend partner), then Under3D[1].
+            u32 u1 = Under3D[0][i], u2 = Under3D[1][i];
+            u32 f2 = u1 >> 24;
+            u32 target2;
+            if      (f2 & 0x80) target2 = 0x1000;
+            else if (f2 & 0x40) target2 = 0x0100;
+            else                target2 = f2 << 8;
+
+            u32 mode;
+            if (blendCnt & target2)
+                mode = 4;   // 3D alpha blend (no window colour-effect check)
+            else
+            {
+                mode = 0;
+                if ((blendCnt & 0x0001) && (WindowMask[i] & 0x20))
+                {
+                    mode = (blendCnt >> 6) & 0x3;
+                    if (mode == 1) mode = 0;   // alpha blend needs a target-2 layer below
+                }
+            }
+            dst[i]     = u1;
+            dst[256+i] = ColorComposite(i, u1, u2);
+            dst[512+i] = (mode << 24) | ((u32)GPU2D.EVY << 8);
+        }
+        else if ((flag2 & 0xC0) == 0x40)
+        {
+            // 3D directly under val1. If the 3D pixel is transparent, val1 sits on the
+            // layer that was under the 3D (Under3D[0]).
+            u32 under = Under3D[0][i];
+            u32 eva = 16, evb = 0;
+            bool blend = false;
+            if ((flag1 & 0x80) && (blendCnt & 0x0100))
+            {
+                // semi-transparent / bitmap sprite over the 3D
+                blend = true;
+                if (flag1 & 0x40) { eva = flag1 & 0x1F; evb = 16 - eva; }
+                else              { eva = GPU2D.EVA;    evb = GPU2D.EVB; }
+            }
+            else if (!(flag1 & 0x80))
+            {
+                u32 t1 = (flag1 & 0x40) ? 0x01 : flag1;
+                if ((blendCnt & t1) && (WindowMask[i] & 0x20) &&
+                    ((blendCnt >> 6) & 0x3) == 1 && (blendCnt & 0x0100))
+                {
+                    blend = true;
+                    eva = GPU2D.EVA; evb = GPU2D.EVB;
+                }
+            }
+            // no blend: the 3D only matters through the fallback, so blend 16:0 with
+            // val1 already carrying any brightness effect
+            dst[i]     = blend ? val1 : ColorComposite(i, val1, val2);
+            dst[256+i] = ColorComposite(i, val1, under);
+            dst[512+i] = (1u << 24) | (evb << 16) | (eva << 8);
+        }
+        else
+        {
+            dst[i]     = ColorComposite(i, val1, val2);
+            dst[256+i] = 0;
+            dst[512+i] = 0x07000000;
+        }
+    }
+}
+
+// CPU version of the hybrid merge (HybridMergeFS.glsl) for one native pixel: c3d is the
+// 3D pixel in software format (6-bit RGB, 5-bit alpha in bits 24-28). Used for display
+// capture in the hybrid renderer and for the descriptor self-check.
+u32 SoftRenderer2D::HybridResolvePixel(u32 val1, u32 val2, u32 val3, u32 c3d)
+{
+    u32 mode = (val3 >> 24) & 0xF;
+    if (mode == 7) return val1;
+    if ((c3d >> 24) == 0) return val2;
+    switch (mode)
+    {
+    case 4: return ColorBlend5(c3d, val1);
+    case 1: return ColorBlend4(val1, c3d, (val3 >> 8) & 0x1F, (val3 >> 16) & 0x1F);
+    case 2: return ColorBrightnessUp(c3d, (val3 >> 8) & 0x1F, 0x8);
+    case 3: return ColorBrightnessDown(c3d, (val3 >> 8) & 0x1F, 0x7);
+    default: return c3d | 0x40000000;
+    }
+}
+
 void SoftRenderer2D::DrawBG_3D()
 {
+    if (HybridDesc)
+    {
+        // placeholder (flag 0x40, alpha 0) where the window allows 3D; remember the two
+        // layers under it for the descriptor
+        for (int i = 0; i < 256; i++)
+        {
+            if (!(WindowMask[i] & 0x01)) continue;
+            Under3D[0][i] = BGOBJLine[i];
+            Under3D[1][i] = BGOBJLine[256+i];
+            BGOBJLine[i+256] = BGOBJLine[i];
+            BGOBJLine[i] = 0x40000000;
+        }
+        return;
+    }
+
 #ifdef LITEV_SOFT2D_THREADED
     const u32* out3d = Cur3DLine;
 #else

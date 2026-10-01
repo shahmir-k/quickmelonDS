@@ -18,6 +18,7 @@
 
 #include "GPU_OpenGL.h"
 
+#include <algorithm>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -103,7 +104,7 @@ void SetupDefaultTexParams(GLuint tex)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 }
 
-GLRenderer3D::GLRenderer3D(melonDS::GPU3D& gpu3D, GLRenderer& parent) noexcept :
+GLRenderer3D::GLRenderer3D(melonDS::GPU3D& gpu3D, GLRenderer* parent) noexcept :
     Renderer3D(gpu3D), Parent(parent), Texcache(gpu3D.GPU, TexcacheOpenGLLoader(false))
 {
     ClearBitmap[0] = new u32[256*256];
@@ -271,8 +272,9 @@ bool GLRenderer3D::Init()
     glGenFramebuffers(1, &MainFramebuffer);
 
     // color buffers
-    glGenTextures(1, &ColorBufferTex);
-    SetupDefaultTexParams(ColorBufferTex);
+    glGenTextures(MaxColorRing, ColorBufferTex);
+    for (int i = 0; i < MaxColorRing; i++)
+        SetupDefaultTexParams(ColorBufferTex[i]);
 
     // depth/stencil buffer
     glGenTextures(1, &DepthBufferTex);
@@ -285,7 +287,7 @@ bool GLRenderer3D::Init()
     glGenTextures(1, &AttrBufferTex);
     SetupDefaultTexParams(AttrBufferTex);
 
-    Parent.OutputTex3D = ColorBufferTex;
+    if (Parent) Parent->OutputTex3D = ColorBufferTex[0];
 
     glEnable(GL_BLEND);
     glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
@@ -302,7 +304,7 @@ GLRenderer3D::~GLRenderer3D()
     Texcache.Reset();
 
     glDeleteFramebuffers(1, &MainFramebuffer);
-    glDeleteTextures(1, &ColorBufferTex);
+    glDeleteTextures(MaxColorRing, ColorBufferTex);
     glDeleteTextures(1, &DepthBufferTex);
     glDeleteTextures(1, &AttrBufferTex);
 
@@ -353,8 +355,7 @@ void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons) noexcept
     ScreenW = 256 * scale;
     ScreenH = 192 * scale;
 
-    glBindTexture(GL_TEXTURE_2D, ColorBufferTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    AllocColorBuffers();
 
     glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, ScreenW, ScreenH, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
@@ -364,7 +365,7 @@ void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons) noexcept
     GLenum fbassign[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
 
     glBindFramebuffer(GL_FRAMEBUFFER, MainFramebuffer);
-    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ColorBufferTex, 0);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ColorBufferTex[CurColor], 0);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, DepthBufferTex, 0);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, AttrBufferTex, 0);
     glDrawBuffers(2, fbassign);
@@ -375,6 +376,22 @@ void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons) noexcept
     //glLineWidth(1.5);
 }
 
+
+void GLRenderer3D::AllocColorBuffers() noexcept
+{
+    for (int i = 0; i < ColorRing; i++)
+    {
+        glBindTexture(GL_TEXTURE_2D, ColorBufferTex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    }
+}
+
+void GLRenderer3D::SetColorRing(int n) noexcept
+{
+    ColorRing = std::clamp(n, 1, MaxColorRing);
+    CurColor = 0;
+    if (ScaleFactor) AllocColorBuffers();
+}
 
 void GLRenderer3D::SetupPolygon(GLRenderer3D::RendererPolygon* rp, Polygon* polygon) const
 {
@@ -916,9 +933,9 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
     glBindVertexArray(VertexArrayID);
 
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent.CaptureOutput128Tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent ? Parent->CaptureOutput128Tex : 0);
     glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent.CaptureOutput256Tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent ? Parent->CaptureOutput256Tex : 0);
 
     glActiveTexture(GL_TEXTURE0);
 
@@ -1287,8 +1304,20 @@ void GLRenderer3D::RenderFrame()
     }
 
     // figure out which chunks of texture memory contain display captures
+    // (only GLRenderer keeps captures as GL textures; without it they are plain VRAM)
     int captureinfo[16];
-    GPU.GetCaptureInfo_Texture(captureinfo);
+    if (Parent)
+        GPU.GetCaptureInfo_Texture(captureinfo);
+    else
+        for (int i = 0; i < 16; i++) captureinfo[i] = -1;
+
+    if (ColorRing > 1)
+    {
+        // next ring entry: the previous frames' 3D stays intact for the hybrid merge
+        CurColor = (CurColor + 1) % ColorRing;
+        glBindFramebuffer(GL_FRAMEBUFFER, MainFramebuffer);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ColorBufferTex[CurColor], 0);
+    }
 
     // if we're using a clear bitmap, set that up
     ClearBitmapDirty |= clrBitmapDirty;

@@ -31,7 +31,9 @@ class GLRenderer;
 class GLRenderer3D : public Renderer3D
 {
 public:
-    GLRenderer3D(melonDS::GPU3D& gpu3D, GLRenderer& parent) noexcept;
+    // parent == nullptr: no GLRenderer around (the hybrid renderer). Display captures
+    // then live in emulated VRAM only, never as hi-res GL textures.
+    GLRenderer3D(melonDS::GPU3D& gpu3D, GLRenderer* parent) noexcept;
     ~GLRenderer3D() override;
     bool Init() override;
     void Reset() override;
@@ -45,8 +47,16 @@ public:
     void RenderFrame() override;
     u32* GetLine(int line) override;
 
+    // Colour output ring (hybrid renderer): with n > 1 every rendered frame goes to the
+    // next of n colour textures, so a frame's 3D stays readable while later frames
+    // render. n = 1 (the default) is the single buffer GLRenderer uses.
+    static constexpr int MaxColorRing = 4;
+    void SetColorRing(int n) noexcept;
+    [[nodiscard]] int GetCurColor() const noexcept { return CurColor; }
+    [[nodiscard]] GLuint GetColorTex(int i) const noexcept { return ColorBufferTex[i]; }
+
 private:
-    GLRenderer& Parent;
+    GLRenderer* Parent;
 
     // GL version requirements
     // * texelFetch: 3.0 (GLSL 1.30)     (3.2/1.50 for MS)
@@ -158,7 +168,10 @@ private:
     bool BetterPolygons {};
     int ScreenW {}, ScreenH {};
 
-    GLuint ColorBufferTex {}, DepthBufferTex {}, AttrBufferTex {};
+    GLuint ColorBufferTex[MaxColorRing] {};
+    int ColorRing = 1, CurColor = 0;
+    GLuint DepthBufferTex {}, AttrBufferTex {};
+    void AllocColorBuffers() noexcept;
 
     GLuint MainFramebuffer {};
 };

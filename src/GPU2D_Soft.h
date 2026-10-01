@@ -134,6 +134,18 @@ public:
     // (PaletteSnap) so frame N's render doesn't race the emu's palette writes in N+1.
     const u8* CurPalette = nullptr;
 
+    // Hybrid renderer (3D on the GPU): engine A emits, per pixel, a 3-word descriptor
+    // instead of a final colour whenever DISPCNT bit 3 (BG0 = 3D) is set:
+    //   dst[i]     val1  blend partner (layer under the 3D, or the layer above it)
+    //   dst[256+i] val2  final colour if the 3D pixel is transparent
+    //   dst[512+i] val3  merge mode in bits 24-27 (7 = no 3D, 4 = 3D on top with 3D-alpha
+    //                    blend, 0/2/3 = 3D on top with no effect / brightness up / down
+    //                    (EVY in bits 8-12), 1 = 3D under val1 (EVA bits 8-12, EVB 16-20))
+    // The caller pre-fills dst[512..767] with 0x07000000 (no 3D). Ported from classic
+    // melonDS's "accelerated" software 2D (removed upstream in ba317e2e).
+    bool HybridDesc = false;
+    static u32 HybridResolvePixel(u32 val1, u32 val2, u32 val3, u32 c3d);
+
 private:
     SoftRenderer& Parent;
 
@@ -151,6 +163,7 @@ private:
     alignas(8) u32 BGOBJLine[256*2];
 
     alignas(8) u8 WindowMask[256];
+    alignas(8) u32 Under3D[2][256];   // HybridDesc: the two layers under the 3D placeholder
 
     alignas(8) u32 OBJLine[256];
     alignas(8) u8 OBJWindow[256];
@@ -184,6 +197,7 @@ private:
     static void DrawPixel(u32* dst, u16 color, u32 flag);
 
     void DrawBG_3D();
+    void HybridCompositeLine(u32* dst);
     template<bool mosaic> void DrawBG_Text(u32 line, u32 bgnum);
     template<bool mosaic> void DrawBG_Affine(u32 line, u32 bgnum);
     template<bool mosaic> void DrawBG_Extended(u32 line, u32 bgnum);
