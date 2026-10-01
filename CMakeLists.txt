@@ -697,6 +697,15 @@ if (LITEV_DMA_TIMING_LAZY)
     add_compile_definitions(LITEV_DMA_TIMING_LAZY=1)
 endif()
 
+# DraStic thread-affinity (teardown 07): pin the software render threads (async 2D, 3D
+# render, tile workers) to cores {0,1,2}, off the emu's core (3, pinned by the app glue). Without this the lib-created render threads land on core 3
+# and preempt the critical emu thread (~13ms/frame descheduling: app runFrame 33.5ms vs
+# 20.4ms headless for identical code). Android-only (Renderer thread cores).
+option(LITEV_PIN_RENDER "Pin software render threads to cores {0,1,2}, off the emu core" OFF)
+if (LITEV_PIN_RENDER)
+    add_compile_definitions(LITEV_PIN_RENDER=1)
+endif()
+
 # DraStic-style aggressive idle-loop recognition (teardown doc 01 item 6). Stock
 # melonDS's IsIdleLoop (ARMJIT.cpp) rejects any loop with a cross-iteration
 # register recurrence (a register read before it is rewritten in the iteration --

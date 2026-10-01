@@ -31,7 +31,7 @@
 #include "GPU2D_NEON.h"
 #endif
 
-#if defined(LITEV_SOFT2D_DEPTH2) && defined(__ANDROID__)
+#if (defined(LITEV_SOFT2D_DEPTH2) || defined(LITEV_PIN_RENDER)) && defined(__ANDROID__)
 #include <sys/system_properties.h>
 #include <stdlib.h>
 #endif
@@ -520,7 +520,41 @@ void SoftRenderer::AsyncRenderFrame()
     for (int b = 0; b < S2D_NBANDS - 1; b++) helpers[b].join();
 }
 
+#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
+#include <sched.h>
+// Pin the software render threads to cores {1,2}, OFF the emu's core (3, pinned by the
+// app glue) and off the UI/Mali core (0). Without this the lib-created render threads
+// land on core 3 and preempt the critical emu thread (~13ms/frame descheduling measured:
+// app runFrame 33.5ms vs 20.4ms headless). DraStic pins its render/raster threads (07).
+static void litevPinRenderThread()
+{
+    // The normal mask deliberately gives the asynchronous 2D worker all three
+    // non-emulator cores.  A fixed core can nevertheless be a useful
+    // scheduler/queueing diagnostic on small SoCs; leave the shipping mask
+    // unchanged unless the property explicitly names core 0, 1, or 2.
+    int selected = -1;
+#if defined(__ANDROID__)
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get("debug.litev.s2dcpu", value) > 0)
+    {
+        int requested = atoi(value);
+        if (requested >= 0 && requested <= 2)
+            selected = requested;
+    }
+#endif
+    cpu_set_t set; CPU_ZERO(&set);
+    if (selected >= 0)
+        CPU_SET(selected, &set);
+    else
+    {
+        CPU_SET(0, &set); CPU_SET(1, &set); CPU_SET(2, &set);
+    }
+    sched_setaffinity(0, sizeof(set), &set);
+    Platform::Log(Platform::Info, "LITEV_S2DCPU resolved=%d\n", selected);
+}
+#else
 static void litevPinRenderThread() {}
+#endif
 
 void SoftRenderer::AsyncRenderThreadFunc()
 {

@@ -25,6 +25,19 @@
 #include "GPU.h"
 #include "LitevSoftProf.h"
 
+#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
+#include <sched.h>
+// Pin the software 3D render thread to cores {0,1,2}, off the emu's core
+// (3), so it stops preempting the critical emu thread.
+static void litevPinRenderThread()
+{
+    cpu_set_t set; CPU_ZERO(&set);
+    CPU_SET(0, &set); CPU_SET(1, &set); CPU_SET(2, &set);
+    sched_setaffinity(0, sizeof(set), &set);
+}
+#else
+static void litevPinRenderThread() {}
+#endif
 
 namespace melonDS
 {
@@ -1813,6 +1826,7 @@ void SoftRenderer3D::RestartFrame()
 
 void SoftRenderer3D::RenderThreadFunc()
 {
+    litevPinRenderThread();
     LSP_NAME("s3d-rt");
     for (;;)
     {

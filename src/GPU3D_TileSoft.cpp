@@ -37,7 +37,21 @@
 #include "LiteProfile.h"   // async attribution counters (compiles to nothing unless LITEV_PROFILE=1)
 #include "LitevSoftProf.h" // tile-coordinator ownership-barrier attribution
 
+#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
+#include <sched.h>
+// Pin each tile band-worker to its OWN core among {0,1,2}, off the emu's core (3). The shared
+// {0,1,2} mask let the scheduler double two workers onto one core and leave another idle (measured:
+// all 3 rarely on distinct cores), so the 3-way raster ran ~2-wide and inflated the render gate the
+// emu waits on. A distinct core per worker guarantees the parallel spread.
+static void litevPinTileWorker(int idx)
+{
+    cpu_set_t set; CPU_ZERO(&set);
+    CPU_SET(idx % 3, &set);
+    sched_setaffinity(0, sizeof(set), &set);
+}
+#else
 static void litevPinTileWorker(int) {}
+#endif
 
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
