@@ -433,7 +433,12 @@ int main(int argc, char** argv)
 
     if (opt.frameskip > 0)
     {
+#ifdef LITEV_AGGRESSIVE_SKIP
+        nds->GPU.SetFrameskipTarget(opt.frameskip);
+        fprintf(stderr, "frameskip: rendering 1 of every %d frames\n", opt.frameskip + 1);
+#else
         fprintf(stderr, "warning: --frameskip ignored (build lacks LITEV_AGGRESSIVE_SKIP)\n");
+#endif
     }
 
     // Report the engine that ACTUALLY engaged (not just what was requested), so a

@@ -184,6 +184,10 @@ if (LITEV_SPU_FAST_INTERP)
     target_compile_definitions(core PUBLIC LITEV_SPU_FAST_INTERP)
 endif()
 
+if (LITEV_AGGRESSIVE_SKIP)
+    target_compile_definitions(core PUBLIC LITEV_AGGRESSIVE_SKIP)
+endif()
+
 if (LITEV_GXFIFO_THREADED)
     # DraStic backlog #3: batched GXFIFO threaded-code interpreter. Builds on the
     # computed-goto jump table AND additionally
