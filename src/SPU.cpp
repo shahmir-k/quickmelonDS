@@ -681,6 +681,17 @@ s32 SPUChannel::Run(u32 cycles)
     s32 val = (s32)CurSample;
 
     // interpolation (emulation improvement, not a hardware feature)
+#ifdef LITEV_SPU_FAST_INTERP
+    // liteDS-v2 (M4): replace the cubic/cosine/Gaussian interpolation with a
+    // cheap linear blend using the raw fractional timer position. Trades a
+    // divide + table lookups for a single mul/add pair. Any InterpType other
+    // than None collapses to this path.
+    if ((type < 3) && (InterpType != AudioInterpolation::None))
+    {
+        s32 frac = (Timer >> 8) & 0xFF;
+        val = ((val * frac) + ((s32)PrevSample[0] * (0xFF - frac))) >> 8;
+    }
+#else
     if ((type < 3) && (InterpType != AudioInterpolation::None))
     {
         s32 samplepos = ((Timer - TimerReload) * 0x100) / (0x10000 - TimerReload);
@@ -721,6 +732,7 @@ s32 SPUChannel::Run(u32 cycles)
             break;
         }
     }
+#endif // LITEV_SPU_FAST_INTERP
 
     val <<= VolumeShift;
     val *= Volume;

@@ -494,6 +494,7 @@ if (LITEV_JIT_FLAGMERGE)
         add_compile_definitions(LITEV_JIT_FLAGMERGE=1)
     endif()
 endif()
+option(LITEV_SPU_FAST_INTERP "Replace SPU channel interpolation with cheap linear interp" OFF)
 
 # Instant ARM9 hardware divider/sqrt: compute the DIV/SQRT result at register-
 # write time and skip the scheduled completion event. In-race profiling showed
