@@ -529,6 +529,24 @@ if (LITEV_COARSE_RTC)
     add_compile_definitions(LITEV_COARSE_RTC=1)
 endif()
 
+# DraStic-style aggressive idle-loop recognition (teardown doc 01 item 6). Stock
+# melonDS's IsIdleLoop (ARMJIT.cpp) rejects any loop with a cross-iteration
+# register recurrence (a register read before it is rewritten in the iteration --
+# e.g. a spin/timeout counter or a poll that also bumps a tick). DraStic
+# fast-forwards such loops anyway: the recurrent register is a dead
+# timeout/accumulator and the observable wait outcome is driven by the memory/IO
+# the loop polls, not by that register's exact value. With this flag IsIdleLoop
+# accepts the loop as long as it does NO store and NO coprocessor access (both
+# still hard-rejected), so it only reads mem/IO, computes in regs, and branches
+# back. Fast-forwards the CPU to the next scheduled event on each such taken
+# back-branch (same mechanism as stock idle loops). Accuracy tradeoff (FPS-first)
+# -- a genuine register-recurrent compute loop that also polls would advance one
+# iteration per event; verify no desync. Default OFF.
+option(LITEV_IDLE_AGGRESSIVE "DraStic: recognize register-recurrent poll loops as idle (fast-forward)" OFF)
+if (LITEV_IDLE_AGGRESSIVE)
+    add_compile_definitions(LITEV_IDLE_AGGRESSIVE=1)
+endif()
+
 # DraStic-style "baked" timer deadline (attacks the run_system bucket). Under
 # LITEV_EVENT_SLICES, NextTarget() recomputes NextTimerDeadline() on every one of
 # the ~1957 scheduler iterations/frame -- an 8-timer scan whose result is provably

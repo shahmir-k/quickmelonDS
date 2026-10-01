@@ -446,27 +446,93 @@ bool IsIdleLoop(bool thumb, FetchedInstr* instrs, int instrsCount)
     // the rules are quite simple
 
     JIT_DEBUGPRINT("checking potential idle loop\n");
+    LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.IdleCandidates);
     u16 regsWrittenTo = 0;
     u16 regsDisallowedToWrite = 0;
+    // LITEV_IDLE_AGGRESSIVE bookkeeping: which registers carry a cross-iteration
+    // recurrence, and which registers are used as the ADDRESS of a load. A true
+    // wait/poll loop reads a loop-INVARIANT address (the polled reg is not
+    // recurrent) and its recurrence is a dead spin/timeout counter. A memory
+    // SCAN/COPY has a recurrent address register (post-indexed pointer) and does
+    // REAL work each iteration -- skipping it desyncs. So we relax the recurrence
+    // reject only when no recurrent register feeds a load address.
+    u16 recurrentRegs = 0;
+    u16 loadAddrRegs = 0;
+    bool hasLoad = false;
+    bool regDepHit = false;
+    bool regDepCounted = false; (void)regDepCounted; (void)recurrentRegs;
+    (void)loadAddrRegs; (void)hasLoad; (void)regDepHit;
     for (int i = 0; i < instrsCount; i++)
     {
         JIT_DEBUGPRINT("instr %d %08x regs(%x %x) %x %x\n", i, instrs[i].Instr, instrs[i].Info.DstRegs, instrs[i].Info.SrcRegs, regsWrittenTo, regsDisallowedToWrite);
         if (instrs[i].Info.SpecialKind == ARMInstrInfo::special_WriteMem)
+        {
+            // A store in the loop body: the loop mutates memory each iteration,
+            // so its effect is NOT purely "wait for an external event". Never
+            // relaxed — skipping it would drop the writes and desync.
+            LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.IdleRejWriteMem);
             return false;
+        }
         if (!thumb && instrs[i].Info.Kind >= ARMInstrInfo::ak_MSR_IMM && instrs[i].Info.Kind <= ARMInstrInfo::ak_MRC)
+        {
+            LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.IdleRejCoproc);
             return false;
+        }
         if (i < instrsCount - 1 && instrs[i].Info.Branches())
+        {
+            LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.IdleRejBranch);
             return false;
+        }
 
         u16 srcRegs = instrs[i].Info.SrcRegs & ~(1 << 15);
         u16 dstRegs = instrs[i].Info.DstRegs & ~(1 << 15);
 
+        if (instrs[i].Info.SpecialKind == ARMInstrInfo::special_LoadMem
+            || instrs[i].Info.SpecialKind == ARMInstrInfo::special_LoadLiteral)
+        {
+            hasLoad = true;
+            loadAddrRegs |= srcRegs; // the load's source regs are its address operands
+        }
+
         regsDisallowedToWrite |= srcRegs & ~regsWrittenTo;
 
         if (dstRegs & regsDisallowedToWrite)
+        {
+            // Cross-iteration register recurrence: a register is read before it
+            // is (re)written within the iteration, so iteration N+1 depends on
+            // iteration N's register state (e.g. a spin/timeout counter
+            // `subs rN,rN,#1; bne` or a poll that also bumps a tick count).
+            // Stock melonDS conservatively rejects these. DraStic fast-forwards
+            // wait/poll loops anyway (teardown doc 01 item 6): the recurrent
+            // register is a dead timeout/accumulator and the observable wait
+            // outcome is driven by the loop-invariant memory/IO it polls.
+            recurrentRegs |= dstRegs & regsDisallowedToWrite;
+            regDepHit = true;
+            if (!regDepCounted)
+            {
+                LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.IdleRejRegDep);
+                regDepCounted = true;
+            }
+#ifndef LITEV_IDLE_AGGRESSIVE
             return false;
+#endif
+        }
         regsWrittenTo |= dstRegs;
     }
+#ifdef LITEV_IDLE_AGGRESSIVE
+    if (regDepHit)
+    {
+        // Relax the recurrence reject ONLY for a genuine wait/poll: the loop must
+        // read memory/IO (hasLoad) and NONE of its recurrent registers may be a
+        // load-address operand. That excludes memory scans/copies (post-indexed
+        // pointer recurs) and pure register compute/delay loops (no load), whose
+        // register state is real work — skipping those desyncs the game (starves
+        // per-frame logic, corrupts the render). Stores/coproc already rejected.
+        if (!(hasLoad && (recurrentRegs & loadAddrRegs) == 0))
+            return false;
+    }
+#endif
+    LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.IdleAccepted);
     return true;
 }
 
