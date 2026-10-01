@@ -541,6 +541,23 @@ if (LITEV_COARSE_RTC)
     add_compile_definitions(LITEV_COARSE_RTC=1)
 endif()
 
+# DraStic-style DMA streamlining for the GXFIFO geometry-DMA path (the dominant
+# in-race DMA: MainRAM display-list -> 0x04000400, fixed dst, incrementing src).
+# The stock loop routes every word through NDS::ARM9Read32 (region decode) and
+# NDS::ARM9Write32 -> ARM9IOWrite32 -> GPU3D::Write32 (I/O address dispatch) before
+# reaching GPU3D::WriteToGXFIFO. Since IsGXFIFODMA already proves src==MainRAM /
+# dst==0x04000400 / DstAddrInc==0, this fast path reads the source word directly
+# from MainRAM (exactly what ARM9Read32's 0x02 case does) and calls WriteToGXFIFO
+# directly (exactly what the 0x400 dispatch resolves to, incl. the GeometryEnabled
+# guard). Per-word DMA timing (UnitTimings9_32) and stall handling are unchanged,
+# so this is BIT-EXACT dispatch elision, not an accuracy tradeoff. Profiled on the
+# Shrek race: DMA::Run9 is ~10.5% of the emu thread and ~60% of that is this
+# GXFIFO chain. Default OFF.
+option(LITEV_DMA_GXFIFO_FAST "DraStic: direct MainRAM->WriteToGXFIFO fast path for geometry DMA (dispatch elision)" OFF)
+if (LITEV_DMA_GXFIFO_FAST)
+    add_compile_definitions(LITEV_DMA_GXFIFO_FAST=1)
+endif()
+
 # Lazy-load the ARM9 32-bit DMA-unit memory timings (DMA::UnitTimings9_32, ~1.5% of the emu
 # thread): defer the 4 ARM9MemTimings[][6/7] loads into the branch that reads them so the hot
 # geometry-DMA burst path (which uses none on a non-refresh unit) skips them. BIT-EXACT (same

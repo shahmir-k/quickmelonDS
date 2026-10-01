@@ -25,6 +25,19 @@
 #include "DMA_Timings.h"
 #include "Platform.h"
 
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#include <cstring>
+#include <cstdlib>
+// default-ON variant: true unless the prop is explicitly present and "0". Lets a compiled-in
+// lever ship ON by default while an A/B (which always sets the prop 0/1) can still force it off.
+static bool litevDmaPropDefaultOn(const char* name) {
+    char b[8] = {0};
+    int n = __system_property_get(name, b);
+    return (n > 0) ? (atoi(b) != 0) : true;
+}
+#endif
+
 namespace melonDS
 {
 using Platform::Log;
@@ -406,6 +419,23 @@ u32 DMA::UnitTimings9_32(bool burststart)
     }
 }
 
+// Exact specialization of UnitTimings9_32's MainRAM-incrementing branch for the
+// fixed 0x04000400 geometry FIFO destination. Callers retain the generic path
+// when the source does not increment. The destination timing index is constant:
+// 0x04000400 >> 14 == 0x1000. This performs the identical burst-table state
+// transition and returns the identical guest-cycle value without region-map loads.
+u32 DMA::UnitTimings9_32_GXFIFO(bool burststart)
+{
+    if (burststart || MRAMBurstTable[MRAMBurstCount] == 0)
+    {
+        MRAMBurstCount = 0;
+        const u32 dst_n = NDS.ARM9MemTimings[0x1000][6];
+        MRAMBurstTable = (dst_n == 2) ?
+            DMATiming::MRAMRead32Bursts[0] : DMATiming::MRAMRead32Bursts[1];
+    }
+    return MRAMBurstTable[MRAMBurstCount++];
+}
+
 // TODO: the ARM7 ones don't take into account that the two wifi regions have different timings
 
 u32 DMA::UnitTimings7_16(bool burststart)
@@ -611,6 +641,82 @@ void DMA::Run9()
             if (NDS.ARM9Timestamp >= NDS.ARM9Target) break;
         }
     }
+#ifdef LITEV_DMA_GXFIFO_FAST
+    else if (IsGXFIFODMA)
+    {
+        // DraStic-style geometry-DMA fast path. IsGXFIFODMA already guarantees
+        // src is MainRAM (0x02), dst is the fixed GXFIFO register 0x04000400, and
+        // DstAddrInc==0. Reading directly from MainRAM is exactly what
+        // NDS::ARM9Read32's 0x02000000 case does; calling WriteToGXFIFO (under the
+        // GeometryEnabled guard) is exactly what ARM9Write32->ARM9IOWrite32->
+        // GPU3D::Write32(0x400) resolves to. Timing + stall handling are untouched,
+        // so this is bit-exact — it only elides the per-word address decode.
+        GPU3D& gpu3d = NDS.GPU.GPU3D;
+#if defined(__ANDROID__)
+        // Exact fixed-GXFIFO timing specialization; default ON, but retained
+        // as a launch-time A/B property for validation and regression isolation.
+        static int _gxfifotiming = litevDmaPropDefaultOn("debug.litev.gxfifotiming") ? 1 : 0;
+        // Candidate: keep the identical GXFIFO burst-table state transition in
+        // Run9's hot loop, removing the per-word out-of-line helper call.  It
+        // defaults ON after the byte-exact A/B gate; the generic path remains
+        // available as the direct regression control.
+        static int _gxtiminginline = litevDmaPropDefaultOn("debug.litev.gxtiminginline") ? 1 : 0;
+#else
+        static int _gxfifotiming = 1;
+        static int _gxtiminginline = 0;
+#endif
+        if (_gxtiminginline && _gxfifotiming && SrcAddrInc > 0)
+        {
+            while (IterCount > 0 && !Stall)
+            {
+                // Textually identical to UnitTimings9_32_GXFIFO: this route's
+                // fixed destination has a constant timing index (0x1000).
+                if (burststart || MRAMBurstTable[MRAMBurstCount] == 0)
+                {
+                    MRAMBurstCount = 0;
+                    const u32 dst_n = NDS.ARM9MemTimings[0x1000][6];
+                    MRAMBurstTable = (dst_n == 2) ?
+                        DMATiming::MRAMRead32Bursts[0] : DMATiming::MRAMRead32Bursts[1];
+                }
+                NDS.ARM9Timestamp += (MRAMBurstTable[MRAMBurstCount++] << NDS.ARM9ClockShift);
+                burststart = false;
+
+                u32 val = *(u32*)&NDS.MainRAM[CurSrcAddr & NDS.MainRAMMask];
+                if (gpu3d.GeometryEnabled)
+                {
+                    gpu3d.WriteToGXFIFO(val);
+                }
+
+                CurSrcAddr += SrcAddrInc<<2;
+                CurDstAddr += DstAddrInc<<2;
+                IterCount--;
+                RemCount--;
+
+                if (NDS.ARM9Timestamp >= NDS.ARM9Target) break;
+            }
+        }
+        else while (IterCount > 0 && !Stall)
+        {
+            const u32 timing = (_gxfifotiming && SrcAddrInc > 0) ?
+                UnitTimings9_32_GXFIFO(burststart) : UnitTimings9_32(burststart);
+            NDS.ARM9Timestamp += (timing << NDS.ARM9ClockShift);
+            burststart = false;
+
+            u32 val = *(u32*)&NDS.MainRAM[CurSrcAddr & NDS.MainRAMMask];
+            if (gpu3d.GeometryEnabled)
+            {
+                gpu3d.WriteToGXFIFO(val);
+            }
+
+            CurSrcAddr += SrcAddrInc<<2;
+            CurDstAddr += DstAddrInc<<2;   // DstAddrInc==0 (fixed dst)
+            IterCount--;
+            RemCount--;
+
+            if (NDS.ARM9Timestamp >= NDS.ARM9Target) break;
+        }
+    }
+#endif
     else
     {
         while (IterCount > 0 && !Stall)

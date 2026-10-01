@@ -42,6 +42,7 @@ public:
 
     u32 UnitTimings9_16(bool burststart);
     u32 UnitTimings9_32(bool burststart);
+    u32 UnitTimings9_32_GXFIFO(bool burststart);
     u32 UnitTimings7_16(bool burststart);
     u32 UnitTimings7_32(bool burststart);
 
