@@ -144,6 +144,24 @@ if (LITEV_JIT_DISPATCH)
     endif()
 endif()
 
+# Stage 2 (liteDS-v2 core-speed / DraStic parity): native-NZCV condition guard.
+# EXACTNESS-PRESERVING. For guest ARM instructions with a COMPOUND condition
+# (cond >= 8: HI/LS/GE/LT/GT/LE), the upstream CheckCondition emits a 5-instruction
+# flag-table lookup out of RCPSR. Since this backend keeps guest CPSR in a GP reg
+# (not host NZCV), we can instead transiently `MSR NZCV, X<cpsr>` and use a native
+# `B.<inverted-cond>` skip (2 instructions). Same architectural branch decision,
+# fewer host ops / smaller blocks. Single-flag conditions (cond < 8, already a
+# 1-instruction TBZ/TBNZ) are left untouched. No register-cache / cycle-model
+# interaction, so ON must stay bit-exact on the exact-timing goldens. AArch64 only.
+option(LITEV_JIT_CONDFOLD "Stage 2: native-NZCV guard for compound conditions (exactness-preserving, AArch64)" OFF)
+if (LITEV_JIT_CONDFOLD)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_CONDFOLD=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_CONDFOLD requires an AArch64 target.")
+    endif()
+endif()
+
 # Unit 4: direct block linking (patch, don't dispatch). Builds ON TOP of the
 # Unit 3 dispatcher: an eligible block exit whose next PC is a compile-time
 # constant emits a per-hop-commit guard followed by a patchable `B` (initially to

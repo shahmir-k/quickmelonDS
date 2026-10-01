@@ -538,12 +538,25 @@ FixupBranch Compiler::CheckCondition(u32 cond)
 {
     if (cond >= 0x8)
     {
+#ifdef LITEV_JIT_CONDFOLD
+        // Compound condition (HI/LS/GE/LT/GT/LE). Guest CPSR lives in RCPSR with
+        // NZCV in bits [31:28] — exactly the layout MSR NZCV consumes. Push the
+        // guest flags into the host PSTATE and let the hardware evaluate the
+        // condition natively. CCFlags is encoded identically to the ARM cond
+        // field (CC_EQ..CC_LE == 0..13), and inverting an AArch64 condition is a
+        // low-bit flip (cond ^ 1). We want to SKIP when the condition is FALSE,
+        // so branch on the inverted condition. Bit-for-bit the same decision as
+        // the flag-table path below, in 2 host instructions instead of 5.
+        _MSR(FIELD_NZCV, EncodeRegTo64(RCPSR));
+        return B((CCFlags)(cond ^ 1));
+#else
         LSR(W1, RCPSR, 28);
         MOVI2R(W2, 1);
         LSLV(W2, W2, W1);
         ANDI2R(W2, W2, ARM::ConditionTable[cond], W3);
 
         return CBZ(W2);
+#endif
     }
     else
     {
