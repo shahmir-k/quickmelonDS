@@ -51,6 +51,10 @@ static_assert(offsetof(ARM, CPSR) == ARM_CPSR_offset,
     "ARM_CPSR_offset out of sync with ARM::CPSR");
 static_assert(offsetof(ARM, CyclesBudget) == ARM_CyclesBudget_offset,
     "ARM_CyclesBudget_offset out of sync with ARM::CyclesBudget");
+#ifdef LITEV_JIT_LAZYFLAGS
+static_assert(offsetof(ARM, JitNZCV) == ARM_JitNZCV_offset,
+    "ARM_JitNZCV_offset out of sync with ARM::JitNZCV (V2 NZCV mirror slot)");
+#endif
 // Unit 3 dispatcher lookup fields (see ARMJIT_Offsets.h). Proven here so a layout
 // shift fails the build rather than corrupting the emitted inline block lookup.
 static_assert(offsetof(ARM, FastBlockLookupStart) == ARM_FastBlockLookupStart_offset,
@@ -90,6 +94,12 @@ static const struct { int GuestReg; Arm64Gen::ARM64Reg HostReg; } GlobalRegPins[
     { 4, Arm64Gen::W23 },
     { 5, Arm64Gen::W24 },
     { 6, Arm64Gen::W25 },
+#if defined(LITEV_JIT_LAZYFLAGS)
+    // FULL LAZY-FLAGS frees W27 (formerly RCPSR, the whole-CPSR carrier) as the 8th
+    // global pin: guest r7 -> W27. Only when SWTABLE is OFF (else r7->W26 above and W27
+    // is left as scratch-pool relief). ARM_Dispatch/Ret load/spill w27 in lockstep.
+    { 7, Arm64Gen::W27 },
+#endif
 };
 static constexpr int NumGlobalRegPins = sizeof(GlobalRegPins) / sizeof(GlobalRegPins[0]);
 // r0..r5 are always pinned; r6 unless it is repurposed as the down-counter's Ran
@@ -98,6 +108,9 @@ static constexpr int NumGlobalRegPins = sizeof(GlobalRegPins) / sizeof(GlobalReg
 static constexpr u16 GlobalRegPinnedMask =
     0x003F
     | 0x0040   // r6
+#if defined(LITEV_JIT_LAZYFLAGS)
+    | 0x0080   // r7 (W26 via sw-table, or W27 freed by lazy-flags)
+#endif
     ;
 #endif
 
@@ -137,14 +150,35 @@ void Compiler::A_Comp_MRS()
 
     if (CurInstr.Instr & (1 << 22))
     {
+#ifdef LITEV_JIT_LAZYFLAGS
+        LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, CPSR));   // control-only (mode) read
+        ANDI2R(W5, W5, 0x1F);
+#else
         ANDI2R(W5, RCPSR, 0x1F);
+#endif
         MOVI2R(W3, 0);
         MOVI2R(W1, 15 - 8);
         BL(ReadBanked);
         MOV(rd, W3);
     }
     else
+    {
+#ifdef LITEV_JIT_LAZYFLAGS
+        // V2 full CPSR read: the guest CPSR word = ARM::CPSR control bits [27:0] (always
+        // canonical) merged with the JitNZCV slot's NZCV nibble [31:28]. Flush any host-
+        // resident guest flags to the slot first (Comp_MaterializeFlags -> slot; for an
+        // unconditional MRS ReconcileFlags already did this via ReadFlags, so it is a no-op
+        // then). Then rd = (CPSR & 0x0FFFFFFF) | (slot & 0xF0000000). rd is a mapped guest
+        // reg (never W0/W1), so W0/W1 are safe scratch.
+        Comp_MaterializeFlags();
+        LDR(INDEX_UNSIGNED, rd, RCPU, offsetof(ARM, CPSR));
+        LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));
+        ANDI2R(rd, rd, 0x0FFFFFFF, W1);
+        ORR(rd, rd, W0);
+#else
         MOV(rd, RCPSR);
+#endif
+    }
 }
 
 void UpdateModeTrampoline(ARM* arm, u32 oldmode, u32 newmode)
@@ -175,14 +209,24 @@ void Compiler::A_Comp_MSR()
 
     if (CurInstr.Instr & (1 << 22))
     {
+#ifdef LITEV_JIT_LAZYFLAGS
+        LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, CPSR));   // mode (control) read
+        ANDI2R(W5, W5, 0x1F);
+#else
         ANDI2R(W5, RCPSR, 0x1F);
+#endif
         MOVI2R(W3, 0);
         MOVI2R(W1, 15 - 8);
         BL(ReadBanked);
 
         MOVI2R(W1, mask);
         MOVI2R(W2, mask & 0xFFFFFF00);
+#ifdef LITEV_JIT_LAZYFLAGS
+        LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, CPSR));   // mode (control) read
+        ANDI2R(W5, W5, 0x1F);
+#else
         ANDI2R(W5, RCPSR, 0x1F);
+#endif
         CMP(W5, 0x10);
         CSEL(W1, W2, W1, CC_EQ);
 
@@ -199,6 +243,57 @@ void Compiler::A_Comp_MSR()
         mask &= 0xFFFFFFDF;
         CPSRDirty = true;
 
+#ifdef LITEV_JIT_LAZYFLAGS
+        // MSR can write the flag byte; its InstrInfo WriteFlags==0xF makes ReconcileFlags's
+        // full-producer fast path SKIP the flush, yet MSR does NOT set host NZCV. Flush any
+        // host-resident guest flags to memory NOW so the following memory RMW is not later
+        // clobbered by a stale materialize (and NZCVDeferred is cleared).
+        Comp_MaterializeFlags();
+        if ((mask & 0xFF) == 0)
+        {
+            LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CPSR));
+            ANDI2R(W1, W1, ~mask);
+            ANDI2R(W0, val, mask);
+            ORR(W1, W1, W0);
+            STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CPSR));
+        }
+        else
+        {
+            LDR(INDEX_UNSIGNED, W4, RCPU, offsetof(ARM, CPSR));   // W4 = CPSR word
+            MOVI2R(W2, mask);
+            MOVI2R(W3, mask & 0xFFFFFF00);
+            ANDI2R(W1, W4, 0x1F);
+            // W1 = first argument (old mode)
+            CMP(W1, 0x10);
+            CSEL(W2, W3, W2, CC_EQ);
+
+            BIC(W4, W4, W2);
+            AND(W0, val, W2);
+            ORR(W4, W4, W0);
+            STR(INDEX_UNSIGNED, W4, RCPU, offsetof(ARM, CPSR));
+
+            MOV(W2, W4);   // newmode arg
+            MOV(X0, RCPU);
+
+            PushRegs(true, true);
+            QuickCallFunction(X3, UpdateModeTrampoline);
+            PopRegs(true, true);
+        }
+
+        // V2: if this MSR wrote the guest flag byte, ARM::CPSR[31:28] now holds the NEW
+        // guest NZCV; refresh the JitNZCV slot (the in-slice NZCV home) from it so the
+        // resuming JIT observes the new flags. If the flag byte was NOT written, the slot
+        // still holds the canonical NZCV (untouched here) and CPSR[31:28] is stale-but-
+        // harmless (re-synced at the next escape / the slice merge), so the slot is left
+        // alone. NZCVDeferred is 0 (Comp_MaterializeFlags above); W0/W1 are free.
+        if (mask & 0xF0000000)
+        {
+            LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, CPSR));
+            ANDI2R(W0, W0, 0xF0000000, W1);
+            STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));
+        }
+    }
+#else
         if ((mask & 0xFF) == 0)
         {
             ANDI2R(RCPSR, RCPSR, ~mask);
@@ -226,6 +321,7 @@ void Compiler::A_Comp_MSR()
             PopRegs(true, true);
         }
     }
+#endif
 }
 
 
@@ -422,8 +518,18 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
             {
                 for (int reg = 0; reg < 32; reg++)
                 {
+                    // FULL LAZY-FLAGS pins guest r7 -> W27 (the freed RCPSR reg). A guest
+                    // LDR/STR r7 through the fault-based fastmem path indexes these tables by
+                    // the mapped host reg, so W27 needs its own patched load/store funcs (the
+                    // shipping LAZYFLAGS config has SWTABLE OFF, so fault-fastmem is the memory
+                    // mechanism). Missing -> a NULL PatchFunc -> wild BL -> SIGILL at boot.
+#ifdef LITEV_JIT_LAZYFLAGS
+                    if (!(reg == W4 || (reg >= W8 && reg <= W15) || (reg >= W19 && reg <= W25) || reg == W27))
+                        continue;
+#else
                     if (!(reg == W4 || (reg >= W8 && reg <= W15) || (reg >= W19 && reg <= W25)))
                         continue;
+#endif
                     ARM64Reg rdMapped = (ARM64Reg)reg;
                     PatchedStoreFuncs[consoleType][num][size][reg] = GetRXPtr();
                     if (num == 0)
@@ -561,7 +667,18 @@ void Compiler::SaveReg(int reg, ARM64Reg nativeReg)
 void Compiler::LoadCPSR()
 {
     assert(!CPSRDirty);
+#ifdef LITEV_JIT_LAZYFLAGS
+    // V2: no RCPSR register to reload — but the within-slice C++ escape we are returning
+    // from (interpreter fallback / restoreCPSR trampoline) may have written the guest NZCV
+    // straight into ARM::CPSR[31:28]. Refresh the JitNZCV slot (the in-slice NZCV home)
+    // from ARM::CPSR so the resuming JIT reads the up-to-date flags. NZCVDeferred is 0 at
+    // every LoadCPSR site (the matching SaveCPSR cleared it). W0/W1 are free.
+    LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, CPSR));
+    ANDI2R(W0, W0, 0xF0000000, W1);
+    STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));
+#else
     LDR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+#endif
 }
 
 void Compiler::SaveCPSR(bool markClean)
@@ -572,11 +689,26 @@ void Compiler::SaveCPSR(bool markClean)
     // LAZYFLAGS this flushes host NZCV into the JitNZCV slot.
     Comp_MaterializeFlags();
 #endif
+#ifdef LITEV_JIT_LAZYFLAGS
+    // V2: the materialize above put the guest NZCV in the JitNZCV slot and the control bits
+    // are always canonical in ARM::CPSR — but ARM::CPSR[31:28] itself is now STALE (V2 does
+    // NOT keep the full word current mid-slice). Merge the slot's NZCV nibble into the
+    // ARM::CPSR word so the imminent within-slice C++/interpreter/trampoline reader observes
+    // a fully-canonical CPSR (LoadCPSR refreshes the slot back afterwards). W0/W1/W2 free.
+    LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));   // W0 = NZCV<<28 (low bits 0)
+    LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CPSR));      // control (+ stale NZCV)
+    ANDI2R(W1, W1, 0x0FFFFFFF, W2);                          // clear the stale NZCV nibble
+    ORR(W1, W1, W0);
+    STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CPSR));
+    if (markClean)
+        CPSRDirty = false;
+#else
     if (CPSRDirty)
     {
         STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
         CPSRDirty = CPSRDirty && !markClean;
     }
+#endif
 }
 
 FixupBranch Compiler::CheckCondition(u32 cond)
@@ -604,6 +736,30 @@ FixupBranch Compiler::CheckCondition(u32 cond)
         // LAZYFLAGS reloads the full guest CPSR from ARM::CPSR memory.
     }
 #endif
+#ifdef LITEV_JIT_LAZYFLAGS
+    // V2: RCPSR is gone and the guest NZCV is homed in the JitNZCV slot (NZCV in [31:28],
+    // low bits 0). Read the condition from the slot: if the FIXEDREG block above hit the
+    // FR_HOST_NZ path it just materialised N,Z into the slot (C,V were already there); under
+    // FR_MEMORY the slot is canonical. Load it into a scratch (W1) and evaluate exactly as
+    // the RCPSR path did — MSR NZCV consumes [31:28] and TBNZ/TBZ test a single bit in
+    // [28..31], so the zero low bits are irrelevant. LAZYFLAGS requires CONDFOLD.
+    {
+        LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+        if (cond >= 0x8)
+        {
+            _MSR(FIELD_NZCV, EncodeRegTo64(W1));
+            return B((CCFlags)(cond ^ 1));
+        }
+        else
+        {
+            u8 bit = (28 + ((~(cond >> 1) & 1) << 1 | (cond >> 2 & 1) ^ (cond >> 1 & 1)));
+            if (cond & 1)
+                return TBNZ(W1, bit);
+            else
+                return TBZ(W1, bit);
+        }
+    }
+#else
     if (cond >= 0x8)
     {
 #ifdef LITEV_JIT_CONDFOLD
@@ -635,6 +791,7 @@ FixupBranch Compiler::CheckCondition(u32 cond)
         else
             return TBZ(RCPSR, bit);
     }
+#endif
 }
 
 #define F(x) &Compiler::A_Comp_##x
@@ -825,7 +982,14 @@ void* Compiler::Gen_Dispatcher(u32 num)
 
     // (d) instrAddr = R[15] - ((CPSR&0x20)?2:4) == (R[15] - 4) + (thumb << 1), as in the loop
     LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
+#ifdef LITEV_JIT_LAZYFLAGS
+    // RCPSR(W27) is now guest r7; read the Thumb bit from the canonical ARM::CPSR memory
+    // (the exiting block materialized NZCV + control is always current, so it is canonical).
+    LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, CPSR));
+    UBFX(W3, W3, 5, 1);                               // W3 = Thumb bit
+#else
     UBFX(W3, RCPSR, 5, 1);                            // W3 = Thumb bit
+#endif
     SUB(W0, W0, 4);
     ADD(W0, W0, W3, ArithOption(W3, ST_LSL, 1));      // W0 = clean instrAddr
 
@@ -860,7 +1024,9 @@ void* Compiler::Gen_Dispatcher(u32 num)
     //     assuming CPSR-in-memory is current at their entry (per-block CPSRDirty starts false,
     //     so an interpreter-fallback first instruction skips its SaveCPSR); upstream upholds
     //     this via ARM_Ret's CPSR store, which chaining bypasses.
+#ifndef LITEV_JIT_LAZYFLAGS
     STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+#endif
     // LAZYFLAGS: ARM::CPSR is already canonical in memory at every block exit (the exiting
     // block materialized host NZCV and control bits are never register-cached), so the
     // per-hop commit is unnecessary; W27 now holds guest r7 and must not be stored here.
@@ -897,6 +1063,14 @@ void* Compiler::Gen_Dispatcher(u32 num)
 
 void Compiler::EmitBlockExit()
 {
+#ifdef LITEV_JIT_LAZYFLAGS
+    // The dispatcher no longer stores RCPSR, so ARM::CPSR memory MUST be canonical here.
+    // In every path this exit is reached the flags were already flushed (block-end 1419 /
+    // Comp_JumpTo / CheckCondition), so this is a compile-time no-op (NZCVDeferred==0 ->
+    // emits nothing); it is the "flags-dirty-guarded" flush the design specifies, and it
+    // makes the invariant explicit / robust rather than implicit.
+    Comp_MaterializeFlags();
+#endif
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.DispatchOnlyExits);
     B(DispatcherEntry[Num]);
 }
@@ -920,6 +1094,13 @@ void Compiler::EmitBlockExit()
 // (link / unlink) concurrently with execution on ARMv8 without synchronisation.
 void Compiler::EmitLinkExit(u32 targetAddr)
 {
+#ifdef LITEV_JIT_LAZYFLAGS
+    // A linked hop bypasses the dispatcher AND (under LAZYFLAGS) neither the stub nor the
+    // inline (d) stores RCPSR, so ARM::CPSR memory MUST be canonical before the exit. It
+    // always is (the mid-block conditional edges reach here after Comp_JumpTo / CheckCondition
+    // flushed, and the block-end after 1419), so this guarded flush is a compile-time no-op.
+    Comp_MaterializeFlags();
+#endif
     void* tsPtr = (Num == 0) ? (void*)&NDS.ARM9Timestamp : (void*)&NDS.ARM7Timestamp;
 
     // (a)
@@ -941,7 +1122,9 @@ void Compiler::EmitLinkExit(u32 targetAddr)
     FixupBranch toDispatchBudget = B(CC_LE);
 
     // (d)
+#ifndef LITEV_JIT_LAZYFLAGS
     STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+#endif
     // LAZYFLAGS: ARM::CPSR already canonical in memory at the linkable exit; W27 = guest r7.
     u32 patchOffset = (u32)((u8*)GetRXPtr() - GetRXBase());
     B(DispatcherEntry[Num]);   // the patch slot (unlinked state)
@@ -1058,6 +1241,15 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     NZCVDeferred = 0;
     NZCVCondValid = false;
 #endif
+#ifdef LITEV_JIT_LAZYFLAGS
+    // V3 item 1: precompute the block's per-instruction flag LiveIn (barrier-conservative,
+    // block exit all-live). Used by Comp_MaterializeFlags' item-1b upgrade to prove the
+    // C,V it would preserve are dead. CompileBlock INTERPRETS the block on first compile
+    // elsewhere, but this pass is pure analysis over CurInstr[] and emits nothing.
+    Comp_ComputeFlagLiveness(instrs, instrsCount);
+    FlagsLiveInCur = 0xF;
+    CarryInHostResident = false;
+#endif
 
 #ifdef LITEV_JIT_LINK
     NumLinkExits = 0;
@@ -1073,6 +1265,13 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         CurInstr = instrs[i];
         R15 = CurInstr.Addr + (Thumb ? 4 : 8);
         CodeRegion = R15 >> 24;
+#ifdef LITEV_JIT_LAZYFLAGS
+        // V3: carry this instruction's flag LiveIn into the flush helpers, and clear the
+        // per-instruction native-carry signal (set only by Comp_ReconcileFlags for this
+        // instruction's ADC/SBC body).
+        FlagsLiveInCur = FlagsLiveIn[i];
+        CarryInHostResident = false;
+#endif
 
 #ifdef LITEV_JIT_LINK
         // Reset per instruction so a mid-block followed branch's static target does
@@ -1236,9 +1435,35 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         LastInstrCompiledNonBranch = (comp != NULL) && !CurInstr.Info.Branches();
         LastInstrFallthroughAddr = CurInstr.Addr + (Thumb ? 2 : 4);
 #endif
+#ifdef LITEV_JIT_LAZYFLAGS
+        // CORRECTNESS FIX (carry/overflow deferral is unsafe): never carry the guest C/V
+        // flags deferred-resident in the host PSTATE across an instruction boundary.
+        // The deferral tracking failed to materialize host C,V before a later host op
+        // clobbered them, so a subsequent guest conditional read stale C/V and took the
+        // WRONG branch — e.g. Pokémon White's intro mis-branched in its 3D geometry
+        // submission and dropped the professor's polygons (RenderNumPolygons 23->0 =>
+        // solid-white professor). Shrek never hit the pattern, and the CPU/RAM state
+        // re-converged, so both the Shrek gate and the state-trace oracle missed it;
+        // only a framebuffer diff vs the interpreter catches it.
+        //
+        // Fix: materialize eagerly whenever C or V is deferred (flushes the arithmetic
+        // producer's NZCV to the canonical JitNZCV slot now). The common logical-producer
+        // N/Z-only deferral is retained, so most of the lazy-flags win is kept. Validated
+        // byte-identical to the interpreter on Pokémon White (professor renders) and Shrek
+        // (no regression). The slot structure and the r7->W27 global pin are untouched.
+        if (NZCVDeferred & 0x3)
+            Comp_MaterializeFlags();
+#endif
     }
 
     RegCache.Flush();
+
+#ifdef LITEV_JIT_LAZYFLAGS
+    // V3: block boundary == all-live (slot must be fully canonical for ARM_Ret /
+    // dispatcher). Force FlagsLiveInCur=0xF so the block-end flush NEVER takes the
+    // item-1b C,V-clobber upgrade.
+    FlagsLiveInCur = 0xF;
+#endif
 #ifdef LITEV_JIT_FIXEDREG
     // Block ends with the last instruction's flags possibly still resident in host
     // NZCV (e.g. a trailing unconditional CMP). The dispatcher / ARM_Ret stores the

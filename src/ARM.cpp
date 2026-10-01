@@ -699,7 +699,26 @@ void ARMv5::Execute()
             CyclesBudget = (s32)std::min<s64>((s64)(NDS.ARM9Target - NDS.ARM9Timestamp), INT32_MAX);
 
             if (block)
+            {
+#ifdef LITEV_JIT_LAZYFLAGS
+                // V2 lazy-flags: bracket the JIT slice ONLY (not the CompileBlock path,
+                // which INTERPRETS the block and updates ARM::CPSR NZCV directly — see
+                // ARMJIT.cpp:996). Seed the per-slice NZCV mirror slot from the
+                // authoritative ARM::CPSR before entering JIT; inside the slice the JIT
+                // homes guest NZCV in host PSTATE / this slot and ARM::CPSR[31:28] goes
+                // stale. This keeps ARM::CPSR the single authoritative NZCV home for every
+                // C++ reader/writer (TriggerIRQ SPSR=CPSR, RestoreCPSR, savestate,
+                // interpreter-compile) outside the JIT slice.
+                JitNZCV = CPSR & 0xF0000000;
+#endif
                 ARM_Dispatch(this, block);
+#ifdef LITEV_JIT_LAZYFLAGS
+                // Merge the slice's final NZCV nibble (canonical in JitNZCV at every block
+                // exit) back into ARM::CPSR before any C++ observes it (the IRQ dispatch
+                // below does SPSR = CPSR).
+                CPSR = (CPSR & 0x0FFFFFFF) | (JitNZCV & 0xF0000000);
+#endif
+            }
             else
                 NDS.JIT.CompileBlock(this);
 
@@ -868,7 +887,17 @@ void ARMv4::Execute()
             CyclesBudget = (s32)std::min<s64>((s64)(NDS.ARM7Target - NDS.ARM7Timestamp), INT32_MAX);
 
             if (block)
+            {
+#ifdef LITEV_JIT_LAZYFLAGS
+                // V2 lazy-flags (ARM7 analog): bracket the JIT slice ONLY, not the
+                // CompileBlock (interpreter) path. See the ARM9 comment above.
+                JitNZCV = CPSR & 0xF0000000;
+#endif
                 ARM_Dispatch(this, block);
+#ifdef LITEV_JIT_LAZYFLAGS
+                CPSR = (CPSR & 0x0FFFFFFF) | (JitNZCV & 0xF0000000);
+#endif
+            }
             else
                 NDS.JIT.CompileBlock(this);
 

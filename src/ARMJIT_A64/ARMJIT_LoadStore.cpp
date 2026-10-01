@@ -194,7 +194,11 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
         ptrdiff_t memopStart = GetCodeOffset();
         LoadStorePatch patch;
 
-        assert((rdMapped >= W8 && rdMapped <= W15) || (rdMapped >= W19 && rdMapped <= W25) || rdMapped == W4);
+        assert((rdMapped >= W8 && rdMapped <= W15) || (rdMapped >= W19 && rdMapped <= W25) || rdMapped == W4
+#ifdef LITEV_JIT_LAZYFLAGS
+            || rdMapped == W27   // guest r7 pin under full lazy-flags (patched funcs generated for W27)
+#endif
+        );
         patch.PatchFunc = flags & memop_Store
             ? PatchedStoreFuncs[NDS.ConsoleType][Num][__builtin_ctz(size) - 3][rdMapped]
             : PatchedLoadFuncs[NDS.ConsoleType][Num][__builtin_ctz(size) - 3][!!(flags & memop_SignExtend)][rdMapped];
@@ -670,7 +674,14 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     if (store)
     {
         if (usermode && (regs & BitSet16(0x7f00)))
+#ifdef LITEV_JIT_LAZYFLAGS
+            // Usermode LDM/STM bank select reads guest mode (control) from ARM::CPSR memory
+            // (RCPSR is now guest r7). Control is always canonical in memory.
+            LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, CPSR));
+            UBFX(W5, W5, 0, 5);
+#else
             UBFX(W5, RCPSR, 0, 5);
+#endif
 
         BitSet16::Iterator it = regs.begin();
         while (it != regs.end())
@@ -851,7 +862,14 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     if (!store)
     {
         if (usermode && !regs[15] && (regs & BitSet16(0x7f00)))
+#ifdef LITEV_JIT_LAZYFLAGS
+            // Usermode LDM/STM bank select reads guest mode (control) from ARM::CPSR memory
+            // (RCPSR is now guest r7). Control is always canonical in memory.
+            LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, CPSR));
+            UBFX(W5, W5, 0, 5);
+#else
             UBFX(W5, RCPSR, 0, 5);
+#endif
 
         BitSet16::Iterator it = regs.begin();
         while (it != regs.end())

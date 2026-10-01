@@ -207,6 +207,29 @@ public:
     // Transient (recomputed every slice) -> never serialized in DoSavestate.
     s32 CyclesBudget = 0;
 
+#ifdef LITEV_JIT_LAZYFLAGS
+    // FULL LAZY-FLAGS V2 — dedicated NZCV mirror slot (DraStic teardown 01 §6.1: the
+    // recompiler keeps an NZCV-ONLY spill slot at cpu+0x2354, SEPARATE from the CPSR
+    // control word at cpu+0x23c0, transferring via MRS/MSR NZCV). V1 made the full
+    // ARM::CPSR word the flag home, so every JIT flag flush was a full-word LDR-merge-STR
+    // RMW (the measured A55 regression). V2 splits guest CPSR into:
+    //   * CONTROL word (bits [27:0]): always canonical in ARM::CPSR memory (unchanged).
+    //   * NZCV nibble (bits [31:28]): homed in THIS slot while a JIT slice runs; a
+    //     full-nibble flush is `MRS w0,NZCV; STR w0,[JitNZCV]` (2 instrs, NO load — MRS
+    //     zeroes the low bits so the raw store is clean). Bits [27:0] are ALWAYS 0 here.
+    // ARM::CPSR[31:28] is (re)synchronised with this slot only at C++-visible escapes:
+    // ARM::Execute seeds `JitNZCV = CPSR & 0xF0000000` immediately before every
+    // ARM_Dispatch and merges `CPSR = (CPSR&0x0FFFFFFF)|JitNZCV` immediately after, so
+    // ARM::CPSR stays the single authoritative NZCV home for every C++ reader/writer
+    // (TriggerIRQ SPSR=CPSR, RestoreCPSR, savestate); the slot is a pure per-slice
+    // scratch. Within-slice escapes (interpreter fallback / restoreCPSR trampoline) are
+    // bracketed by SaveCPSR (slot->CPSR) / LoadCPSR (CPSR->slot). Placed AFTER the
+    // offset-critical hot fields (Cycles/StopExecution/CPSR/CyclesBudget/FastBlockLookup*)
+    // so it cannot disturb their hard-coded / static_asserted offsets; its own offset
+    // (ARM_JitNZCV_offset) is proven by static_assert in ARMJIT_A64/ARMJIT_Compiler.cpp.
+    // Transient (per-slice recomputed) -> never serialized in DoSavestate.
+    u32 JitNZCV = 0;
+#endif
 
     static const u32 ConditionTable[16];
 #ifdef GDBSTUB_ENABLED

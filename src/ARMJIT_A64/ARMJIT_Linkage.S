@@ -42,7 +42,12 @@ ARM_Dispatch:
 
     mov RCPU, x0
     ldr RCycles, [RCPU, ARM_Cycles_offset]
+#ifndef LITEV_JIT_LAZYFLAGS
+    // FULL LAZY-FLAGS deletes RCPSR (w27) as the CPSR carrier: the guest CPSR lives only
+    // in ARM::CPSR memory (control) / host PSTATE (deferred NZCV), so there is no per-slice
+    // CPSR load, and w27 is instead loaded as the guest r7 GLOBALREG pin below.
     ldr RCPSR, [RCPU, ARM_CPSR_offset]
+#endif
 
 #ifdef LITEV_JIT_GLOBALREG
     // GLOBALREG: load the globally-pinned never-banked guest regs into their
@@ -59,6 +64,10 @@ ARM_Dispatch:
     ldr w23, [RCPU, ARM_R_offset + 16]
     ldr w24, [RCPU, ARM_R_offset + 20]
     ldr w25, [RCPU, ARM_R_offset + 24]
+#if defined(LITEV_JIT_LAZYFLAGS)
+    // FULL LAZY-FLAGS frees w27 (was RCPSR) -> pin guest r7 -> w27.
+    ldr w27, [RCPU, ARM_R_offset + 28]
+#endif
 #endif
 
     br x1
@@ -85,9 +94,14 @@ ARM_Ret:
     str w23, [RCPU, ARM_R_offset + 16]
     str w24, [RCPU, ARM_R_offset + 20]
     str w25, [RCPU, ARM_R_offset + 24]
+#if defined(LITEV_JIT_LAZYFLAGS)
+    str w27, [RCPU, ARM_R_offset + 28]   // spill guest r7 (LAZYFLAGS pins it to w27)
+#endif
 #endif
     str RCycles, [RCPU, ARM_Cycles_offset]
+#ifndef LITEV_JIT_LAZYFLAGS
     str RCPSR, [RCPU, ARM_CPSR_offset]
+#endif
 
     ldp x29, x30, [sp, #80]
     ldp x27, x28, [sp, #64]

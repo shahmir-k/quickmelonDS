@@ -37,3 +37,10 @@
 #define ARM_FastBlockLookupSize_offset  0xdc
 #define ARM_FastBlockLookup_offset      0xe0
 
+#ifdef LITEV_JIT_LAZYFLAGS
+// FULL LAZY-FLAGS V2: dedicated NZCV mirror slot (DraStic's cpu+0x2354 analog). It falls
+// immediately after CyclesBudget (0xe8, s32) => 0xec. Not referenced from asm — the
+// emitter uses offsetof(ARM, JitNZCV) directly and the C++ seed/merge access the field;
+// the #define exists only to guard the layout via static_assert (like the others).
+#define ARM_JitNZCV_offset              0xec
+#endif

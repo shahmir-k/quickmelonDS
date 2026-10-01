@@ -202,6 +202,35 @@ if (LITEV_JIT_GLOBALREG)
     endif()
 endif()
 
+# FULL LAZY-FLAGS (DraStic teardown 01 §6.1 — the terminal step of the fixed-register /
+# CPSR-in-NZCV rearchitecture). LITEV_JIT_FIXEDREG kept a partial lazy-NZCV but still
+# carried the ENTIRE guest CPSR (flags + control bits) live in a permanently-reserved
+# host register (RCPSR = W27), loaded/spilled per JIT slice and committed at every block
+# boundary. This flag COMPLETES the transition: the guest CONTROL word becomes always-
+# canonical in ARM::CPSR MEMORY (every control-bit RMW writes memory directly, no cross-
+# instruction caching), the guest NZCV lives EITHER in host PSTATE (deferred, the hot
+# path) OR in ARM::CPSR memory (flushed) tracked by the existing NZCVDeferred/NZCVCondValid
+# residency, and RCPSR (W27) is DELETED as a CPSR carrier. The freed callee-saved W27 is
+# then globally pinned to guest r7 (the 8th GLOBALREG pin), matching DraStic's wider
+# fixed-register file. Pure codegen: guest cycle counts, event-check points and every
+# architecturally-visible guest observation point are byte-identical (only host register
+# allocation / instruction layout changes) -> MP-safe / bit-exact. Builds ON TOP of and
+# REQUIRES LITEV_JIT_DISPATCH + LITEV_JIT_FIXEDREG + LITEV_JIT_GLOBALREG + LITEV_JIT_CONDFOLD
+# (the shipping .dev config). AArch64 only. Default OFF -> flag-off codegen is byte-identical
+# (every edit is inside #ifdef LITEV_JIT_LAZYFLAGS or provably no-op when OFF).
+option(LITEV_JIT_LAZYFLAGS "Full lazy-flags: control word in memory, NZCV in host PSTATE/memory, delete RCPSR + pin r7->W27 (AArch64)" OFF)
+if (LITEV_JIT_LAZYFLAGS)
+    if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        message(FATAL_ERROR "LITEV_JIT_LAZYFLAGS requires an AArch64 target.")
+    endif()
+    if (NOT (LITEV_JIT_DISPATCH AND LITEV_JIT_FIXEDREG AND LITEV_JIT_GLOBALREG AND LITEV_JIT_CONDFOLD))
+        message(FATAL_ERROR "LITEV_JIT_LAZYFLAGS requires LITEV_JIT_DISPATCH, "
+                            "LITEV_JIT_FIXEDREG, LITEV_JIT_GLOBALREG and LITEV_JIT_CONDFOLD all ON "
+                            "(the shipping .dev config).")
+    endif()
+    add_compile_definitions(LITEV_JIT_LAZYFLAGS=1)
+endif()
+
 # Unit 4: direct block linking (patch, don't dispatch). Builds ON TOP of the
 # Unit 3 dispatcher: an eligible block exit whose next PC is a compile-time
 # constant emits a per-hop-commit guard followed by a patchable `B` (initially to

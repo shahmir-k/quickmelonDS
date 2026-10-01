@@ -51,12 +51,26 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
     if (addr & 0x1 && !Thumb)
     {
         CPSRDirty = true;
+#ifdef LITEV_JIT_LAZYFLAGS
+        // Set guest T-bit in ARM::CPSR memory (control RMW). Comp_MaterializeFlags above
+        // already flushed host NZCV, so the word is canonical; W1 is free here.
+        LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CPSR));
+        ORRI2R(W1, W1, 0x20);
+        STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CPSR));
+#else
         ORRI2R(RCPSR, RCPSR, 0x20);
+#endif
     }
     else if (!(addr & 0x1) && Thumb)
     {
         CPSRDirty = true;
+#ifdef LITEV_JIT_LAZYFLAGS
+        LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CPSR));
+        ANDI2R(W1, W1, ~0x20);
+        STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CPSR));
+#else
         ANDI2R(RCPSR, RCPSR, ~0x20);
+#endif
     }
 
     if (Num == 0)
@@ -208,7 +222,18 @@ void* Compiler::Gen_JumpTo9(int kind)
     {
         // ARM
         if (kind == 0)
+#ifdef LITEV_JIT_LAZYFLAGS
+        {
+            // Clear guest T-bit in ARM::CPSR memory (RCPSR is gone / is guest r7 at runtime).
+            // W3 (kCodeCacheTiming) is dead here; the caller (Comp_JumpTo reg) already
+            // materialized host NZCV so the word is canonical and only the T-bit changes.
+            LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, CPSR));
+            ANDI2R(W3, W3, ~0x20);
+            STR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, CPSR));
+        }
+#else
             ANDI2R(RCPSR, RCPSR, ~0x20);
+#endif
 
         ANDI2R(W0, W0, ~3);
         ADD(W0, W0, 4);
@@ -225,7 +250,13 @@ void* Compiler::Gen_JumpTo9(int kind)
         if (kind == 0)
         {
             SetJumpTarget(switchToThumb);
+#ifdef LITEV_JIT_LAZYFLAGS
+            LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, CPSR));
+            ORRI2R(W3, W3, 0x20);
+            STR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, CPSR));
+#else
             ORRI2R(RCPSR, RCPSR, 0x20);
+#endif
         }
 
         ANDI2R(W0, W0, ~1);
@@ -268,7 +299,16 @@ void* Compiler::Gen_JumpTo7(int kind)
         ANDI2R(W0, W0, ~3);
 
         if (kind == 0)
+#ifdef LITEV_JIT_LAZYFLAGS
+        {
+            // Clear guest T-bit in ARM::CPSR memory (W2 is dead here).
+            LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, CPSR));
+            ANDI2R(W2, W2, ~0x20);
+            STR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, CPSR));
+        }
+#else
             ANDI2R(RCPSR, RCPSR, ~0x20);
+#endif
 
         ADD(W3, W0, 4);
         STR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, R[15]));
@@ -281,7 +321,14 @@ void* Compiler::Gen_JumpTo7(int kind)
         {
             SetJumpTarget(switchToThumb);
 
+#ifdef LITEV_JIT_LAZYFLAGS
+            // Set guest T-bit in ARM::CPSR memory (W2 free; W3 holds the live memtimings word).
+            LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, CPSR));
+            ORRI2R(W2, W2, 0x20);
+            STR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, CPSR));
+#else
             ORRI2R(RCPSR, RCPSR, 0x20);
+#endif
         }
 
         UBFX(W2, W3, 16, 8);

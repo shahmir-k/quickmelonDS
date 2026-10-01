@@ -23,6 +23,93 @@ using namespace Arm64Gen;
 namespace melonDS
 {
 
+#ifdef LITEV_JIT_LAZYFLAGS
+#include <cstdio>
+#include <cstdlib>
+// ---- LAZY-FLAGS V3 eliminated-write counters (diagnostics only) ----
+// Compile-time (emit-time) tallies of the flag traffic V3 removed vs V2. Printed once
+// at process exit via a static object's destructor (runs from __cxa_atexit when main
+// returns normally). The core library gets no LITEV_HEADLESS macro (that CMake option
+// only add_subdirectory's the harness), so this lives under LITEV_JIT_LAZYFLAGS and is
+// SILENT unless the LITEV_LF_STATS env var is set -> zero output on the shipping .dev
+// APK, a printed line under the headless gate. The three counter increments run only at
+// JIT COMPILE sites (never in emitted guest code), so they cost nothing at run time and
+// are architecturally invisible. Single-writer (blocks compile on the emu thread).
+namespace LazyFlagsV3Stat
+{
+    unsigned long long CVSlotWritesElided = 0;   // item 1a: CVInGPR C/V slot RMWs skipped (dead)
+    unsigned long long PartialFlushUpgraded = 0; // item 1b: FR_HOST_NZ partial flush -> MRS+STR
+    unsigned long long NativeCarryIn = 0;        // item 3: ADC/SBC consumed host C directly
+
+    struct Reporter {
+        ~Reporter() {
+            if (getenv("LITEV_LF_STATS"))
+                fprintf(stderr,
+                    "[lazyflags-v3] eliminated-writes: CV-slot-elided=%llu "
+                    "partial-flush-upgraded=%llu native-carry-in=%llu\n",
+                    CVSlotWritesElided, PartialFlushUpgraded, NativeCarryIn);
+        }
+    };
+    __attribute__((used)) Reporter g_reporter;
+}
+#define LFV3_STAT(name) (++melonDS::LazyFlagsV3Stat::name)
+#else
+#define LFV3_STAT(name) ((void)0)
+#endif
+
+#ifdef LITEV_JIT_LAZYFLAGS
+// V3 item 1: per-block backward dead-flag liveness. melonDS already runs this pass
+// (FloodFillSetFlags -> FetchedInstr::SetFlags gives the LIVE PRODUCED bits, gated by
+// every producer flush); this companion retains the running live set as LiveIn[i]
+// (flags live at the START of instr i, i.e. observed by i's body OR anything after it)
+// so a flush emitted just before i's body can answer "are the C,V I would preserve
+// dead?" — which SetFlags (a produced-bit mask) cannot express.
+//
+// Semantics mirror FloodFillSetFlags exactly: block exit = ALL-LIVE (0xF); a DEFINITE
+// write (WriteFlags low nibble — the InstrInfo conditional transform already zeroes it
+// for cond<0xE ARM ops and moves the maybe-write to the high nibble) KILLS; ReadFlags
+// (which already folds in the condition's own reads) is a USE. A "barrier" — any point
+// that can reach C++ / raise an exception / restore SPSR mid-block, where ARM::CPSR
+// (fed from the slot) must be fully canonical — forces the live-in to 0xF. Barriers are
+// over-approximated (SOUND-first): only a compilable, non-branching ARM ALU / multiply
+// / CLZ body is a non-barrier (its every flag observation is already in Info.ReadFlags);
+// EVERYTHING else — memory ops, MRS/MSR, SWI/undef/coproc, interpreter fallbacks,
+// branches, and (conservatively) ALL Thumb bodies — is an all-live barrier. This
+// matches the prompt's barrier list and Comp_ReconcileFlags' own conservatism.
+void Compiler::Comp_ComputeFlagLiveness(FetchedInstr* instrs, int instrsCount)
+{
+    using namespace ARMInstrInfo;
+    u8 live = 0xF; // live-out of the block (slot-canonical boundary contract)
+    for (int i = instrsCount - 1; i >= 0; i--)
+    {
+        FetchedInstr& in = instrs[i];
+        // `live` here == LiveOut[i]. Fold in instr i's own effect to get LiveIn[i].
+        bool nonBarrier = false;
+        const u16 kind = in.Info.Kind;
+        // ARM data-processing / multiply / CLZ that stays in JIT and cannot escape.
+        // Thumb is left entirely conservative (barrier) — item 1b simply never fires
+        // inside Thumb blocks, which is sound (LiveIn stays 0xF there).
+        if (!Thumb && !in.Info.Branches() && CanCompile(false, kind))
+        {
+            if (kind <= ak_MVN_IMM_S
+                || (kind >= ak_MUL && kind <= ak_SMLAL)
+                || kind == ak_CLZ)
+                nonBarrier = true;
+        }
+
+        if (!nonBarrier)
+            live = 0xF; // all-live barrier: everything before it is live
+        else
+        {
+            u8 kill = in.Info.WriteFlags & 0x0F; // DEFINITE writes only
+            u8 use  = in.Info.ReadFlags  & 0x0F; // reads (incl. condition reads)
+            live = (u8)((live & ~kill) | use);
+        }
+        FlagsLiveIn[i] = live; // flags live at the START of instr i
+    }
+}
+#endif
+
 void Compiler::Comp_RegShiftReg(int op, bool S, Op2& op2, ARM64Reg rs)
 {
     if (!(CurInstr.SetFlags & 0x2))
@@ -64,7 +151,11 @@ void Compiler::Comp_RegShiftReg(int op, bool S, Op2& op2, ARM64Reg rs)
         if (op == 3)
         {
             RORV(W0, op2.Reg.Rm, W1);
+#ifdef LITEV_JIT_LAZYFLAGS
+            Comp_CPSRInsertBitToMem(W2, W0, 29);   // guest C -> ARM::CPSR[29] (W2 scratch)
+#else
             BFI(RCPSR, W0, 29, 1);
+#endif
         }
         else
         {
@@ -74,7 +165,11 @@ void Compiler::Comp_RegShiftReg(int op, bool S, Op2& op2, ARM64Reg rs)
                 MOVI2R(W2, 31);
                 CSEL(W1, W2, W1, CC_GT);
                 ASRV(W0, op2.Reg.Rm, W1);
+#ifdef LITEV_JIT_LAZYFLAGS
+                Comp_CPSRInsertBitToMem(W2, W0, 29);   // W2 dead (was #31) -> reuse as word
+#else
                 BFI(RCPSR, W0, 29, 1);
+#endif
             }
             else
             {
@@ -86,7 +181,13 @@ void Compiler::Comp_RegShiftReg(int op, bool S, Op2& op2, ARM64Reg rs)
                 else if (op == 1)
                     LSRV(W0, op2.Reg.Rm, W1);
                 CSEL(W1, WZR, op ? W0 : W1, CC_GT);
+#ifdef LITEV_JIT_LAZYFLAGS
+                // W1 = carry (src), W2 free here (LSL/LSR sub-branch never wrote it); the
+                // LDR/BFI/STR leave host NZCV (the CMP W1,31 flags) intact for the CSEL below.
+                Comp_CPSRInsertBitToMem(W2, W1, 29);
+#else
                 BFI(RCPSR, W1, 29, 1);
+#endif
                 CSEL(W0, WZR, W0, CC_GE);
             }
         }
@@ -110,7 +211,11 @@ void Compiler::Comp_RegShiftImm(int op, int amount, bool S, Op2& op2, ARM64Reg t
         if (S && amount)
         {
             UBFX(tmp, op2.Reg.Rm, 32 - amount, 1);
+#ifdef LITEV_JIT_LAZYFLAGS
+            Comp_CPSRInsertBitToMem(W1, tmp, 29);  // shifter C -> ARM::CPSR[29]
+#else
             BFI(RCPSR, tmp, 29, 1);
+#endif
         }
         op2 = Op2(op2.Reg.Rm, ST_LSL, amount);
         return;
@@ -118,7 +223,11 @@ void Compiler::Comp_RegShiftImm(int op, int amount, bool S, Op2& op2, ARM64Reg t
         if (S)
         {
             UBFX(tmp, op2.Reg.Rm, (amount ? amount : 32) - 1, 1);
+#ifdef LITEV_JIT_LAZYFLAGS
+            Comp_CPSRInsertBitToMem(W1, tmp, 29);  // shifter C -> ARM::CPSR[29]
+#else
             BFI(RCPSR, tmp, 29, 1);
+#endif
         }
         if (amount == 0)
         {
@@ -131,13 +240,34 @@ void Compiler::Comp_RegShiftImm(int op, int amount, bool S, Op2& op2, ARM64Reg t
         if (S)
         {
             UBFX(tmp, op2.Reg.Rm, (amount ? amount : 32) - 1, 1);
+#ifdef LITEV_JIT_LAZYFLAGS
+            Comp_CPSRInsertBitToMem(W1, tmp, 29);  // shifter C -> ARM::CPSR[29]
+#else
             BFI(RCPSR, tmp, 29, 1);
+#endif
         }
         op2 = Op2(op2.Reg.Rm, ST_ASR, amount ? amount : 31);
         return;
     case 3: // ROR
         if (amount == 0)
         {
+#ifdef LITEV_JIT_LAZYFLAGS
+            // RRX: read old guest C from the ARM::JitNZCV slot, and (if S) write new
+            // C = Rm[0] back to it. Single load (W1) serves both; read must precede the
+            // write. tmp(result)/Rm/W1 are distinct, and the RMW leaves host PSTATE
+            // untouched. RRX reads C so Comp_ReconcileFlags materialised any residency to
+            // the slot first -> slot[29] is the canonical old guest C.
+            LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+            UBFX(tmp, W1, 29, 1);
+            LSL(tmp, tmp, 31);
+            if (S)
+            {
+                BFI(W1, op2.Reg.Rm, 29, 1);
+                STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+            }
+            ORR(tmp, tmp, op2.Reg.Rm, ArithOption(tmp, ST_LSR, 1));
+            op2 = Op2(tmp, ST_LSL, 0);
+#else
             UBFX(tmp, RCPSR, 29, 1);
             LSL(tmp, tmp, 31);
             if (S)
@@ -145,13 +275,18 @@ void Compiler::Comp_RegShiftImm(int op, int amount, bool S, Op2& op2, ARM64Reg t
             ORR(tmp, tmp, op2.Reg.Rm, ArithOption(tmp, ST_LSR, 1));
 
             op2 = Op2(tmp, ST_LSL, 0);
+#endif
         }
         else
         {
             if (S)
             {
                 UBFX(tmp, op2.Reg.Rm, amount - 1, 1);
+#ifdef LITEV_JIT_LAZYFLAGS
+                Comp_CPSRInsertBitToMem(W1, tmp, 29);  // shifter C -> ARM::CPSR[29]
+#else
                 BFI(RCPSR, tmp, 29, 1);
+#endif
             }
             op2 = Op2(op2.Reg.Rm, ST_ROR, amount);
         }
@@ -164,6 +299,48 @@ void Compiler::Comp_RetriveFlags(bool retriveCV)
     if (CurInstr.SetFlags)
         CPSRDirty = true;
 
+#ifdef LITEV_JIT_LAZYFLAGS
+    // V2: the guest NZCV nibble is homed in the dedicated ARM::JitNZCV slot (DraStic's
+    // cpu+0x2354 analog), NOT the full ARM::CPSR word (V1's full-word LDR-merge-STR is the
+    // measured A55 regression). Two shapes:
+    //   * FULL nibble (retriveCV && all four flags set — the hot arithmetic S / CMP / CMN):
+    //     host PSTATE already holds the COMPLETE guest NZCV, so `MRS w0,NZCV; STR w0,[slot]`
+    //     writes it in 2 instrs with NO load — MRS zeroes the low bits and the slot is
+    //     NZCV-only, so the raw store is clean. This is the big new win (V1 paid 8-10 here)
+    //     and it is independent of FLAGMERGE, so conditional producers win it too.
+    //   * PARTIAL (logical N,Z; or a sub-nibble arithmetic form): the un-written slot bits
+    //     (e.g. barrel-shifter C, preserved V) must survive, so RMW the slot per set flag.
+    // Bit-exact to the CSET/BFI extraction: MRS[31:28] == the CSET(CC_MI/EQ/CS/VS)+BFI
+    // result for the same host PSTATE.
+    {
+        if (retriveCV && (CurInstr.SetFlags & 0xF) == 0xF)
+        {
+            MRS(X0, FIELD_NZCV);
+            STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));
+            return;
+        }
+        u32 wm = 0;
+        if (CurInstr.SetFlags & 0x4) wm |= 1u << 30; // Z
+        if (CurInstr.SetFlags & 0x8) wm |= 1u << 31; // N
+        if (retriveCV)
+        {
+            if (CurInstr.SetFlags & 0x2) wm |= 1u << 29; // C
+            if (CurInstr.SetFlags & 0x1) wm |= 1u << 28; // V
+        }
+        if (!wm)
+            return;
+        LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+        if (CurInstr.SetFlags & 0x4) { CSET(W0, CC_EQ); BFI(W1, W0, 30, 1); }
+        if (CurInstr.SetFlags & 0x8) { CSET(W0, CC_MI); BFI(W1, W0, 31, 1); }
+        if (retriveCV)
+        {
+            if (CurInstr.SetFlags & 0x2) { CSET(W0, CC_CS); BFI(W1, W0, 29, 1); }
+            if (CurInstr.SetFlags & 0x1) { CSET(W0, CC_VS); BFI(W1, W0, 28, 1); }
+        }
+        STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+    }
+    return;
+#endif
     if (CurInstr.SetFlags & 0x4)
     {
         CSET(W0, CC_EQ);
@@ -205,12 +382,73 @@ void Compiler::Comp_MaterializeFlags()
     NZCVDeferred = 0;
     CPSRDirty = true;
 
+#ifdef LITEV_JIT_LAZYFLAGS
+    // V2 MaterializeFlagsToSlot: flush the host-PSTATE-resident guest flags into the
+    // dedicated ARM::JitNZCV slot (NOT the full ARM::CPSR word — V1's LDR-merge-STR was
+    // the regression). Two shapes:
+    //   * FULL nibble (m == 0xF <=> FR_HOST_FULL with all four deferred; only an
+    //     arithmetic producer ever defers C,V, so m==0xF implies NZCVCondValid): host
+    //     PSTATE holds the complete guest NZCV, so `MRS w0,NZCV; STR w0,[slot]` = 2
+    //     instrs, NO load. MRS zeroes the low bits -> the slot (NZCV-only) stays clean.
+    //     Replaces V1's LDR + 4*(CSET/BFI) + STR (10 instrs) at every block boundary /
+    //     pre-non-transparent-body flush after a full arithmetic S-op.
+    //   * PARTIAL (m == 0xC under FR_HOST_NZ: N,Z host-resident, C,V canonical in the
+    //     slot; or a sub-nibble form): the un-deferred slot bits (C,V) must survive, so
+    //     RMW the slot. LDR/CSET/BFI/STR do NOT touch host PSTATE, so a caller (e.g.
+    //     CheckCondition) may still branch natively on the resident flags afterwards.
+    // V3 item 1(b): upgrade the partial FR_HOST_NZ flush (N,Z host-resident, C,V
+    // canonical in the slot) to the 2-instr full-nibble MRS+STR when the C,V it would
+    // preserve are DEAD to their next definition. FR_HOST_NZ (!NZCVCondValid) with
+    // m==0xC means the host op was a LOGICAL producer: host N,Z == guest N,Z, host
+    // C,V == 0 (AArch64 zeroes them). MRS therefore yields N,Z,0,0; storing it clobbers
+    // the slot's guest C,V with 0 — SOUND only if C,V are dead (never observed before
+    // their next definition). FlagsLiveInCur (barrier-conservative; folds in this and
+    // every later instr's flag reads, and every C++/exception escape) is the exact
+    // dead test; it DEFAULTS to 0xF at block-end / trampoline call sites so those never
+    // upgrade. This replaces LDR + 2*(CSET/BFI) + STR (6 instrs) with MRS + STR (2).
+    if (m != 0xF && !NZCVCondValid && m == 0xC && (FlagsLiveInCur & 0x3) == 0)
+    {
+        MRS(X0, FIELD_NZCV);
+        STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));
+        LFV3_STAT(PartialFlushUpgraded);
+    }
+    else if (m == 0xF)
+    {
+        MRS(X0, FIELD_NZCV);
+        STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));
+    }
+    else
+    {
+        LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+        if (m & 0x4) { CSET(W0, CC_EQ); BFI(W1, W0, 30, 1); } // Z
+        if (m & 0x8) { CSET(W0, CC_MI); BFI(W1, W0, 31, 1); } // N
+        if (m & 0x2) { CSET(W0, CC_CS); BFI(W1, W0, 29, 1); } // C
+        if (m & 0x1) { CSET(W0, CC_VS); BFI(W1, W0, 28, 1); } // V
+        STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+    }
+#else
     if (m & 0x4) { CSET(W0, CC_EQ); BFI(RCPSR, W0, 30, 1); } // Z
     if (m & 0x8) { CSET(W0, CC_MI); BFI(RCPSR, W0, 31, 1); } // N
     if (m & 0x2) { CSET(W0, CC_CS); BFI(RCPSR, W0, 29, 1); } // C
     if (m & 0x1) { CSET(W0, CC_VS); BFI(RCPSR, W0, 28, 1); } // V
+#endif
 }
 
+#ifdef LITEV_JIT_LAZYFLAGS
+void Compiler::Comp_CPSRInsertBitToMem(ARM64Reg word, ARM64Reg src, int pos)
+{
+    // V2: read-modify-write the dedicated ARM::JitNZCV slot (the guest NZCV home while a
+    // JIT slice runs): word = *slot; word[pos] = src[0]; *slot = word. Used ONLY for the
+    // barrel-shifter carry (guest C, bit 29) of a shifted logical-S op. The op's
+    // Comp_ReconcileFlags materialised any prior residency to the slot first (a flag-
+    // writing body is never transparent), so the slot is canonical here and the RMW
+    // preserves the other three flag bits. LDR/BFI/STR do not touch host PSTATE, so the
+    // following logical host op (which then defers N,Z) is unaffected. `pos` is always 29.
+    LDR(INDEX_UNSIGNED, word, RCPU, offsetof(ARM, JitNZCV));
+    BFI(word, src, pos, 1);
+    STR(INDEX_UNSIGNED, word, RCPU, offsetof(ARM, JitNZCV));
+}
+#endif
 
 // liteDS-v2 Stage 2b: is the CURRENT instruction body flag-transparent, i.e. does it
 // leave host PSTATE NZCV completely untouched AND read no guest CPSR flag? Only such
@@ -292,6 +530,43 @@ void Compiler::Comp_ReconcileFlags()
     // for that read (e.g. ADC/SBC/RSC read C, RRX reads C, MRS reads all).
     if (read & NZCVDeferred)
     {
+#ifdef LITEV_JIT_LAZYFLAGS
+        // V3 item 3 (native carry-in): if the ONLY deferred flag this body reads is C,
+        // and the FULL guest NZCV is genuinely resident in host PSTATE (FR_HOST_FULL),
+        // an ADC/SBC with a PSTATE-safe register op2 can consume host C DIRECTLY via the
+        // AArch64 ADCS/SBCS form (carry-in == guest C, 0 setup instrs) instead of
+        // materialising C to the slot and re-reading it (LDR+UBFX+CMP). We KEEP host
+        // PSTATE live (skip the materialize): nothing between here and the ADCS/SBCS
+        // clobbers it — for a register op2 with a non-register-specified shift,
+        // A_Comp_GetOp2 emits only cycle ADDs and, if shifted, a no-flag MOV; Thumb
+        // ADC/SBC op2 is a plain register. We exclude register-specified-shift (its CMP
+        // clobbers host NZCV) and ROR/RRX (reads C for the shift, from the slot). The old
+        // resident N,Z,V are DEAD across the ADCS/SBCS (a full producer this body does not
+        // read) — identical soundness to reconcile case (B). Comp_Arithmetic re-defers the
+        // fresh NZCV, so residency stays self-consistent.
+        if (NZCVCondValid && (NZCVDeferred & 0x2) && read == 0x2)
+        {
+            bool nativeCarry;
+            if (!Thumb)
+            {
+                u32 instr = CurInstr.Instr;
+                u32 aop = (instr >> 21) & 0xF;
+                nativeCarry = (aop == 0x5 || aop == 0x6)       // ADC / SBC
+                    && (instr & (1 << 20))                     // S-form
+                    && !(instr & (1 << 25))                    // register op2
+                    && !(instr & (1 << 4))                     // not register-specified shift
+                    && ((instr >> 5) & 3) != 3;                // not ROR / RRX
+            }
+            else
+                nativeCarry = (CurInstr.Info.Kind == ARMInstrInfo::tk_ADC_REG
+                            || CurInstr.Info.Kind == ARMInstrInfo::tk_SBC_REG);
+            if (nativeCarry)
+            {
+                CarryInHostResident = true; // Comp_Arithmetic emits ADCS/SBCS directly
+                return;                     // keep host PSTATE; do NOT materialize
+            }
+        }
+#endif
         Comp_MaterializeFlags();
         return;
     }
@@ -474,7 +749,23 @@ void Compiler::Comp_Arithmetic(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2
         }
         break;
     case 0x5: // ADC
+#ifdef LITEV_JIT_LAZYFLAGS
+        // V2 carry-in from the guest C flag, read from the ARM::JitNZCV slot. The
+        // invariant guarantees C is canonical in the slot here: an ADC/SBC/RSC reads C,
+        // so Comp_ReconcileFlags/CheckCondition already materialised any host-resident C
+        // to the slot (case A), and under FR_HOST_NZ / FR_MEMORY guest C already lives in
+        // slot[29].
+        // V3 item 3: when Comp_ReconcileFlags proved the guest C is live in host PSTATE-C
+        // (FR_HOST_FULL) for this S-form register-op2 ADC, skip the slot read entirely —
+        // ADCS consumes host C directly below.
+        if (!CarryInHostResident)
+        {
+            LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+            UBFX(W2, W1, 29, 1);
+        }
+#else
         UBFX(W2, RCPSR, 29, 1);
+#endif
         if (S)
         {
             if (op2.IsImm)
@@ -497,7 +788,16 @@ void Compiler::Comp_Arithmetic(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2
                     MOV(W0, op2.Reg.Rm, op2.ToArithOption());
                     op2 = Op2(W0, ST_LSL, 0);
                 }
-                CMP(W2, 1);
+#ifdef LITEV_JIT_LAZYFLAGS
+                // V3 item 3: host PSTATE-C already holds guest C (ADCS reads it as
+                // carry-in) — no `CMP W2,1` seed needed. Bit-exact: ADCS' carry-in and
+                // resulting N,Z,C,V are identical whether host C came from CMP W2,1 or
+                // was left resident by the producer.
+                if (CarryInHostResident)
+                    LFV3_STAT(NativeCarryIn);
+                else
+#endif
+                    CMP(W2, 1);
                 ADCS(rd, rn, op2.Reg.Rm);
             }
         }
@@ -511,7 +811,23 @@ void Compiler::Comp_Arithmetic(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2
         }
         break;
     case 0x6: // SBC
+#ifdef LITEV_JIT_LAZYFLAGS
+        // V2 carry-in from the guest C flag, read from the ARM::JitNZCV slot. The
+        // invariant guarantees C is canonical in the slot here: an ADC/SBC/RSC reads C,
+        // so Comp_ReconcileFlags/CheckCondition already materialised any host-resident C
+        // to the slot (case A), and under FR_HOST_NZ / FR_MEMORY guest C already lives in
+        // slot[29].
+        // V3 item 3: skip the slot read when guest C is live in host PSTATE-C — SBCS
+        // consumes host C directly. AArch64 SBC and ARM SBC both use NOT-borrow, so a
+        // resident host C == guest C makes this exact.
+        if (!CarryInHostResident)
+        {
+            LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+            UBFX(W2, W1, 29, 1);
+        }
+#else
         UBFX(W2, RCPSR, 29, 1);
+#endif
         if (S && !op2.IsImm)
         {
             if (op2.Reg.ShiftAmount > 0)
@@ -519,7 +835,12 @@ void Compiler::Comp_Arithmetic(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2
                 MOV(W0, op2.Reg.Rm, op2.ToArithOption());
                 op2 = Op2(W0, ST_LSL, 0);
             }
-            CMP(W2, 1);
+#ifdef LITEV_JIT_LAZYFLAGS
+            if (CarryInHostResident)
+                LFV3_STAT(NativeCarryIn);
+            else
+#endif
+                CMP(W2, 1);
             SBCS(rd, rn, op2.Reg.Rm);
         }
         else
@@ -547,7 +868,17 @@ void Compiler::Comp_Arithmetic(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2
         }
         break;
     case 0x7: // RSC
+#ifdef LITEV_JIT_LAZYFLAGS
+        // V2 carry-in from the guest C flag, read from the ARM::JitNZCV slot. The
+        // invariant guarantees C is canonical in the slot here: an ADC/SBC/RSC reads C,
+        // so Comp_ReconcileFlags/CheckCondition already materialised any host-resident C
+        // to the slot (case A), and under FR_HOST_NZ / FR_MEMORY guest C already lives in
+        // slot[29].
+        LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+        UBFX(W2, W1, 29, 1);
+#else
         UBFX(W2, RCPSR, 29, 1);
+#endif
         // W1 = -rn - 1
         MVN(W1, rn);
         if (S)
@@ -578,8 +909,40 @@ void Compiler::Comp_Arithmetic(int op, bool S, ARM64Reg rd, ARM64Reg rn, Op2 op2
     {
         if (CVInGPR)
         {
+#ifdef LITEV_JIT_LAZYFLAGS
+            // C in W2, V in W3 (GPR-computed for ADC/SBC/RSC-imm & RSC) -> ARM::JitNZCV
+            // slot RMW; N,Z then via Comp_RetriveFlags(false) (its own slot RMW). The slot
+            // is canonical here (Comp_ReconcileFlags materialised the prior residency
+            // before this arithmetic producer). W1 is dead.
+            //
+            // V3 item 1(a): this C,V slot RMW is the last eager PRODUCER write V2 emitted
+            // ungated by liveness (Comp_RetriveFlags and the deferral masks are all already
+            // SetFlags-gated). Gate it the same way: SetFlags (FloodFillSetFlags, all-live
+            // at block exit) tells us which of C,V are live; skip the dead ones, and when
+            // BOTH are dead the whole load/store disappears. Sound by the same argument as
+            // every other SetFlags-gated flush: a dead bit is never observed before its
+            // next definition, and anything reaching the block boundary is live -> written.
+            {
+                u8 cvsf = CurInstr.SetFlags & 0x3;
+                // V2 unconditionally wrote BOTH C and V; count each dead bit we now skip
+                // (both the full-elision cvsf==0 and the partial case, e.g. a GE/LT/GT/LE
+                // consumer reads N,V so C is dead -> skip the C BFI).
+                if (!(cvsf & 0x2)) LFV3_STAT(CVSlotWritesElided); // C dead
+                if (!(cvsf & 0x1)) LFV3_STAT(CVSlotWritesElided); // V dead
+                if (cvsf)
+                {
+                    LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+                    if (cvsf & 0x2) BFI(W1, W2, 29, 1); // C
+                    if (cvsf & 0x1) BFI(W1, W3, 28, 1); // V
+                    STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+                }
+            }
+            Comp_RetriveFlags(false);
+#else
             BFI(RCPSR, W2, 29, 1);
             BFI(RCPSR, W3, 28, 1);
+            Comp_RetriveFlags(false);
+#endif
         }
         else
         {
@@ -679,10 +1042,22 @@ void Compiler::A_Comp_GetOp2(bool S, Op2& op2)
         if (S && shift && (CurInstr.SetFlags & 0x2))
         {
             CPSRDirty = true;
+#ifdef LITEV_JIT_LAZYFLAGS
+            // Compile-time-known shifter C (imm-rotate carry) -> ARM::JitNZCV slot[29] RMW.
+            // The slot is canonical (this logical-S op's Comp_ReconcileFlags materialised
+            // any prior residency to it first); the RMW preserves the other flag bits.
+            LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+            if (imm & 0x80000000)
+                ORRI2R(W1, W1, 1 << 29);
+            else
+                ANDI2R(W1, W1, ~(1 << 29));
+            STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+#else
             if (imm & 0x80000000)
                 ORRI2R(RCPSR, RCPSR, 1 << 29);
             else
                 ANDI2R(RCPSR, RCPSR, ~(1 << 29));
+#endif
         }
 
         op2 = Op2(imm);    
@@ -898,6 +1273,23 @@ void Compiler::A_Comp_Mul_Short()
 
         MUL(W0, W0, W1);
 
+#ifdef LITEV_JIT_LAZYFLAGS
+        // Sticky Q (bit 27) is a control bit -> ARM::CPSR memory RMW conditioned on the
+        // ADDS overflow (host V). Flags are already canonical in memory (SMLAxy is not a
+        // transparent body, so ReconcileFlags materialized the prior residency); the ADDS
+        // clobbers host NZCV but SMLAxy does not set guest NZCV, so nothing is deferred and
+        // memory NZCV (preserved by the RMW) stays correct. W2 = word scratch.
+        LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, CPSR));
+        ORRI2R(W1, W2, 0x08000000);
+
+        ARM64Reg rn = MapReg(CurInstr.A_Reg(12));
+        ADDS(rd, W0, rn);
+
+        CSEL(W2, W1, W2, CC_VS);
+        STR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, CPSR));
+
+        CPSRDirty = true;
+#else
         ORRI2R(W1, RCPSR, 0x08000000);
 
         ARM64Reg rn = MapReg(CurInstr.A_Reg(12));
@@ -906,6 +1298,7 @@ void Compiler::A_Comp_Mul_Short()
         CSEL(RCPSR, W1, RCPSR, CC_VS);
 
         CPSRDirty = true;
+#endif
 
         Comp_AddCycles_C();
     }
@@ -944,6 +1337,19 @@ void Compiler::A_Comp_Mul_Short()
 
         if (!x)
         {
+#ifdef LITEV_JIT_LAZYFLAGS
+            // Sticky Q (bit 27) -> ARM::CPSR memory RMW on ADDS overflow (as SMLAxy above).
+            LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, CPSR));
+            ORRI2R(W1, W2, 0x08000000);
+
+            ARM64Reg rn = MapReg(CurInstr.A_Reg(12));
+            ADDS(rd, W0, rn);
+
+            CSEL(W2, W1, W2, CC_VS);
+            STR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, CPSR));
+
+            CPSRDirty = true;
+#else
             ORRI2R(W1, RCPSR, 0x08000000);
 
             ARM64Reg rn = MapReg(CurInstr.A_Reg(12));
@@ -952,6 +1358,7 @@ void Compiler::A_Comp_Mul_Short()
             CSEL(RCPSR, W1, RCPSR, CC_VS);
 
             CPSRDirty = true;
+#endif
         }
 
         Comp_AddCycles_C();

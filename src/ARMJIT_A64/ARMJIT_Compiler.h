@@ -233,6 +233,69 @@ public:
     void Comp_ReconcileFlags();
     bool Comp_BodyIsNZCVTransparent(u16 kind, u8 writeFlags, u8 readFlags);
 
+#ifdef LITEV_JIT_LAZYFLAGS
+    // ============================ LAZY-FLAGS V3 ============================
+    // V3 tightens the residual flag traffic V2 still emits, using the block's
+    // BACKWARD DEAD-FLAG LIVENESS. melonDS already runs that liveness pass:
+    // FloodFillSetFlags (ARMJIT.cpp) walks each block's CurInstr[] backward
+    // seeding a consumer's Info.ReadFlags (and 0xF at block exit / at any non-
+    // compilable / cond-follow boundary — the conservative all-live barrier),
+    // KILLING a flag only on a DEFINITE write (WriteFlags low nibble — the
+    // conditional transform in ARM_InstrInfo.cpp already zeroes that nibble for
+    // cond<0xE ARM ops and folds the maybe-write into the high nibble, and adds
+    // the condition's own reads into ReadFlags), and depositing the surviving
+    // live set of PRODUCED bits into each instr's FetchedInstr::SetFlags. So
+    // `CurInstr.SetFlags` IS the per-instruction "produced flags that are live"
+    // result; every producer flush (Comp_RetriveFlags, the deferral masks) is
+    // already gated on it. V3 (a) extends that gate to the last ungated eager
+    // producer write (the CVInGPR C,V slot RMW), and (b) needs a companion
+    // "which flags are live IMMEDIATELY AFTER instr i" set (FloodFill's SetFlags
+    // cannot answer this at a mid-instruction flush point) to upgrade a partial
+    // FR_HOST_NZ flush to the 2-instr full-nibble MRS+STR when the C,V it would
+    // preserve are dead. FlagsLiveInCur carries LiveIn[i] (flags live at the START
+    // of instr i — observed by i's body OR anything after it, barrier => 0xF) into
+    // the flush helpers, which run just before instr i's body. It DEFAULTS to 0xF
+    // (all-live => never upgrade) at every call site outside the compile loop body
+    // (block-end flush, trampolines) so an un-set context can only be conservative.
+    u8 FlagsLiveInCur = 0xF;
+    // Per-block LiveIn[i] (flags live at the start of instruction i), same barrier
+    // conservatism as FloodFillSetFlags. Computed once per block in CompileBlock.
+    void Comp_ComputeFlagLiveness(FetchedInstr* instrs, int instrsCount);
+    u8 FlagsLiveIn[64] = {}; // MaxBlockSize is 32 (ARMJIT.cpp); 64 is slack.
+
+    // Item 3 (native carry-in): set by Comp_ReconcileFlags when an UNCONDITIONAL
+    // ADC/SBC (S-form, PSTATE-safe register op2) reads the guest C that is
+    // genuinely resident in host PSTATE (FR_HOST_FULL). Comp_Arithmetic then
+    // consumes host C directly via the AArch64 ADCS/SBCS form (0 setup instrs)
+    // instead of LDR slot + UBFX + CMP. Reset per instruction in CompileBlock.
+    bool CarryInHostResident = false;
+
+    // FULL LAZY-FLAGS. RCPSR (W27) is no longer a CPSR carrier (it is repurposed as the
+    // 8th GLOBALREG pin, guest r7). The guest CPSR is now split into two stores:
+    //   * CONTROL word (bits [27:0] — mode / T / I,F / Q): ALWAYS canonical in ARM::CPSR
+    //     MEMORY. Every control-bit read/write is a memory access (LDR/modify/STR); nothing
+    //     is cached across instructions.
+    //   * NZCV flags (bits [31:28]): FlagResidency, encoded by the EXISTING FIXEDREG state
+    //     (kept as the single source of truth — no separate enum to desync):
+    //       FR_MEMORY    == (NZCVDeferred == 0)                : guest NZCV canonical in memory.
+    //       FR_HOST_FULL == (NZCVDeferred && NZCVCondValid)    : full guest NZCV in host PSTATE
+    //                                                            (memory NZCV stale).
+    //       FR_HOST_NZ   == (NZCVDeferred && !NZCVCondValid)   : guest N,Z in host PSTATE;
+    //                                                            guest C,V in memory[29:28].
+    // Comp_MaterializeFlags / Comp_RetriveFlags therefore RMW the ARM::CPSR MEMORY word (the
+    // "MaterializeFlagsToMem" the design calls for) instead of RCPSR; CheckCondition branches
+    // on host PSTATE when a full-NZCV producer is resident, else on a freshly-loaded memory
+    // word; carry-in / shifter-C / all control sites operate on memory. The invariant that
+    // memory is canonical whenever a flag-setting body or a shifter-C write runs is upheld by
+    // the existing ReconcileFlags/CheckCondition/MaterializeFlags choke points (a flag-writing
+    // body is never "transparent", so it always materializes the old residency first).
+    //
+    // Insert src[0] into the ARM::CPSR memory word at bit `pos` (read-modify-write, preserving
+    // every other bit), using `word` as a scratch that MUST differ from `src`. Used by the
+    // eager shifter-C writes now that RCPSR[29] is gone (the interim memory RMW the design
+    // flags as the L4 lazy-shifter-C target).
+    void Comp_CPSRInsertBitToMem(Arm64Gen::ARM64Reg word, Arm64Gen::ARM64Reg src, int pos);
+#endif
 #endif
 
     Arm64Gen::FixupBranch CheckCondition(u32 cond);
