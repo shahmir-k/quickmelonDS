@@ -1,0 +1,39 @@
+# liteDS-v2 input script - Shrek Smash n' Crash Racing IN-RACE gameplay workload.
+#
+# Drives from direct boot through the button-only menu path into a live Quick
+# Race, then holds A (accelerate) for the rest of the run. Unlike the boot/menu
+# workload (600f, no input), this exercises live 3D rasterization, GXFIFO and
+# DMA every frame - the real gameplay hot path.
+#
+# Milestones (PPM-verified, software renderer, FreeBIOS direct boot, fixed RTC):
+#   ~900   main menu, "Single Player" highlighted
+#   ~960   SELECT GAME TYPE (Tournament highlighted); DOWN,DOWN -> Quick Race
+#   ~1080  QUICK RACE track select ("Swamp" default) -> A
+#   ~1150  SELECT CHARACTER ("Shrek" default)         -> A
+#   ~1230  SELECT PROFILE ("DEFAULT")                 -> A
+#   ~1320  "Loading..."
+#   ~1560  RACE LIVE: HUD "1st"/"Lap 1/3", P1-P4 list, minimap, live 3D
+#   1600   race-start reference frame F (savestate dump point); kart at line
+#   1600+  A held: kart accelerates; race timer runs; AI karts race (minimap)
+#
+# No touchscreen input is used or required to reach the race - the whole menu
+# path is button-playable. Format: "<frame> <keys>" holds those keys from that
+# frame onward (level, not edge). Keys: A B SELECT START RIGHT LEFT UP DOWN R L X Y.
+
+# --- menu navigation ---
+900 A
+910 NONE
+970 DOWN
+980 NONE
+990 DOWN
+1000 NONE
+1010 A
+1020 NONE
+1080 A
+1090 NONE
+1150 A
+1160 NONE
+1230 A
+1240 NONE
+# --- race: hold A (accelerate) from race start to end of run ---
+1540 A

@@ -170,6 +170,10 @@ int LocalMP::SendPacketGeneric(int inst, u32 type, u8* packet, int len, u64 time
     pktheader.Length = len;
     pktheader.Timestamp = timestamp;
 
+    PacketCount++;
+    if (type == 1) CmdCount++;
+    else if (type == 2) ReplyCount++;
+
     type &= 0xFFFF;
     int nfifo = (type == 2) ? 1 : 0;
     FIFOWrite(inst, nfifo, &pktheader, sizeof(pktheader));

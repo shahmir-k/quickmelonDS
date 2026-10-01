@@ -1,0 +1,57 @@
+# liteDS-v2 input script - Rockwrestler (RockPolish, 2023 WIP DS tester).
+# Hierarchical menu: A drills ARMv4 -> sub-test list -> runs the test
+# (result shown as 'OK' top-left, or an error code on failure). Pulsing A
+# drives into ARMv4 and cycles its condition-code / instruction sub-tests,
+# all reporting OK. 600-frame run; interp and JIT are byte-identical.
+# Format: '<frame> <keys>' = hold exactly those keys from that frame on.
+
+200 A
+206 NONE
+220 A
+226 NONE
+240 A
+246 NONE
+260 A
+266 NONE
+280 A
+286 NONE
+300 A
+306 NONE
+320 A
+326 NONE
+340 A
+346 NONE
+360 A
+366 NONE
+380 A
+386 NONE
+400 A
+406 NONE
+420 A
+426 NONE
+440 A
+446 NONE
+460 A
+466 NONE
+480 A
+486 NONE
+500 A
+506 NONE
+520 A
+526 NONE
+540 A
+546 NONE
+560 A
+566 NONE
+580 A
+586 NONE
+600 A
+606 NONE
+620 A
+626 NONE
+640 A
+646 NONE
+660 A
+666 NONE
+680 A
+686 NONE

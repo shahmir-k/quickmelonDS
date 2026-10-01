@@ -1,0 +1,7 @@
+# liteDS-v2 input script - hold A for the whole run.
+#
+# Used with the savestate-based in-race benchmark: load the race-start savestate
+# (savestates/shrek-race.mln, dumped at frame F=1600 of shrek-race.script) and
+# hold A (accelerate) from frame 0 so the kart drives during the measured window.
+# This reproduces shrek-race.script's in-race workload without re-running menus.
+0 A

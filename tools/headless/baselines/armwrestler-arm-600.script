@@ -1,0 +1,58 @@
+# liteDS-v2 input script - ARMWrestler DS (mic-, 2006 / Atem2069 fixed build).
+# From the test menu (ARM ALU highlighted) START runs the selected suite;
+# on a results page START='Next page', SELECT='Menu'. Pulsing START pages
+# through the full ARM instruction suite - ARM ALU pt1, ALU pt2/MISC,
+# ARM LDR/STR, ARM LDM/STM - then wraps, cycling deterministically. Every
+# subtest reports OK. 600-frame run; interp and JIT are byte-identical.
+# Format: '<frame> <keys>' = hold exactly those keys from that frame on.
+
+200 START
+206 NONE
+220 START
+226 NONE
+240 START
+246 NONE
+260 START
+266 NONE
+280 START
+286 NONE
+300 START
+306 NONE
+320 START
+326 NONE
+340 START
+346 NONE
+360 START
+366 NONE
+380 START
+386 NONE
+400 START
+406 NONE
+420 START
+426 NONE
+440 START
+446 NONE
+460 START
+466 NONE
+480 START
+486 NONE
+500 START
+506 NONE
+520 START
+526 NONE
+540 START
+546 NONE
+560 START
+566 NONE
+580 START
+586 NONE
+600 START
+606 NONE
+620 START
+626 NONE
+640 START
+646 NONE
+660 START
+666 NONE
+680 START
+686 NONE

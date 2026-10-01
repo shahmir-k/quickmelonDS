@@ -53,6 +53,14 @@ public:
     void Begin(int inst);
     void End(int inst);
 
+    // Read-only observability for the headless MP test harness (no timing effect):
+    // ConnectedBitmask == which instances have called Begin (associated); the
+    // counters tally MP traffic so the harness can tell a live link from a dead one.
+    [[nodiscard]] u16 ObserveConnectedBitmask() const noexcept override { return MPStatus.ConnectedBitmask; }
+    [[nodiscard]] u64 ObserveCmdCount() const noexcept override { return CmdCount; }
+    [[nodiscard]] u64 ObserveReplyCount() const noexcept override { return ReplyCount; }
+    [[nodiscard]] u64 ObservePacketCount() const noexcept override { return PacketCount; }
+
     int SendPacket(int inst, u8* data, int len, u64 timestamp);
     int RecvPacket(int inst, u8* data, u64* timestamp);
     int SendCmd(int inst, u8* data, int len, u64 timestamp);
@@ -76,6 +84,11 @@ private:
 
     int LastHostID = -1;
     Platform::Semaphore* SemPool[32] {};
+
+    // Observability counters (harness only; incremented under MPQueueLock).
+    u64 CmdCount = 0;      // type-1 (host CMD) frames sent
+    u64 ReplyCount = 0;    // type-2 (client reply) frames sent
+    u64 PacketCount = 0;   // all frames sent
 };
 }
 

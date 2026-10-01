@@ -1,0 +1,11 @@
+# liteDS-v2 input script - DEMO for the --input-script feature.
+# Shrek Smash n' Crash Racing auto-advances its intro logos into the main
+# menu by ~frame 860 (Single Player highlighted). This script presses A to
+# confirm, advancing to the "SELECT GAME TYPE" submenu. Compared against a
+# no-script run at the same frame count, the framebuffer hash diverges,
+# proving scripted input reaches emulation deterministically.
+#
+# Format: "<frame> <keys>" holds exactly those keys from that frame onward.
+# Keys: A B SELECT START RIGHT LEFT UP DOWN R L X Y | NONE | 0x<hex pressed-mask>
+920 A
+930 NONE

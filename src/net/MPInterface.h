@@ -61,6 +61,13 @@ public:
     virtual void Begin(int inst) = 0;
     virtual void End(int inst) = 0;
 
+    // Read-only observability for the headless MP test harness. Default 0;
+    // LocalMP overrides. No effect on emulated timing.
+    [[nodiscard]] virtual u16 ObserveConnectedBitmask() const noexcept { return 0; }
+    [[nodiscard]] virtual u64 ObserveCmdCount() const noexcept { return 0; }
+    [[nodiscard]] virtual u64 ObserveReplyCount() const noexcept { return 0; }
+    [[nodiscard]] virtual u64 ObservePacketCount() const noexcept { return 0; }
+
     virtual int SendPacket(int inst, u8* data, int len, u64 timestamp) = 0;
     virtual int RecvPacket(int inst, u8* data, u64* timestamp) = 0;
     virtual int SendCmd(int inst, u8* data, int len, u64 timestamp) = 0;
