@@ -126,6 +126,23 @@ option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence"
 if (LITEV_SHADOW_ASSERT)
     add_compile_definitions(LITEV_SHADOW_ASSERT=1)
 endif()
+
+# Unit 3: AArch64-only emitted JIT dispatcher. When ON, JIT block exits jump to a
+# generated dispatcher stub that does the fast block lookup inline and branches
+# straight into the next block, staying in JIT context for the whole slice; it
+# only returns to C++ (ARM_Ret) on budget-expiry, StopExecution, region miss, or
+# lookup miss. Default OFF -> the build is bit-identical to the shadow-budget
+# tree. The x64 JIT ALWAYS keeps the unmodified upstream C++ dispatch loop; this
+# option therefore requires an AArch64 target and errors at configure time on x86.
+option(LITEV_JIT_DISPATCH "AArch64 emitted JIT block dispatcher (chained block exits)" OFF)
+if (LITEV_JIT_DISPATCH)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_DISPATCH=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_DISPATCH requires an AArch64 target "
+                            "(the x64 JIT keeps the upstream C++ dispatch loop).")
+    endif()
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

@@ -222,6 +222,18 @@ public:
     void* Gen_JumpTo9(int kind);
     void* Gen_JumpTo7(int kind);
 
+#ifdef LITEV_JIT_DISPATCH
+    // liteDS-v2 Unit 3: emitted per-CPU dispatcher stub (num=0 ARM9, num=1 ARM7).
+    // Generated in Reset() so GetRXBase() is the stable rebased block-cache base.
+    void* Gen_Dispatcher(u32 num);
+    // Common block-exit tail: jump to this CPU's dispatcher instead of ARM_Ret so
+    // execution stays in JIT context across block boundaries.
+    void EmitBlockExit();
+    void* DispatcherEntry[2] = { nullptr, nullptr };
+
+
+#endif
+
     void Comp_BranchSpecialBehaviour(bool taken);
 
     JitBlockEntry AddEntryOffset(u32 offset)

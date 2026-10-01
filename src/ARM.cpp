@@ -708,6 +708,20 @@ void ARMv5::Execute()
                                      (s64)NDS.ARM9Timestamp, (s64)NDS.ARM9Target);
 #endif
 
+#if defined(LITEV_JIT_DISPATCH) && LITEV_PROFILE
+            // Unit 3: count C++ re-entries from the dispatcher. Dispatcher *hits*
+            // (chained transitions) happen entirely in asm and are not counted here;
+            // this tallies only the boundaries where the dispatcher handed control back.
+            if (block)
+            {
+                using namespace melonDS::LiteProfile;
+                AddAtomic(g_Frame.CppReentries);
+                // budget left and no pending stop => the dispatcher's inline lookup missed
+                // (uncompiled target or region change) rather than the slice ending.
+                if (!StopExecution && CyclesBudget > 0)
+                    AddAtomic(g_Frame.DispatcherMisses);
+            }
+#endif
 
             if (StopExecution)
             {
@@ -863,6 +877,15 @@ void ARMv4::Execute()
                                      (s64)NDS.ARM7Timestamp, (s64)NDS.ARM7Target);
 #endif
 
+#if defined(LITEV_JIT_DISPATCH) && LITEV_PROFILE
+            if (block)
+            {
+                using namespace melonDS::LiteProfile;
+                AddAtomic(g_Frame.CppReentries);
+                if (!StopExecution && CyclesBudget > 0)
+                    AddAtomic(g_Frame.DispatcherMisses);
+            }
+#endif
 
             if (StopExecution)
             {

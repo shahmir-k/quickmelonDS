@@ -683,12 +683,156 @@ bool Compiler::CanCompile(bool thumb, u16 kind)
     return (thumb ? T_Comp[kind] : A_Comp[kind]) != NULL;
 }
 
+#ifdef LITEV_JIT_DISPATCH
+// liteDS-v2 Unit 3 — emitted per-CPU block dispatcher.
+//
+// Entered by an unconditional `B` from a block's exit tail. The exiting block has
+// flushed all guest registers to memory and committed R[15] (the invariant upstream's
+// C++ loop already relies on to recompute instrAddr after every ARM_Ret). RCPU(x29)/
+// RCPSR(w27)/RCycles(w28) are live; RMemBase(x26) is reloaded by each block's own
+// prologue; scratch w0-w7/x2-x7 are freely clobbered (the next block reloads its guest
+// state from memory).
+//
+// It reproduces, bit-for-bit, the inter-block work of ARM::Execute<JIT>. Upstream runs:
+//     run block K
+//     if (StopExecution) { if (IRQ) TriggerIRQ(); if (Halted||IdleLoop) {..} }
+//     Timestamp += Cycles; Cycles = 0;
+// The order is load-bearing: the StopExecution handling (IRQ delivery, idle/halt skip)
+// must observe Timestamp *without* block K's cycles, and only same-slice work that
+// continues (chains) may advance Timestamp. Crucially `NDS::ScheduleEvent` schedules
+// relative to ARMxTimestamp (not Timestamp+Cycles), so a stale mid-slice Timestamp
+// would move every event a chained block schedules — hence the per-hop Timestamp update.
+//
+//   (a) StopExecution set  -> exit to C++ WITHOUT touching Timestamp/Cycles/budget, so
+//       C++ runs its StopExecution handling (old Timestamp) then does Timestamp += Cycles.
+//   (b) otherwise commit block K: Timestamp += Cycles; budget -= Cycles; Cycles = 0.
+//   (c) budget <= 0 (natural slice end, or ForceExecutionExit which zeroes it) -> exit.
+//   (d) region miss / lookup miss -> exit (Timestamp already advanced, Cycles 0).
+//   (e) hit -> commit CPSR, br straight into the next block.
+// All exit edges go to ARM_Ret (commits Cycles/CPSR, pops the callee frame).
+void* Compiler::Gen_Dispatcher(u32 num)
+{
+    AlignCode16();
+    void* res = GetRXPtr();
+
+    // (Compiler has a member named NDS, so the bare name resolves to it; force the type.)
+    // Bake the exact address of this CPU's Timestamp field. offsetof(NDS, ARMxTimestamp)
+    // is multiple MB (NDS embeds the two ARM cores' huge PU/MemTimings arrays), which
+    // overflows the scaled 12-bit immediate of a 64-bit LDR/STR — so address it at offset 0.
+    void* tsPtr = (num == 0) ? (void*)&NDS.ARM9Timestamp : (void*)&NDS.ARM7Timestamp;
+
+    // (a) StopExecution first — bounce out leaving RCycles = block K's cycles and Timestamp
+    //     untouched (C++ handles IRQ/halt/idle with the pre-block Timestamp, then adds Cycles).
+    LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
+    FixupBranch exitStop = CBNZ(W2);
+
+    // (b) commit block K to the timeline: Timestamp += Cycles (64-bit, unshifted, exactly as
+    //     `NDS.ARMxTimestamp += Cycles`), keep budget == Target-Timestamp, restart the
+    //     accumulator at 0 for the next block. Cycles is always >= 0 so uxtw == the s32 value.
+    MOVP2R(X4, tsPtr);
+    LDR(INDEX_UNSIGNED, X5, X4, 0);
+    ADD(X5, X5, RCycles, ArithOption(RCycles));      // x5 += (u32)RCycles
+    STR(INDEX_UNSIGNED, X5, X4, 0);
+    LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CyclesBudget));
+    SUB(W1, W1, RCycles);
+    STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CyclesBudget));
+    MOVI2R(RCycles, 0);
+
+    // (c) slice over or forced exit? budget <= 0
+    CMP(W1, 0);
+    FixupBranch exitBudget = B(CC_LE);
+
+    // (d) instrAddr = R[15] - ((CPSR&0x20)?2:4) == (R[15] - 4) + (thumb << 1), as in the loop
+    LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
+    UBFX(W3, RCPSR, 5, 1);                            // W3 = Thumb bit
+    SUB(W0, W0, 4);
+    ADD(W0, W0, W3, ArithOption(W3, ST_LSL, 1));      // W0 = clean instrAddr
+
+
+    // (e) region bounds: offset = instrAddr - FastBlockLookupStart, exit if >= Size (unsigned;
+    //     a single compare also catches instrAddr < Start via wraparound)
+    LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, FastBlockLookupStart));
+    SUB(W4, W0, W3);
+    LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, FastBlockLookupSize));
+    CMP(W4, W5);
+    FixupBranch exitRegion = B(CC_HS);
+
+    // (f) inline tag lookup: entry = FastBlockLookup[offset/2]; tag = entry>>32 == (instrAddr|num)
+    LDR(INDEX_UNSIGNED, X6, RCPU, offsetof(ARM, FastBlockLookup));
+    LSR(W4, W4, 1);
+    LDR(X7, X6, ArithOption(W4, true));               // ldr x7, [x6, w4, uxtw #3]
+    LSR(X2, X7, 32);                                  // W2 = tag (high word)
+    FixupBranch miss;
+    if (num == 0)
+    {
+        CMP(W2, W0);
+        miss = B(CC_NEQ);
+    }
+    else
+    {
+        ORRI2R(W3, W0, 1);                            // ARM7 tag carries num bit
+        CMP(W2, W3);
+        miss = B(CC_NEQ);
+    }
+
+    // (g) hit: commit live CPSR to memory before entering the next block. Blocks are compiled
+    //     assuming CPSR-in-memory is current at their entry (per-block CPSRDirty starts false,
+    //     so an interpreter-fallback first instruction skips its SaveCPSR); upstream upholds
+    //     this via ARM_Ret's CPSR store, which chaining bypasses.
+    STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+    // LAZYFLAGS: ARM::CPSR is already canonical in memory at every block exit (the exiting
+    // block materialized host NZCV and control bits are never register-cached), so the
+    // per-hop commit is unnecessary; W27 now holds guest r7 and must not be stored here.
+    // low 32 bits of the entry (W7) are the sub-entry offset into the RX region; baked RXBase
+    // == GetRXBase() (stable rebased base, the same one SubEntryOffset subtracts).
+    MOVI2R(X3, (u64)GetRXBase());
+    ADD(X0, X3, W7, ArithOption(W7));                 // add x0, x3, w7, uxtw
+#if LITEV_PROFILE
+    // Runtime dispatcher-resolved chain hops (compare to CommitStubEntries = linked hops -> the
+    // ACTUAL hot-loop link coverage). X4/X5 are dead here; X0 (the branch target) is preserved.
+    MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.DispatcherHits);
+    LDR(INDEX_UNSIGNED, X5, X4, 0);
+    ADD(X5, X5, 1);
+    STR(INDEX_UNSIGNED, X5, X4, 0);
+#endif
+    BR(X0);
+
+
+    SetJumpTarget(exitStop);
+    SetJumpTarget(exitBudget);
+    SetJumpTarget(exitRegion);
+    SetJumpTarget(miss);
+#if LITEV_PROFILE
+    // Dispatcher exits to C++ (block-lookup miss / recompile churn + the rare slice-end).
+    MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.DispatcherMisses);
+    LDR(INDEX_UNSIGNED, X5, X4, 0);
+    ADD(X5, X5, 1);
+    STR(INDEX_UNSIGNED, X5, X4, 0);
+#endif
+    QuickTailCall(X0, ARM_Ret);
+
+    return res;
+}
+
+void Compiler::EmitBlockExit()
+{
+    LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.DispatchOnlyExits);
+    B(DispatcherEntry[Num]);
+}
+#endif
+
 void Compiler::Comp_BranchSpecialBehaviour(bool taken)
 {
     if (taken && CurInstr.BranchFlags & branch_IdleBranch)
     {
         MOVI2R(W0, 1);
         STRB(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, IdleLoop));
+#ifdef LITEV_JIT_DISPATCH
+        // The dispatcher checks the budget, not IdleLoop; zero it so the exit bounces
+        // to C++ (which performs the idle-skip). Keeps the ForceExecutionExit invariant:
+        // every setter of StopExecution/Halted/IdleLoop also zeroes CyclesBudget.
+        STR(INDEX_UNSIGNED, WZR, RCPU, offsetof(ARM, CyclesBudget));
+#endif
     }
 
     if ((CurInstr.BranchFlags & branch_FollowCondNotTaken && taken)
@@ -698,7 +842,11 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
 
         if (ConstantCycles)
             ADD(RCycles, RCycles, ConstantCycles);
+#ifdef LITEV_JIT_DISPATCH
+        EmitBlockExit();
+#else
         QuickTailCall(X0, ARM_Ret);
+#endif
     }
 }
 
@@ -850,7 +998,11 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
     if (ConstantCycles)
         ADD(RCycles, RCycles, ConstantCycles);
+#ifdef LITEV_JIT_DISPATCH
+    EmitBlockExit();
+#else
     QuickTailCall(X0, ARM_Ret);
+#endif
 
     FlushIcache();
 
@@ -868,6 +1020,19 @@ void Compiler::Reset()
 
     for (int i = 0; i < (JitMemMainSize + JitMemSecondarySize) / 4; i++)
         *(((u32*)GetRWPtr()) + i) = brk_0;
+
+#ifdef LITEV_JIT_DISPATCH
+    // Generate the per-CPU dispatchers at the very start of the (now-brk-filled)
+    // block-cache region. Doing it here — not in the constructor — means GetRXBase()
+    // is already the stable, rebased block-cache base (== the base SubEntryOffset uses),
+    // so the RXBase baked into the hit path is always correct. Blocks compiled after
+    // this Reset() start just past the dispatcher code. Regenerated on every
+    // ResetBlockCache(), which is cheap and keeps the base bit-for-bit consistent.
+    SetCodePtr(0);
+    DispatcherEntry[0] = Gen_Dispatcher(0);
+    DispatcherEntry[1] = Gen_Dispatcher(1);
+    FlushIcache();
+#endif
 }
 
 void Compiler::Comp_AddCycles_C(bool forceNonConstant)
