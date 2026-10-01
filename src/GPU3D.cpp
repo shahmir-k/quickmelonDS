@@ -42,7 +42,7 @@ static int litevGxPropDefault(const char* name, int def) {
 }
 #endif
 
-#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2)) && defined(__ARM_NEON)
+#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2) || defined(LITEV_GEOM_NEON3)) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 
@@ -52,7 +52,7 @@ namespace melonDS
 using Platform::Log;
 using Platform::LogLevel;
 
-#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2)) && defined(__ARM_NEON)
+#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2) || defined(LITEV_GEOM_NEON3)) && defined(__ARM_NEON)
 // M6.11 step 3 — integer-NEON kernels for the GPU3D geometry engine's hot
 // fixed-point math. These reproduce the scalar results BIT-EXACTLY, not
 // approximately:
@@ -817,6 +817,25 @@ void MatrixMult3x3(s32* m, s32* s)
 
 void MatrixScale(s32* m, s32* s)
 {
+#if defined(LITEV_GEOM_NEON3) && defined(__ARM_NEON)
+    // m[4r+j] = ((s64)s[r] * m[4r+j]) >> 12, rows r=0..2 (row 3 / m[12..15] is
+    // left untouched, exactly as the scalar below). Each lane is a widening
+    // 32x32->64 multiply (== scalar (s64)s[r]*m[4r+j], both operands s32), an
+    // arithmetic 64-bit >>12, then a truncating store to s32 — bit-identical to
+    // the scalar narrowing assignment. The vld1q of a row happens before its
+    // store, so aliasing m in/out is safe.
+    for (int r = 0; r < 3; r++)
+    {
+        int32x4_t row = vld1q_s32(m + r*4);
+        int64x2_t lo = vshrq_n_s64(vmull_n_s32(vget_low_s32(row),  s[r]), 12);
+        int64x2_t hi = vshrq_n_s64(vmull_n_s32(vget_high_s32(row), s[r]), 12);
+        m[r*4+0] = (s32)vgetq_lane_s64(lo, 0);
+        m[r*4+1] = (s32)vgetq_lane_s64(lo, 1);
+        m[r*4+2] = (s32)vgetq_lane_s64(hi, 0);
+        m[r*4+3] = (s32)vgetq_lane_s64(hi, 1);
+    }
+    return;
+#endif
     m[0] = ((s64)s[0]*m[0]) >> 12;
     m[1] = ((s64)s[0]*m[1]) >> 12;
     m[2] = ((s64)s[0]*m[2]) >> 12;
@@ -835,6 +854,21 @@ void MatrixScale(s32* m, s32* s)
 
 void MatrixTranslate(s32* m, s32* s)
 {
+#if defined(LITEV_GEOM_NEON3) && defined(__ARM_NEON)
+    // The added delta is a 3-term Mat*Vec: lane j = (s[0]*m[j] + s[1]*m[4+j] +
+    // s[2]*m[8+j]) >> 12. Reuses the proven NeonMat4Vec4_s64<12> kernel with v3=0
+    // (so the +v3*m[12..15] term is exactly 0) writing to a SEPARATE temp t[] that
+    // does not alias m. Then m[12+j] += t[j]: because m[12+j] is s32 and t[j] is
+    // the s32-truncated shifted sum, m[12+j] + t[j] (mod 2^32) equals the scalar
+    // (s32)(m[12+j] + (s64)sum>>12) (mod 2^32) — truncation distributes over add.
+    s32 t[4];
+    NeonMat4Vec4_s64<12>(t, m, s[0], s[1], s[2], 0);
+    m[12] += t[0];
+    m[13] += t[1];
+    m[14] += t[2];
+    m[15] += t[3];
+    return;
+#endif
     m[12] += ((s64)s[0]*m[0] + (s64)s[1]*m[4] + (s64)s[2]*m[8]) >> 12;
     m[13] += ((s64)s[0]*m[1] + (s64)s[1]*m[5] + (s64)s[2]*m[9]) >> 12;
     m[14] += ((s64)s[0]*m[2] + (s64)s[1]*m[6] + (s64)s[2]*m[10]) >> 12;
@@ -1830,10 +1864,18 @@ void GPU3D::BoxTest(const u32* params) noexcept
         s32 y = cube[i].Position[1];
         s32 z = cube[i].Position[2];
 
+#if defined(LITEV_GEOM_NEON3) && defined(__ARM_NEON)
+        // Identical clip-matrix transform to the per-vertex path in SubmitVertex
+        // (w = 0x1000). x/y/z are captured above so out=cube[i].Position does not
+        // alias the scalar inputs, and ClipMatrix (M) is distinct storage. Reuses
+        // the proven NeonMat4Vec4_s64<12> kernel -> bit-exact vs the scalar below.
+        NeonMat4Vec4_s64<12>(cube[i].Position, ClipMatrix, x, y, z, 0x1000);
+#else
         cube[i].Position[0] = ((s64)x*ClipMatrix[0] + (s64)y*ClipMatrix[4] + (s64)z*ClipMatrix[8] + (s64)0x1000*ClipMatrix[12]) >> 12;
         cube[i].Position[1] = ((s64)x*ClipMatrix[1] + (s64)y*ClipMatrix[5] + (s64)z*ClipMatrix[9] + (s64)0x1000*ClipMatrix[13]) >> 12;
         cube[i].Position[2] = ((s64)x*ClipMatrix[2] + (s64)y*ClipMatrix[6] + (s64)z*ClipMatrix[10] + (s64)0x1000*ClipMatrix[14]) >> 12;
         cube[i].Position[3] = ((s64)x*ClipMatrix[3] + (s64)y*ClipMatrix[7] + (s64)z*ClipMatrix[11] + (s64)0x1000*ClipMatrix[15]) >> 12;
+#endif
     }
 
     // front face (-Z)
@@ -1896,10 +1938,19 @@ void GPU3D::PosTest() noexcept
     s64 vertex[4] = {(s64)CurVertex[0], (s64)CurVertex[1], (s64)CurVertex[2], 0x1000};
 
     UpdateClipMatrix();
+#if defined(LITEV_GEOM_NEON3) && defined(__ARM_NEON)
+    // Same clip-matrix transform as SubmitVertex/BoxTest: CurVertex is s16 (fits
+    // s32), w = 0x1000, PosTestResult is s32[4]. Reuses the proven kernel; the
+    // scalar's (s64)vertex[i] widening equals the kernel's 32x32->64 mul since the
+    // inputs fit in s32. Bit-exact.
+    NeonMat4Vec4_s64<12>(PosTestResult, ClipMatrix,
+                         (s32)vertex[0], (s32)vertex[1], (s32)vertex[2], (s32)vertex[3]);
+#else
     PosTestResult[0] = (vertex[0]*ClipMatrix[0] + vertex[1]*ClipMatrix[4] + vertex[2]*ClipMatrix[8] + vertex[3]*ClipMatrix[12]) >> 12;
     PosTestResult[1] = (vertex[0]*ClipMatrix[1] + vertex[1]*ClipMatrix[5] + vertex[2]*ClipMatrix[9] + vertex[3]*ClipMatrix[13]) >> 12;
     PosTestResult[2] = (vertex[0]*ClipMatrix[2] + vertex[1]*ClipMatrix[6] + vertex[2]*ClipMatrix[10] + vertex[3]*ClipMatrix[14]) >> 12;
     PosTestResult[3] = (vertex[0]*ClipMatrix[3] + vertex[1]*ClipMatrix[7] + vertex[2]*ClipMatrix[11] + vertex[3]*ClipMatrix[15]) >> 12;
+#endif
 
     AddCycles(5);
 }
@@ -1914,9 +1965,30 @@ void GPU3D::VecTest(u32 param) noexcept
     normal[1] = (s16)((param & 0x000FFC00) >> 4) >> 6;
     normal[2] = (s16)((param & 0x3FF00000) >> 14) >> 6;
 
+#if defined(LITEV_GEOM_NEON3) && defined(__ARM_NEON)
+    // 32-bit modular dot with arithmetic >>9. The scalar has NO (s64) casts, so
+    // each product and the 3-term sum are computed modulo 2^32 exactly as
+    // CalculateLighting's shipping normaltrans NEON does: vmulq_n_s32 /
+    // vmlaq_n_s32 keep the low 32 bits per lane (== scalar int products/sum mod
+    // 2^32), and vshrq_n_s32 is the arithmetic >>9 on a signed 32-bit lane. Lane j
+    // = normal[0]*VM[j] + normal[1]*VM[4+j] + normal[2]*VM[8+j] (j=0..2, matching
+    // VecMatrix[0/4/8], [1/5/9], [2/6/10]); lane 3 is computed and discarded.
+    // Assigning a lane to the s16 VecTestResult[j] narrows identically to the
+    // scalar store, and the 0x1000/0xF000 sign-extend below then runs unchanged.
+    {
+        int32x4_t nt = vmulq_n_s32(vld1q_s32(VecMatrix + 0), (s32)normal[0]);
+        nt = vmlaq_n_s32(nt, vld1q_s32(VecMatrix + 4), (s32)normal[1]);
+        nt = vmlaq_n_s32(nt, vld1q_s32(VecMatrix + 8), (s32)normal[2]);
+        nt = vshrq_n_s32(nt, 9);
+        VecTestResult[0] = vgetq_lane_s32(nt, 0);
+        VecTestResult[1] = vgetq_lane_s32(nt, 1);
+        VecTestResult[2] = vgetq_lane_s32(nt, 2);
+    }
+#else
     VecTestResult[0] = (normal[0]*VecMatrix[0] + normal[1]*VecMatrix[4] + normal[2]*VecMatrix[8]) >> 9;
     VecTestResult[1] = (normal[0]*VecMatrix[1] + normal[1]*VecMatrix[5] + normal[2]*VecMatrix[9]) >> 9;
     VecTestResult[2] = (normal[0]*VecMatrix[2] + normal[1]*VecMatrix[6] + normal[2]*VecMatrix[10]) >> 9;
+#endif
 
     if (VecTestResult[0] & 0x1000) VecTestResult[0] |= 0xF000;
     if (VecTestResult[1] & 0x1000) VecTestResult[1] |= 0xF000;

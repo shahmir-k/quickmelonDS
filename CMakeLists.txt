@@ -518,6 +518,20 @@ if (LITEV_GEOM_NEON2)
     add_compile_definitions(LITEV_GEOM_NEON2=1)
 endif()
 
+# liteV wave-3 integer-NEON GPU3D geometry: completes NEON coverage of the remaining
+# per-command clip/vector-matrix transforms in the GXFIFO command path that waves 1/2
+# left scalar — the BoxTest 8-vertex cube transform (0x70), PosTest (0x71), VecTest
+# (0x72), and MatrixScale (0x1B) / MatrixTranslate (0x1C). BoxTest/PosTest/Translate
+# reuse the SAME proven NeonMat4Vec4_s64<12> kernel as the shipping per-vertex clip
+# transform; VecTest mirrors CalculateLighting's shipping 32-bit >>N NEON dot; Scale is
+# a widening per-row scale. Bit-exact by construction (integer NEON, scalar #else
+# fallback, flag-OFF byte-identical); no AddCycles/timing change so MP-safe. AArch64-only
+# (each block also guarded by __ARM_NEON).
+option(LITEV_GEOM_NEON3 "liteV wave-3 integer-NEON GPU3D geometry: BoxTest/PosTest/VecTest + MatrixScale/MatrixTranslate command-path transforms (bit-exact, AArch64)" OFF)
+if (LITEV_GEOM_NEON3)
+    add_compile_definitions(LITEV_GEOM_NEON3=1)
+endif()
+
 # Instant ARM9 hardware divider/sqrt: compute the DIV/SQRT result at register-
 # write time and skip the scheduled completion event. In-race profiling showed
 # Event_Div is the single largest scheduler load (~1233 dispatches/frame, 42% of
