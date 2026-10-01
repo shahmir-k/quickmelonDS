@@ -143,6 +143,41 @@ if (LITEV_JIT_DISPATCH)
                             "(the x64 JIT keeps the upstream C++ dispatch loop).")
     endif()
 endif()
+
+# Unit 4: direct block linking (patch, don't dispatch). Builds ON TOP of the
+# Unit 3 dispatcher: an eligible block exit whose next PC is a compile-time
+# constant emits a per-hop-commit guard followed by a patchable `B` (initially to
+# the dispatcher). When the target block exists the site is patched to branch
+# straight into it, bypassing the dispatcher's inline lookup. Three independent
+# kill switches gate the three eligible exit CLASSES (unconditional static
+# branch / conditional-branch edge / block-end fall-through) so a regression can
+# be bisected to a class. All default ON, but each only takes effect when
+# LITEV_JIT_DISPATCH is ON (linking has no meaning without the dispatcher). With
+# all three OFF the build is bit-identical to the pure Unit-3 dispatcher.
+option(LITEV_LINK_UNCOND "Unit 4: link unconditional static branch exits" ON)
+option(LITEV_LINK_COND "Unit 4: link conditional-branch edge exits" ON)
+option(LITEV_LINK_FALLTHROUGH "Unit 4: link block-end fall-through exits" ON)
+if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    set(_litev_any_link OFF)
+    if (LITEV_LINK_UNCOND)
+        add_compile_definitions(LITEV_LINK_UNCOND=1)
+        set(_litev_any_link ON)
+    endif()
+    if (LITEV_LINK_COND)
+        add_compile_definitions(LITEV_LINK_COND=1)
+        set(_litev_any_link ON)
+    endif()
+    if (LITEV_LINK_FALLTHROUGH)
+        add_compile_definitions(LITEV_LINK_FALLTHROUGH=1)
+        set(_litev_any_link ON)
+    endif()
+    # Umbrella: the link registry / JitBlock link fields / patch machinery are
+    # compiled in whenever at least one exit class links. All three OFF -> the
+    # bookkeeping vanishes and the tree is the pure Unit-3 dispatcher.
+    if (_litev_any_link)
+        add_compile_definitions(LITEV_JIT_LINK=1)
+    endif()
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

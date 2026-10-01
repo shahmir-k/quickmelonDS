@@ -234,6 +234,32 @@ public:
 
 #endif
 
+#ifdef LITEV_JIT_LINK
+    // liteDS-v2 Unit 4: emit a per-hop-commit guard followed by a patchable `B`
+    // (initially -> dispatcher) for a static, same-mode exit whose next PC is the
+    // compile-time constant targetAddr. Records the patch site + target into
+    // LinkExits[] for the C++ registry to resolve after the block is registered.
+    void EmitLinkExit(u32 targetAddr);
+    // Rewrite the 4-byte `B` at RX offset rxOffset to branch to RX offset
+    // targetRxOffset. Caller owns the W^X (JitEnableWrite/Execute) bracket.
+    void PatchLinkSite(u32 rxOffset, u32 targetRxOffset);
+    u32 DispatcherRXOffset(u32 num) { return (u32)((u8*)DispatcherEntry[num] - GetRXBase()); }
+
+    // Populated during CompileBlock; copied into the JitBlock by ARMJIT::CompileBlock.
+    u8 NumLinkExits = 0;
+    OutgoingLink LinkExits[2];
+
+    // Threaded from Comp_JumpTo(u32) to the exit tail: does the last-compiled branch
+    // have a compile-time-constant same-mode target, and was it conditional?
+    bool HasStaticExit = false;
+    u32 StaticExitTarget = 0;
+    bool StaticExitCond = false;
+    // Tracked per instruction so the block-end fall-through exit is only linked when
+    // the last instruction was a JIT-compiled non-branch (single known next PC).
+    bool LastInstrCompiledNonBranch = false;
+    u32 LastInstrFallthroughAddr = 0;
+#endif
+
     void Comp_BranchSpecialBehaviour(bool taken);
 
     JitBlockEntry AddEntryOffset(u32 offset)

@@ -821,6 +821,78 @@ void Compiler::EmitBlockExit()
 }
 #endif
 
+#ifdef LITEV_JIT_LINK
+// liteDS-v2 Unit 4 — a linkable static exit.
+//
+// A linked branch bypasses the dispatcher, so it must reproduce, at the SOURCE
+// site, exactly the per-hop work the dispatcher does before entering the next
+// block — otherwise a chained hop diverges from the pure-dispatch build. The
+// order here mirrors Gen_Dispatcher bit-for-bit:
+//   (a) StopExecution set  -> dispatcher (which, still holding this block's Cycles
+//       and an un-advanced Timestamp, bounces to C++ identically to a plain exit);
+//   (b) commit this block: Timestamp += Cycles; budget -= Cycles; Cycles = 0;
+//   (c) budget <= 0        -> dispatcher (re-commits as a no-op, then exits);
+//   (d) hit: commit CPSR, then the patchable `B`. UNLINKED it targets the
+//       dispatcher (whose inline lookup finds the — possibly not-yet-compiled —
+//       target); LINKED it is rewritten to branch straight into the target block.
+// Because the slot only ever holds an unconditional `B`, it can be re-patched
+// (link / unlink) concurrently with execution on ARMv8 without synchronisation.
+void Compiler::EmitLinkExit(u32 targetAddr)
+{
+    void* tsPtr = (Num == 0) ? (void*)&NDS.ARM9Timestamp : (void*)&NDS.ARM7Timestamp;
+
+    // (a)
+    LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
+    FixupBranch toDispatchStop = CBNZ(W2);
+
+    // (b)
+    MOVP2R(X4, tsPtr);
+    LDR(INDEX_UNSIGNED, X5, X4, 0);
+    ADD(X5, X5, RCycles, ArithOption(RCycles));      // x5 += (u32)RCycles
+    STR(INDEX_UNSIGNED, X5, X4, 0);
+    LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CyclesBudget));
+    SUB(W1, W1, RCycles);
+    STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CyclesBudget));
+    MOVI2R(RCycles, 0);
+
+    // (c)
+    CMP(W1, 0);
+    FixupBranch toDispatchBudget = B(CC_LE);
+
+    // (d)
+    STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+    // LAZYFLAGS: ARM::CPSR already canonical in memory at the linkable exit; W27 = guest r7.
+    u32 patchOffset = (u32)((u8*)GetRXPtr() - GetRXBase());
+    B(DispatcherEntry[Num]);   // the patch slot (unlinked state)
+
+    SetJumpTarget(toDispatchStop);
+    SetJumpTarget(toDispatchBudget);
+    B(DispatcherEntry[Num]);
+
+    if (NumLinkExits < 2)
+    {
+        LinkExits[NumLinkExits].PatchOffset = patchOffset;
+        LinkExits[NumLinkExits].TargetAddr = targetAddr;
+        NumLinkExits++;
+    }
+    LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinkSitesEmitted);
+}
+
+void Compiler::PatchLinkSite(u32 rxOffset, u32 targetRxOffset)
+{
+    ptrdiff_t delta = (ptrdiff_t)targetRxOffset - (ptrdiff_t)rxOffset;
+    // A64 unconditional B reaches +-128MB; the whole block cache is a few MB.
+    assert(delta >= -(1 << 27) && delta < (1 << 27));
+    u32 instr = 0x14000000u | ((u32)((delta >> 2)) & 0x03FFFFFFu);
+
+    u8* rwbase = GetWriteableRWPtr() - GetCodeOffset();   // m_rwbase
+    *(u32*)(rwbase + rxOffset) = instr;
+
+    u8* rxptr = GetRXBase() + rxOffset;
+    __builtin___clear_cache((char*)rxptr, (char*)rxptr + 4);
+}
+#endif
+
 void Compiler::Comp_BranchSpecialBehaviour(bool taken)
 {
     if (taken && CurInstr.BranchFlags & branch_IdleBranch)
@@ -843,7 +915,27 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
         if (ConstantCycles)
             ADD(RCycles, RCycles, ConstantCycles);
 #ifdef LITEV_JIT_DISPATCH
+  #if defined(LITEV_JIT_LINK) && defined(LITEV_LINK_COND)
+        // Conditional-branch edges each have a single compile-time-constant next PC:
+        //   taken edge     -> the static branch target (Comp_JumpTo(u32) just ran);
+        //   not-taken edge -> the fall-through address after this instruction.
+        // A dynamic conditional branch (e.g. conditional BX) leaves HasStaticExit
+        // false on the taken edge -> fall back to the dispatcher for that edge.
+        if (taken && HasStaticExit)
+        {
+            EmitLinkExit(StaticExitTarget);
+        }
+        else if (!taken)
+        {
+            EmitLinkExit(CurInstr.Addr + (Thumb ? 2 : 4));
+        }
+        else
+        {
+            EmitBlockExit();
+        }
+  #else
         EmitBlockExit();
+  #endif
 #else
         QuickTailCall(X0, ARM_Ret);
 #endif
@@ -872,6 +964,12 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     RegCache = RegisterCache<Compiler, ARM64Reg>(this, instrs, instrsCount, true);
     CPSRDirty = false;
 
+#ifdef LITEV_JIT_LINK
+    NumLinkExits = 0;
+    HasStaticExit = false;
+    LastInstrCompiledNonBranch = false;
+#endif
+
     if (hasMemInstr)
         MOVP2R(RMemBase, Num == 0 ? NDS.JIT.Memory.FastMem9Start : NDS.JIT.Memory.FastMem7Start);
 
@@ -880,6 +978,12 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         CurInstr = instrs[i];
         R15 = CurInstr.Addr + (Thumb ? 4 : 8);
         CodeRegion = R15 >> 24;
+
+#ifdef LITEV_JIT_LINK
+        // Reset per instruction so a mid-block followed branch's static target does
+        // not leak into the block-end exit decision.
+        HasStaticExit = false;
+#endif
 
         CompileFunc comp = Thumb
             ? T_Comp[CurInstr.Info.Kind]
@@ -992,6 +1096,13 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
             LoadCycles();
             LoadCPSR();
         }
+
+#ifdef LITEV_JIT_LINK
+        // Only a JIT-compiled non-branch has a statically-known single next PC (an
+        // interpreter fallback might mutate R15). Captured for the block-end tail.
+        LastInstrCompiledNonBranch = (comp != NULL) && !CurInstr.Info.Branches();
+        LastInstrFallthroughAddr = CurInstr.Addr + (Thumb ? 2 : 4);
+#endif
     }
 
     RegCache.Flush();
@@ -999,7 +1110,36 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     if (ConstantCycles)
         ADD(RCycles, RCycles, ConstantCycles);
 #ifdef LITEV_JIT_DISPATCH
+  #ifdef LITEV_JIT_LINK
+    // Block-end exit eligibility:
+    //   - an UNCONDITIONAL static branch (Comp_JumpTo(u32), not a BCOND) has one
+    //     target and no converging not-taken path here -> LINK_UNCOND;
+    //   - a JIT-compiled non-branch falls through to a single known PC -> LINK_FALLTHROUGH.
+    // A conditional branch at block end converges taken+not-taken onto this one
+    // exit (two possible PCs) and a dynamic branch has no compile-time target;
+    // both keep the plain dispatcher exit.
+    bool linked = false;
+    if (HasStaticExit && !StaticExitCond)
+    {
+    #ifdef LITEV_LINK_UNCOND
+        EmitLinkExit(StaticExitTarget);
+        linked = true;
+    #endif
+    }
+    else if (!HasStaticExit && LastInstrCompiledNonBranch)
+    {
+    #ifdef LITEV_LINK_FALLTHROUGH
+        EmitLinkExit(LastInstrFallthroughAddr);
+        linked = true;
+    #endif
+    }
+    if (!linked)
+    {
+        EmitBlockExit();
+    }
+  #else
     EmitBlockExit();
+  #endif
 #else
     QuickTailCall(X0, ARM_Ret);
 #endif

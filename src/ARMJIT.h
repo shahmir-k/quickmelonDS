@@ -97,6 +97,28 @@ public:
 
     std::unordered_map<u32, JitBlock*> RestoreCandidates {};
 
+#ifdef LITEV_JIT_LINK
+    // liteDS-v2 Unit 4 (direct block linking). Per-CPU pending links keyed by the
+    // targetAddr a source site is waiting to be compiled. All mutation happens on
+    // the emulator thread while it owns execution -> no locking.
+    std::unordered_multimap<u32, LinkSite> PendingLinks9 {};
+    std::unordered_multimap<u32, LinkSite> PendingLinks7 {};
+
+    // Resolve a freshly-compiled-or-restored block's outgoing links + drain any
+    // pending links waiting on its StartAddr. Block must already be in JitBlocks +
+    // FastBlockLookup.
+    void LinkBlock(JitBlock* block) noexcept;
+    // A dying block: rewrite its incoming sites back to the dispatcher (and re-pend
+    // them), and purge its outgoing sites from targets' Incoming / from pending.
+    // Must run before the block leaves JitBlocks / RetireJitBlock.
+    void UnlinkBlock(JitBlock* block) noexcept;
+  #if defined(LITEV_SHADOW_ASSERT)
+    // Walk every live block's incoming/outgoing sites and assert each currently
+    // holds a `B` to either the dispatcher or a live block entry. Shadow-only.
+    void ValidateLinkSites() noexcept;
+  #endif
+#endif
+
 
     AddressRange CodeIndexITCM[ITCMPhysicalSize / 512] {};
     AddressRange CodeIndexMainRAM[MainRAMMaxSize / 512] {};

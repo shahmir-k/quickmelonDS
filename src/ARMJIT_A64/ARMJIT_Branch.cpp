@@ -163,6 +163,18 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
         ConstantCycles += cycles;
     else
         ADD(RCycles, RCycles, cycles);
+
+#ifdef LITEV_JIT_LINK
+    // liteDS-v2 Unit 4: this exit has a compile-time-constant, same-mode target.
+    // `addr` is now masked (thumb bit / alignment stripped) == the target block's
+    // key (blockAddr) that JitBlocks / the dispatcher tag lookup use. The T-bit is
+    // committed into CPSR above, so linking straight into the target block (compiled
+    // for that instruction-set state) is correct across ARM<->Thumb transitions.
+    HasStaticExit = true;
+    StaticExitTarget = addr;
+    StaticExitCond = Thumb ? (CurInstr.Info.Kind == ARMInstrInfo::tk_BCOND)
+                           : (CurInstr.Cond() < 0xE);
+#endif
 }
 
 

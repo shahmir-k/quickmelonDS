@@ -21,6 +21,11 @@
 #include <string.h>
 #include <assert.h>
 #include <unordered_map>
+#include <unordered_set>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <algorithm>
 
 #define XXH_STATIC_LINKING_ONLY
 #include "xxhash/xxhash.h"
@@ -496,6 +501,177 @@ void ARMJIT::RetireJitBlock(JitBlock* block) noexcept
     }
 }
 
+#ifdef LITEV_JIT_LINK
+static inline void LiteV_UpdatePendingPeak(size_t p9, size_t p7) noexcept
+{
+#if LITEV_PROFILE
+    using namespace melonDS::LiteProfile;
+    uint64_t p = (uint64_t)(p9 + p7);
+    if (p > g_Frame.PendingPeak.load(std::memory_order_relaxed))
+        g_Frame.PendingPeak.store(p, std::memory_order_relaxed);
+#else
+    (void)p9; (void)p7;
+#endif
+}
+
+void ARMJIT::LinkBlock(JitBlock* block) noexcept
+{
+    auto& blocks  = block->Num == 0 ? JitBlocks9    : JitBlocks7;
+    auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
+
+    JitEnableWrite();
+
+    // (a) resolve this block's own outgoing links: target compiled -> patch now and
+    //     register in the target's incoming list; else park in pending.
+    for (int i = 0; i < block->NumOutgoing; i++)
+    {
+        const OutgoingLink& link = block->Outgoing[i];
+        auto it = blocks.find(link.TargetAddr);
+        if (it != blocks.end())
+        {
+            JitBlock* target = it->second;
+            u32 targetOff = JITCompiler.SubEntryOffset(target->EntryPoint);
+            JITCompiler.PatchLinkSite(link.PatchOffset, targetOff);
+            target->Incoming.Add(LinkSite{block->StartAddr, link.PatchOffset});
+            LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
+        }
+        else
+        {
+            pending.insert({link.TargetAddr, LinkSite{block->StartAddr, link.PatchOffset}});
+        }
+    }
+
+    // (b) drain pending links waiting on THIS block's start address.
+    u32 entryOff = JITCompiler.SubEntryOffset(block->EntryPoint);
+    auto range = pending.equal_range(block->StartAddr);
+    for (auto it = range.first; it != range.second; ++it)
+    {
+        const LinkSite& site = it->second;
+        JITCompiler.PatchLinkSite(site.PatchOffset, entryOff);
+        block->Incoming.Add(site);
+        LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
+    }
+    pending.erase(range.first, range.second);
+
+    JitEnableExecute();
+
+    LiteV_UpdatePendingPeak(PendingLinks9.size(), PendingLinks7.size());
+}
+
+void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
+{
+    auto& blocks  = block->Num == 0 ? JitBlocks9    : JitBlocks7;
+    auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
+
+    JitEnableWrite();
+
+    u32 dispOff = JITCompiler.DispatcherRXOffset(block->Num);
+
+    // (a) rewrite every incoming site back to the dispatcher and re-pend it so a
+    //     recompile at this StartAddr re-arms the link.
+    for (int i = 0; i < block->Incoming.Length; i++)
+    {
+        LinkSite site = block->Incoming[i];
+        JITCompiler.PatchLinkSite(site.PatchOffset, dispOff);
+        pending.insert({block->StartAddr, site});
+        LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksUnlinked);
+    }
+    block->Incoming.Clear();
+
+    // (b) purge our own outgoing sites. A site is in exactly one place: pending, or
+    //     the target's Incoming. Search pending first (this also cleanly removes the
+    //     self-link re-pended by (a) when a block links to itself), else the target.
+    for (int i = 0; i < block->NumOutgoing; i++)
+    {
+        const OutgoingLink& link = block->Outgoing[i];
+
+        bool found = false;
+        auto range = pending.equal_range(link.TargetAddr);
+        for (auto pit = range.first; pit != range.second; ++pit)
+        {
+            if (pit->second.PatchOffset == link.PatchOffset
+                && pit->second.SourceBlockAddr == block->StartAddr)
+            {
+                pending.erase(pit);
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            auto it = blocks.find(link.TargetAddr);
+            if (it != blocks.end())
+            {
+                JitBlock* target = it->second;
+                for (int k = 0; k < target->Incoming.Length; k++)
+                {
+                    if (target->Incoming[k].PatchOffset == link.PatchOffset
+                        && target->Incoming[k].SourceBlockAddr == block->StartAddr)
+                    {
+                        target->Incoming.Remove(k);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Reset our own slot: our RX is preserved until ResetBlockCache, but a stale
+        // B->dead-target must never survive a restore (LinkBlock re-drives it).
+        JITCompiler.PatchLinkSite(link.PatchOffset, dispOff);
+    }
+
+    JitEnableExecute();
+
+    LiteV_UpdatePendingPeak(PendingLinks9.size(), PendingLinks7.size());
+}
+
+#if defined(LITEV_SHADOW_ASSERT)
+void ARMJIT::ValidateLinkSites() noexcept
+{
+    // Build the set of valid branch targets: the two dispatcher entries + every
+    // live block's entry offset. Every incoming/outgoing site must currently hold
+    // an unconditional B to one of these.
+    std::unordered_set<u32> valid;
+    valid.insert(JITCompiler.DispatcherRXOffset(0));
+    valid.insert(JITCompiler.DispatcherRXOffset(1));
+    for (auto& kv : JitBlocks9) valid.insert(JITCompiler.SubEntryOffset(kv.second->EntryPoint));
+    for (auto& kv : JitBlocks7) valid.insert(JITCompiler.SubEntryOffset(kv.second->EntryPoint));
+
+    u8* rxbase = JITCompiler.GetRXBase();
+    auto checkSite = [&](u32 srcBlock, u32 patchOffset)
+    {
+        u32 instr = *(const u32*)(rxbase + patchOffset);
+        // unconditional B: top 6 bits == 0b000101
+        s32 imm = (s32)(instr << 6) >> 4;   // sign-extend imm26, *4
+        u32 targetOff = patchOffset + (u32)imm;
+        // Use abort() not assert(): the shadow build is Release (NDEBUG), matching
+        // the LiteV_ShadowAssertBudget convention.
+        if ((instr & 0xFC000000u) != 0x14000000u || valid.count(targetOff) != 1)
+        {
+            fprintf(stderr,
+                "[LITEV_SHADOW_ASSERT] stale link site: srcBlock=%08x off=%x "
+                "instr=%08x targetOff=%x valid=%d\n",
+                srcBlock, patchOffset, instr, targetOff, (int)valid.count(targetOff));
+            fflush(stderr);
+            abort();
+        }
+    };
+
+    auto walk = [&](std::unordered_map<u32, JitBlock*>& map)
+    {
+        for (auto& kv : map)
+        {
+            JitBlock* b = kv.second;
+            for (int i = 0; i < b->NumOutgoing; i++) checkSite(b->StartAddr, b->Outgoing[i].PatchOffset);
+            for (int i = 0; i < b->Incoming.Length; i++) checkSite(b->Incoming[i].SourceBlockAddr, b->Incoming[i].PatchOffset);
+        }
+    };
+    walk(JitBlocks9);
+    walk(JitBlocks7);
+}
+#endif
+#endif  // LITEV_JIT_LINK
+
 void ARMJIT::SetJITArgs(JITArgs args) noexcept
 {
     args.FastMemory = args.FastMemory && ARMJIT_Memory::IsFastMemSupported();
@@ -570,6 +746,11 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         }
 
         // some memory has been remapped
+#ifdef LITEV_JIT_LINK
+        // This block dies here without passing through InvalidateByAddr; unlink it
+        // before it leaves JitBlocks so no stale link points into its recycled code.
+        UnlinkBlock(existingBlockIt->second);
+#endif
         RetireJitBlock(existingBlockIt->second);
         map.erase(existingBlockIt);
     }
@@ -908,6 +1089,15 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         block->EntryPoint = JITCompiler.CompileBlock(cpu, thumb, instrs, i, hasMemoryInstr);
         JitEnableExecute();
 
+#ifdef LITEV_JIT_LINK
+        // Carry the compiler's recorded outgoing link sites onto the block (a
+        // restored block already has these from its original compile).
+        block->NumOutgoing = JITCompiler.NumLinkExits;
+        for (int j = 0; j < JITCompiler.NumLinkExits; j++)
+            block->Outgoing[j] = JITCompiler.LinkExits[j];
+        block->Incoming.Clear();
+#endif
+
         JIT_DEBUGPRINT("block start %p\n", block->EntryPoint);
     }
     else
@@ -941,6 +1131,12 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     u64* entry = &FastBlockLookupRegions[(localAddr >> 27)][(localAddr & 0x7FFFFFF) / 2];
     *entry = ((u64)blockAddr | cpu->Num) << 32;
     *entry |= JITCompiler.SubEntryOffset(block->EntryPoint);
+
+#ifdef LITEV_JIT_LINK
+    // Block is now in JitBlocks + FastBlockLookup: resolve its outgoing links and
+    // drain any pending links that were waiting for a block at this StartAddr.
+    LinkBlock(block);
+#endif
 }
 
 void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
@@ -1020,6 +1216,13 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
             }
         }
 
+#ifdef LITEV_JIT_LINK
+        // Unlink BEFORE the block leaves JitBlocks / FastBlockLookup / is retired:
+        // rewrite incoming sites back to the dispatcher (+ re-pend) and purge our
+        // outgoing sites from targets / pending.
+        UnlinkBlock(block);
+#endif
+
         FastBlockLookupRegions[block->StartAddrLocal >> 27][(block->StartAddrLocal & 0x7FFFFFF) / 2] = (u64)UINT32_MAX << 32;
         if (block->Num == 0)
             JitBlocks9.erase(block->StartAddr);
@@ -1035,6 +1238,13 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
             delete block;
         }
     }
+
+
+#if defined(LITEV_JIT_LINK) && defined(LITEV_SHADOW_ASSERT)
+    // Prove every surviving link site still holds a B to the dispatcher or a live
+    // block entry after this invalidation churn.
+    ValidateLinkSites();
+#endif
 }
 
 void ARMJIT::CheckAndInvalidateITCM() noexcept
@@ -1162,7 +1372,28 @@ void ARMJIT::ResetBlockCache() noexcept
     JitBlocks9.clear();
     JitBlocks7.clear();
 
+#ifdef LITEV_JIT_LINK
+    // Code memory is wiped and the dispatcher regenerated by JITCompiler.Reset();
+    // every block (and its Incoming vector) is deleted above, so simply drop all
+    // pending links. Both structures must be empty after this.
+    PendingLinks9.clear();
+    PendingLinks7.clear();
+#endif
+
     JITCompiler.Reset();
+
+#if defined(LITEV_JIT_LINK) && defined(LITEV_SHADOW_ASSERT)
+    if (!PendingLinks9.empty() || !PendingLinks7.empty()
+        || !JitBlocks9.empty() || !JitBlocks7.empty())
+    {
+        fprintf(stderr, "[LITEV_SHADOW_ASSERT] link structures not empty after "
+                        "ResetBlockCache: pending9=%zu pending7=%zu blocks9=%zu blocks7=%zu\n",
+                PendingLinks9.size(), PendingLinks7.size(),
+                JitBlocks9.size(), JitBlocks7.size());
+        fflush(stderr);
+        abort();
+    }
+#endif
 }
 
 void ARMJIT::JitEnableWrite() noexcept
