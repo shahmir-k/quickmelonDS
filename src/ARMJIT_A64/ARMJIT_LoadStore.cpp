@@ -228,7 +228,53 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
         if (addrIsStatic)
             func = NDS.JIT.Memory.GetFuncForAddr(CurCPU, staticAddress, flags & memop_Store, size);
 
-        PushRegs(false, false);
+        // ---- M3 Tier A: MainRAM-hit inline single u32 load ------------------
+        // Only for dynamic-address u32 ARM9 loads whose decoded data region is
+        // MainRAM (the SlowRead9<u32> dominant case). DS only, region 0x02000000.
+        // Runtime guards exclude DTCM (which can be based inside the 0x02 range)
+        // and any non-MainRAM target, falling back to the exact helper. Stores
+        // are deliberately NOT accelerated (no MainRAM raw-store thunk: preserves
+        // JIT invalidation semantics, per plan constraint). MainRAM base/mask are
+        // baked at compile time (stable for the block cache's lifetime; a reset
+        // reallocates and recompiles). Cycles already added by Comp_AddCycles_CDI.
+#ifdef LITEV_MEM_MAINRAM_LOAD
+        const bool mainramFast = (Num == 0) && (NDS.ConsoleType == 0) && !func
+            && (size == 32) && !(flags & memop_Store)
+            && (expectedTarget == ARMJIT_Memory::memregion_MainRAM);
+#else
+        const bool mainramFast = false;
+#endif
+#ifdef LITEV_MEM_MAINRAM_LOAD
+        FixupBranch mainramDone;
+        if (mainramFast)
+        {
+            FixupBranch mrMiss[2];
+            // W0 = access address (low 2 bits carry the u32 rotate). W4 = addr&~3.
+            ANDI2R(W4, W0, ~3);
+            // exclude DTCM (SlowRead9 checks DTCM before the region switch).
+            LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARMv5, DTCMBase));
+            LDR(INDEX_UNSIGNED, W6, RCPU, offsetof(ARMv5, DTCMMask));
+            AND(W6, W4, W6);
+            CMP(W6, W5);
+            mrMiss[0] = B(CC_EQ);
+            // require MainRAM region (DS: (addr & 0xFF000000) == 0x02000000).
+            ANDI2R(W5, W4, 0xFF000000);
+            MOVI2R(W6, 0x02000000);
+            CMP(W5, W6);
+            mrMiss[1] = B(CC_NEQ);
+            // hit: rd = MainRAM[(addr&~3) & MainRAMMask], then ROR by (addr&3)*8.
+            ANDI2R(W4, W4, NDS.MainRAMMask);
+            MOVP2R(X7, NDS.MainRAM);
+            LDRGeneric(32, false, rdMapped, X4, X7);
+            UBFIZ(W0, W0, 3, 2);
+            RORV(rdMapped, rdMapped, W0);
+            mainramDone = B();
+            SetJumpTarget(mrMiss[0]);
+            SetJumpTarget(mrMiss[1]);
+        }
+#endif
+
+        PushRegs(false, false, !mainramFast);
 
         if (func)
         {
@@ -328,6 +374,10 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
                     UBFX(rdMapped, W0, 0, size);
             }
         }
+#ifdef LITEV_MEM_MAINRAM_LOAD
+        if (mainramFast)
+            SetJumpTarget(mainramDone);
+#endif
     }
 
     if (CurInstr.Info.Branches())
@@ -673,7 +723,98 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         }
     }
 
-    PushRegs(false, false, !compileFastPath);
+    // ---- M3 Tier A: DTCM-hit inline block transfer -------------------------
+    // Emitted ONLY where the block helper would otherwise be called (i.e. the
+    // fastmem path was not taken: fastmem disabled on this host, or a shape
+    // fastmem never covers such as ANY LDM / a non-fastmem-region STM). ARM9
+    // only (DTCM is an ARMv5 feature). One compound runtime guard, one fallback
+    // to the exact existing helper. The guest-register<->stack marshalling above
+    // (store) and below (load) is SHARED by both paths and is the only part that
+    // touches the register cache; the guard merely chooses whether the stack
+    // buffer is filled/drained by an inline DTCM copy or by SlowBlockTransfer9.
+    // Cycles were already added by Comp_AddCycles_CD/CDI above, identically on
+    // both paths, so this is bit-exact.
+#ifdef LITEV_MEM_DTCM_BLOCK
+    const bool dtcmFast = (Num == 0) && !compileFastPath && (regsCount >= 1);
+#else
+    const bool dtcmFast = false;
+#endif
+#ifdef LITEV_MEM_DTCM_BLOCK
+    FixupBranch dtcmDone;
+    if (dtcmFast)
+    {
+        FixupBranch dtcmMiss[3];
+        int nMiss = 0;
+
+        // W0 = transfer start address (lowest addr, not yet & ~3 masked on this
+        // path; the helper masks internally). DTCMMask has zero low bits so the
+        // region test is unaffected by the low 2 bits.
+        LDR(INDEX_UNSIGNED, W6, RCPU, offsetof(ARMv5, DTCMBase));
+        LDR(INDEX_UNSIGNED, W7, RCPU, offsetof(ARMv5, DTCMMask));
+
+        // guard 1: first word in the DTCM region.
+        AND(W5, W0, W7);
+        CMP(W5, W6);
+        dtcmMiss[nMiss++] = B(CC_NEQ);
+
+        // guard 2: last word in the SAME region (no region exit mid-transfer;
+        // SlowBlockTransfer re-classifies every word, so a partial-region block
+        // must fall back).
+        if (regsCount > 1)
+        {
+            ADDI2R(W5, W0, (u32)((regsCount - 1) * 4));
+            AND(W5, W5, W7);
+            CMP(W5, W6);
+            dtcmMiss[nMiss++] = B(CC_NEQ);
+        }
+
+        // guard 3: no 16KB physical wrap (matters only for DTCM regions > 16KB,
+        // which mirror; keeps the inline copy contiguous == SlowRead's per-word
+        // & (DTCMPhysicalSize-1) indexing). idx = (addr & ~3) & (0x4000-1).
+        ANDI2R(W5, W0, (u32)(DTCMPhysicalSize - 4));
+        CMPI2R(W5, (u32)(DTCMPhysicalSize - regsCount * 4), W3);
+        dtcmMiss[nMiss++] = B(CC_HI);
+
+        // hit: X4 = DTCM base pointer + idx (W5, zero-extended by the 32-bit AND).
+        ADDI2R(X4, RCPU, offsetof(ARMv5, DTCM), X3);
+        LDR(INDEX_UNSIGNED, X4, X4, 0);
+        ADD(X4, X4, EncodeRegTo64(W5));
+
+        // Copy between the stack marshalling buffer (8 bytes/word, low 4 = data,
+        // matching u64* data[]) and DTCM (contiguous 4 bytes/word).
+        //
+        // LITEV_JIT_LDMSTM: pair the contiguous DTCM side with LDP/STP, mirroring
+        // DraStic's arm64_load/store_blockN stubs which move two guest words per
+        // instruction (ldp/stp) instead of a per-word ldr/str loop. Only the DTCM
+        // side is contiguous 4-byte and pairs cleanly; the stack buffer has an
+        // 8-byte stride (u64 slots) so its side stays scalar. Byte-identical to the
+        // per-word copy: same words, same values, same relative order (the two
+        // words STP writes are contiguous, exactly the two STRs they replace).
+        // X4 (== W4) is the live base pointer, so the second scratch is W5 (free
+        // after the region guards), never W4.
+        int w = 0;
+        for (; w < regsCount; w++)
+        {
+            if (store)
+            {
+                LDR(INDEX_UNSIGNED, W3, SP, w * 8);
+                STR(INDEX_UNSIGNED, W3, X4, w * 4);
+            }
+            else
+            {
+                LDR(INDEX_UNSIGNED, W3, X4, w * 4);
+                STR(INDEX_UNSIGNED, W3, SP, w * 8);
+            }
+        }
+
+        dtcmDone = B();
+        for (int m = 0; m < nMiss; m++)
+            SetJumpTarget(dtcmMiss[m]);
+    }
+#endif
+
+    // ---- Tier B / C fallback: the exact upstream helper --------------------
+    PushRegs(false, false, !compileFastPath && !dtcmFast);
 
     ADD(X1, SP, 0);
     MOVI2R(W2, regsCount);
@@ -701,6 +842,11 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     }
 
     PopRegs(false, false);
+
+#ifdef LITEV_MEM_DTCM_BLOCK
+    if (dtcmFast)
+        SetJumpTarget(dtcmDone);
+#endif
 
     if (!store)
     {

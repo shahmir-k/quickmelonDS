@@ -194,6 +194,39 @@ option(LITEV_EVENT_SLICES "Unit 5: event-true scheduler slices (remove fixed ite
 if (LITEV_EVENT_SLICES)
     add_compile_definitions(LITEV_EVENT_SLICES=1)
 endif()
+
+# Milestone 3 (M3): tiered memory fast paths. AArch64-only (the A64 JIT emits the
+# guarded raw accesses); the x64 JIT keeps the unmodified upstream helper paths.
+# These claim ZERO semantic change: every fast path adds EXACTLY the cycles the
+# slow helper would (cycles are accounted at compile time by Comp_AddCycles_*,
+# independent of the runtime memory path), reads/writes the SAME bytes, and falls
+# back to the existing helper on any runtime-guard miss. Default OFF -> the build
+# is emission-identical to the pre-M3 tree (every fast path is #if'd out).
+#
+#   LITEV_MEM_FAST         umbrella; ON enables the two sub-flags below by default.
+#   LITEV_MEM_DTCM_BLOCK   Tier A: DTCM-hit inline path for LDM/STM block xfers
+#                          (plan order 1; the single biggest memory-helper cost).
+#   LITEV_MEM_MAINRAM_LOAD Tier A: MainRAM-hit inline path for single u32 loads
+#                          (plan order 4; SlowRead9<u32>'s dominant case). Stores
+#                          stay on the helper (no MainRAM raw-store thunk: v1
+#                          rejection, preserves JIT invalidation semantics).
+# Each sub-flag is independently toggleable for per-shape bisection.
+option(LITEV_MEM_FAST "M3: tiered memory fast paths (DTCM block + MainRAM load)" OFF)
+option(LITEV_MEM_DTCM_BLOCK "M3 Tier A: DTCM inline path for LDM/STM block transfers" ${LITEV_MEM_FAST})
+option(LITEV_MEM_MAINRAM_LOAD "M3 Tier A: MainRAM inline path for single u32 loads" ${LITEV_MEM_FAST})
+if (LITEV_MEM_DTCM_BLOCK OR LITEV_MEM_MAINRAM_LOAD)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        if (LITEV_MEM_DTCM_BLOCK)
+            add_compile_definitions(LITEV_MEM_DTCM_BLOCK=1)
+        endif()
+        if (LITEV_MEM_MAINRAM_LOAD)
+            add_compile_definitions(LITEV_MEM_MAINRAM_LOAD=1)
+        endif()
+    else()
+        message(FATAL_ERROR "LITEV_MEM_FAST requires an AArch64 target "
+                            "(the x64 JIT keeps the upstream helper paths).")
+    endif()
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---
