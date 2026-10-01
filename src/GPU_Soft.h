@@ -62,6 +62,14 @@ private:
     friend class SoftRenderer2D;
     friend class SoftRenderer3D;
 
+    // true while the 3D backend is the accurate SoftRenderer3D (runtime choice,
+    // RendererSettings::Accurate3D). It renders into ONE colour buffer, which the async
+    // 2D thread must not read while the next frame renders into it: in that mode the
+    // emu thread copies the 3D lines into Snap3D at VBlank (see VBlank) and the 2D
+    // thread reads the copy. The tile renderer has its own frame ring.
+    bool AccurateBackend = false;
+    void SetAccurateBackend(bool accurate);
+
 #ifdef LITEV_SOFT2D_DEPTH2
     // Part 3: THREE framebuffers for the depth-2 flip (one rendering, one queued, one
     // presenting). Depth-1 (pipedepth==1) uses only [0]/[1] exactly as before -> byte-
@@ -102,13 +110,10 @@ private:
 #else
     FrameLineSnap FrameSnapR[192];
 #endif
-    // 3D output copied per line DURING the visible period, keeping the threaded-3D
-    // GetLine semaphore consumption in lockstep with the render thread (the deferred
-    // 2D batch at VBlank then reads these copies instead of re-calling GetLine, which
-    // would race the 3D render thread's frame schedule).
-    alignas(8) u32 Snap3D[192][256];
-    // Render-owned copy of Snap3D (emu copies at VBlank; async render reads this).
-    alignas(8) u32 Snap3DR[192][256];
+    // Accurate 3D backend only: the frame's 3D lines, copied by the emu thread at
+    // VBlank (GetLine, which also keeps the threaded renderer's per-scanline semaphore
+    // balanced) into the 2D snapshot slot the async render reads.
+    alignas(8) u32 Snap3D[2][192][256];
     // Full-frame per-engine 2D output, so engine A and engine B (independent GPU2D
     // units + SoftRenderer2D instances + buffers) can render in parallel before the
     // sequential composite reads both. (M2 step 1: 2-way A||B; later: line bands.)

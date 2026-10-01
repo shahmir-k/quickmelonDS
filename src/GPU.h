@@ -936,6 +936,10 @@ struct RendererSettings
 
     // "improved polygon splitting" (regular OpenGL renderer)
     bool BetterPolygons;
+
+    // software renderer only: false = fast tile 3D (TileRenderer3D, when compiled in),
+    // true = melonDS's accurate SoftRenderer3D. Other renderers ignore it.
+    bool Accurate3D;
 };
 
 class Renderer

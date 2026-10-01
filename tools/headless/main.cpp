@@ -73,6 +73,7 @@ struct Options
 
     AudioInterpolation interp = AudioInterpolation::None;
     int frameskip = 0;                  // LITEV_AGGRESSIVE_SKIP target (0 = off)
+    bool accurate3d = false;            // --soft3d accurate: SoftRenderer3D instead of the tile renderer
 
     std::string inputScript;            // --input-script: scripted button input
 
@@ -107,6 +108,7 @@ struct Options
         "                            (multiple frames in ONE run; flag may also repeat)\n"
         "  --audio-interp <mode>     SPU interpolation: none|linear|cosine|cubic|gaussian (default none)\n"
         "  --frameskip N             skip N of every N+1 frames' rasterization (LITEV_AGGRESSIVE_SKIP build)\n"
+        "  --soft3d fast|accurate    software 3D backend: tile renderer (default when built in) or SoftRenderer3D\n"
         "  --bench-window <s>:<e>    report avg FPS over frames [s,e] inclusive only (still runs all frames)\n"
         "  --profile-json <path>     write per-run totals as JSON\n"
         "  --data-dir <path>         local firmware/save directory (default ./headless-data)\n"
@@ -188,6 +190,13 @@ bool ParseArgs(int argc, char** argv, Options& o)
             else { fprintf(stderr, "error: --audio-interp must be none|linear|cosine|cubic|gaussian\n"); return false; }
         }
         else if (a == "--frameskip") o.frameskip = std::atoi(next("--frameskip").c_str());
+        else if (a == "--soft3d")
+        {
+            std::string m = next("--soft3d");
+            if (m == "accurate") o.accurate3d = true;
+            else if (m == "fast") o.accurate3d = false;
+            else { fprintf(stderr, "error: --soft3d must be fast or accurate\n"); Usage(argv[0], 2); }
+        }
         else if (a == "--profile-json") o.profileJson = next("--profile-json");
         else if (a == "--data-dir") o.dataDir = next("--data-dir");
         else if (a == "--fixed-rtc") o.fixedRtc = std::atoll(next("--fixed-rtc").c_str());
@@ -396,6 +405,7 @@ int main(int argc, char** argv)
         rs.Threaded = threaded;
         rs.HiresCoordinates = false;
         rs.BetterPolygons = false;
+        rs.Accurate3D = opt.accurate3d;
         nds->GPU.GetRenderer().SetRenderSettings(rs);
     }
     nds->SetNDSCart(std::move(cart));

@@ -110,12 +110,14 @@ SoftRenderer::SoftRenderer(melonDS::NDS& nds)
 
     Rend2D_A = std::make_unique<SoftRenderer2D>(GPU.GPU2D_A, *this);
     Rend2D_B = std::make_unique<SoftRenderer2D>(GPU.GPU2D_B, *this);
+    // Default 3D backend: the fast DraStic-style tile renderer when it is compiled in,
+    // else melonDS's accurate SoftRenderer3D. SetRenderSettings (Accurate3D) can swap it
+    // at run time; both implement Renderer3D, so the frame driving above is unchanged.
 #ifdef LITEV_SOFT3D_DRASTIC
-    // Alternate DraStic-style tile renderer (P1 skeleton). Implements the same Renderer3D
-    // interface, so everything above (GetLine consumption, frame driving) is unchanged.
     Rend3D = std::make_unique<TileRenderer3D>(GPU.GPU3D, *this);
 #else
     Rend3D = std::make_unique<SoftRenderer3D>(GPU.GPU3D, *this);
+    AccurateBackend = true;
 #endif
 
 #ifdef LITEV_SOFT2D_THREADED
@@ -209,12 +211,46 @@ void SoftRenderer::PostSavestate()
 
 void SoftRenderer::SetRenderSettings(RendererSettings& settings)
 {
+    SetAccurateBackend(settings.Accurate3D);
+
     auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
 #ifdef LITEV_SOFT3D_DRASTIC
-    if (!rend3d) return;   // TileRenderer3D is synchronous -- threaded setting does not apply
+    if (!rend3d) return;   // TileRenderer3D always runs its own threads -- setting does not apply
 #endif
     rend3d->SetThreaded(settings.Threaded);
 }
+
+// Swap the 3D backend at run time (emu thread, between frames or mid-frame).
+void SoftRenderer::SetAccurateBackend(bool accurate)
+{
+#ifdef LITEV_SOFT3D_DRASTIC
+    if (accurate == AccurateBackend) return;
+#ifdef LITEV_SOFT2D_THREADED
+    FlushAsyncRender();   // the async 2D thread reads Rend3D->GetLine
+#endif
+    Rend3D.reset();       // tile: joins its workers; accurate: stops its render thread
+    if (accurate)
+        Rend3D = std::make_unique<SoftRenderer3D>(GPU.GPU3D, *this);
+    else
+        Rend3D = std::make_unique<TileRenderer3D>(GPU.GPU3D, *this);
+    AccurateBackend = accurate;
+    Rend3D->Init();
+    Rend3D->Reset();   // accurate: also kicks one render of the latched frame
+    if (!accurate)
+    {
+        // The tile renderer has rendered nothing yet: render the latched frame once
+        // (RenderPolygonRAM and the Render* registers are still valid), otherwise a
+        // static scene stays black until the game changes it.
+        bool identical = GPU.GPU3D.RenderFrameIdentical;
+        GPU.GPU3D.RenderFrameIdentical = false;
+        Rend3D->RenderFrame();
+        GPU.GPU3D.RenderFrameIdentical = identical;
+    }
+#else
+    (void)accurate;   // only the accurate renderer is compiled in
+#endif
+}
+
 
 
 void SoftRenderer::DrawScanline(u32 line)
@@ -404,7 +440,11 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         // GetLine EVERY line (0..191) to keep the semaphore count balanced even for
         // skipped lines. (Single-threaded async render — S2D_NBANDS=1 — so in-order.)
         const double _lspG0 = LSP_NOW();
-        u32* l3d = Rend3D->GetLine(line);
+#ifdef LITEV_SOFT2D_DEPTH2
+        u32* l3d = AccurateBackend ? Snap3D[_ss][line] : Rend3D->GetLine(line);
+#else
+        u32* l3d = AccurateBackend ? Snap3D[0][line] : Rend3D->GetLine(line);
+#endif
         LSP_ADD(S2DBlock[bi], LSP_NOW() - _lspG0);
 #ifdef LITEV_SOFT2D_DEPTH2
         if (pipeTraceOn)
@@ -752,7 +792,13 @@ void SoftRenderer::VBlank()
     static_cast<SoftRenderer2D*>(Rend2D_B.get())->CopyLineSnaps(SnapParity);
     memcpy(PaletteSnap[SnapParity], GPU.Palette, sizeof(PaletteSnap[SnapParity]));
     memcpy(OAMSnap[SnapParity], GPU.OAM, sizeof(OAMSnap[SnapParity]));
+    if (AccurateBackend)
+        for (int y = 0; y < 192; y++)
+            memcpy(Snap3D[SnapParity][y], Rend3D->GetLine(y), sizeof(Snap3D[0][0]));
 #else
+    if (AccurateBackend)
+        for (int y = 0; y < 192; y++)
+            memcpy(Snap3D[0][y], Rend3D->GetLine(y), sizeof(Snap3D[0][0]));
     memcpy(FrameSnapR, FrameSnap, sizeof(FrameSnap));
     static_cast<SoftRenderer2D*>(Rend2D_A.get())->CopyLineSnaps();
     static_cast<SoftRenderer2D*>(Rend2D_B.get())->CopyLineSnaps();
