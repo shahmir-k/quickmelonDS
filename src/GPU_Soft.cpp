@@ -23,6 +23,10 @@
 #include "Platform.h"
 #include "LitevSoftProf.h"
 
+#ifdef LITEV_SOFT3D_DRASTIC
+#include "GPU3D_TileSoft.h"   // alternate tile-based 3D renderer (P1 skeleton)
+#endif
+
 #if defined(LITEV_NEON_RENDERER) && defined(__aarch64__)
 #include "GPU2D_NEON.h"
 #endif
@@ -106,7 +110,13 @@ SoftRenderer::SoftRenderer(melonDS::NDS& nds)
 
     Rend2D_A = std::make_unique<SoftRenderer2D>(GPU.GPU2D_A, *this);
     Rend2D_B = std::make_unique<SoftRenderer2D>(GPU.GPU2D_B, *this);
+#ifdef LITEV_SOFT3D_DRASTIC
+    // Alternate DraStic-style tile renderer (P1 skeleton). Implements the same Renderer3D
+    // interface, so everything above (GetLine consumption, frame driving) is unchanged.
+    Rend3D = std::make_unique<TileRenderer3D>(GPU.GPU3D, *this);
+#else
     Rend3D = std::make_unique<SoftRenderer3D>(GPU.GPU3D, *this);
+#endif
 
 #ifdef LITEV_SOFT2D_THREADED
     AsyncStart = Platform::Semaphore_Create();
@@ -179,6 +189,9 @@ void SoftRenderer::PreSavestate()
     FlushAsyncRender();
 #endif
     auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
+#ifdef LITEV_SOFT3D_DRASTIC
+    if (!rend3d) return;   // TileRenderer3D is synchronous -- no render thread to set up
+#endif
     if (rend3d->IsThreaded())
         rend3d->SetupRenderThread();
 }
@@ -186,6 +199,9 @@ void SoftRenderer::PreSavestate()
 void SoftRenderer::PostSavestate()
 {
     auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
+#ifdef LITEV_SOFT3D_DRASTIC
+    if (!rend3d) return;   // TileRenderer3D is synchronous -- no render thread to enable
+#endif
     if (rend3d->IsThreaded())
         rend3d->EnableRenderThread();
 }
@@ -194,6 +210,9 @@ void SoftRenderer::PostSavestate()
 void SoftRenderer::SetRenderSettings(RendererSettings& settings)
 {
     auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
+#ifdef LITEV_SOFT3D_DRASTIC
+    if (!rend3d) return;   // TileRenderer3D is synchronous -- threaded setting does not apply
+#endif
     rend3d->SetThreaded(settings.Threaded);
 }
 

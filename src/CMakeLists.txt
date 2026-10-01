@@ -39,6 +39,7 @@ add_library(core STATIC
     GPU2D_Soft.cpp
     GPU3D.cpp
     GPU3D_Soft.cpp
+    GPU3D_TileSoft.cpp
     GPU3D_Texcache.cpp
     GPU3D_Texcache.h
     LitevSoftProf.cpp

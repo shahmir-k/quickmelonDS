@@ -147,6 +147,15 @@ option(LITEV_IO_DISPATCH_TABLE "liteV: O(1) offset-indexed dispatch for ARM9 32-
 if (LITEV_IO_DISPATCH_TABLE)
     add_compile_definitions(LITEV_IO_DISPATCH_TABLE=1)
 endif()
+# DRASTIC: DraStic-style TILE-BASED software 3D renderer (TileRenderer3D, GPU3D_TileSoft.*).
+# Two planes per pixel (colour + packed depth|id) in 32 KB tiles that fit one core's L1D,
+# polygons bucketed per 16-line block, AA/edge/fog recomputed in a post-pass. Selected at
+# GPU_Soft.cpp construction instead of SoftRenderer3D; the new files compile to nothing when
+# OFF. Render-only: emulation state is unchanged. Default OFF.
+option(LITEV_SOFT3D_DRASTIC "liteV: DraStic-style tile-based software 3D renderer (TileRenderer3D)" OFF)
+if (LITEV_SOFT3D_DRASTIC)
+    add_compile_definitions(LITEV_SOFT3D_DRASTIC=1)
+endif()
 option(LITEV_SOFT2D_DEPTH2 "liteV: 2D depth-2 async (double-buffered 2D snapshots + emu runs a frame ahead of the 2D compositor; removes the VBlank bar2D barrier). For the DraStic tile renderer." OFF)
 if (LITEV_SOFT2D_DEPTH2)
     add_compile_definitions(LITEV_SOFT2D_DEPTH2=1)
