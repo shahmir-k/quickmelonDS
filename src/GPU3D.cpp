@@ -31,6 +31,17 @@
 // The extern decl inside also gives CmdNumParams (defined below) external linkage for other TUs.
 #include "GPU3D_GXFIFO_inl.h"
 
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#include <cstdlib>
+// Read an integer debug.litev.* prop; returns `def` when it is unset (for default-ON levers).
+static int litevGxPropDefault(const char* name, int def) {
+    char b[8] = {0};
+    if (__system_property_get(name, b) > 0) return (atoi(b) != 0) ? 1 : 0;
+    return def;
+}
+#endif
+
 
 namespace melonDS
 {
@@ -2985,8 +2996,28 @@ void GPU3D::CheckFIFOIRQ() noexcept
     case 2: irq = CmdFIFO.IsEmpty(); break;
     }
 
-    if (irq) NDS.SetIRQ(0, IRQ_GXFIFO);
-    else     NDS.ClearIRQ(0, IRQ_GXFIFO);
+    // Only touch the IRQ line when the GXFIFO IRQ state actually CHANGES. CmdFIFORead fires this
+    // every ~2 commands; unguarded it calls SetIRQ/ClearIRQ -> UpdateIRQ every time, redundantly
+    // recomputing an unchanged ARM9 IRQ line (with no GXFIFO IRQ configured — GXStat>>30==0 — that's
+    // a ClearIRQ per read). Bit-exact: this is the ARM9 (cpu 0, no ARM7 sleep-wakeup path) and
+    // UpdateIRQ is idempotent when IF is unchanged (IE/IME writes run their own UpdateIRQ), so the
+    // skipped Set/Clear are pure no-ops. debug.litev.irqguard=0 restores the unconditional path.
+#if defined(__ANDROID__)
+    static const int _irqguard = litevGxPropDefault("debug.litev.irqguard", 1);
+#else
+    static const int _irqguard = 1;
+#endif
+    if (_irqguard)
+    {
+        const bool cur = (NDS.IF[0] >> IRQ_GXFIFO) & 1;
+        if (irq && !cur)      NDS.SetIRQ(0, IRQ_GXFIFO);
+        else if (!irq && cur) NDS.ClearIRQ(0, IRQ_GXFIFO);
+    }
+    else
+    {
+        if (irq) NDS.SetIRQ(0, IRQ_GXFIFO);
+        else     NDS.ClearIRQ(0, IRQ_GXFIFO);
+    }
 }
 
 void GPU3D::CheckFIFODMA() noexcept
