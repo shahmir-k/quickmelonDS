@@ -520,11 +520,61 @@ void TileRenderer3D::BuildFrameGeom(int gi)
     u32 npolys = GPU3D.RenderNumPolygons;
     if (npolys > MaxPolys) npolys = MaxPolys;
 
+#ifdef LITEV_GEOM_PREFETCH2
+    // Default ON. Runtime prop so it can be A/B'd off without a rebuild
+    // (debug.litev.geoprefetch=0); read once per frame (negligible).
+    const bool geoPf = litevTileProp("debug.litev.geoprefetch", 1);
+#endif
+#ifdef LITEV_GEOM_PREFETCH2
+    // Staged/deep prefetch distances, tunable on-device without rebuild. The shallow (1-poly)
+    // geoprefetch measured only ~-1pp because on the in-order A55 the gather is ~150-190 cyc/vert
+    // (fully-exposed DRAM miss) while useful work is only ~10-15 cyc/vert: to overlap ~180 cyc you
+    // need ~4 polys of lookahead, and PF_POLY > PF_VTX so the Polygon struct is already warm when
+    // we chase its Vertices[] to prefetch the actual (cold) vertex lines.
+    const int pfPoly = litevTilePropInt("debug.litev.geopf_poly", 8, 0, 64);  // Polygon-struct lookahead
+    const int pfVtx  = litevTilePropInt("debug.litev.geopf_vtx",  4, 0, 64);  // Vertex-line   lookahead
+    const int pfVL   = litevTilePropInt("debug.litev.geopf_vl",   2, 1, 10);  // vertex lines prefetched/poly
+#endif
 
     for (u32 i = 0; i < npolys; i++)
     {
         Polygon* poly = polySrc[i];
 
+#if defined(LITEV_GEOM_PREFETCH2)
+        // Staged, deep, multi-line software-pipelined prefetch of the pointer-chased Vertex
+        // structs — the cold ~64B line fetch (poly->Vertices[v] -> sv) that dominates this
+        // loop's latency. PURE prefetch + const reads the loop already does -> byte-identical
+        // output -> MP-safe (Category-A guest-identical, Category-B settled-PPM identical).
+        if (geoPf)
+        {
+            // Stage A — warm the Polygon struct pfPoly polys ahead, ALL 4 lines the loop reads
+            // (Vertices@0-79, FinalZ/FinalW@84-163, Attr/flags/YTop/VTop@168-219). The ptr array
+            // polySrc[] is hot/sequential, so indexing it far ahead never stalls.
+            const u32 ja = i + (u32)pfPoly;
+            if (ja < npolys)
+            {
+                const char* pj = (const char*)polySrc[ja];
+                __builtin_prefetch(pj + 0,   0, 1);
+                __builtin_prefetch(pj + 64,  0, 1);
+                __builtin_prefetch(pj + 128, 0, 1);
+                __builtin_prefetch(pj + 192, 0, 1);
+            }
+            // Stage B — warm the cold Vertex lines pfVtx polys ahead. np is already warm
+            // (Stage A prefetched it pfPoly-pfVtx iters ago) so these ptr-loads hit. Prefetch
+            // FEW lines from DEEP (not all nnv from shallow): [0] (strip-reused/first vert) and
+            // [2] (start of the fresh contiguous run) — the A55 next-line HW prefetcher covers
+            // [3..], and issuing fewer prefetches avoids flooding the ~4-6 L1 fill buffers.
+            const u32 jb = i + (u32)pfVtx;
+            if (jb < npolys)
+            {
+                const Polygon* np = polySrc[jb];
+                u32 nnv = np->NumVertices; if (nnv > 10) nnv = 10;
+                if (nnv > 0) __builtin_prefetch(np->Vertices[0], 0, 1);
+                for (u32 k = 2; k < nnv && k < (u32)(pfVL + 1); k++)
+                    __builtin_prefetch(np->Vertices[k], 0, 1);
+            }
+        }
+#endif
 
         // Poly-level scope-outs (later phases): degenerate, flat single-scanline, lines, shadows,
         // wireframe (alpha 0). Doing them here keeps the buckets drawable-only.

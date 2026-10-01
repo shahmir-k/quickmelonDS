@@ -611,6 +611,17 @@ if (LITEV_GEOM_NEON2)
     add_compile_definitions(LITEV_GEOM_NEON2=1)
 endif()
 
+# Staged deep prefetch for the pointer-chased Vertex structs in BuildFrameGeom (the LANDED
+# lever; a superseded shallow 1-poly variant was removed 2026-09-17). The shallow 1-poly prefetch
+# only recovered ~-1pp because it landed after the ~180-cyc DRAM miss already stalled the
+# in-order A55. PREFETCH2 warms the Polygon struct pfPoly polys ahead (all 4 lines) and the
+# Vertex lines pfVtx polys ahead (pfPoly>pfVtx so the poly is warm before we chase Vertices[]),
+# deep enough to overlap the latency. Pure prefetch -> bit-exact. Distances swept via props.
+option(LITEV_GEOM_PREFETCH2 "Staged deep prefetch for BuildFrameGeom scatter (bit-exact)" OFF)
+if (LITEV_GEOM_PREFETCH2)
+    add_compile_definitions(LITEV_GEOM_PREFETCH2=1)
+endif()
+
 # liteV wave-3 integer-NEON GPU3D geometry: completes NEON coverage of the remaining
 # per-command clip/vector-matrix transforms in the GXFIFO command path that waves 1/2
 # left scalar — the BoxTest 8-vertex cube transform (0x70), PosTest (0x71), VecTest
