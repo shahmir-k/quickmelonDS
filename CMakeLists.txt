@@ -411,6 +411,17 @@ if (LITEV_JIT_LDMSTM)
                             "(the x64 JIT keeps the upstream helper paths).")
     endif()
 endif()
+
+# DraStic JIT emit-quality (teardown 01, FUN_001912f0): merge the host NZCV flags into
+# guest CPSR with one MRS + masked AND/ORR (3 host instrs) instead of a per-flag CSET+BFI
+# pair (8 instrs) for full-flag arithmetic S-ops (CMP/SUBS/ADDS...). Guest CPSR N/Z/C/V
+# == host NZCV MRS layout -> bit-exact. AArch64-only; the x64 path keeps CSET/BFI.
+option(LITEV_JIT_FLAGMERGE "DraStic: one-shot MRS-NZCV flag merge vs per-flag CSET+BFI (AArch64)" OFF)
+if (LITEV_JIT_FLAGMERGE)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_FLAGMERGE=1)
+    endif()
+endif()
 add_subdirectory(src)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---

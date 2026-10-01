@@ -341,6 +341,35 @@ void Compiler::Comp_RetriveFlags(bool retriveCV)
     }
     return;
 #endif
+
+#ifdef LITEV_JIT_FLAGMERGE
+    // liteDS JIT emit-quality (DraStic FUN_001912f0 / .so 0x8232c): transfer the host
+    // NZCV flags into guest CPSR in ONE shot (MRS + masked merge) instead of a per-flag
+    // CSET+BFI pair. Guest CPSR N=b31/Z=b30/C=b29/V=b28 is exactly the host NZCV MRS
+    // layout, so the top nibble of MRS NZCV IS the guest flags, bit-for-bit == the
+    // CSET(CC_MI/EQ/CS/VS)+BFI result. Only when C/V come from the host flags (retriveCV;
+    // logical ops take C from the barrel shifter + preserve V -> scalar path). Gated
+    // popcount>=3: below that the per-flag path ties or wins; at 3-4 flags this collapses
+    // the hot full-flag arithmetic S-op (CMP/CMN/SUBS/ADDS/RSBS) 8 host instrs -> 3.
+    if (retriveCV)
+    {
+        u32 mask = 0;
+        if (CurInstr.SetFlags & 0x8) mask |= 1u << 31; // N  (CC_MI)
+        if (CurInstr.SetFlags & 0x4) mask |= 1u << 30; // Z  (CC_EQ)
+        if (CurInstr.SetFlags & 0x2) mask |= 1u << 29; // C  (CC_CS)
+        if (CurInstr.SetFlags & 0x1) mask |= 1u << 28; // V  (CC_VS)
+        if (__builtin_popcount(mask) >= 3)
+        {
+            MRS(X0, FIELD_NZCV);              // W0[31:28] = N Z C V (zero-extended)
+            if (mask != 0xF0000000u)
+                ANDI2R(W0, W0, mask, W1);     // keep only the requested flags
+            ANDI2R(RCPSR, RCPSR, ~mask, W1);  // clear the bits being written
+            ORR(RCPSR, RCPSR, W0);
+            return;
+        }
+    }
+#endif
+
     if (CurInstr.SetFlags & 0x4)
     {
         CSET(W0, CC_EQ);
