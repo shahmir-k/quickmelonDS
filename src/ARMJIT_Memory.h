@@ -98,7 +98,7 @@ public:
 
 #ifdef JIT_ENABLED
 public:
-    explicit ARMJIT_Memory(melonDS::NDS& nds);
+    explicit ARMJIT_Memory(melonDS::NDS& nds, bool fastmem);
     ~ARMJIT_Memory() noexcept;
     ARMJIT_Memory(const ARMJIT_Memory&) = delete;
     ARMJIT_Memory(ARMJIT_Memory&&) = delete;
@@ -144,9 +144,15 @@ public:
     static void RegisterFaultHandler();
     static void UnregisterFaultHandler();
 
+    // Install/remove this instance's contribution to the process-wide fastmem
+    // fault handler. Idempotent; call with true when this instance's fastmem is
+    // effectively enabled, false otherwise (including at destruction).
+    void SetFastMemHandler(bool enabled) noexcept;
+
     static u32 PageSize;
     static u32 PageShift;
 private:
+    bool FastMemHandlerActive = false;
     friend class Compiler;
     struct Mapping
     {
@@ -198,7 +204,7 @@ private:
     TinyVector<Mapping> Mappings[memregions_Count] {};
 #else
 public:
-    explicit ARMJIT_Memory(melonDS::NDS&) {};
+    explicit ARMJIT_Memory(melonDS::NDS&, bool fastmem = false) {};
     ~ARMJIT_Memory() = default;
     ARMJIT_Memory(const ARMJIT_Memory&) = delete;
     ARMJIT_Memory(ARMJIT_Memory&&) = delete;

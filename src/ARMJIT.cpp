@@ -470,7 +470,7 @@ InterpreterFunc InterpretTHUMB[ARMInstrInfo::tk_Count] =
 
 ARMJIT::ARMJIT(melonDS::NDS& nds, std::optional<JITArgs> jit) noexcept : 
         NDS(nds),
-        Memory(nds),
+        Memory(nds, (jit.has_value() ? jit->FastMemory : false) && ARMJIT_Memory::IsFastMemSupported()),
         JITCompiler(nds),
         MaxBlockSize(jit.has_value() ? std::clamp(jit->MaxBlockSize, 1u, 32u) : 32),
         LiteralOptimizations(jit.has_value() ? jit->LiteralOptimizations : false),
@@ -502,6 +502,11 @@ void ARMJIT::SetJITArgs(JITArgs args) noexcept
         || BranchOptimizations != args.BranchOptimizations
         || FastMemory != args.FastMemory)
         ResetBlockCache();
+
+    // Keep the fastmem fault handler installation in sync with the effective
+    // fastmem state (it may be toggled at runtime).
+    if (FastMemory != args.FastMemory)
+        Memory.SetFastMemHandler(args.FastMemory);
 
     MaxBlockSize = args.MaxBlockSize;
     LiteralOptimizations = args.LiteralOptimizations;

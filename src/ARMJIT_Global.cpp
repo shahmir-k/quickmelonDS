@@ -108,7 +108,9 @@ void Init()
             mprotect(GetAlignedCodeMemoryStart(), CodeMemoryAlignedSize, PROT_EXEC | PROT_READ | PROT_WRITE);
         #endif
 
-        ARMJIT_Memory::RegisterFaultHandler();
+        // NOTE: the fastmem fault handler is NOT installed here. It is installed
+        // lazily via AcquireFaultHandler() only when a JIT instance actually
+        // enables fastmem (see ARMJIT_Memory::SetFastMemHandler).
     }
 }
 
@@ -119,8 +121,25 @@ void DeInit()
     RefCounter--;
     if (RefCounter == 0)
     {
-        ARMJIT_Memory::UnregisterFaultHandler();
+        // Handler ownership is tracked separately (AcquireFaultHandler); nothing
+        // to do here.
     }
+}
+
+static int FaultHandlerRefCounter = 0;
+
+void AcquireFaultHandler()
+{
+    std::lock_guard guard(globalMutex);
+    if (FaultHandlerRefCounter++ == 0)
+        ARMJIT_Memory::RegisterFaultHandler();
+}
+
+void ReleaseFaultHandler()
+{
+    std::lock_guard guard(globalMutex);
+    if (FaultHandlerRefCounter > 0 && --FaultHandlerRefCounter == 0)
+        ARMJIT_Memory::UnregisterFaultHandler();
 }
 
 }

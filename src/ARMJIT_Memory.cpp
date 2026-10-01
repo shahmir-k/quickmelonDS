@@ -841,7 +841,7 @@ bool ARMJIT_Memory::FaultHandler(FaultDescription& faultDesc, melonDS::NDS& nds)
     return false;
 }
 
-ARMJIT_Memory::ARMJIT_Memory(melonDS::NDS& nds) : NDS(nds)
+ARMJIT_Memory::ARMJIT_Memory(melonDS::NDS& nds, bool fastmem) : NDS(nds)
 {
     ARMJIT_Global::Init();
 #if defined(__SWITCH__)
@@ -925,10 +925,29 @@ ARMJIT_Memory::ARMJIT_Memory(melonDS::NDS& nds) : NDS(nds)
 #endif
     FastMem9Start = MemoryBase+MemoryTotalSize;
     FastMem7Start = static_cast<u8*>(FastMem9Start)+AddrSpaceSize;
+
+    // Install the fastmem fault handler only if this instance's fastmem is
+    // effectively enabled. When it is off (or unsupported), no handler is
+    // registered so unrelated faults are never intercepted.
+    SetFastMemHandler(fastmem && IsFastMemSupported());
+}
+
+void ARMJIT_Memory::SetFastMemHandler(bool enabled) noexcept
+{
+    if (enabled == FastMemHandlerActive)
+        return;
+
+    FastMemHandlerActive = enabled;
+    if (enabled)
+        ARMJIT_Global::AcquireFaultHandler();
+    else
+        ARMJIT_Global::ReleaseFaultHandler();
 }
 
 ARMJIT_Memory::~ARMJIT_Memory() noexcept
 {
+    SetFastMemHandler(false);
+
 #if defined(__SWITCH__)
     virtmemLock();
     if (FastMem9Reservation)

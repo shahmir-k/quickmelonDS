@@ -34,6 +34,16 @@ static constexpr size_t CodeMemorySliceSize = 1024*1024*32;
 void Init();
 void DeInit();
 
+// Fastmem fault-handler management. The SIGSEGV/SIGBUS (or Windows vectored)
+// handler that services fastmem faults must ONLY be installed while at least
+// one JIT instance actually has fastmem enabled. Installing it unconditionally
+// (as long as the JIT is on) means it intercepts every process-wide fault even
+// when fastmem is off/unsupported, mis-handling unrelated faults (e.g. ART's on
+// Android, or a JIT code fault) into a hard crash. These are ref-counted so the
+// handler is registered on the first fastmem user and removed with the last.
+void AcquireFaultHandler();
+void ReleaseFaultHandler();
+
 void* AllocateCodeMem();
 void FreeCodeMem(void* codeMem);
 
