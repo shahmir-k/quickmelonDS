@@ -120,6 +120,23 @@ option(LITEV_SOFTPROF "liteV: software-render phase profiler (thread names + pha
 if (LITEV_SOFTPROF)
     add_compile_definitions(LITEV_SOFTPROF=1)
 endif()
+# O(1) offset-indexed dispatch for the ARM9 memory-mapped I/O 32-bit path
+# (NDS::ARM9IORead32 / ARM9IOWrite32). Stock melonDS routes these through a
+# switch(addr) over the FULL sparse address (0x04000004 .. 0x04FFFA24) which the
+# compiler lowers to a data-dependent compare/binary-search tree (~6 mispredict-
+# prone branches per access on the in-order A55). This flag adds a fast path that,
+# for word-aligned accesses in the primary 8 KB I/O window (0x04000000-0x04001FFF),
+# dispatches on the dense word index (addr & 0x1FFF) >> 2 -- the compiler lowers
+# that to an indexed jump. Out-of-window regs (0x041xxxxx / 0x04004xxx / 0x04FFFAxx)
+# and misaligned accesses fall through to the ORIGINAL switch, which is preserved
+# verbatim. Each fast case keeps its original body byte-for-byte and its label is a
+# mechanical compile-time reduction (LABEL & 0x1FFF) >> 2 of the original case, so
+# the mapping is 1:1 by inspection. Default OFF => flag-OFF build is byte-identical;
+# flag-ON must be bit-exact (state + framebuffer hashes over a 2000-frame trace).
+option(LITEV_IO_DISPATCH_TABLE "liteV: O(1) offset-indexed dispatch for ARM9 32-bit I/O reads/writes" OFF)
+if (LITEV_IO_DISPATCH_TABLE)
+    add_compile_definitions(LITEV_IO_DISPATCH_TABLE=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

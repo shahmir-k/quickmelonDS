@@ -3155,6 +3155,109 @@ u16 NDS::ARM9IORead16(u32 addr)
 
 u32 NDS::ARM9IORead32(u32 addr)
 {
+#ifdef LITEV_IO_DISPATCH_TABLE
+    // Fast O(1) dispatch for word-aligned accesses in the primary 8 KB I/O window
+    // (0x04000000-0x04001FFF). (addr & 0xFFFFE003) == 0x04000000 is true iff addr is
+    // in that window AND word-aligned. Every case below is a verbatim copy of the
+    // matching in-window case in the original switch; its label is the mechanical
+    // compile-time reduction (LABEL & 0x1FFF) >> 2 applied to the switch value
+    // ((addr & 0x1FFF) >> 2). That reduction is injective over word-aligned in-window
+    // addresses, so a fast case fires for exactly the addr its original case fired for.
+    // Out-of-window regs (0x041xxxxx / 0x04004xxx / 0x04FFFAxx) and misaligned accesses
+    // fail the guard and drop to the ORIGINAL switch + tail below (kept byte-for-byte).
+    if ((addr & 0xFFFFE003) == 0x04000000)
+    {
+        switch ((addr & 0x1FFF) >> 2)
+        {
+        case (0x04000004 & 0x1FFF) >> 2: return GPU.DispStat[0] | (GPU.VCount << 16);
+
+        case (0x04000060 & 0x1FFF) >> 2: return GPU.GPU3D.Read32(addr);
+        case (0x04000064 & 0x1FFF) >> 2:
+        case (0x0400006C & 0x1FFF) >> 2:
+        case (0x0400106C & 0x1FFF) >> 2: return GPU.Read32(addr);
+
+        case (0x040000B0 & 0x1FFF) >> 2: return DMAs[0].SrcAddr;
+        case (0x040000B4 & 0x1FFF) >> 2: return DMAs[0].DstAddr;
+        case (0x040000B8 & 0x1FFF) >> 2: return DMAs[0].Cnt;
+        case (0x040000BC & 0x1FFF) >> 2: return DMAs[1].SrcAddr;
+        case (0x040000C0 & 0x1FFF) >> 2: return DMAs[1].DstAddr;
+        case (0x040000C4 & 0x1FFF) >> 2: return DMAs[1].Cnt;
+        case (0x040000C8 & 0x1FFF) >> 2: return DMAs[2].SrcAddr;
+        case (0x040000CC & 0x1FFF) >> 2: return DMAs[2].DstAddr;
+        case (0x040000D0 & 0x1FFF) >> 2: return DMAs[2].Cnt;
+        case (0x040000D4 & 0x1FFF) >> 2: return DMAs[3].SrcAddr;
+        case (0x040000D8 & 0x1FFF) >> 2: return DMAs[3].DstAddr;
+        case (0x040000DC & 0x1FFF) >> 2: return DMAs[3].Cnt;
+
+        case (0x040000E0 & 0x1FFF) >> 2: return DMA9Fill[0];
+        case (0x040000E4 & 0x1FFF) >> 2: return DMA9Fill[1];
+        case (0x040000E8 & 0x1FFF) >> 2: return DMA9Fill[2];
+        case (0x040000EC & 0x1FFF) >> 2: return DMA9Fill[3];
+
+        case (0x040000F4 & 0x1FFF) >> 2: return 0; // ???? Golden Sun Dark Dawn keeps reading this
+
+        case (0x04000100 & 0x1FFF) >> 2: return TimerGetCounter(0) | (Timers[0].Cnt << 16);
+        case (0x04000104 & 0x1FFF) >> 2: return TimerGetCounter(1) | (Timers[1].Cnt << 16);
+        case (0x04000108 & 0x1FFF) >> 2: return TimerGetCounter(2) | (Timers[2].Cnt << 16);
+        case (0x0400010C & 0x1FFF) >> 2: return TimerGetCounter(3) | (Timers[3].Cnt << 16);
+
+        case (0x04000130 & 0x1FFF) >> 2: LagFrameFlag = false; return (KeyInput & 0xFFFF) | (KeyCnt[0] << 16);
+
+        case (0x04000180 & 0x1FFF) >> 2: return IPCSync9;
+        case (0x04000184 & 0x1FFF) >> 2: return NDS::ARM9IORead16(addr);
+
+        case (0x040001A0 & 0x1FFF) >> 2: return NDSCartSlots[0]->ReadSPICnt(0) | (NDSCartSlots[0]->ReadSPIData(0) << 16);
+        case (0x040001A4 & 0x1FFF) >> 2: return NDSCartSlots[0]->ReadROMCnt(0);
+
+        case (0x04000208 & 0x1FFF) >> 2: return IME[0];
+        case (0x04000210 & 0x1FFF) >> 2: return IE[0];
+        case (0x04000214 & 0x1FFF) >> 2: return IF[0];
+
+        case (0x04000240 & 0x1FFF) >> 2: return GPU.VRAMCNT[0] | (GPU.VRAMCNT[1] << 8) | (GPU.VRAMCNT[2] << 16) | (GPU.VRAMCNT[3] << 24);
+        case (0x04000244 & 0x1FFF) >> 2: return GPU.VRAMCNT[4] | (GPU.VRAMCNT[5] << 8) | (GPU.VRAMCNT[6] << 16) | (WRAMCnt << 24);
+        case (0x04000248 & 0x1FFF) >> 2: return GPU.VRAMCNT[7] | (GPU.VRAMCNT[8] << 8);
+
+        case (0x04000280 & 0x1FFF) >> 2: return DivCnt;
+        case (0x04000290 & 0x1FFF) >> 2: return DivNumerator[0];
+        case (0x04000294 & 0x1FFF) >> 2: return DivNumerator[1];
+        case (0x04000298 & 0x1FFF) >> 2: return DivDenominator[0];
+        case (0x0400029C & 0x1FFF) >> 2: return DivDenominator[1];
+        case (0x040002A0 & 0x1FFF) >> 2: return DivQuotient[0];
+        case (0x040002A4 & 0x1FFF) >> 2: return DivQuotient[1];
+        case (0x040002A8 & 0x1FFF) >> 2: return DivRemainder[0];
+        case (0x040002AC & 0x1FFF) >> 2: return DivRemainder[1];
+
+        case (0x040002B0 & 0x1FFF) >> 2: return SqrtCnt;
+        case (0x040002B4 & 0x1FFF) >> 2: return SqrtRes;
+        case (0x040002B8 & 0x1FFF) >> 2: return SqrtVal[0];
+        case (0x040002BC & 0x1FFF) >> 2: return SqrtVal[1];
+
+        case (0x04000300 & 0x1FFF) >> 2: return PostFlag9;
+        case (0x04000304 & 0x1FFF) >> 2: return PowerControl9;
+
+        default: break;
+        }
+
+        // In-window word-aligned addr that matched no register above: replicate the
+        // ORIGINAL switch tail (region fall-throughs + default) exactly.
+        if ((addr >= 0x04000000 && addr < 0x04000060) || (addr == 0x0400006C))
+        {
+            return GPU.GPU2D_A.Read32(addr);
+        }
+        if ((addr >= 0x04001000 && addr < 0x04001060) || (addr == 0x0400106C))
+        {
+            return GPU.GPU2D_B.Read32(addr);
+        }
+        if (addr >= 0x04000320 && addr < 0x040006A4)
+        {
+            return GPU.GPU3D.Read32(addr);
+        }
+
+        if ((addr & 0xFFFFF000) != 0x04004000)
+            Log(LogLevel::Debug, "unknown ARM9 IO read32 %08X %08X\n", addr, ARM9.R[15]);
+        return 0;
+    }
+#endif
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[0] | (GPU.VCount << 16);
@@ -3575,6 +3678,176 @@ void NDS::ARM9IOWrite16(u32 addr, u16 val)
 
 void NDS::ARM9IOWrite32(u32 addr, u32 val)
 {
+#ifdef LITEV_IO_DISPATCH_TABLE
+    // Fast O(1) dispatch for word-aligned accesses in the primary 8 KB I/O window
+    // (see NDS::ARM9IORead32 for the full rationale). Every case is a verbatim copy of
+    // the matching in-window case in the original switch; its label is the mechanical
+    // compile-time reduction (LABEL & 0x1FFF) >> 2. Out-of-window regs (0x04100010 /
+    // 0x04FFFAxx) and misaligned accesses fall to the ORIGINAL switch + tail below.
+    if ((addr & 0xFFFFE003) == 0x04000000)
+    {
+        switch ((addr & 0x1FFF) >> 2)
+        {
+        case (0x04000004 & 0x1FFF) >> 2:
+            GPU.SetDispStat(0, val & 0xFFFF, 0xFFFF);
+            GPU.SetVCount(val >> 16, 0xFFFF);
+            return;
+
+        case (0x04000060 & 0x1FFF) >> 2: GPU.GPU3D.Write32(addr, val); return;
+        case (0x04000064 & 0x1FFF) >> 2:
+        case (0x04000068 & 0x1FFF) >> 2:
+        case (0x0400006C & 0x1FFF) >> 2:
+        case (0x0400106C & 0x1FFF) >> 2: GPU.Write32(addr, val); return;
+
+        case (0x040000B0 & 0x1FFF) >> 2: DMAs[0].SrcAddr = val; return;
+        case (0x040000B4 & 0x1FFF) >> 2: DMAs[0].DstAddr = val; return;
+        case (0x040000B8 & 0x1FFF) >> 2: DMAs[0].WriteCnt(val); return;
+        case (0x040000BC & 0x1FFF) >> 2: DMAs[1].SrcAddr = val; return;
+        case (0x040000C0 & 0x1FFF) >> 2: DMAs[1].DstAddr = val; return;
+        case (0x040000C4 & 0x1FFF) >> 2: DMAs[1].WriteCnt(val); return;
+        case (0x040000C8 & 0x1FFF) >> 2: DMAs[2].SrcAddr = val; return;
+        case (0x040000CC & 0x1FFF) >> 2: DMAs[2].DstAddr = val; return;
+        case (0x040000D0 & 0x1FFF) >> 2: DMAs[2].WriteCnt(val); return;
+        case (0x040000D4 & 0x1FFF) >> 2: DMAs[3].SrcAddr = val; return;
+        case (0x040000D8 & 0x1FFF) >> 2: DMAs[3].DstAddr = val; return;
+        case (0x040000DC & 0x1FFF) >> 2: DMAs[3].WriteCnt(val); return;
+
+        case (0x040000E0 & 0x1FFF) >> 2: DMA9Fill[0] = val; return;
+        case (0x040000E4 & 0x1FFF) >> 2: DMA9Fill[1] = val; return;
+        case (0x040000E8 & 0x1FFF) >> 2: DMA9Fill[2] = val; return;
+        case (0x040000EC & 0x1FFF) >> 2: DMA9Fill[3] = val; return;
+
+        case (0x04000100 & 0x1FFF) >> 2:
+            Timers[0].Reload = val & 0xFFFF;
+            TimerStart(0, val>>16);
+            return;
+        case (0x04000104 & 0x1FFF) >> 2:
+            Timers[1].Reload = val & 0xFFFF;
+            TimerStart(1, val>>16);
+            return;
+        case (0x04000108 & 0x1FFF) >> 2:
+            Timers[2].Reload = val & 0xFFFF;
+            TimerStart(2, val>>16);
+            return;
+        case (0x0400010C & 0x1FFF) >> 2:
+            Timers[3].Reload = val & 0xFFFF;
+            TimerStart(3, val>>16);
+            return;
+
+        case (0x04000130 & 0x1FFF) >> 2:
+            KeyCnt[0] = val >> 16;
+            return;
+
+        case (0x04000180 & 0x1FFF) >> 2:
+        case (0x04000184 & 0x1FFF) >> 2:
+            NDS::ARM9IOWrite16(addr, val);
+            return;
+        case (0x04000188 & 0x1FFF) >> 2:
+            if (IPCFIFOCnt9 & 0x8000)
+            {
+                if (IPCFIFO9.IsFull())
+                    IPCFIFOCnt9 |= 0x4000;
+                else
+                {
+                    bool wasempty = IPCFIFO9.IsEmpty();
+                    IPCFIFO9.Write(val);
+                    if ((IPCFIFOCnt7 & 0x0400) && wasempty)
+                        SetIRQ(1, IRQ_IPCRecv);
+                }
+            }
+            return;
+
+        case (0x040001A0 & 0x1FFF) >> 2:
+            NDSCartSlots[0]->WriteSPICnt(0, val & 0xFFFF, 0xFFFF);
+            NDSCartSlots[0]->WriteSPIData(0, (val >> 16) & 0xFF);
+            return;
+        case (0x040001A4 & 0x1FFF) >> 2:
+            NDSCartSlots[0]->WriteROMCnt(0, val, 0xFFFFFFFF);
+            return;
+
+        case (0x040001A8 & 0x1FFF) >> 2:
+            NDSCartSlots[0]->WriteROMCommand(0, 0, val & 0xFF);
+            NDSCartSlots[0]->WriteROMCommand(0, 1, (val >> 8) & 0xFF);
+            NDSCartSlots[0]->WriteROMCommand(0, 2, (val >> 16) & 0xFF);
+            NDSCartSlots[0]->WriteROMCommand(0, 3, val >> 24);
+            return;
+        case (0x040001AC & 0x1FFF) >> 2:
+            NDSCartSlots[0]->WriteROMCommand(0, 4, val & 0xFF);
+            NDSCartSlots[0]->WriteROMCommand(0, 5, (val >> 8) & 0xFF);
+            NDSCartSlots[0]->WriteROMCommand(0, 6, (val >> 16) & 0xFF);
+            NDSCartSlots[0]->WriteROMCommand(0, 7, val >> 24);
+            return;
+
+        case (0x040001B0 & 0x1FFF) >> 2:
+            NDSCartSlots[0]->WriteKey2Seed0(0, (u64)val, 0x00FFFFFFFFULL);
+            return;
+        case (0x040001B4 & 0x1FFF) >> 2:
+            NDSCartSlots[0]->WriteKey2Seed1(0, (u64)val, 0x00FFFFFFFFULL);
+            return;
+
+        case (0x04000208 & 0x1FFF) >> 2: IME[0] = val & 0x1; UpdateIRQ(0); return;
+        case (0x04000210 & 0x1FFF) >> 2: IE[0] = val; UpdateIRQ(0); return;
+        case (0x04000214 & 0x1FFF) >> 2: IF[0] &= ~val; GPU.GPU3D.CheckFIFOIRQ(); UpdateIRQ(0); return;
+
+        case (0x04000240 & 0x1FFF) >> 2:
+            GPU.MapVRAM_AB(0, val & 0xFF);
+            GPU.MapVRAM_AB(1, (val >> 8) & 0xFF);
+            GPU.MapVRAM_CD(2, (val >> 16) & 0xFF);
+            GPU.MapVRAM_CD(3, val >> 24);
+            return;
+        case (0x04000244 & 0x1FFF) >> 2:
+            GPU.MapVRAM_E(4, val & 0xFF);
+            GPU.MapVRAM_FG(5, (val >> 8) & 0xFF);
+            GPU.MapVRAM_FG(6, (val >> 16) & 0xFF);
+            MapSharedWRAM(val >> 24);
+            return;
+        case (0x04000248 & 0x1FFF) >> 2:
+            GPU.MapVRAM_H(7, val & 0xFF);
+            GPU.MapVRAM_I(8, (val >> 8) & 0xFF);
+            return;
+
+        case (0x04000280 & 0x1FFF) >> 2: DivCnt = val; StartDiv(); return;
+
+        case (0x040002B0 & 0x1FFF) >> 2: SqrtCnt = val; StartSqrt(); return;
+
+        case (0x04000290 & 0x1FFF) >> 2: DivNumerator[0] = val; StartDiv(); return;
+        case (0x04000294 & 0x1FFF) >> 2: DivNumerator[1] = val; StartDiv(); return;
+        case (0x04000298 & 0x1FFF) >> 2: DivDenominator[0] = val; StartDiv(); return;
+        case (0x0400029C & 0x1FFF) >> 2: DivDenominator[1] = val; StartDiv(); return;
+
+        case (0x040002B8 & 0x1FFF) >> 2: SqrtVal[0] = val; StartSqrt(); return;
+        case (0x040002BC & 0x1FFF) >> 2: SqrtVal[1] = val; StartSqrt(); return;
+
+        case (0x04000304 & 0x1FFF) >> 2:
+            PowerControl9 = val & 0x820F;
+            GPU.SetPowerCnt(PowerControl9);
+            return;
+
+        default: break;
+        }
+
+        // In-window word-aligned addr that matched no register above: replicate the
+        // ORIGINAL switch tail (region fall-throughs + default) exactly.
+        if (addr >= 0x04000000 && addr < 0x04000060)
+        {
+            GPU.GPU2D_A.Write32(addr, val);
+            return;
+        }
+        if (addr >= 0x04001000 && addr < 0x04001060)
+        {
+            GPU.GPU2D_B.Write32(addr, val);
+            return;
+        }
+        if (addr >= 0x04000320 && addr < 0x040006A4)
+        {
+            GPU.GPU3D.Write32(addr, val);
+            return;
+        }
+
+        Log(LogLevel::Debug, "unknown ARM9 IO write32 %08X %08X %08X\n", addr, val, ARM9.R[15]);
+        return;
+    }
+#endif
     switch (addr)
     {
     case 0x04000004:
