@@ -42,6 +42,19 @@ namespace melonDS
 #include "OpenGL_shaders/HybridMergeVS.h"
 #include "OpenGL_shaders/HybridMergeFS.h"
 
+// Upload the descriptors straight from RAM on the emu thread (default). The PBO path (the
+// 2D thread fills a mapped buffer, debug.litev.hybdirect=0) costs less emu CPU in the
+// upload itself but more frame time on Mali: ABBA 72.5/73.2 fps vs 75.0/75.5 direct.
+static bool HybDirect()
+{
+#ifdef __ANDROID__
+    static const bool on = [] { char b[92] = {}; return !(__system_property_get("debug.litev.hybdirect", b) > 0 && atoi(b) == 0); }();
+    return on;
+#else
+    return true;
+#endif
+}
+
 static double HybNowMs()
 {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -447,6 +460,7 @@ void HybridRenderer::Restart3DRendering()
 // emu thread, 2D kick for slot b: map its staging buffer for the 2D thread to fill
 void HybridRenderer::HybridKick(int b)
 {
+    if (HybDirect()) return;
     if (HybMap[b]) return;   // still mapped (that frame was never presented): reuse
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, DescPBO[b]);
     HybMap[b] = (u8*)glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, 2 * 192 * HybStride * 4,
@@ -543,6 +557,25 @@ void HybridRenderer::Merge(GLuint fbo, int single, int bottomY)
         glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, HybStride, 192, 2,
                         GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, nullptr);
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    }
+    else if (HybDirect())
+    {
+        // per screen: everything if a line carries 3D descriptors, else plane 1 + control column
+        glBindTexture(GL_TEXTURE_2D_ARRAY, DescTex[fb]);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, HybStride);
+        for (int s = 0; s < 2; s++)
+        {
+            const u32* src = HybFB[fb] + s * 192 * HybStride;
+            if (HybHas3D[fb][s])
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, s, HybStride, 192, 1, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, src);
+            else
+            {
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, s, 256, 192, 1, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, src);
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 512, 0, s, 1, 192, 1, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, src + 512);
+            }
+        }
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     }
     ProfUpload += HybNowMs() - t0;
 
