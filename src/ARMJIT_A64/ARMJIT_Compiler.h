@@ -36,6 +36,9 @@ class ARMJIT;
 const Arm64Gen::ARM64Reg RMemBase = Arm64Gen::X26;
 const Arm64Gen::ARM64Reg RCPSR = Arm64Gen::W27;
 const Arm64Gen::ARM64Reg RCycles = Arm64Gen::W28;
+#ifdef LITEV_JIT_BUDGET_REG
+const Arm64Gen::ARM64Reg RBudget = Arm64Gen::W15;   // remaining slice budget across hops
+#endif
 const Arm64Gen::ARM64Reg RCPU = Arm64Gen::X29;
 
 struct Op2
@@ -328,6 +331,12 @@ public:
     // liteDS-v2 Unit 3: emitted per-CPU dispatcher stub (num=0 ARM9, num=1 ARM7).
     // Generated in Reset() so GetRXBase() is the stable rebased block-cache base.
     void* Gen_Dispatcher(u32 num);
+#ifdef LITEV_JIT_BUDGET_REG
+    void QuickCallFunction(Arm64Gen::ARM64Reg scratchreg, const void* func);
+    template <typename T>
+    void QuickCallFunction(Arm64Gen::ARM64Reg scratchreg, T func) { QuickCallFunction(scratchreg, (const void*)func); }
+    void EmitBudgetSpill(Arm64Gen::ARM64Reg t0, Arm64Gen::ARM64Reg t1, Arm64Gen::ARM64Reg t2);
+#endif
     // Common block-exit tail: jump to this CPU's dispatcher instead of ARM_Ret so
     // execution stays in JIT context across block boundaries.
     void EmitBlockExit();

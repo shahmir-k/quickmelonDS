@@ -91,7 +91,14 @@ public:
     // reached its Target" because CyclesBudget is maintained in the same unit as
     // Cycles (see ARM.cpp Execute<JIT>). This is INERT this unit: nothing reads
     // CyclesBudget for control flow yet.
+#ifdef LITEV_JIT_BUDGET_REG
+    // During a JIT slice the budget lives in W15 and is spilled to CyclesBudget around
+    // every helper call; Timestamp == JitTsBase - budget. Re-base so the time stays exact
+    // with a zero budget. (Outside a slice JitTsBase is re-initialized before dispatch.)
+    void ForceExecutionExit() { JitTsBase -= (s64)CyclesBudget; CyclesBudget = 0; }
+#else
     void ForceExecutionExit() { CyclesBudget = 0; }
+#endif
 
     void NocashPrint(u32 addr) noexcept;
 
@@ -243,6 +250,13 @@ public:
     // asserted hot field (Cycles/StopExecution/CPSR/CyclesBudget/FastBlockLookup*/
     // JitNZCV) so it disturbs no baked offset; transient -> never serialized.
     u32 ICacheEpoch = 0;
+#endif
+
+#ifdef LITEV_JIT_BUDGET_REG
+    // Slice time base for the W15 budget register (LITEV_JIT_BUDGET_REG): the CPU's
+    // Timestamp at any helper call / exit is JitTsBase - budget. JitTsPtr = &ARMxTimestamp.
+    u64 JitTsBase = 0;
+    u64* JitTsPtr = nullptr;
 #endif
 
 #ifdef LITEV_JIT_REGION_CACHE

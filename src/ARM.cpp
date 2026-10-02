@@ -729,6 +729,10 @@ void ARMv5::Execute()
             // unit as Cycles. The loop guarantees ARM9Timestamp < ARM9Target here, so
             // this is strictly positive before dispatch (a 0 later => forced exit).
             CyclesBudget = (s32)std::min<s64>((s64)(NDS.ARM9Target - NDS.ARM9Timestamp), INT32_MAX);
+#ifdef LITEV_JIT_BUDGET_REG
+            JitTsPtr = &NDS.ARM9Timestamp;
+            JitTsBase = NDS.ARM9Timestamp + CyclesBudget;
+#endif
 
             if (block)
             {
@@ -921,6 +925,10 @@ void ARMv4::Execute()
             // liteDS-v2 Unit 2 (shadow): ARM7 analog. ARM7 timestamps carry no clock
             // shift, so budget = ARM7Target - ARM7Timestamp is already in Cycles units.
             CyclesBudget = (s32)std::min<s64>((s64)(NDS.ARM7Target - NDS.ARM7Timestamp), INT32_MAX);
+#ifdef LITEV_JIT_BUDGET_REG
+            JitTsPtr = &NDS.ARM7Timestamp;
+            JitTsBase = NDS.ARM7Timestamp + CyclesBudget;
+#endif
 
             if (block)
             {

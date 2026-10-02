@@ -436,6 +436,19 @@ endif()
 # to C++ for SetupExecutableRegion. Entries are only cached when they equal what
 # SetupExecutableRegion would return for every address in the window, and are cleared on
 # every mapping change (ITCM/DTCM, WRAMCNT, savestate, reset) -> guest-identical.
+# Budget register (probe): the slice budget lives in W15 across block hops instead of a
+# per-hop Timestamp + CyclesBudget read-modify-write. Timestamp is materialized from it
+# (JitTsBase - W15) before every C++ helper call and at every exit to C++, so every C++
+# reader still sees the exact block-start time. Exact (category A).
+option(LITEV_JIT_BUDGET_REG "Keep the slice budget in a register across JIT hops (exact)" OFF)
+if (LITEV_JIT_BUDGET_REG)
+    if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_BUDGET_REG=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_BUDGET_REG requires LITEV_JIT_DISPATCH and an AArch64 target.")
+    endif()
+endif()
+
 option(LITEV_JIT_REGION_CACHE "Dispatcher-side multi-region block lookup (exact)" OFF)
 if (LITEV_JIT_REGION_CACHE)
     if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")

@@ -70,6 +70,9 @@ ARM_Dispatch:
 #endif
 #endif
 
+#ifdef LITEV_JIT_BUDGET_REG
+    ldr w15, [RCPU, ARM_CyclesBudget_offset]
+#endif
     br x1
 
 .p2align 4,,15

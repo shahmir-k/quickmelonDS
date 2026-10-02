@@ -267,12 +267,45 @@ template <>
 const ARM64Reg RegisterCache<Compiler, ARM64Reg>::NativeRegAllocOrder[] =
 {
     W19, W20, W21, W22, W23, W24, W25,
+#ifdef LITEV_JIT_BUDGET_REG
+    W8, W9, W10, W11, W12, W13, W14     // W15 = slice budget (RBudget)
+};
+template <>
+const int RegisterCache<Compiler, ARM64Reg>::NativeRegsAvailable = 14;
+
+const BitSet32 CallerSavedPushRegs({W8, W9, W10, W11, W12, W13, W14});
+#else
     W8, W9, W10, W11, W12, W13, W14, W15
 };
 template <>
 const int RegisterCache<Compiler, ARM64Reg>::NativeRegsAvailable = 15;
 
 const BitSet32 CallerSavedPushRegs({W8, W9, W10, W11, W12, W13, W14, W15});
+#endif
+
+#ifdef LITEV_JIT_BUDGET_REG
+// Every C++ helper call: spill the budget, materialize Timestamp = JitTsBase - budget
+// (the exact block-start time the per-hop commit used to leave in memory), call, then
+// reload the budget (a helper may have forced an exit = zeroed it). X16/X17 are never
+// allocated; X15 is free once spilled. Args in X0-X7 and `scratchreg` are untouched.
+void Compiler::QuickCallFunction(ARM64Reg scratchreg, const void* func)
+{
+    EmitBudgetSpill(X16, X17, X15);
+    ARM64XEmitter::QuickCallFunction(scratchreg, func);
+    LDR(INDEX_UNSIGNED, RBudget, RCPU, offsetof(ARM, CyclesBudget));
+}
+
+// STR budget; Timestamp = JitTsBase - (s64)budget. Clobbers t0, t1, t2 (64-bit regs).
+void Compiler::EmitBudgetSpill(ARM64Reg t0, ARM64Reg t1, ARM64Reg t2)
+{
+    STR(INDEX_UNSIGNED, RBudget, RCPU, offsetof(ARM, CyclesBudget));
+    SXTW(t1, RBudget);
+    LDR(INDEX_UNSIGNED, t0, RCPU, offsetof(ARM, JitTsBase));
+    SUB(t0, t0, t1);
+    LDR(INDEX_UNSIGNED, t2, RCPU, offsetof(ARM, JitTsPtr));
+    STR(INDEX_UNSIGNED, t0, t2, 0);
+}
+#endif
 
 void Compiler::MovePC()
 {
@@ -1134,6 +1167,14 @@ void* Compiler::Gen_Dispatcher(u32 num)
     LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
     FixupBranch exitStop = CBNZ(W2);
 
+#ifdef LITEV_JIT_BUDGET_REG
+    // (b) budget register: consume block K (Timestamp stays JitTsBase - budget; it is
+    //     written only at the C++ exit tail below and before helper calls).
+    (void)tsPtr;
+    SUBS(RBudget, RBudget, RCycles);
+    MOVI2R(RCycles, 0);
+    FixupBranch exitBudget = B(CC_LE);
+#else
     // (b) commit block K to the timeline: Timestamp += Cycles (64-bit, unshifted, exactly as
     //     `NDS.ARMxTimestamp += Cycles`), keep budget == Target-Timestamp, restart the
     //     accumulator at 0 for the next block. Cycles is always >= 0 so uxtw == the s32 value.
@@ -1149,6 +1190,7 @@ void* Compiler::Gen_Dispatcher(u32 num)
     // (c) slice over or forced exit? budget <= 0
     CMP(W1, 0);
     FixupBranch exitBudget = B(CC_LE);
+#endif
 
     // (d) instrAddr = R[15] - ((CPSR&0x20)?2:4) == (R[15] - 4) + (thumb << 1), as in the loop
     LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
@@ -1390,6 +1432,11 @@ void* Compiler::Gen_Dispatcher(u32 num)
     SetJumpTarget(exitBudget);
     SetJumpTarget(exitRegion);
     SetJumpTarget(miss);
+#ifdef LITEV_JIT_BUDGET_REG
+    // Back to C++: leave CyclesBudget / Timestamp exactly as the per-hop commit did
+    // (on the StopExecution path block K's cycles are still in RCycles, uncommitted).
+    EmitBudgetSpill(X1, X2, X3);
+#endif
 #if LITEV_PROFILE
     // Dispatcher exits to C++ (block-lookup miss / recompile churn + the rare slice-end).
     MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.DispatcherMisses);
@@ -1464,6 +1511,14 @@ void Compiler::EmitLinkExit(u32 targetAddr)
     LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
     FixupBranch toDispatchStop = CBNZ(W2);
 
+#ifdef LITEV_JIT_BUDGET_REG
+    // (b)+(c) in the budget register. On the slice end, undo the subtraction and let
+    // the dispatcher do the exit (it re-runs (a)-(c) with the canonical state).
+    (void)tsPtr;
+    SUBS(RBudget, RBudget, RCycles);
+    FixupBranch toBudgetEnd = B(CC_LE);
+    MOVI2R(RCycles, 0);
+#else
     // (b)
     MOVP2R(X4, tsPtr);
     LDR(INDEX_UNSIGNED, X5, X4, 0);
@@ -1477,6 +1532,7 @@ void Compiler::EmitLinkExit(u32 targetAddr)
     // (c)
     CMP(W1, 0);
     FixupBranch toDispatchBudget = B(CC_LE);
+#endif
 
     // (d)
 #ifndef LITEV_JIT_LAZYFLAGS
@@ -1489,8 +1545,14 @@ void Compiler::EmitLinkExit(u32 targetAddr)
     u32 patchOffset = (u32)((u8*)GetRXPtr() - GetRXBase());
     B(DispatcherEntry[Num]);   // the patch slot (unlinked state)
 
+#ifdef LITEV_JIT_BUDGET_REG
+    SetJumpTarget(toBudgetEnd);
+    ADD(RBudget, RBudget, RCycles);
+    SetJumpTarget(toDispatchStop);
+#else
     SetJumpTarget(toDispatchStop);
     SetJumpTarget(toDispatchBudget);
+#endif
     B(DispatcherEntry[Num]);
 
     if (NumLinkExits < 2)
@@ -1569,6 +1631,14 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
     LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
     FixupBranch toDispStop = CBNZ(W2);
 
+#ifdef LITEV_JIT_BUDGET_REG
+    // (b)+(c) in the budget register; on the slice end the dispatcher (a)-(c) re-runs as a
+    // no-op subtraction (RCycles = 0) and exits through its spill tail.
+    (void)tsPtr;
+    SUBS(RBudget, RBudget, RCycles);
+    MOVI2R(RCycles, 0);
+    FixupBranch toDispBudget = B(CC_LE);
+#else
     // (b) commit block K: Timestamp += Cycles; budget -= Cycles; Cycles = 0.
     MOVP2R(X4, tsPtr);
     LDR(INDEX_UNSIGNED, X5, X4, 0);
@@ -1582,6 +1652,7 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
     // (c) slice over? budget <= 0 -> dispatcher (re-commit no-op, then exits).
     CMP(W1, 0);
     FixupBranch toDispBudget = B(CC_LE);
+#endif
 
     // (d) instrAddr = R[15] - ((CPSR&0x20)?2:4)  (== dispatcher step (d), byte for byte).
     LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
@@ -1717,6 +1788,15 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
         // The dispatcher checks the budget, not IdleLoop; zero it so the exit bounces
         // to C++ (which performs the idle-skip). Keeps the ForceExecutionExit invariant:
         // every setter of StopExecution/Halted/IdleLoop also zeroes CyclesBudget.
+#ifdef LITEV_JIT_BUDGET_REG
+        // Register form of ForceExecutionExit: re-base JitTsBase so Timestamp stays the
+        // block-start time with a zero budget.
+        SXTW(X17, RBudget);
+        LDR(INDEX_UNSIGNED, X16, RCPU, offsetof(ARM, JitTsBase));
+        SUB(X16, X16, X17);
+        STR(INDEX_UNSIGNED, X16, RCPU, offsetof(ARM, JitTsBase));
+        MOVI2R(RBudget, 0);
+#endif
         STR(INDEX_UNSIGNED, WZR, RCPU, offsetof(ARM, CyclesBudget));
 #endif
     }
