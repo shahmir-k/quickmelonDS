@@ -81,6 +81,7 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 | geom: staged deep prefetch in BuildFrameGeom (LITEV_GEOM_PREFETCH2) | `LITEV_GEOM_PREFETCH2` | A |
 | sched: drain DMA9/GXFIFO-stall steps in one iteration while ARM7 is halted (LITEV_SCHED_DRAIN) | `LITEV_SCHED_DRAIN` | A |
 | jit: region-aware dispatcher, keep the last 4 code regions per CPU (LITEV_JIT_REGION_CACHE) | `LITEV_JIT_REGION_CACHE` | A |
+| jit: keep the slice budget in W15 across block hops (LITEV_JIT_BUDGET_REG) | `LITEV_JIT_BUDGET_REG` | A |
 | build: add LITEV_AUTO_FRAMESKIP option (adaptive real-time frameskip) | `LITEV_AUTO_FRAMESKIP` | A (UX feature; see section) |
 
 ## Performance options
@@ -720,6 +721,18 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 **Measured.** Device headless, emu thread, 500 f, n = 3: PW overworld cycles -3.4 % (headless fps 59.0 -> 61.3), Shrek slot 2 -0.75 %. With SCHED_DRAIN: PW overworld -3.6 %, PW pw.ml1 -4.8 %, Shrek -1.9 % (2026-10-02).
 
 **Option.** LITEV_JIT_REGION_CACHE (default OFF; needs LITEV_JIT_DISPATCH; enabled in the app's shipping build)
+
+### jit: keep the slice budget in W15 across block hops (LITEV_JIT_BUDGET_REG)
+
+**What.** The remaining slice budget lives in W15 (removed from the register allocator) for the whole JIT slice. A hop (linked exit, DIRECTPATCH guard stub, dispatcher) is `SUBS W15, W15, RCycles` + `B.LE` instead of a 64-bit Timestamp read-modify-write through a MOVZ/MOVK address plus a CyclesBudget read-modify-write. Timestamp is `JitTsBase - budget`; it and CyclesBudget are written to memory before every C++ helper call (`Compiler::QuickCallFunction` wrapper, which reloads W15 afterwards) and in the dispatcher's exit tail. `ForceExecutionExit` and the idle-branch exit re-base `JitTsBase` before zeroing the budget.
+
+**Why it works.** ~15k (PW) to ~22k (Shrek) hops per frame each paid ~11 instructions, 2 loads and 2 stores; the exit commit was 14 % of hot JIT bytes.
+
+**Exactness.** A: every C++ reader sees the same block-start Timestamp as before. The per-hop StopExecution check stays (an IRQ can be pending while the budget is positive). The trace gate catches both a missing Timestamp write at helper calls and a missing re-base.
+
+**Measured.** Device headless, emu thread, 500 f, vs SCHED_DRAIN + REGION_CACHE: PW overworld cycles -1.66 % (n = 6), Shrek slot 2 -2.70 % (n = 3), PW pw.ml1 -1.07 % (n = 2). App PW overworld software uncapped ABBA: 63.3/63.0 -> 63.8/63.8 fps, runFrame CPU 11.87 -> 11.59 ms (2026-10-02).
+
+**Option.** LITEV_JIT_BUDGET_REG (default OFF; needs LITEV_JIT_DISPATCH; enabled in the app's shipping build)
 
 ## Unflagged optimizations
 
