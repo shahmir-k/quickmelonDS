@@ -16,6 +16,7 @@ uniform sampler2D Tex3D;           // Nx 3D colour buffer
 uniform int uScale;
 uniform int uSingle;     // -1: both screens (MRT); 0/1: only that screen, to output 0
 uniform ivec2 uOrigin;   // viewport origin of this draw in the target
+smooth in highp vec2 fNative;
 
 FRAGLOC(0) out vec4 oTopColor;
 FRAGLOC(1) out vec4 oBottomColor;
@@ -38,7 +39,12 @@ ivec4 Get3D(ivec2 pos)
 
 vec4 Screen(int layer, ivec2 P)
 {
+#ifdef NATIVE_VARYING
+    // debug.litev.hybdiv (default on): no per-pixel integer divide (emulated on Mali)
+    ivec2 n = ivec2(fNative);
+#else
     ivec2 n = P / uScale;
+#endif
     ivec4 ctl = Desc(512, n.y, layer);
     int dispmode = ctl.b & 0x3;
     ivec4 pix = Desc(n.x, n.y, layer);

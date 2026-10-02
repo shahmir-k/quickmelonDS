@@ -122,6 +122,8 @@ bool HybridRenderer::Init()
     std::string mergeFS = kHybridMergeFS;
     if (OpenGL::Prop("hybmp", 1))
         mergeFS.insert(mergeFS.find('\n') + 1, "precision mediump float;\nprecision mediump int;\n");
+    if (OpenGL::Prop("hybdiv", 1))
+        mergeFS.insert(mergeFS.find('\n') + 1, "#define NATIVE_VARYING\n");
     if (!OpenGL::CompileVertexFragmentProgram(MergeShader,
             kHybridMergeVS, mergeFS, "HybridMergeShader",
             {}, {{"oTopColor", 0}, {"oBottomColor", 1}}))
