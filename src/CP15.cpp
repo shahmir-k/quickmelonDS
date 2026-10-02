@@ -105,6 +105,9 @@ void ARMv5::CP15DoSavestate(Savestate* file)
 
 void ARMv5::UpdateDTCMSetting()
 {
+#ifdef LITEV_JIT_REGION_CACHE
+    JitRegionCacheClear();
+#endif
     u32 newDTCMBase;
     u32 newDTCMMask;
     u32 newDTCMSize;
@@ -133,6 +136,9 @@ void ARMv5::UpdateDTCMSetting()
 
 void ARMv5::UpdateITCMSetting()
 {
+#ifdef LITEV_JIT_REGION_CACHE
+    JitRegionCacheClear();
+#endif
     if (CP15Control & (1<<18))
     {
         ITCMSize = 0x200 << ((ITCMSetting >> 1) & 0x1F);

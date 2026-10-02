@@ -1195,10 +1195,44 @@ void* Compiler::Gen_Dispatcher(u32 num)
     SUB(W4, W0, W3);
     LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, FastBlockLookupSize));
     CMP(W4, W5);
+#ifdef LITEV_JIT_REGION_CACHE
+    // (e') window miss: try the cached regions (ARM::JitRegions, exact by construction)
+    //      before giving up to C++. A hit makes it the current window, exactly as the
+    //      C++ re-entry's JitSetupRegion would, then continues with the tag lookup.
+    FixupBranch inRegion = B(CC_LO);
+    FixupBranch rcHit[ARM::JitRegionCount];
+    const u32 rcBase = offsetof(ARM, JitRegions);
+    const u32 rcSize = sizeof(ARM::JitRegionEntry);
+    for (int k = 0; k < ARM::JitRegionCount; k++)
+    {
+        LDR(INDEX_UNSIGNED, W3, RCPU, rcBase + k * rcSize + offsetof(ARM::JitRegionEntry, Start));
+        SUB(W4, W0, W3);
+        LDR(INDEX_UNSIGNED, W5, RCPU, rcBase + k * rcSize + offsetof(ARM::JitRegionEntry, Size));
+        CMP(W4, W5);
+        rcHit[k] = B(CC_LO);
+    }
+    FixupBranch exitRegion = B();
+    FixupBranch rcToLookup[ARM::JitRegionCount];
+    for (int k = 0; k < ARM::JitRegionCount; k++)
+    {
+        SetJumpTarget(rcHit[k]);
+        LDR(INDEX_UNSIGNED, X6, RCPU, rcBase + k * rcSize + offsetof(ARM::JitRegionEntry, Lookup));
+        STR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, FastBlockLookupStart));
+        STR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, FastBlockLookupSize));
+        STR(INDEX_UNSIGNED, X6, RCPU, offsetof(ARM, FastBlockLookup));
+        rcToLookup[k] = B();
+    }
+    SetJumpTarget(inRegion);
+#else
     FixupBranch exitRegion = B(CC_HS);
+#endif
 
     // (f) inline tag lookup: entry = FastBlockLookup[offset/2]; tag = entry>>32 == (instrAddr|num)
     LDR(INDEX_UNSIGNED, X6, RCPU, offsetof(ARM, FastBlockLookup));
+#ifdef LITEV_JIT_REGION_CACHE
+    for (int k = 0; k < ARM::JitRegionCount; k++)
+        SetJumpTarget(rcToLookup[k]);
+#endif
     LSR(W4, W4, 1);
     LDR(X7, X6, ArithOption(W4, true));               // ldr x7, [x6, w4, uxtw #3]
     LSR(X2, X7, 32);                                  // W2 = tag (high word)

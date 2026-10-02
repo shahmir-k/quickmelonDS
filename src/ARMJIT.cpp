@@ -1463,12 +1463,13 @@ void ARMJIT::blockSanityCheck(u32 num, u32 blockAddr, JitBlockEntry entry) noexc
     assert(JITCompiler.AddEntryOffset((u32)FastBlockLookupRegions[localAddr >> 27][(localAddr & 0x7FFFFFF) / 2]) == entry);
 }
 
-bool ARMJIT::SetupExecutableRegion(u32 num, u32 blockAddr, u64*& entry, u32& start, u32& size) noexcept
+bool ARMJIT::SetupExecutableRegion(u32 num, u32 blockAddr, u64*& entry, u32& start, u32& size, int* regionOut) noexcept
 {
     // amazingly ignoring the DTCM is the proper behaviour for code fetches
     int region = num == 0
         ? Memory.ClassifyAddress9(blockAddr)
         : Memory.ClassifyAddress7(blockAddr);
+    if (regionOut) *regionOut = region;
 
     u32 memoryOffset;
     if (FastBlockLookupRegions[region]
@@ -1480,6 +1481,37 @@ bool ARMJIT::SetupExecutableRegion(u32 num, u32 blockAddr, u64*& entry, u32& sta
     }
     return false;
 }
+
+#ifdef LITEV_JIT_REGION_CACHE
+// May the window [start, start+size) that SetupExecutableRegion just returned be reused
+// for any other address inside it? Only if Classify + GetMirrorLocation give the same
+// result everywhere in it under the current mappings (they are re-checked from scratch
+// after every mapping change, which clears the caches). NDS only.
+bool ARMJIT::RegionCacheable(u32 num, int region, u32 start, u32 size) const noexcept
+{
+    if (NDS.ConsoleType != 0 || size == 0)
+        return false;
+    const u64 end = (u64)start + size;
+    if (num == 0)
+    {
+        const u32 itcm = NDS.ARM9.ITCMSize;
+        if (region == ARMJIT_Memory::memregion_ITCM)
+            return end <= itcm;   // ITCM wins over DTCM inside [0, ITCMSize)
+        if (region != ARMJIT_Memory::memregion_MainRAM && region != ARMJIT_Memory::memregion_BIOS9)
+            return false;
+        if (start < itcm)
+            return false;
+        const u32 mask = NDS.ARM9.DTCMMask, base = NDS.ARM9.DTCMBase;
+        if ((base & mask) != base)
+            return true;          // DTCM disabled (base 0xFFFFFFFF, mask 0): matches nothing
+        const u64 dend = (u64)base + ((u64)(~mask) + 1);
+        return end <= base || start >= dend;
+    }
+    // ARM7: classification of these windows depends only on the SWRAM mapping.
+    return region == ARMJIT_Memory::memregion_MainRAM || region == ARMJIT_Memory::memregion_BIOS7
+        || region == ARMJIT_Memory::memregion_WRAM7 || region == ARMJIT_Memory::memregion_SharedWRAM;
+}
+#endif
 
 template void ARMJIT::CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(u32) noexcept;
 template void ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(u32) noexcept;

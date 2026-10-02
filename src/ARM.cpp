@@ -247,6 +247,9 @@ void ARM::Reset()
     FastBlockLookup = NULL;
     FastBlockLookupStart = 0;
     FastBlockLookupSize = 0;
+#ifdef LITEV_JIT_REGION_CACHE
+    JitRegionCacheClear();
+#endif
 #endif
 
 #ifdef GDBSTUB_ENABLED
@@ -650,6 +653,31 @@ void ARM::CheckGdbIncoming()
     GdbCheckA();
 }
 
+#ifdef LITEV_JIT_REGION_CACHE
+bool ARM::JitSetupRegion(u32 instrAddr)
+{
+    for (const JitRegionEntry& e : JitRegions)
+    {
+        if (instrAddr - e.Start < e.Size)
+        {
+            FastBlockLookup = e.Lookup;
+            FastBlockLookupStart = e.Start;
+            FastBlockLookupSize = e.Size;
+            return true;
+        }
+    }
+    int region;
+    if (!NDS.JIT.SetupExecutableRegion(Num, instrAddr, FastBlockLookup, FastBlockLookupStart, FastBlockLookupSize, &region))
+        return false;
+    if (NDS.JIT.RegionCacheable(Num, region, FastBlockLookupStart, FastBlockLookupSize))
+    {
+        JitRegions[JitRegionNext] = {FastBlockLookupStart, FastBlockLookupSize, FastBlockLookup};
+        JitRegionNext = (JitRegionNext + 1) % JitRegionCount;
+    }
+    return true;
+}
+#endif
+
 template <CPUExecuteMode mode>
 void ARMv5::Execute()
 {
@@ -683,7 +711,11 @@ void ARMv5::Execute()
             u32 instrAddr = R[15] - ((CPSR&0x20)?2:4);
 
             if ((instrAddr < FastBlockLookupStart || instrAddr >= (FastBlockLookupStart + FastBlockLookupSize))
+#ifdef LITEV_JIT_REGION_CACHE
+                && !JitSetupRegion(instrAddr))
+#else
                 && !NDS.JIT.SetupExecutableRegion(0, instrAddr, FastBlockLookup, FastBlockLookupStart, FastBlockLookupSize))
+#endif
             {
                 NDS.ARM9Timestamp = NDS.ARM9Target;
                 Log(LogLevel::Error, "ARMv5 PC in non executable region %08X\n", R[15]);
@@ -872,7 +904,11 @@ void ARMv4::Execute()
             u32 instrAddr = R[15] - ((CPSR&0x20)?2:4);
 
             if ((instrAddr < FastBlockLookupStart || instrAddr >= (FastBlockLookupStart + FastBlockLookupSize))
+#ifdef LITEV_JIT_REGION_CACHE
+                && !JitSetupRegion(instrAddr))
+#else
                 && !NDS.JIT.SetupExecutableRegion(1, instrAddr, FastBlockLookup, FastBlockLookupStart, FastBlockLookupSize))
+#endif
             {
                 NDS.ARM7Timestamp = NDS.ARM7Target;
                 Log(LogLevel::Error, "ARMv4 PC in non executable region %08X\n", R[15]);

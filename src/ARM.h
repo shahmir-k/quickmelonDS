@@ -245,6 +245,20 @@ public:
     u32 ICacheEpoch = 0;
 #endif
 
+#ifdef LITEV_JIT_REGION_CACHE
+    // Last executable code regions (LITEV_JIT_REGION_CACHE), read by the emitted
+    // dispatcher on a FastBlockLookup window miss. Size 0 = empty. Only windows for
+    // which SetupExecutableRegion gives the same answer at every address are inserted
+    // (ARMJIT::RegionCacheable), and JitRegionCacheClear() runs on every mapping change,
+    // so a hit is exactly what the C++ re-entry would have set up. Transient.
+    struct JitRegionEntry { u32 Start, Size; u64* Lookup; };
+    static constexpr int JitRegionCount = 4;
+    JitRegionEntry JitRegions[JitRegionCount] = {};
+    u32 JitRegionNext = 0;
+    void JitRegionCacheClear() { for (auto& e : JitRegions) e.Size = 0; }
+    bool JitSetupRegion(u32 instrAddr);
+#endif
+
     static const u32 ConditionTable[16];
 #ifdef GDBSTUB_ENABLED
     Gdb::GdbStub GdbStub;

@@ -63,7 +63,10 @@ public:
             InvalidateByAddr(localAddr);
     }
     JitBlockEntry LookUpBlock(u32 num, u64* entries, u32 offset, u32 addr) noexcept;
-    bool SetupExecutableRegion(u32 num, u32 blockAddr, u64*& entry, u32& start, u32& size) noexcept;
+    bool SetupExecutableRegion(u32 num, u32 blockAddr, u64*& entry, u32& start, u32& size, int* regionOut = nullptr) noexcept;
+#ifdef LITEV_JIT_REGION_CACHE
+    bool RegionCacheable(u32 num, int region, u32 start, u32 size) const noexcept;
+#endif
     u32 LocaliseCodeAddress(u32 num, u32 addr) const noexcept;
 
     ARMJIT_Memory Memory;

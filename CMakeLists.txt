@@ -430,6 +430,21 @@ endif()
 # stale in O(1) (single-block invalidations are ~4/3400f in steady state). Pure
 # predictor (same block runs, same cycle accounting as the plain hit path) -> BIT-EXACT /
 # MP-safe. Default OFF -> flag-off byte-identical (all code behind #ifdef).
+# Region cache: the dispatcher (and the C++ re-entry path) keep the last 4 executable
+# code regions per CPU, so a dynamic branch into another region (ITCM <-> main RAM <->
+# BIOS, WRAM7 <-> main RAM) switches FastBlockLookup in emitted code instead of returning
+# to C++ for SetupExecutableRegion. Entries are only cached when they equal what
+# SetupExecutableRegion would return for every address in the window, and are cleared on
+# every mapping change (ITCM/DTCM, WRAMCNT, savestate, reset) -> guest-identical.
+option(LITEV_JIT_REGION_CACHE "Dispatcher-side multi-region block lookup (exact)" OFF)
+if (LITEV_JIT_REGION_CACHE)
+    if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_REGION_CACHE=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_REGION_CACHE requires LITEV_JIT_DISPATCH and an AArch64 target.")
+    endif()
+endif()
+
 option(LITEV_JIT_ICACHE "Per-site 2-way block inline cache in the dispatcher (guest-PC->host-ptr), epoch-guarded" OFF)
 if (LITEV_JIT_ICACHE)
     if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")

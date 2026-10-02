@@ -776,6 +776,10 @@ bool NDS::DoSavestate(Savestate* file)
 #ifdef JIT_ENABLED
         JIT.Reset();
 #endif
+#ifdef LITEV_JIT_REGION_CACHE
+        ARM9.JitRegionCacheClear();
+        ARM7.JitRegionCacheClear();
+#endif
     }
 
     file->Finish();
@@ -1473,6 +1477,10 @@ void NDS::MapSharedWRAM(u8 val)
         return;
 
     JIT.Memory.RemapSWRAM();
+#ifdef LITEV_JIT_REGION_CACHE
+    ARM9.JitRegionCacheClear();
+    ARM7.JitRegionCacheClear();
+#endif
 
     WRAMCnt = val;
 
