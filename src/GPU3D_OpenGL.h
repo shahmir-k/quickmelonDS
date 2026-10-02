@@ -196,6 +196,7 @@ private:
     void AllocColorBuffers() noexcept;
 
     GLuint MainFramebuffer {};
+    GLuint WrapSampler[9] {};   // [wrapS * 3 + wrapT], 0 clamp / 1 repeat / 2 mirror
 };
 }
 #endif

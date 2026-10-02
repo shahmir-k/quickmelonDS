@@ -294,6 +294,16 @@ bool GLRenderer3D::Init()
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+    static const GLint modes[3] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT};
+    glGenSamplers(9, WrapSampler);
+    for (int i = 0; i < 9; i++)
+    {
+        glSamplerParameteri(WrapSampler[i], GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glSamplerParameteri(WrapSampler[i], GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glSamplerParameteri(WrapSampler[i], GL_TEXTURE_WRAP_S, modes[i / 3]);
+        glSamplerParameteri(WrapSampler[i], GL_TEXTURE_WRAP_T, modes[i % 3]);
+    }
+
     return true;
 }
 
@@ -304,6 +314,7 @@ GLRenderer3D::~GLRenderer3D()
     Texcache.Reset();
 
     glDeleteFramebuffers(1, &MainFramebuffer);
+    glDeleteSamplers(9, WrapSampler);
     glDeleteTextures(MaxColorRing, ColorBufferTex);
     glDeleteTextures(1, &DepthBufferTex);
     glDeleteTextures(1, &AttrBufferTex);
@@ -802,33 +813,28 @@ void GLRenderer3D::SetupPolygonTexture(const RendererPolygon* poly) const
 {
     bool iscap = (poly->TexID == (GLuint)-1 || poly->TexID == (GLuint)-2);
 
-    if (iscap)
+    // wrap mode per axis: 0 clamp, 1 repeat, 2 mirrored repeat
+    const int ws = (poly->TexRepeat & (1<<0)) ? ((poly->TexRepeat & (1<<2)) ? 2 : 1) : 0;
+    const int wt = (poly->TexRepeat & (1<<1)) ? ((poly->TexRepeat & (1<<3)) ? 2 : 1) : 0;
+
+    if (!iscap)
     {
-        if (poly->TexID == (GLuint)-1)
-            glActiveTexture(GL_TEXTURE1);
-        else
-            glActiveTexture(GL_TEXTURE2);
-    }
-    else
-    {
+        // Sampler objects instead of glTexParameteri on the (shared) texture array: a
+        // texture-state change per draw is a costly revalidation in the Mali driver.
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D_ARRAY, poly->TexID);
+        glBindSampler(0, WrapSampler[ws * 3 + wt]);
+        return;
     }
 
-    GLint repeatS, repeatT;
-
-    if (poly->TexRepeat & (1<<0))
-        repeatS = (poly->TexRepeat & (1<<2)) ? GL_MIRRORED_REPEAT : GL_REPEAT;
+    if (poly->TexID == (GLuint)-1)
+        glActiveTexture(GL_TEXTURE1);
     else
-        repeatS = GL_CLAMP_TO_EDGE;
+        glActiveTexture(GL_TEXTURE2);
 
-    if (poly->TexRepeat & (1<<1))
-        repeatT = (poly->TexRepeat & (1<<3)) ? GL_MIRRORED_REPEAT : GL_REPEAT;
-    else
-        repeatT = GL_CLAMP_TO_EDGE;
-
-    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, repeatS);
-    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, repeatT);
+    static const GLint modes[3] = {GL_CLAMP_TO_EDGE, GL_REPEAT, GL_MIRRORED_REPEAT};
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, modes[ws]);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, modes[wt]);
 }
 
 int GLRenderer3D::RenderSinglePolygon(int i) const
@@ -1234,6 +1240,8 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
         }
     }
 
+    glBindSampler(0, 0);   // polygon passes done (SetupPolygonTexture)
+
     if (S.RenderDispCnt & 0x00A0) // fog/edge enabled
     {
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -1456,10 +1464,10 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
     ShaderConfig.uFogOffset = S.RenderFogOffset;
     ShaderConfig.uFogShift = S.RenderFogShift;
 
+    // Buffer updates below re-specify the storage (orphaning): updating a buffer the GPU may
+    // still be reading from the previous frame makes the Mali driver wait or copy it.
     glBindBuffer(GL_UNIFORM_BUFFER, ShaderConfigUBO);
-    void* unibuf = glMapBuffer(GL_UNIFORM_BUFFER, GL_WRITE_ONLY);
-    if (unibuf) memcpy(unibuf, &ShaderConfig, sizeof(ShaderConfig));
-    glUnmapBuffer(GL_UNIFORM_BUFFER);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(ShaderConfig), &ShaderConfig, GL_DYNAMIC_DRAW);
 
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_DEPTH_TEST);
@@ -1547,10 +1555,12 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
 
         BuildPolygons(&PolygonList[0], npolys, captureinfo);
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(VertexBuffer), nullptr, GL_DYNAMIC_DRAW);
         glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*7*4, VertexBuffer);
 
         // bind to access the index buffer
         glBindVertexArray(VertexArrayID);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(IndexBuffer), nullptr, GL_DYNAMIC_DRAW);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, NumIndices * 2, IndexBuffer);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, EdgeIndicesOffset * 2, NumEdgeIndices * 2, IndexBuffer + EdgeIndicesOffset);
 
