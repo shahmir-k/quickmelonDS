@@ -39,6 +39,24 @@ layout(std140) uniform ubScanlineConfig
     sScanline uScanline[192];
 };
 
+// SCANLINE_RUN (debug.litev.glcomprun): the draw covers lines with identical config, which
+// comes from a single-struct block - constant offsets instead of a per-pixel indexed load
+// The BG offsets may advance linearly over the run (text BG Y + 1 per line, rotscale
+// reference + (B, D) per line): offset(line) = base + (line - uRunStart) * uStep.
+#ifdef SCANLINE_RUN
+layout(std140) uniform ubLineConfig
+{
+    sScanline uLine;
+    ivec4 uStep[4];
+    int uRunStart;
+};
+#define SL(l) uLine
+#define BGOFF(k, l) (uLine.BGOffset[k] + ((l) - uRunStart) * uStep[k].xy)
+#else
+#define SL(l) uScanline[l]
+#define BGOFF(k, l) uScanline[l].BGOffset[k]
+#endif
+
 layout(std140) uniform ubCompositorConfig
 {
     ivec4 uBGPrio;
@@ -88,10 +106,10 @@ vec4 BG3Fetch(vec2 coord)
 
 vec4 BG0CalcAndFetch(vec2 coord, int line)
 {
-    ivec2 bgoffset = uScanline[line].BGOffset[0];
+    ivec2 bgoffset = BGOFF(0, line);
     vec2 bgpos = vec2(bgoffset.xy) + coord;
 
-    if (uScanline[line].BGMosaicEnable[0])
+    if (SL(line).BGMosaicEnable[0])
     {
         bgpos = floor(bgpos) - vec2(MosaicX, 0);
     }
@@ -101,10 +119,10 @@ vec4 BG0CalcAndFetch(vec2 coord, int line)
 
 vec4 BG1CalcAndFetch(vec2 coord, int line)
 {
-    ivec2 bgoffset = uScanline[line].BGOffset[1];
+    ivec2 bgoffset = BGOFF(1, line);
     vec2 bgpos = vec2(bgoffset.xy) + coord;
 
-    if (uScanline[line].BGMosaicEnable[1])
+    if (SL(line).BGMosaicEnable[1])
     {
         bgpos = floor(bgpos) - vec2(MosaicX, 0);
     }
@@ -114,13 +132,13 @@ vec4 BG1CalcAndFetch(vec2 coord, int line)
 
 vec4 BG2CalcAndFetch(vec2 coord, int line)
 {
-    ivec2 bgoffset = uScanline[line].BGOffset[2];
+    ivec2 bgoffset = BGOFF(2, line);
     vec2 bgpos;
     if (uBGConfig[2].Type >= 2)
     {
         // rotscale BG
         bgpos = vec2(bgoffset.xy) / 256.0;
-        vec4 rotscale = vec4(uScanline[line].BGRotscale[0]) / 256.0;
+        vec4 rotscale = vec4(SL(line).BGRotscale[0]) / 256.0;
         mat2 rsmatrix = mat2(rotscale.xy, rotscale.zw);
         bgpos = bgpos + (coord * rsmatrix);
     }
@@ -130,7 +148,7 @@ vec4 BG2CalcAndFetch(vec2 coord, int line)
         bgpos = vec2(bgoffset.xy) + coord;
     }
 
-    if (uScanline[line].BGMosaicEnable[2])
+    if (SL(line).BGMosaicEnable[2])
     {
         bgpos = floor(bgpos) - vec2(MosaicX, 0);
     }
@@ -160,13 +178,13 @@ vec4 BG2CalcAndFetch(vec2 coord, int line)
 
 vec4 BG3CalcAndFetch(vec2 coord, int line)
 {
-    ivec2 bgoffset = uScanline[line].BGOffset[3];
+    ivec2 bgoffset = BGOFF(3, line);
     vec2 bgpos;
     if (uBGConfig[3].Type >= 2)
     {
         // rotscale BG
         bgpos = vec2(bgoffset.xy) / 256.0;
-        vec4 rotscale = vec4(uScanline[line].BGRotscale[1]) / 256.0;
+        vec4 rotscale = vec4(SL(line).BGRotscale[1]) / 256.0;
         mat2 rsmatrix = mat2(rotscale.xy, rotscale.zw);
         bgpos = bgpos + (coord * rsmatrix);
     }
@@ -176,7 +194,7 @@ vec4 BG3CalcAndFetch(vec2 coord, int line)
         bgpos = vec2(bgoffset.xy) + coord;
     }
 
-    if (uScanline[line].BGMosaicEnable[3])
+    if (SL(line).BGMosaicEnable[3])
     {
         bgpos = floor(bgpos) - vec2(MosaicX, 0);
     }
@@ -217,7 +235,7 @@ void CalcSpriteMosaic(in ivec2 coord, out ivec4 objflags, out vec4 objcolor)
         }
         else
         {
-            int mosx = texelFetch(MosaicTex, ivec2(curpos.x, uScanline[curpos.y].MosaicSize.z), 0).r;
+            int mosx = texelFetch(MosaicTex, ivec2(curpos.x, SL(curpos.y).MosaicSize.z), 0).r;
             vec4 color = texelFetch(OBJLayerTex, ivec3(curpos * uScaleFactor, 0), 0);
             ivec4 flags = ivec4(texelFetch(OBJLayerTex, ivec3(curpos * uScaleFactor, 1), 0) * 255.0);
 
@@ -240,6 +258,9 @@ void CalcSpriteMosaic(in ivec2 coord, out ivec4 objflags, out vec4 objcolor)
     }
 }
 
+#ifndef COMPDIAG
+#define COMPDIAG 0   // diagnostic variants (debug.litev.glcomp=2..5), wrong pixels by design
+#endif
 // Fast variant (debug.litev.glcomp, default on; 0 = 2DCompositorFS.glsl). Same result:
 // - disabled BGs are not fetched (uniform branches)
 // - the 4x5 priority loop becomes a top-two selection over per-layer draw-order keys
@@ -251,30 +272,48 @@ vec4 CompositeLayers()
     ivec2 coord = ivec2(fTexcoord.zw);
     vec2 bgcoord = vec2(fTexcoord.x, fract(fTexcoord.y));
     int xpos = int(fTexcoord.x);
+#if COMPDIAG == 2
+    int line = 0;
+#else
     int line = int(fTexcoord.y);
+#endif
 
-    ivec4 mosaicsize = uScanline[line].MosaicSize;
+    ivec4 mosaicsize = SL(line).MosaicSize;
     if (mosaicsize.x > 0)
         MosaicX = texelFetch(MosaicTex, ivec2(bgcoord.x, mosaicsize.x), 0).r;
 
-    uint winregs = uScanline[line].WinRegs;
-    int winmask = uScanline[line].WinMask;
-    ivec4 winpos = uScanline[line].WinPos;
+    uint winregs = SL(line).WinRegs;
+    int winmask = SL(line).WinMask;
+    ivec4 winpos = SL(line).WinPos;
 
     vec4 lc0 = vec4(0), lc1 = vec4(0), lc2 = vec4(0), lc3 = vec4(0), lc4 = vec4(0);
+#if COMPDIAG == 4
+    lc0 = lc1 = lc2 = lc3 = vec4(0.5);
+#elif COMPDIAG == 5
+    if (uBGPrio[0] >= 0) lc0 = BG0CalcAndFetch(bgcoord, line);
+#else
     if (uBGPrio[0] >= 0) lc0 = BG0CalcAndFetch(bgcoord, line);
     if (uBGPrio[1] >= 0) lc1 = BG1CalcAndFetch(bgcoord, line);
     if (uBGPrio[2] >= 0) lc2 = BG2CalcAndFetch(bgcoord, line);
     if (uBGPrio[3] >= 0) lc3 = BG3CalcAndFetch(bgcoord, line);
+#endif
 
     ivec4 objflags = ivec4(0);
+#if COMPDIAG == 3
+    if (false)
+#else
     if (mosaicsize.z > 0)
+#endif
     {
         vec4 oc;
         CalcSpriteMosaic(ivec2(fTexcoord.xy), objflags, oc);
         lc4 = oc;
     }
+#if COMPDIAG != 3
     else
+#else
+    if (false)
+#endif
     {
         lc4 = texelFetch(OBJLayerTex, ivec3(coord, 0), 0);
         objflags = ivec4(texelFetch(OBJLayerTex, ivec3(coord, 1), 0) * 255.0);
@@ -325,7 +364,7 @@ vec4 CompositeLayers()
     if (k4 >= 0) { TOP2(k4, 4, lc4) }
 #undef TOP2
 
-    mediump ivec4 back = ivec4(ConvertColor(uScanline[line].BackColor), 0x20);
+    mediump ivec4 back = ivec4(ConvertColor(SL(line).BackColor), 0x20);
     mediump ivec4 col1, col2;
     mediump int mask1, mask2;
     if (t1 < 0)

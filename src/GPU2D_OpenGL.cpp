@@ -97,12 +97,27 @@ bool GLRenderer2D::InitShaders()
                                               {{"oColor", 0}, {"oFlags", 1}}))
         return false;
 
+    // glcomp >= 2: diagnostic variants of the fast shader (COMPDIAG)
+    std::string fastFS = k2DCompositorFastFS;
+    if (GLProp("debug.litev.glcomp", 1) >= 2)
+        fastFS.insert(fastFS.find('\n') + 1, "#define COMPDIAG " + std::to_string(GLProp("debug.litev.glcomp", 1)) + "\n");
     if (!OpenGL::CompileVertexFragmentProgram(CompositorShader,
-                                              k2DCompositorVS, CompFast() ? k2DCompositorFastFS : k2DCompositorFS,
+                                              k2DCompositorVS, CompFast() ? fastFS : std::string(k2DCompositorFS),
                                               "2DCompositorShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
+    // debug.litev.glcomprun (default on): per run of lines whose config differs only by a
+    // linear BG offset step, draw with the config in a single-struct block (SCANLINE_RUN)
+    CompositorRun = 0;
+    if (CompFast() && GLProp("debug.litev.glcomprun", 1) != 0)
+    {
+        std::string runFS = fastFS;
+        runFS.insert(runFS.find('\n') + 1, "#define SCANLINE_RUN\n");
+        if (!OpenGL::CompileVertexFragmentProgram(CompositorRun, k2DCompositorVS, runFS,
+                "2DCompositorRun", {{"vPosition", 0}}, {{"oColor", 0}}))
+            CompositorRun = 0;
+    }
     CompositorRef = 0;
     if (CompCheck() && !OpenGL::CompileVertexFragmentProgram(CompositorRef,
                                               k2DCompositorVS, CompFast() ? k2DCompositorFS : k2DCompositorFastFS,
@@ -154,7 +169,7 @@ bool GLRenderer2D::InitShaders()
     SpriteRenderTransULoc = glGetUniformLocation(SpriteShader, "uRenderTransparent");
 
 
-    for (GLuint prog : {CompositorShader, CompositorRef})
+    for (GLuint prog : {CompositorShader, CompositorRef, CompositorRun})
     {
     if (!prog) continue;
     glUseProgram(prog);
@@ -185,6 +200,8 @@ bool GLRenderer2D::InitShaders()
 
     }
     CompositorScaleULoc = glGetUniformLocation(CompositorShader, "uScaleFactor");
+    if (CompositorRun)
+        glUniformBlockBinding(CompositorRun, glGetUniformBlockIndex(CompositorRun, "ubLineConfig"), 25);
 
     // generate mosaic lookup texture
 
@@ -219,6 +236,7 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     SpriteShader = other.SpriteShader;
     CompositorShader = other.CompositorShader;
     CompositorRef = other.CompositorRef;
+    CompositorRun = other.CompositorRun;
 
     LayerPreCurBGULoc = other.LayerPreCurBGULoc;
     SpriteRenderTransULoc = other.SpriteRenderTransULoc;
@@ -494,10 +512,11 @@ void GLRenderer2D::SetScaleFactor(int scale)
 
     glUseProgram(CompositorShader);
     glUniform1i(CompositorScaleULoc, ScaleFactor);
-    if (CompositorRef)
+    for (GLuint prog : {CompositorRef, CompositorRun})
     {
-        glUseProgram(CompositorRef);
-        glUniform1i(glGetUniformLocation(CompositorRef, "uScaleFactor"), ScaleFactor);
+        if (!prog) continue;
+        glUseProgram(prog);
+        glUniform1i(glGetUniformLocation(prog, "uScaleFactor"), ScaleFactor);
     }
 
     glBindTexture(GL_TEXTURE_2D_ARRAY, OBJLayerTex);
@@ -1879,10 +1898,74 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
     glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
     glBindVertexArray(Parent.RectVtxArray);
     OpenGL::GLStatAdd(OpenGL::GLStatComp);
+    if (!(OpenGL::GLSkip() & (4 | 256)) && CompositorRun && DrawRuns(ystart, yend))
+    {
+        glDisable(GL_SCISSOR_TEST);
+        return;
+    }
     if (!(OpenGL::GLSkip() & 4)) glDrawArrays(GL_TRIANGLES, 0, 2*3);
     if (CompositorRef && !(OpenGL::GLSkip() & 260)) CheckCompositor(ystart, yend);
 
     glDisable(GL_SCISSOR_TEST);
+}
+
+// Split [ystart, yend) into runs of lines whose scanline config is the first line's plus
+// (line - start) * step in the BG offsets, and draw each run with CompositorRun. False
+// (nothing drawn) when there would be more than MaxRuns runs.
+bool GLRenderer2D::DrawRuns(int ystart, int yend)
+{
+    using SL = sScanlineConfig::sScanline;
+    constexpr int MaxRuns = 16;
+    struct alignas(16) RunBlock { SL Line; s32 Step[4][4]; s32 RunStart; s32 pad[3]; };
+    static_assert(sizeof(SL) == 160 && sizeof(RunBlock) == 240);
+    static GLint align = 0;
+    if (!align) { glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &align); if (align < 16) align = 16; }
+    const int stride = (sizeof(RunBlock) + align - 1) / align * align;
+
+    u8 buf[MaxRuns * 512];
+    if (stride > 512) return false;
+    int ry[MaxRuns + 1], n = 0;
+    const SL* cfg = ScanlineConfig.uScanline;
+    for (int y = ystart; y < yend; )
+    {
+        if (n == MaxRuns) return false;
+        RunBlock& b = *(RunBlock*)(buf + n * stride);
+        memset(&b, 0, sizeof(b));
+        b.Line = cfg[y];
+        b.RunStart = y;
+        if (y + 1 < yend)
+            for (int k = 0; k < 4; k++)
+                for (int c = 0; c < 2; c++)
+                    b.Step[k][c] = cfg[y + 1].BGOffset[k][c] - cfg[y].BGOffset[k][c];
+        ry[n++] = y;
+        int e = y + 1;
+        for (; e < yend; e++)
+        {
+            if (memcmp((const u8*)&cfg[e] + 64, (const u8*)&cfg[y] + 64, sizeof(SL) - 64)) break;
+            bool lin = true;
+            for (int k = 0; k < 4 && lin; k++)
+                for (int c = 0; c < 2; c++)
+                    if (cfg[e].BGOffset[k][c] != cfg[y].BGOffset[k][c] + (e - y) * b.Step[k][c]) { lin = false; break; }
+            if (!lin) break;
+        }
+        y = e;
+    }
+    ry[n] = yend;
+
+    if (!LineRunUBO) glGenBuffers(1, &LineRunUBO);
+    glBindBuffer(GL_UNIFORM_BUFFER, LineRunUBO);
+    glBufferData(GL_UNIFORM_BUFFER, n * stride, buf, GL_STREAM_DRAW);
+    glUseProgram(CompositorRun);
+    glEnable(GL_SCISSOR_TEST);
+    for (int i = 0; i < n; i++)
+    {
+        glBindBufferRange(GL_UNIFORM_BUFFER, 25, LineRunUBO, i * stride, sizeof(RunBlock));
+        glScissor(0, ry[i] * ScaleFactor, ScreenW, (ry[i + 1] - ry[i]) * ScaleFactor);
+        glDrawArrays(GL_TRIANGLES, 0, 2*3);
+    }
+    if (CompositorRef) { glScissor(0, ystart * ScaleFactor, ScreenW, (yend - ystart) * ScaleFactor); CheckCompositor(ystart, yend); }
+    OpenGL::GLStatAdd(OpenGL::GLStatRunDraws, n);
+    return true;
 }
 
 // debug.litev.compcheck: every 30th draw, render the reference compositor shader with the

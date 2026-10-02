@@ -77,6 +77,9 @@ private:
     GLuint CheckFB = 0, CheckTex = 0;
     int CheckW = 0;
     void CheckCompositor(int ystart, int yend);
+    GLuint CompositorRun = 0;   // debug.litev.glcomprun: SCANLINE_RUN program
+    GLuint LineRunUBO = 0;
+    bool DrawRuns(int ystart, int yend);
     GLuint CompositorConfigUBO;
     GLint CompositorScaleULoc;
 
