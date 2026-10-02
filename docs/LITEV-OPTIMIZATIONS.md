@@ -79,6 +79,8 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 | render: pin software render threads off the emulator core (LITEV_PIN_RENDER) | `LITEV_PIN_RENDER` | R |
 | gpu: copy only dirty chunks into the 2D VRAM shadows (LITEV_SNAP_DIRTY) | `LITEV_SNAP_DIRTY` | R |
 | geom: staged deep prefetch in BuildFrameGeom (LITEV_GEOM_PREFETCH2) | `LITEV_GEOM_PREFETCH2` | A |
+| sched: drain DMA9/GXFIFO-stall steps in one iteration while ARM7 is halted (LITEV_SCHED_DRAIN) | `LITEV_SCHED_DRAIN` | A |
+| jit: region-aware dispatcher, keep the last 4 code regions per CPU (LITEV_JIT_REGION_CACHE) | `LITEV_JIT_REGION_CACHE` | A |
 | build: add LITEV_AUTO_FRAMESKIP option (adaptive real-time frameskip) | `LITEV_AUTO_FRAMESKIP` | A (UX feature; see section) |
 
 ## Performance options
@@ -694,6 +696,30 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 **Measured.** Device headless, emu thread, n = 3: instructions -1.55 %, cycles -0.52 % (lib 4e558dad, 2026-10-02).
 
 **Option.** LITEV_GXFIFO_UNIFIED (default OFF; enabled in the app's shipping build)
+
+### sched: drain DMA9/GXFIFO-stall steps in one iteration while ARM7 is halted (LITEV_SCHED_DRAIN)
+
+**What.** While ARM9 is stopped on a DMA or a GXFIFO stall, the scheduler loops the ARM9-side step (DMA burst or stall advance, `RunTimers(0)`, `GPU3D.Run`) inside one iteration instead of also running `NextTarget`, the ARM7 catch-up, `RunTimers(1)` and `RunSystem` each time. It only does so while those tails are no-ops: the slice target is not reached (no event can fire), ARM7 is halted with no pending IRQ and no DMA7, and EVENT_SLICES bounds the slice by the next timer overflow (`NDS::SchedDrainContinue`).
+
+**Why it works.** Shrek's geometry DMA ping-pongs with the FIFO: ~1,760 scheduler steps per frame, ~1,000 of them drainable (host count). PW has almost none.
+
+**Exactness.** A. The study's probe also deferred a running ARM7; that is not exact (an event ARM7 schedules inside the deferred window fires late) and the trace gate catches it on PW.
+
+**Measured.** Device headless, emu thread, 500 f, n = 3: Shrek slot 2 cycles -0.80 %, instructions -1.51 %; PW overworld ~-1 % (2026-10-02).
+
+**Option.** LITEV_SCHED_DRAIN (default OFF; needs LITEV_EVENT_SLICES; enabled in the app's shipping build)
+
+### jit: region-aware dispatcher, keep the last 4 code regions per CPU (LITEV_JIT_REGION_CACHE)
+
+**What.** Each CPU keeps its last 4 executable code windows `{start, size, lookup}` (`ARM::JitRegions`). On a FastBlockLookup window miss the emitted dispatcher checks them and, on a hit, makes that window current and continues with the inline lookup instead of returning to C++. The C++ re-entry uses the same cache before `SetupExecutableRegion`.
+
+**Why it works.** Pokemon White bounces between main RAM, ITCM and BIOS through dynamic branches: ~2,000 C++ re-entries per frame were region switches to already-compiled blocks (host: ARM9 re-entries 2,949 -> 931 per frame on pw.ml1).
+
+**Exactness.** A. Only windows for which `SetupExecutableRegion` gives the same answer at every address are cached (`ARMJIT::RegionCacheable`), and the caches are cleared on every ITCM/DTCM, WRAMCNT, savestate or reset change; NDS only.
+
+**Measured.** Device headless, emu thread, 500 f, n = 3: PW overworld cycles -3.4 % (headless fps 59.0 -> 61.3), Shrek slot 2 -0.75 %. With SCHED_DRAIN: PW overworld -3.6 %, PW pw.ml1 -4.8 %, Shrek -1.9 % (2026-10-02).
+
+**Option.** LITEV_JIT_REGION_CACHE (default OFF; needs LITEV_JIT_DISPATCH; enabled in the app's shipping build)
 
 ## Unflagged optimizations
 
