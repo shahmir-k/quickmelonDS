@@ -278,6 +278,19 @@ report frame time and cap share. Never use fast-forward or any frameskip to get 
   - Gate visuals with PPM **plus a same-binary control** (`abtest.sh --control` / `--control-on`)
     showing 0 px. Re-run any 1-frame PPM diff before believing it.
   - Do not use record/verify runs for performance (trace and hashing overhead).
+- **Trace modes and savestates (fixed 2026-10-02, lib 8d86ce48):** before that commit
+  `--record-trace` / `--verify-trace` ignored `--savestate` and booted the ROM intro, so every
+  earlier "trace identical on Shrek slot 2 / race-fresh / PW" gate compared the intro, not the
+  scene. The session's exact levers (LDM_FASTMEM, CYCLE_BATCH, GXFIFO_UNIFIED, the ASYNC deadlock
+  fix) were re-gated on the real scenes against their parents and are identical (600 f, 3 scenes,
+  JIT + interp). A GX-timing mutation is now caught at frame 5.
+- **Savestate round trip:** `LITEV_TRACE_ROUNDTRIP=<frame>` saves to memory after that frame and
+  loads it back; the trace must match a run without it. Known issue: **JIT runs diverge 1-7 frames
+  after a load** (interp is identical). Cause: `NDS::DoSavestate` calls `JIT.Reset()` on load
+  (upstream code), the recompiled blocks start at different PCs, and the JIT checks events at block
+  boundaries, so timing shifts. It reproduces with every LITEV flag off and with `JIT.Reset()` alone
+  (no save/load). Two peers loading the same state stay identical to each other, so local MP is
+  not affected; it matters only for rewind / rollback. Not fixed.
 
 ### 3.9 Headless sync-render dilution and single-thread vs whole-frame
 - The headless `app` config renders with the same tile workers, but the absolute scene and frame
