@@ -58,6 +58,8 @@ bool GLRenderer3D::BuildRenderShader(bool wbuffer)
     }
 
     std::string fsbuf = k3DRenderFS;
+    if (OpenGL::Prop("gl3dmp", 1))
+        fsbuf.replace(fsbuf.find("// MEDIUMP_HERE"), 15, "precision mediump float; //");
     if (wbuffer)
     {
         auto pos = fsbuf.find('\n') + 1;

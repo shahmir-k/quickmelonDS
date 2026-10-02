@@ -21,14 +21,15 @@ layout(std140) uniform uConfig
     int uFogShift;
 };
 
+// MEDIUMP_HERE (debug.litev.gl3dmp: colour maths in mediump; texcoords and depth stay highp)
 uniform int uRenderMode; // 0=opaque 1=translucent 2=shadowmask
 
 smooth in vec4 fColor;
-smooth in vec2 fTexcoord;
+smooth in highp vec2 fTexcoord;
 flat in ivec3 fPolygonAttr;
 
 #ifdef WBuffer
-smooth in float fZ;
+smooth in highp float fZ;
 #endif
 
 FRAGLOC(0) out vec4 oColor;
@@ -62,7 +63,7 @@ vec4 FinalColor()
     }
     else
     {
-        vec3 texcoord = vec3(fTexcoord, fPolygonAttr.y);
+        highp vec3 texcoord = vec3(fTexcoord, fPolygonAttr.y);
         vec4 tcol;
         if (fPolygonAttr.z == 0)
             tcol = vec4(texture(CurTexture, texcoord)) / vec4(63,63,63,31);
