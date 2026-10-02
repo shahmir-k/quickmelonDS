@@ -628,7 +628,7 @@ public:
     int FrameskipTarget = 0;
     int FrameskipCounter = 0;
     bool SkipThisFrame = false;
-    static constexpr int LITEV_FRAMESKIP_MAX = 3;
+    static constexpr int LITEV_FRAMESKIP_MAX = 9;
 
     void SetFrameskipTarget(int target) noexcept
     {
