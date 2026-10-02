@@ -117,8 +117,13 @@ bool HybridRenderer::Init()
     // glFinish: the new texture storage must be complete before the emu context uses it
     Thread3D()->Run([this] { GL3D()->SetColorRing(GLRenderer3D::MaxColorRing); glFinish(); }, true);
 
+    // debug.litev.hybmp (default on): the merge in mediump (all values fit: colours <= 63,
+    // products <= 63*32, coordinates < 2^15; 8-bit unorm fetches round exactly in fp16)
+    std::string mergeFS = kHybridMergeFS;
+    if (OpenGL::Prop("hybmp", 1))
+        mergeFS.insert(mergeFS.find('\n') + 1, "precision mediump float;\nprecision mediump int;\n");
     if (!OpenGL::CompileVertexFragmentProgram(MergeShader,
-            kHybridMergeVS, kHybridMergeFS, "HybridMergeShader",
+            kHybridMergeVS, mergeFS, "HybridMergeShader",
             {}, {{"oTopColor", 0}, {"oBottomColor", 1}}))
         return false;
 
@@ -419,7 +424,6 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_FALSE);
-
     glUseProgram(MergeShader);
     glUniform1i(ScaleULoc, Scale);
     glActiveTexture(GL_TEXTURE0);

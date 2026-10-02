@@ -190,6 +190,17 @@ writeError:
     NewShaders.clear();
 }
 
+int Prop(const char* name, int def)
+{
+#ifdef __ANDROID__
+    char key[92], b[92] = {};
+    snprintf(key, sizeof(key), "debug.litev.%s", name);
+    return __system_property_get(key, b) > 0 ? atoi(b) : def;
+#else
+    return def;
+#endif
+}
+
 int GLSkip()
 {
 #ifdef __ANDROID__
@@ -206,8 +217,8 @@ void GLStatLog(int frames)
 {
     int v[GLStatN];
     for (int i = 0; i < GLStatN; i++) v[i] = GLStat[i].exchange(0);
-    Log(LogLevel::Info, "LITEV_GLSTAT %df: comp=%.2f sprites=%.2f final=%.2f per frame | 3d=%d fog=%d edge=%d shadowdraws=%d wbuf=%d (skip=%d)\n",
-        frames, (double)v[GLStatComp] / frames, (double)v[GLStatSprites] / frames, (double)v[GLStatFinal] / frames,
+    Log(LogLevel::Info, "LITEV_GLSTAT %df: comp=%.2f (run draws %.2f) sprites=%.2f final=%.2f per frame | 3d=%d fog=%d edge=%d shadowdraws=%d wbuf=%d (skip=%d)\n",
+        frames, (double)v[GLStatComp] / frames, (double)v[GLStatRunDraws] / frames, (double)v[GLStatSprites] / frames, (double)v[GLStatFinal] / frames,
         v[GLStat3D], v[GLStatFog], v[GLStatEdge], v[GLStatShadow], v[GLStatWBuf], GLSkip());
 }
 

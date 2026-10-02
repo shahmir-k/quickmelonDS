@@ -52,8 +52,11 @@ bool CompileComputeProgram(GLuint& result, const std::string& source, const std:
 // 128 compositor does not bind the 3D texture, 256 compositor uses a trivial shader.
 int GLSkip();
 
+// debug.litev.<name> as an int (Android; def when unset or elsewhere)
+int Prop(const char* name, int def);
+
 // debug.litev.prof pass counters (any thread; logged by GLRenderer::VBlank every 120 frames)
-enum { GLStatComp, GLStatSprites, GLStatFinal, GLStat3D, GLStatFog, GLStatEdge, GLStatShadow, GLStatWBuf, GLStatN };
+enum { GLStatComp, GLStatSprites, GLStatFinal, GLStat3D, GLStatFog, GLStatEdge, GLStatShadow, GLStatWBuf, GLStatRunDraws, GLStatN };
 void GLStatAdd(int i, int n = 1);
 void GLStatLog(int frames);
 
