@@ -58,6 +58,7 @@ public:
 
 protected:
     int HybridCurrentTag() override;
+    void HybridKick(int b) override;
     void HybridReadback3D(u32* dst) override;
 
 private:
@@ -71,14 +72,17 @@ private:
     GLuint MergeShader = 0;
     GLint ScaleULoc = -1;
     GLuint EmptyVAO = 0;
-    GLuint DescTex = 0;            // 769x192x2 RGBA8UI
+    // 513x192x2 RGBA8UI + staging buffer per framebuffer slot (a slot is reused 3 frames
+    // later, so an upload never targets a texture an earlier merge may still be reading)
+    GLuint DescTex[3] {};
+    GLuint DescPBO[3] {};
     GLuint OutTex[2] {};           // Nx, 2 layers (top, bottom), like GLRenderer's FPOutputTex
     GLuint OutFB[2] {};
     int OutIdx = 0;
     GLuint ReadFB = 0, DownFB = 0, DownTex = 0;   // capture readback at 1x
     u8 ReadBuf[256 * 192 * 4];
     // emu-thread CPU time per 60 frames (logged as LITEV_HYB)
-    double ProfGL3D = 0, ProfWait = 0, ProfMerge = 0, ProfUpload = 0, ProfReadback = 0;
+    double ProfGL3D = 0, ProfWait = 0, ProfMerge = 0, ProfUpload = 0, ProfSync = 0, ProfDraw = 0, ProfReadback = 0;
     int ProfFrames = 0;
 };
 

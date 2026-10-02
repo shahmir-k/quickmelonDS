@@ -134,17 +134,19 @@ public:
     // (PaletteSnap) so frame N's render doesn't race the emu's palette writes in N+1.
     const u8* CurPalette = nullptr;
 
-    // Hybrid renderer (3D on the GPU): engine A emits, per pixel, a 3-word descriptor
+    // Hybrid renderer (3D on the GPU): engine A emits, per pixel, a 2-word descriptor
     // instead of a final colour whenever DISPCNT bit 3 (BG0 = 3D) is set:
-    //   dst[i]     val1  blend partner (layer under the 3D, or the layer above it)
-    //   dst[256+i] val2  final colour if the 3D pixel is transparent
-    //   dst[512+i] val3  merge mode in bits 24-27 (7 = no 3D, 4 = 3D on top with 3D-alpha
-    //                    blend, 0/2/3 = 3D on top with no effect / brightness up / down
-    //                    (EVY in bits 8-12), 1 = 3D under val1 (EVA bits 8-12, EVB 16-20))
-    // The caller pre-fills dst[512..767] with 0x07000000 (no 3D). Ported from classic
-    // melonDS's "accelerated" software 2D (removed upstream in ba317e2e).
+    //   dst[i]     val1  RGB: blend partner (layer under the 3D, or the layer above it)
+    //                    bits 29-31: merge mode (7 = no 3D, 4 = 3D on top with 3D-alpha
+    //                    blend, 0/2/3 = 3D on top with no effect / brightness up / down,
+    //                    1 = 3D under val1); bits 24-28: EVY (modes 2/3) or EVA (mode 1)
+    //   dst[256+i] val2  RGB: final colour if the 3D pixel is transparent; bits 24-28: EVB
+    // LastLineHas3D says whether the last DrawScanlineDeferred emitted descriptors (else
+    // dst[0..255] is plain colour). Ported from classic melonDS's "accelerated" software 2D
+    // (removed upstream in ba317e2e), packed into 2 planes instead of 3.
     bool HybridDesc = false;
-    static u32 HybridResolvePixel(u32 val1, u32 val2, u32 val3, u32 c3d);
+    bool LastLineHas3D = false;
+    static u32 HybridResolvePixel(u32 val1, u32 val2, u32 c3d);
 
 private:
     SoftRenderer& Parent;

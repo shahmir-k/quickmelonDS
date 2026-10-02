@@ -320,6 +320,7 @@ void SoftRenderer2D::SyncVRAM_OBJ()
 // (Milestone 1: single-thread batched at VBlank, reusing DrawScanline_BGOBJ.)
 void SoftRenderer2D::DrawScanlineDeferred(const S2DLineState& s, u32 line, u32* dst)
 {
+    LastLineHas3D = false;
     if (!s.Enabled)
     {
         u32 fillcolor = (GPU2D.Num == 0) ? 0xFF000000 : 0xFF3F3F3F;
@@ -577,6 +578,7 @@ void SoftRenderer2D::DrawPixel(u32* dst, u16 color, u32 flag)
 // pixel left symbolic: the GPU merge (or HybridResolvePixel) applies it per Nx pixel.
 void SoftRenderer2D::HybridCompositeLine(u32* dst)
 {
+    LastLineHas3D = true;
     const u32 blendCnt = GPU2D.BlendCnt;
     for (int i = 0; i < 256; i++)
     {
@@ -607,9 +609,8 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
                     if (mode == 1) mode = 0;   // alpha blend needs a target-2 layer below
                 }
             }
-            dst[i]     = u1;
-            dst[256+i] = ColorComposite(i, u1, u2);
-            dst[512+i] = (mode << 24) | ((u32)GPU2D.EVY << 8);
+            dst[i]     = (u1 & 0xFFFFFF) | (mode << 29) | (((u32)GPU2D.EVY & 0x1F) << 24);
+            dst[256+i] = ColorComposite(i, u1, u2) & 0xFFFFFF;
         }
         else if ((flag2 & 0xC0) == 0x40)
         {
@@ -637,15 +638,12 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
             }
             // no blend: the 3D only matters through the fallback, so blend 16:0 with
             // val1 already carrying any brightness effect
-            dst[i]     = blend ? val1 : ColorComposite(i, val1, val2);
-            dst[256+i] = ColorComposite(i, val1, under);
-            dst[512+i] = (1u << 24) | (evb << 16) | (eva << 8);
+            dst[i]     = ((blend ? val1 : ColorComposite(i, val1, val2)) & 0xFFFFFF) | (1u << 29) | ((eva & 0x1F) << 24);
+            dst[256+i] = (ColorComposite(i, val1, under) & 0xFFFFFF) | ((evb & 0x1F) << 24);
         }
         else
         {
-            dst[i]     = ColorComposite(i, val1, val2);
-            dst[256+i] = 0;
-            dst[512+i] = 0x07000000;
+            dst[i]     = (ColorComposite(i, val1, val2) & 0xFFFFFF) | (7u << 29);
         }
     }
 }
@@ -653,17 +651,18 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
 // CPU version of the hybrid merge (HybridMergeFS.glsl) for one native pixel: c3d is the
 // 3D pixel in software format (6-bit RGB, 5-bit alpha in bits 24-28). Used for display
 // capture in the hybrid renderer and for the descriptor self-check.
-u32 SoftRenderer2D::HybridResolvePixel(u32 val1, u32 val2, u32 val3, u32 c3d)
+u32 SoftRenderer2D::HybridResolvePixel(u32 val1, u32 val2, u32 c3d)
 {
-    u32 mode = (val3 >> 24) & 0xF;
-    if (mode == 7) return val1;
-    if ((c3d >> 24) == 0) return val2;
+    const u32 mode = val1 >> 29, ev1 = (val1 >> 24) & 0x1F, ev2 = (val2 >> 24) & 0x1F;
+    const u32 rgb1 = val1 & 0xFFFFFF;
+    if (mode == 7) return rgb1 | 0xFF000000;
+    if ((c3d >> 24) == 0) return (val2 & 0xFFFFFF) | 0xFF000000;
     switch (mode)
     {
-    case 4: return ColorBlend5(c3d, val1);
-    case 1: return ColorBlend4(val1, c3d, (val3 >> 8) & 0x1F, (val3 >> 16) & 0x1F);
-    case 2: return ColorBrightnessUp(c3d, (val3 >> 8) & 0x1F, 0x8);
-    case 3: return ColorBrightnessDown(c3d, (val3 >> 8) & 0x1F, 0x7);
+    case 4: return ColorBlend5(c3d, rgb1);
+    case 1: return ColorBlend4(rgb1, c3d, ev1, ev2);
+    case 2: return ColorBrightnessUp(c3d, ev1, 0x8);
+    case 3: return ColorBrightnessDown(c3d, ev1, 0x7);
     default: return c3d | 0x40000000;
     }
 }

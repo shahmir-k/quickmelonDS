@@ -11,7 +11,7 @@
 // SoftRenderer2D::HybridResolvePixel and SoftRenderer::ApplyMasterBrightness exactly.
 // Port of classic melonDS kCompositorFS_Nearest (removed upstream in ba317e2e).
 
-uniform usampler2DArray DescTex;   // 769x192x2 RGBA8UI: 3 planes x 256 + control column
+uniform usampler2DArray DescTex;   // 513x192x2 RGBA8UI: 2 planes x 256 + control column
 uniform sampler2D Tex3D;           // Nx 3D colour buffer
 uniform int uScale;
 
@@ -37,14 +37,14 @@ ivec4 Get3D(ivec2 pos)
 vec4 Screen(int layer, ivec2 P)
 {
     ivec2 n = P / uScale;
-    ivec4 ctl = Desc(768, n.y, layer);
+    ivec4 ctl = Desc(512, n.y, layer);
     int dispmode = ctl.b & 0x3;
     ivec4 pix = Desc(n.x, n.y, layer);
 
-    if (dispmode == 1)
+    if (dispmode == 1 && (ctl.b & 0x4) != 0)   // the line carries 3D descriptors
     {
-        ivec4 v3 = Desc(n.x + 512, n.y, layer);
-        int mode = v3.a & 0xF;
+        int mode = pix.a >> 5;
+        int ev1 = pix.a & 0x1F;
         if (mode != 7)
         {
             int xpos = ctl.a | ((ctl.b & 0x80) << 1);
@@ -53,6 +53,8 @@ vec4 Screen(int layer, ivec2 P)
 
             if (c3.a == 0)
                 pix = Desc(n.x + 256, n.y, layer);
+            else if (mode == 1)
+                pix = min((pix * ev1 + c3 * (Desc(n.x + 256, n.y, layer).a & 0x1F) + 0x8) >> 4, ivec4(0x3F));
             else if (mode == 4)
             {
                 int eva = c3.a + 1;
@@ -61,13 +63,11 @@ vec4 Screen(int layer, ivec2 P)
                 else
                     pix = c3;
             }
-            else if (mode == 1)
-                pix = min((pix * v3.g + c3 * v3.b + 0x8) >> 4, ivec4(0x3F));
             else
             {
                 pix = c3;
-                if (mode == 2)      pix += (((0x3F - pix) * v3.g) + 0x8) >> 4;
-                else if (mode == 3) pix -= ((pix * v3.g) + 0x7) >> 4;
+                if (mode == 2)      pix += (((0x3F - pix) * ev1) + 0x8) >> 4;
+                else if (mode == 3) pix -= ((pix * ev1) + 0x7) >> 4;
             }
         }
     }

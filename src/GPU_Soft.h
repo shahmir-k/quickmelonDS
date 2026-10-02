@@ -212,17 +212,26 @@ protected:
     // ---- Hybrid renderer support (HybridRenderer derives from this class) ----
     // Hybrid: engine A emits descriptors (SoftRenderer2D::HybridDesc), the 3D is merged
     // on the GPU. Per framebuffer slot b, HybFB[b] holds both screens (top, then bottom),
-    // each 192 lines of HybStride words: 3 descriptor planes of 256 + 1 control word
-    // (master brightness | display mode << 16 | 3D x-scroll in bits 24-31 and 23).
-    static constexpr int HybStride = 256*3 + 1;
+    // each 192 lines of HybStride words: 2 descriptor planes of 256 + 1 control word
+    // (master brightness | display mode << 16 | line has descriptors << 18 | 3D x-scroll
+    // in bits 24-31 and 23). HybHas3D[b][screen]: some line of that screen has descriptors
+    // (else only plane 1 + the control column need uploading).
+    static constexpr int HybStride = 256*2 + 1;
+    bool HybHas3D[3][2] {};
     bool Hybrid = false;
     u32* HybFB[3] {};
     int HybTag[3] {};              // 3D colour-ring index the slot's frame pairs with
     u32* Hyb3D[2] {};              // capture frames: the 1x 3D read back (per snap slot)
     bool Hyb3DValid[2] {};
     virtual int HybridCurrentTag() { return 0; }
+    // emu thread, at the 2D kick for framebuffer slot b: the hybrid maps a staging buffer
+    // into HybMap[b]; the 2D thread copies the finished frame's descriptors into it, so
+    // the emu thread's upload is just a GPU-side copy
+    virtual void HybridKick(int b) {}
+    u8* HybMap[3] {};
+    void HybridStage(int b);
     virtual void HybridReadback3D(u32* dst) {}
-    void HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32* descB, const u32* l3d);
+    void HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32* descB, const u32* l3d, bool has3D);
     // LITEV_HYBRID_CHECK (headless self-test): the software path also builds engine A's
     // descriptor line, resolves it on the CPU with the same 3D line and counts pixels
     // that differ from the real composite. Must stay 0.

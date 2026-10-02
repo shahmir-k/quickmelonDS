@@ -445,6 +445,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
     u64 pipeSpriteTopHash = 1469598103934665603ULL;
     u64 pipe2dTopHash = 1469598103934665603ULL;
 #endif
+    if (Hybrid && y0 == 0) HybHas3D[AsyncTargetBuf][0] = HybHas3D[AsyncTargetBuf][1] = false;
     for (u32 line = y0; line < y1; line++)
     {
         // DraStic model: consume the 3D line HERE, on the async render thread, paced by
@@ -477,7 +478,6 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             u32* fb = HybFB[AsyncTargetBuf];
             u32* descA = &fb[((f.ScreenSwap ? 0 : 1) * 192 + line) * HybStride];
             u32* descB = &fb[((f.ScreenSwap ? 1 : 0) * 192 + line) * HybStride];
-            for (int i = 512; i < 768; i++) { descA[i] = 0x07000000; descB[i] = 0x07000000; }
             rA->CurOAM = oamSnap; rA->CurPalette = palSnap;
 #ifdef LITEV_SOFT2D_DEPTH2
             rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
@@ -494,7 +494,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             rB->DrawSpritesDeferred(mainB->SprSnapR[line], line);
             rB->DrawScanlineDeferred(mainB->LineSnapR[line], line, descB);
 #endif
-            HybridLine(line, f, descA, descB, l3d);
+            HybridLine(line, f, descA, descB, l3d, rA->LastLineHas3D);
             f.Valid = 0;
             continue;
         }
@@ -503,7 +503,6 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         {
             // self-test: descriptor + CPU resolve must equal the real composite below
             alignas(8) u32 desc[HybStride];
-            for (int i = 512; i < 768; i++) desc[i] = 0x07000000;
             rA->Cur3DLine = l3d; rA->CurOAM = oamSnap; rA->CurPalette = palSnap;
             rA->HybridDesc = true;
 #ifdef LITEV_SOFT2D_DEPTH2
@@ -514,6 +513,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             rA->DrawScanlineDeferred(mainA->LineSnapR[line], line, desc);
 #endif
             rA->HybridDesc = false;
+            const bool has3D = rA->LastLineHas3D;
             u32 ref[256];
 #ifdef LITEV_SOFT2D_DEPTH2
             rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
@@ -526,7 +526,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             for (int i = 0; i < 256; i++)
             {
                 // GetLine already applied the x-scroll, so index the 3D line directly
-                u32 r = SoftRenderer2D::HybridResolvePixel(desc[i], desc[256+i], desc[512+i], l3d[i]);
+                u32 r = has3D ? SoftRenderer2D::HybridResolvePixel(desc[i], desc[256+i], l3d[i]) : desc[i];
                 if (((r ^ ref[i]) & 0x3F3F3F) || (((r >> 24) != 0) != ((ref[i] >> 24) != 0))) bad++;
             }
             HybCheckBad += bad;
@@ -607,6 +607,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         PipeTrace2DTopHash = pipe2dTopHash;
     }
 #endif
+    if (Hybrid && y1 == 192) HybridStage(AsyncTargetBuf);
     LSP_ADD(S2DBand[bi], LSP_NOW() - _lspB0);
 }
 
@@ -936,6 +937,7 @@ void SoftRenderer::VBlank()
         int freshBuf = P2FrameBufRR;
         P2FrameBufRR = (P2FrameBufRR + 1) % 3;
         HybTag[freshBuf] = HybridCurrentTag();
+        if (Hybrid) HybridKick(freshBuf);
         // consume3DParity = the P2 bank the 2D-N consumer must read = the parity 3D-N was
         // rastered into. 3D-N was kicked at frame N's VCount-215 RenderFrame (which toggled
         // P2KickParity mod-3); the next toggle is N+1's VCount 215, so at THIS VBlank(N)
@@ -956,6 +958,7 @@ void SoftRenderer::VBlank()
 #endif
     AsyncTargetBuf = BackBuffer;
     HybTag[AsyncTargetBuf] = HybridCurrentTag();
+    if (Hybrid) HybridKick(AsyncTargetBuf);
     AsyncInFlight = true;
     S2DDeferActive = false;
 #ifdef LITEV_SOFT2D_DEPTH2
@@ -972,10 +975,33 @@ void SoftRenderer::VBlank()
 #endif
 
 #ifdef LITEV_SOFT2D_THREADED
+// Hybrid, 2D thread, end of frame: copy the descriptors into the staging buffer mapped at
+// the kick. Per screen: everything if a line carries 3D descriptors, else only plane 1
+// and the control column (the merge never reads plane 2 of a line without the 3D flag).
+void SoftRenderer::HybridStage(int b)
+{
+    u8* map = HybMap[b];
+    if (!map) return;
+    const size_t screenBytes = (size_t)192 * HybStride * 4;
+    for (int s = 0; s < 2; s++)
+    {
+        const u8* src = (const u8*)(HybFB[b] + s * 192 * HybStride);
+        u8* dst = map + s * screenBytes;
+        if (HybHas3D[b][s])
+            memcpy(dst, src, screenBytes);
+        else
+            for (int y = 0; y < 192; y++)
+            {
+                memcpy(dst + y * HybStride * 4, src + y * HybStride * 4, 256 * 4);
+                memcpy(dst + (y * HybStride + 512) * 4, src + (y * HybStride + 512) * 4, 4);
+            }
+    }
+}
+
 // Hybrid: finish one line of both screens' descriptors after the BG/OBJ raster. The CPU
 // resolves everything except the 3D pixel, master brightness and the 6->8-bit expansion,
 // which the GPU merge does per Nx pixel. l3d: the 1x 3D read back on capture frames.
-void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32* descB, const u32* l3d)
+void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32* descB, const u32* l3d, bool has3D)
 {
     if (f.CaptureEnable)
     {
@@ -986,7 +1012,7 @@ void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32*
         {
             int x = i + (int)xpos - ((xpos & 0x100) ? 512 : 0);
             line3d[i] = (l3d && x >= 0 && x < 256) ? l3d[x] : 0;
-            resA[i] = SoftRenderer2D::HybridResolvePixel(descA[i], descA[256+i], descA[512+i], line3d[i]);
+            resA[i] = has3D ? SoftRenderer2D::HybridResolvePixel(descA[i], descA[256+i], line3d[i]) : descA[i];
         }
         DoCapture(line, resA, line3d);
     }
@@ -997,7 +1023,7 @@ void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32*
     {
         // screen off / VRAM / FIFO display: plain colour, no 3D
         DrawScanlineA(line, descA, descA, f.DispCntA, 0);
-        for (int i = 512; i < 768; i++) descA[i] = 0x07000000;
+        has3D = false;
     }
     if (modeB != 1)
         DrawScanlineB(line, descB, descB, f.DispCntB, 0);
@@ -1007,11 +1033,16 @@ void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32*
     if (!f.ScreensEnabled)
     {
         for (int i = 0; i < 256; i++) { descA[i] = 0; descB[i] = 0; }
-        for (int i = 512; i < 768; i++) { descA[i] = 0x07000000; descB[i] = 0x07000000; }
         ctlA = ctlB = 0;   // display mode 0 in the merge: no brightness, black stays black
+        has3D = false;
     }
-    descA[768] = ctlA;
-    descB[768] = ctlB;
+    if (has3D)
+    {
+        ctlA |= 1u << 18;
+        HybHas3D[AsyncTargetBuf][f.ScreenSwap ? 0 : 1] = true;
+    }
+    descA[512] = ctlA;
+    descB[512] = ctlB;
 }
 #endif
 
