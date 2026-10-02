@@ -809,6 +809,9 @@ void Compiler::LoadCycles()
 
 void Compiler::SaveCycles()
 {
+#ifdef LITEV_JIT_CYCLE_BATCH
+    FlushPendingCycles();
+#endif
     STR(INDEX_UNSIGNED, RCycles, RCPU, offsetof(ARM, Cycles));
 }
 
@@ -1689,8 +1692,18 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
     {
         RegCache.PrepareExit();
 
+#ifdef LITEV_JIT_CYCLE_BATCH
+        // Mid-block exit: add the pending cycles on this path only; the path that
+        // continues in the block keeps them deferred.
+        u32 exitCycles = ConstantCycles + PendingCycles;
+        for (; exitCycles > 0xFFF; exitCycles -= 0xFFF)
+            ADD(RCycles, RCycles, 0xFFF);
+        if (exitCycles)
+            ADD(RCycles, RCycles, exitCycles);
+#else
         if (ConstantCycles)
             ADD(RCycles, RCycles, ConstantCycles);
+#endif
 #ifdef LITEV_JIT_DISPATCH
   #if defined(LITEV_JIT_LINK) && defined(LITEV_LINK_COND)
         // Conditional-branch edges each have a single compile-time-constant next PC:
@@ -1738,6 +1751,10 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     Num = cpu->Num;
     CurCPU = cpu;
     ConstantCycles = 0;
+#ifdef LITEV_JIT_CYCLE_BATCH
+    PendingCycles = 0;
+    DeferCycles = false;
+#endif
     RegCache = RegisterCache<Compiler, ARM64Reg>(this, instrs, instrsCount, true);
 #ifdef LITEV_JIT_GLOBALREG
     // GLOBALREG: install the fixed guest->host map. These regs are already resident
@@ -1801,6 +1818,22 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         //printf("%x instr %x regs: r%x w%x n%x flags: %x %x %x\n", R15, CurInstr.Instr, CurInstr.Info.SrcRegs, CurInstr.Info.DstRegs, CurInstr.Info.ReadFlags, CurInstr.Info.NotStrictlyNeeded, CurInstr.Info.WriteFlags, CurInstr.SetFlags);
 
         bool isConditional = Thumb ? CurInstr.Info.Kind == ARMInstrInfo::tk_BCOND : CurInstr.Cond() < 0xE;
+#ifdef LITEV_JIT_CYCLE_BATCH
+        // RCycles is read by SaveCycles (which flushes first) and at exits (which add the
+        // pending cycles on the exit path). Flush up front for interpreter fallbacks and
+        // conditional branches that may SaveCycles inside their skippable body (PC-writing ALU/LDM/LDR,
+        // which can restore the CPSR). Plain conditional B/BL/BX/BLX and every other
+        // conditional instruction leave the pending adds alone (nothing in the body reads
+        // RCycles) but keep their own adds inline, since those run on one path only.
+        // Unconditional instructions defer; the block-end add then carries everything.
+        bool plainBranch = Thumb || CurInstr.Info.Kind == ARMInstrInfo::ak_B
+            || CurInstr.Info.Kind == ARMInstrInfo::ak_BL || CurInstr.Info.Kind == ARMInstrInfo::ak_BX
+            || CurInstr.Info.Kind == ARMInstrInfo::ak_BLX_REG;
+        bool readsCycles = comp == NULL || (isConditional && CurInstr.Info.Branches() && !plainBranch);
+        if (readsCycles)
+            FlushPendingCycles();
+        DeferCycles = !readsCycles && !isConditional;
+#endif
         if (comp == NULL || (CurInstr.BranchFlags & branch_FollowCondTaken) || (i == instrsCount - 1 && (!CurInstr.Info.Branches() || isConditional)))
         {
             MOVI2R(W0, R15);
@@ -1984,6 +2017,16 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     Comp_MaterializeFlags();
 #endif
 
+#ifdef LITEV_JIT_CYCLE_BATCH
+    DeferCycles = false;
+    if (ConstantCycles + PendingCycles <= 0xFFF)
+    {
+        ConstantCycles += PendingCycles;   // both are added at this one point
+        PendingCycles = 0;
+    }
+    else
+        FlushPendingCycles();
+#endif
     if (ConstantCycles)
         ADD(RCycles, RCycles, ConstantCycles);
 #ifdef LITEV_JIT_DISPATCH
@@ -2114,6 +2157,10 @@ void Compiler::Comp_AddCycles_C(bool forceNonConstant)
 
     if (forceNonConstant)
         ConstantCycles += cycles;
+#ifdef LITEV_JIT_CYCLE_BATCH
+    else if (DeferCycles)
+        PendingCycles += cycles;
+#endif
     else
         ADD(RCycles, RCycles, cycles);
 }
@@ -2140,6 +2187,11 @@ void Compiler::Comp_AddCycles_CI(u32 c, ARM64Reg numI, ArithOption shift)
         NDS.ARM7MemTimings[CurInstr.CodeCycles][Thumb ? 0 : 2]
         : ((R15 & 0x2) ? 0 : CurInstr.CodeCycles)) + c;
 
+#ifdef LITEV_JIT_CYCLE_BATCH
+    if (DeferCycles)
+        PendingCycles += cycles;
+    else
+#endif
     ADD(RCycles, RCycles, cycles);
     if (Thumb || CurInstr.Cond() >= 0xE)
         ConstantCycles += cycles;

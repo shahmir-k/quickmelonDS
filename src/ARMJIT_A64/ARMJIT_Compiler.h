@@ -449,6 +449,22 @@ public:
     u32 Num;
     ARM* CurCPU;
     u32 ConstantCycles;
+#ifdef LITEV_JIT_CYCLE_BATCH
+    // Inline RCycles adds deferred at compile time. Only accumulated while compiling an
+    // unconditional JIT-compiled instruction (DeferCycles), whose adds always execute.
+    // Added before every read of RCycles: SaveCycles, mid-block exits (on the exit path
+    // only) and the block end, so every read sees the same value as without batching.
+    u32 PendingCycles;
+    bool DeferCycles;
+    void FlushPendingCycles()
+    {
+        for (; PendingCycles > 0xFFF; PendingCycles -= 0xFFF)   // imm12 limit
+            ADD(RCycles, RCycles, 0xFFF);
+        if (PendingCycles)
+            ADD(RCycles, RCycles, PendingCycles);
+        PendingCycles = 0;
+    }
+#endif
     u32 CodeRegion;
 
     BitSet32 SavedRegs;
