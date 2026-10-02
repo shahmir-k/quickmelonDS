@@ -41,6 +41,7 @@ namespace melonDS
 #include "OpenGL_shaders/3DFinalPassVS.h"
 #include "OpenGL_shaders/3DFinalPassEdgeFS.h"
 #include "OpenGL_shaders/3DFinalPassFogFS.h"
+#include "OpenGL_shaders/3DFinalPassFogFetchFS.h"
 
 bool GLRenderer3D::BuildRenderShader(bool wbuffer)
 {
@@ -197,6 +198,37 @@ bool GLRenderer3D::Init()
     uni_id = glGetUniformLocation(FinalPassEdgeShader, "AttrBuffer");
     glUniform1i(uni_id, 1);
 
+#ifdef __ANDROID__
+    // debug.litev.gl3dtile (default on): keep the 3D pass in tile memory - invalidate the
+    // attachments before the clear and depth/stencil + attributes after the frame (never
+    // loaded or written back), fog reads them by framebuffer fetch instead of as textures
+    {
+        char b[92] = {};
+        TileMode = !(__system_property_get("debug.litev.gl3dtile", b) > 0 && atoi(b) == 0);
+        bool fetch = false, fetchDS = false;
+        GLint n = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        for (GLint i = 0; i < n; i++)
+        {
+            const char* e = (const char*)glGetStringi(GL_EXTENSIONS, i);
+            if (!e) continue;
+            if (!strcmp(e, "GL_EXT_shader_framebuffer_fetch")) fetch = true;
+            if (!strcmp(e, "GL_ARM_shader_framebuffer_fetch_depth_stencil")) fetchDS = true;
+        }
+        if (TileMode && fetch && fetchDS &&
+            OpenGL::CompileVertexFragmentProgram(FinalPassFogFetchShader,
+                k3DFinalPassVS, k3DFinalPassFogFetchFS, "FinalPassFogFetchShader",
+                {{"vPosition", 0}}, {{"oColor", 0}, {"oAttr", 1}}))
+        {
+            uni_id = glGetUniformBlockIndex(FinalPassFogFetchShader, "uConfig");
+            glUniformBlockBinding(FinalPassFogFetchShader, uni_id, 0);
+        }
+        else
+            FinalPassFogFetchShader = 0;
+        Platform::Log(Platform::Info, "LITEV_GL3D tile=%d fbfetch=%d/%d fogfetch=%d\n", TileMode, fetch, fetchDS, FinalPassFogFetchShader != 0);
+    }
+#endif
+
     uni_id = glGetUniformBlockIndex(FinalPassFogShader, "uConfig");
     glUniformBlockBinding(FinalPassFogShader, uni_id, 0);
 
@@ -324,6 +356,7 @@ GLRenderer3D::~GLRenderer3D()
 
     Texcache.Reset();
 
+    if (FinalPassFogFetchShader) glDeleteProgram(FinalPassFogFetchShader);
     glDeleteFramebuffers(1, &MainFramebuffer);
     glDeleteSamplers(9, WrapSampler);
     glDeleteTextures(MaxColorRing, ColorBufferTex);
@@ -1391,10 +1424,15 @@ polygons_done:
         glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
         glStencilMask(0);
 
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, AttrBufferTex);
+        // fog alone reads only this pixel: framebuffer fetch, no attachment sampling
+        const bool fogFetch = FinalPassFogFetchShader && !(S.RenderDispCnt & (1<<5));
+        if (!fogFetch)
+        {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, AttrBufferTex);
+        }
 
         glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
         glBindVertexArray(ClearVertexArrayID);
@@ -1415,7 +1453,7 @@ polygons_done:
         {
             // fog
 
-            glUseProgram(FinalPassFogShader);
+            glUseProgram(fogFetch ? FinalPassFogFetchShader : FinalPassFogShader);
 
             if (S.RenderDispCnt & (1<<6))
                 glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_CONSTANT_COLOR, GL_ONE_MINUS_SRC_ALPHA);
@@ -1568,6 +1606,12 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
+    if (TileMode)
+    {
+        // the clear below rewrites every pixel of every attachment: nothing to load
+        static const GLenum all[3] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_DEPTH_STENCIL_ATTACHMENT};
+        glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 3, all);
+    }
 
     ShaderConfig.uScreenSize[0] = ScreenW;
     ShaderConfig.uScreenSize[1] = ScreenH;
@@ -1721,6 +1765,13 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, EdgeIndicesOffset * 2, NumEdgeIndices * 2, IndexBuffer + EdgeIndicesOffset);
 
         RenderSceneChunk(0, 192);
+    }
+
+    if (TileMode)
+    {
+        // only the colour buffer leaves the 3D pass
+        static const GLenum aux[2] = {GL_COLOR_ATTACHMENT1, GL_DEPTH_STENCIL_ATTACHMENT};
+        glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 2, aux);
     }
 }
 

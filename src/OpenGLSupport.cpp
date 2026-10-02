@@ -240,10 +240,19 @@ bool CompilerShader(GLuint& id, const std::string& source, const std::string& na
             "precision highp usampler2DArray;\n";
         size_t vpos = source.find("#version");
         size_t eol = (vpos == std::string::npos) ? std::string::npos : source.find('\n', vpos);
-        if (eol != std::string::npos)
-            patched = std::string(kEsPreamble) + source.substr(eol + 1);
-        else
-            patched = std::string(kEsPreamble) + source;
+        std::string body = (eol != std::string::npos) ? source.substr(eol + 1) : source;
+        // #extension directives must precede the injected precision statements
+        std::string ext;
+        for (size_t p; (p = body.find("#extension")) != std::string::npos; )
+        {
+            size_t e = body.find('\n', p);
+            e = (e == std::string::npos) ? body.size() : e + 1;
+            ext += body.substr(p, e - p);
+            body.erase(p, e - p);
+        }
+        std::string pre = kEsPreamble;
+        pre.insert(pre.find('\n') + 1, ext);
+        patched = pre + body;
     }
     const char* sourceC = patched.c_str();
     int len = patched.length();

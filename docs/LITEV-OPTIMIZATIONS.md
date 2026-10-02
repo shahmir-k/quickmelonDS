@@ -752,6 +752,7 @@ All exactness **R** (local framebuffer only, MP-safe). Each has a `debug.litev.*
 | Diagnostics (not optimizations): `glskip` bitmask skips GPU passes for a per-pass cost breakdown (1 3D polygons, 2 3D edge/fog, 4 2D compositor, 8 sprites, 16 final pass, 32 hi-res present copy, 64 hybrid merge, 128 compositor without the 3D texture, 256 trivial compositor shader); with `prof=1` a `LITEV_GLSTAT` line counts passes per frame | `glskip` | GH3 Shrek slot 2 (31.5 fps): compositor ~16-21 ms/frame, 3D polygons ~4, final pass ~2.3, fog ~0.7, present copy ~0.7 |
 | GL hi-res: frame copy-out on a present thread | `glhiasync` | 1x 58.4/58.4 -> 60.1/61.3 fps |
 | GL hi-res: 2D compositor shader without the 4x5 priority loop (top-two selection over draw-order keys), no fetches of disabled BGs, mediump blend maths. Same output (in-process check `compcheck=1`: 0 px differ over 8.8M px at 3x) | `glcomp` | hi-res 3x 31.5/31.5 -> 43.3/43.3 fps (GPU-bound) |
+| GL 3D (hybrid and hi-res): attachments invalidated before the clear, depth/stencil + attribute buffer invalidated after the frame (never loaded or written back); fog reads depth/attributes by framebuffer fetch (`GL_EXT_shader_framebuffer_fetch` + `GL_ARM_shader_framebuffer_fetch_depth_stencil`) instead of sampling the attachments (texture path kept when edge marking is on or the extensions are missing) | `gl3dtile` | hi-res 3x 43.3/43.2 -> 43.8/43.8 fps (GPU-bound; Shrek's 3D renders at 30 Hz) |
 
 
 ### jit: pass the ARM* to slow-memory and region helpers

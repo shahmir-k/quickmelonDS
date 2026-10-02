@@ -124,6 +124,8 @@ private:
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};
+    GLuint FinalPassFogFetchShader {};   // debug.litev.gl3dtile: fog by framebuffer fetch
+    bool TileMode = false;               // debug.litev.gl3dtile: invalidate around the 3D pass
 
     // std140 compliant structure
     struct
