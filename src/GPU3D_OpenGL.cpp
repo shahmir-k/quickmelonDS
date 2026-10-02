@@ -24,6 +24,10 @@
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#include <stdlib.h>
+#endif
 
 namespace melonDS
 {
@@ -120,6 +124,13 @@ GLRenderer3D::GLRenderer3D(melonDS::GPU3D& gpu3D, GLRenderer* parent) noexcept :
 
 bool GLRenderer3D::Init()
 {
+#ifdef __ANDROID__
+    {
+        // debug.litev.linequads=0: draw line polygons as GL_LINES (default: thin quads)
+        char b[92] = {};
+        LineQuads = !(__system_property_get("debug.litev.linequads", b) > 0 && atoi(b) == 0);
+    }
+#endif
     GLint uni_id;
 
     glEnable(GL_DEPTH_TEST);
@@ -641,6 +652,33 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 vidx++;
                 nout++;
                 if (nout >= 2) break;
+            }
+
+            if (LineQuads)
+            {
+                // Draw the line as a thin quad, ScaleFactor pixels wide (the DS line width at
+                // this resolution), so it batches with the triangle draws around it: offset
+                // a copy of both ends along the minor axis. A 1-vertex line draws nothing,
+                // as with GL_LINES.
+                rp->PrimType = GL_TRIANGLES;
+                iidx -= rp->NumIndices;
+                rp->NumIndices = 0;
+                if (nout == 2)
+                {
+                    u32* v0 = vptr - 14;
+                    u32* v1 = vptr - 7;
+                    int dx = (int)(v1[0] & 0xFFFF) - (int)(v0[0] & 0xFFFF);
+                    int dy = (int)(v1[0] >> 16) - (int)(v0[0] >> 16);
+                    const u32 w = ScaleFactor > 1 ? ScaleFactor : 1;
+                    const u32 off = (std::abs(dx) >= std::abs(dy)) ? (w << 16) : w;
+                    memcpy(vptr, v0, 7 * 4); vptr[0] += off; vptr += 7;
+                    memcpy(vptr, v1, 7 * 4); vptr[0] += off; vptr += 7;
+                    const u32 a = vidx - 2, b = vidx - 1, a2 = vidx, b2 = vidx + 1;
+                    vidx += 2;
+                    IndexBuffer[iidx++] = a; IndexBuffer[iidx++] = b; IndexBuffer[iidx++] = b2;
+                    IndexBuffer[iidx++] = a; IndexBuffer[iidx++] = b2; IndexBuffer[iidx++] = a2;
+                    rp->NumIndices = 6;
+                }
             }
         }
         else if (poly->NumVertices == 3) // regular triangle

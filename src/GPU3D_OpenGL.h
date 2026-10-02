@@ -175,6 +175,7 @@ private:
     const u32 EdgeIndicesOffset = 2048 * 30;
 
     int ScaleFactor {};
+    bool LineQuads = true;   // line polygons as thin quads (debug.litev.linequads=0: GL_LINES)
     bool BetterPolygons {};
     int ScreenW {}, ScreenH {};
 
