@@ -339,6 +339,7 @@ int main(int argc, char** argv)
         cfg.jit = opt.jit;
         cfg.fixedRtcEpoch = opt.fixedRtc;
         cfg.inputScript = opt.inputScript;
+        cfg.savestate = opt.savestate;
 
         switch (opt.mode)
         {

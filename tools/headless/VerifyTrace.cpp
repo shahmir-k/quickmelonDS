@@ -96,6 +96,19 @@ static_assert(sizeof(TraceRecord) == 192, "TraceRecord layout drift");
 // Helpers
 // ---------------------------------------------------------------------------
 
+// LITEV_TRACE_ROUNDTRIP=<frame>: save the state to memory after that frame and load it back
+// (a run with the round trip must trace identically to one without).
+void RoundTripAt(NDS& nds, int frame)
+{
+    static const char* e = getenv("LITEV_TRACE_ROUNDTRIP");
+    if (!e || atoi(e) != frame) return;
+    Savestate save;
+    nds.DoSavestate(&save);
+    Savestate load(save.Buffer(), save.Length(), false);
+    if (save.Error || !nds.DoSavestate(&load) || load.Error) fprintf(stderr, "error: round trip failed\n");
+    else fprintf(stderr, "round trip at frame %d (%u bytes)\n", frame, save.Length());
+}
+
 std::unique_ptr<u8[]> ReadFile(const std::string& path, u32& lenOut)
 {
     FILE* f = fopen(path.c_str(), "rb");
@@ -187,6 +200,15 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
     out.nds->SetupDirectBoot("headless.nds");
     out.nds->Start();
     out.nds->SetKeyMask(0xFFFF); // no buttons pressed (active-low)
+
+    if (!cfg.savestate.empty())
+    {
+        u32 len = 0;
+        auto buf = ReadFile(cfg.savestate, len);
+        if (!buf) { err = "cannot read savestate '" + cfg.savestate + "'"; return false; }
+        Savestate st(buf.get(), len, false);
+        if (st.Error || !out.nds->DoSavestate(&st) || st.Error) { err = "failed to load savestate"; return false; }
+    }
 
     if (!cfg.inputScript.empty())
     {
@@ -323,6 +345,7 @@ int RecordTrace(const TraceRunConfig& cfg, int frames, const std::string& outPat
         b.ApplyInput(frame);
         LITE_PROFILE_RESET_FRAME();
         b.nds->RunFrame();
+        RoundTripAt(*b.nds, (int)frame);
 
         TraceRecord rec;
         CaptureRecord(*b.nds, frame, rec);
@@ -438,6 +461,7 @@ int VerifyTrace(const TraceRunConfig& cfg, const std::string& tracePath)
         b.ApplyInput((int)frame);
         LITE_PROFILE_RESET_FRAME();
         b.nds->RunFrame();
+        RoundTripAt(*b.nds, (int)frame);
 
         TraceRecord actual;
         CaptureRecord(*b.nds, (int)frame, actual);
