@@ -697,6 +697,8 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 
 ## Unflagged optimizations
 
+The renderer changes in the first table are approximate (R); the rest are byte-exact and always on; a few have a `debug.litev.*` Android property to turn them off for an A/B.
+
 ### Renderer threading and draw-count changes (runtime props, 2026-10-02)
 
 All exactness **R** (local framebuffer only, MP-safe). Each has a `debug.litev.*` prop to turn it off.
@@ -710,8 +712,6 @@ All exactness **R** (local framebuffer only, MP-safe). Each has a `debug.litev.*
 | GL hi-res: show the 3D rendered one frame earlier, so the emu thread never waits for the newest render. **Trade-off: one extra frame of 3D display latency relative to the 2D layers** | `glhilate` | without it the emu waits 3.6 ms (1x) / 14.7 ms (3x) per frame: 1x 48.5, 3x 26.2 |
 | GL hi-res: frame copy-out on a present thread | `glhiasync` | 1x 58.4/58.4 -> 60.1/61.3 fps |
 
-
-These are byte-exact and always on; a few have a `debug.litev.*` Android property to turn them off for an A/B.
 
 ### jit: pass the ARM* to slow-memory and region helpers
 
