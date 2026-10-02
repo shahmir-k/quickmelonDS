@@ -20,6 +20,7 @@
 #include <algorithm>
 #include "NDS.h"
 #include "GPU_Hybrid.h"
+#include "GLWorker.h"
 #include <chrono>
 #include <condition_variable>
 #include <atomic>
@@ -76,12 +77,12 @@ static double HybNowMs()
 // Each finished render leaves a fence; the emu context waits on it (GPU-side) before
 // sampling that colour buffer. Without EGL (desktop builds) or if the shared context
 // cannot be made, everything runs inline on the caller's thread as before.
-class GLThread3D : public Renderer3D
+class GLThread3D : public Renderer3D, public GLWorker
 {
 public:
     GLThread3D(melonDS::GPU3D& gpu3D) : Renderer3D(gpu3D)
     {
-        StartThread();
+        StartThread("hyb-gl3d");
         Run([this, &gpu3D] { GL = std::make_unique<GLRenderer3D>(gpu3D, nullptr); }, true);
     }
     ~GLThread3D() override
@@ -147,30 +148,6 @@ public:
     // keeps the app's per-frame query from waiting on the in-flight render job
     bool NeedsShaderCompile() override { return false; }
 
-    // run f on the GL thread (inline when there is none); wait = block until done
-    void Run(std::function<void()> f, bool wait)
-    {
-        if (!Threaded) { f(); return; }
-        {
-            std::lock_guard<std::mutex> l(M);
-            Q.push_back(std::move(f));
-        }
-        CV.notify_one();
-        if (wait) Wait();
-    }
-    void Wait()
-    {
-        if (!Threaded) return;
-        std::unique_lock<std::mutex> l(M);
-        DoneCV.wait(l, [this] { return Q.empty() && !Busy; });
-    }
-    void WaitQueued()   // every queued job has started (the running one may continue)
-    {
-        if (!Threaded) return;
-        std::unique_lock<std::mutex> l(M);
-        DoneCV.wait(l, [this] { return Q.empty(); });
-    }
-
     std::unique_ptr<GLRenderer3D> GL;
     GLsync Fence[GLRenderer3D::MaxColorRing] {};
     u64 Seq = 0, ColorSeq[GLRenderer3D::MaxColorRing] {};
@@ -180,114 +157,7 @@ public:
     double JobQueued = 0, JobWall = 0, JobCpu = 0, PrepWait = 0, PrepMs = 0, JobTail = 0, KickGap = 0, LastKick = 0, JobEndFromKick = 0; int JobN = 0;
     static double NowMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     static double CpuMs() { timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
-    bool Threaded = false;
 
-private:
-    std::thread T;
-    std::mutex M;
-    std::condition_variable CV, DoneCV;
-    std::deque<std::function<void()>> Q;
-    bool Busy = false, Quit = false;
-#ifdef __ANDROID__
-    EGLDisplay Dpy = EGL_NO_DISPLAY;
-    EGLContext Ctx = EGL_NO_CONTEXT;
-    EGLSurface Surf = EGL_NO_SURFACE;
-#endif
-
-    void StartThread()
-    {
-#ifdef __ANDROID__
-        Dpy = eglGetCurrentDisplay();
-        EGLContext share = eglGetCurrentContext();
-        if (Dpy == EGL_NO_DISPLAY || share == EGL_NO_CONTEXT) return;
-        EGLint cfgId = 0, n = 0;
-        EGLConfig cfg = nullptr;
-        eglQueryContext(Dpy, share, EGL_CONFIG_ID, &cfgId);
-        const EGLint cfgAttr[] = {EGL_CONFIG_ID, cfgId, EGL_NONE};
-        if (!eglChooseConfig(Dpy, cfgAttr, &cfg, 1, &n) || n < 1) return;
-        const EGLint ctxAttr[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
-        Ctx = eglCreateContext(Dpy, cfg, share, ctxAttr);
-        if (Ctx == EGL_NO_CONTEXT) return;
-
-        bool ok = false, started = false;
-        T = std::thread([this, cfg, &ok, &started] {
-            // surfaceless if supported, else a 1x1 pbuffer
-            bool cur = eglMakeCurrent(Dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, Ctx);
-            if (!cur)
-            {
-                const EGLint pb[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
-                Surf = eglCreatePbufferSurface(Dpy, cfg, pb);
-                cur = Surf != EGL_NO_SURFACE && eglMakeCurrent(Dpy, Surf, Surf, Ctx);
-            }
-            // off the emu thread's core 3 (it is pinned there by the app)
-            cpu_set_t set; CPU_ZERO(&set);
-            CPU_SET(0, &set); CPU_SET(1, &set); CPU_SET(2, &set);
-            sched_setaffinity(0, sizeof(set), &set);
-            // the emu thread waits for this job when it falls a frame behind: let it win
-            // cores 0-2 against the 2D thread and the app's background threads
-            setpriority(PRIO_PROCESS, 0, -10);
-            pthread_setname_np(pthread_self(), "hyb-gl3d");
-            {
-                std::lock_guard<std::mutex> l(M);
-                ok = cur; started = true;
-            }
-            DoneCV.notify_all();
-            if (!cur) return;
-            Loop();
-            eglMakeCurrent(Dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        });
-        {
-            std::unique_lock<std::mutex> l(M);
-            DoneCV.wait(l, [&] { return started; });
-        }
-        Threaded = ok;
-        Platform::Log(Platform::Info, "LITEV_HYB GL 3D thread: %s\n", ok ? "on" : "FAILED (inline)");
-        if (!ok)
-        {
-            T.join();
-            if (Surf != EGL_NO_SURFACE) eglDestroySurface(Dpy, Surf);
-            eglDestroyContext(Dpy, Ctx);
-            Ctx = EGL_NO_CONTEXT; Surf = EGL_NO_SURFACE;
-        }
-#endif
-    }
-    void StopThread()
-    {
-        if (!Threaded) return;
-        {
-            std::lock_guard<std::mutex> l(M);
-            Quit = true;
-        }
-        CV.notify_one();
-        T.join();
-        Threaded = false;
-#ifdef __ANDROID__
-        if (Surf != EGL_NO_SURFACE) eglDestroySurface(Dpy, Surf);
-        eglDestroyContext(Dpy, Ctx);
-#endif
-    }
-    void Loop()
-    {
-        for (;;)
-        {
-            std::function<void()> f;
-            {
-                std::unique_lock<std::mutex> l(M);
-                CV.wait(l, [this] { return Quit || !Q.empty(); });
-                if (Q.empty()) return;   // Quit with nothing left
-                f = std::move(Q.front());
-                Q.pop_front();
-                Busy = true;
-            }
-            DoneCV.notify_all();   // WaitQueued
-            f();
-            {
-                std::lock_guard<std::mutex> l(M);
-                Busy = false;
-            }
-            DoneCV.notify_all();
-        }
-    }
 };
 
 GLThread3D* HybridRenderer::Thread3D() { return static_cast<GLThread3D*>(Rend3D.get()); }
@@ -316,6 +186,9 @@ HybridRenderer::HybridRenderer(melonDS::NDS& nds)
 
 HybridRenderer::~HybridRenderer()
 {
+    WaitPresent();       // an async present may still use the merge objects below
+    if (GLThreadFB) Present->Run([this] { glDeleteFramebuffers(1, &GLThreadFB); glDeleteVertexArrays(1, &GLThreadVAO); }, true);
+    Present.reset();
     StopAsyncThread();   // the 2D thread reads HybFB; stop it before GL teardown below
     glDeleteProgram(MergeShader);
     glDeleteVertexArrays(1, &EmptyVAO);
@@ -460,6 +333,8 @@ void HybridRenderer::Restart3DRendering()
 // emu thread, 2D kick for slot b: map its staging buffer for the 2D thread to fill
 void HybridRenderer::HybridKick(int b)
 {
+    // an async present may still be reading this slot on the GL thread
+    if (Present && MergeDone.load(std::memory_order_acquire) < SlotMergeSeq[b]) Present->Wait();
     if (HybDirect()) return;
     if (HybMap[b]) return;   // still mapped (that frame was never presented): reuse
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, DescPBO[b]);
@@ -540,10 +415,60 @@ void HybridRenderer::PresentInto(GLuint dstTex, int bottomY)
 // merge them with the 3D that frame pairs with, at Nx.
 //   single < 0: one draw, both screens into layers 0/1 of fbo's colour attachments 0/1
 //   single = 0: fbo has one target; top screen at row 0, bottom screen at row bottomY
+static bool HybAsync()
+{
+#ifdef __ANDROID__
+    static const bool on = [] { char b[92] = {}; return !(__system_property_get("debug.litev.hybasync", b) > 0 && atoi(b) == 0); }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+void HybridRenderer::PresentIntoAsync(GLuint dstTex, int bottomY, std::function<void()> pre, std::function<void()> post)
+{
+    if (!Present)
+    {
+        Present = std::make_unique<GLWorker>();
+        if (HybDirect() && HybAsync() && Thread3D()->Threaded) Present->StartThread("hyb-present");
+    }
+    if (!Present->Threaded)
+    {
+        pre(); PresentInto(dstTex, bottomY); post();
+        return;
+    }
+    const int fb = AsyncPresentBuf, tag = HybTag[fb];
+    const u64 seq = ++MergeSeq;
+    SlotMergeSeq[fb] = seq;   // HybridKick(fb) waits for this before the 2D thread rewrites the slot
+    glFlush();                // the frame texture may have just been (re)allocated on this context
+    Present->Run([this, fb, tag, dstTex, bottomY, seq, pre = std::move(pre), post = std::move(post)] {
+        pre();
+        if (!GLThreadFB) { glGenFramebuffers(1, &GLThreadFB); glGenVertexArrays(1, &GLThreadVAO); }
+        glBindFramebuffer(GL_FRAMEBUFFER, GLThreadFB);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+        const GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_NONE};
+        glDrawBuffers(2, bufs);
+        MergeSlot(GLThreadFB, 0, bottomY, fb, tag, GLThreadVAO, true);
+        post();
+        MergeDone.store(seq, std::memory_order_release);
+    }, false);
+}
+
+void HybridRenderer::WaitPresent()
+{
+    if (Present && MergeDone.load(std::memory_order_acquire) < MergeSeq) Present->Wait();
+}
+
 void HybridRenderer::Merge(GLuint fbo, int single, int bottomY)
 {
+    MergeSlot(fbo, single, bottomY, AsyncPresentBuf, HybTag[AsyncPresentBuf], EmptyVAO, true);
+}
+
+// ponytail: the Prof* counters are shared by the emu-thread and GL-thread merge paths
+// (diagnostic only; one path is active per session)
+void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int tag, GLuint vao, bool sync)
+{
     const double t0 = HybNowMs();
-    const int fb = AsyncPresentBuf;
 
     // the descriptors were copied into DescPBO[fb] by the 2D thread (HybridStage):
     // unmap and let the GPU copy them into this slot's texture
@@ -593,10 +518,10 @@ void HybridRenderer::Merge(GLuint fbo, int single, int bottomY)
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D_ARRAY, DescTex[fb]);
     const double ts = HybNowMs();
-    Sync3D(HybTag[fb]);
+    if (sync) Sync3D(tag);
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, GL3D()->GetColorTex(HybTag[fb]));
-    glBindVertexArray(EmptyVAO);
+    glBindTexture(GL_TEXTURE_2D, GL3D()->GetColorTex(tag));
+    glBindVertexArray(vao);
     const double td = HybNowMs();
     if (single < 0)
     {

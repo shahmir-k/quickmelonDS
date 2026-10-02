@@ -19,6 +19,8 @@
 #ifndef GPU_HYBRID_H
 #define GPU_HYBRID_H
 
+#include <atomic>
+#include <functional>
 #include "GPU_Soft.h"
 #include "GPU3D_OpenGL.h"
 
@@ -26,6 +28,7 @@ namespace melonDS
 {
 
 class GLThread3D;
+class GLWorker;
 
 // Hybrid renderer: 3D on the GPU at Nx (GLRenderer3D), 2D on the CPU at native
 // resolution (the threaded software 2D in descriptor mode), one GPU merge pass at Nx.
@@ -55,6 +58,12 @@ public:
     // Present directly into the app's frame texture (instead of GetFramebuffers + a blit):
     // top screen at row 0, bottom screen at row bottomY.
     void PresentInto(GLuint dstTex, int bottomY);
+    // Same, but the upload + merge run on a present thread with its own shared context
+    // (GPU-side wait on the 3D fence): pre() runs there first, post() after the merge commands are issued (fence +
+    // hand-off). Falls back to PresentInto when there is no GL 3D thread or the PBO path is on.
+    // debug.litev.hybasync=0: always synchronous.
+    void PresentIntoAsync(GLuint dstTex, int bottomY, std::function<void()> pre, std::function<void()> post);
+    void WaitPresent();   // every queued async present has run
     void Finish3DRendering() override;
     void Restart3DRendering() override;
 
@@ -76,7 +85,14 @@ private:
     GLint ScaleULoc = -1, SingleULoc = -1, OriginULoc = -1;
     GLuint PresentFB = 0;
     void Merge(GLuint fbo, int single, int bottomY);
+    // fb: framebuffer slot, tag: its 3D colour ring index, vao: this context's VAO,
+    // sync: wait (GPU-side) for that 3D render first (not needed on the GL thread)
+    void MergeSlot(GLuint fbo, int single, int bottomY, int fb, int tag, GLuint vao, bool sync);
     GLuint EmptyVAO = 0;
+    std::unique_ptr<GLWorker> Present;        // async present thread (shared EGL context)
+    GLuint GLThreadFB = 0, GLThreadVAO = 0;   // its objects
+    u64 MergeSeq = 0, SlotMergeSeq[3] {};
+    std::atomic<u64> MergeDone { 0 };
     // 513x192x2 RGBA8UI + staging buffer per framebuffer slot (a slot is reused 3 frames
     // later, so an upload never targets a texture an earlier merge may still be reading)
     GLuint DescTex[3] {};
