@@ -25,6 +25,8 @@
 namespace melonDS
 {
 
+class GLThread3D;
+
 // Hybrid renderer: 3D on the GPU at Nx (GLRenderer3D), 2D on the CPU at native
 // resolution (the threaded software 2D in descriptor mode), one GPU merge pass at Nx.
 // This is classic melonDS's OpenGL mode (removed upstream in ba317e2e) on top of the
@@ -50,16 +52,19 @@ public:
 
     bool GetFramebuffers(void** top, void** bottom) override;
     void Start3DRendering() override;
+    void Finish3DRendering() override;
+    void Restart3DRendering() override;
 
-    bool NeedsShaderCompile() override { return Rend3D->NeedsShaderCompile(); }
-    void ShaderCompileStep(int& current, int& count) override { Rend3D->ShaderCompileStep(current, count); }
 
 protected:
     int HybridCurrentTag() override;
     void HybridReadback3D(u32* dst) override;
 
 private:
-    GLRenderer3D* GL3D() { return static_cast<GLRenderer3D*>(Rend3D.get()); }
+    GLThread3D* Thread3D();
+    GLRenderer3D* GL3D();
+    void Wait3D();             // the last 3D job is done (its colour buffer + fence are valid)
+    void Sync3D(int colorIdx); // make this context's GPU commands wait for that 3D render
     void SetScale(int scale);
 
     int Scale = 0;
@@ -73,7 +78,7 @@ private:
     GLuint ReadFB = 0, DownFB = 0, DownTex = 0;   // capture readback at 1x
     u8 ReadBuf[256 * 192 * 4];
     // emu-thread CPU time per 60 frames (logged as LITEV_HYB)
-    double ProfGL3D = 0, ProfMerge = 0, ProfReadback = 0;
+    double ProfGL3D = 0, ProfWait = 0, ProfMerge = 0, ProfUpload = 0, ProfReadback = 0;
     int ProfFrames = 0;
 };
 

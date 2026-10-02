@@ -23,6 +23,7 @@
 #include "OpenGLSupport.h"
 #include "GPU3D_TexcacheOpenGL.h"
 #include "NonStupidBitfield.h"
+#include <functional>
 
 namespace melonDS
 {
@@ -47,10 +48,18 @@ public:
     void RenderFrame() override;
     u32* GetLine(int line) override;
 
+    // RenderFrame split for the hybrid's GL thread: PrepareFrame on the emu thread,
+    // RenderPreparedFrame on the thread that owns this renderer's GL objects.
+    // slot: up to two prepared frames may be outstanding (one rendering, one queued);
+    // beforeVRAMWrite runs before PrepareFrame modifies the flat texture VRAM a running
+    // frame may still be reading (the caller waits for it there).
+    void PrepareFrame(int slot = 0, const std::function<void()>& beforeVRAMWrite = {});
+    void RenderPreparedFrame(int slot = 0);
+
     // Colour output ring (hybrid renderer): with n > 1 every rendered frame goes to the
     // next of n colour textures, so a frame's 3D stays readable while later frames
     // render. n = 1 (the default) is the single buffer GLRenderer uses.
-    static constexpr int MaxColorRing = 4;
+    static constexpr int MaxColorRing = 6;
     void SetColorRing(int n) noexcept;
     [[nodiscard]] int GetCurColor() const noexcept { return CurColor; }
     [[nodiscard]] GLuint GetColorTex(int i) const noexcept { return ColorBufferTex[i]; }
@@ -170,6 +179,19 @@ private:
 
     GLuint ColorBufferTex[MaxColorRing] {};
     int ColorRing = 1, CurColor = 0;
+    // render state snapshot taken in PrepareFrame (Next[slot]); RenderPreparedFrame copies
+    // it to S, which everything that renders reads
+    struct Snap
+    {
+        bool Skip;
+        int Color;
+        u32 RenderDispCnt, RenderClearAttr1, RenderClearAttr2;
+        u32 RenderFogColor, RenderFogOffset, RenderFogShift;
+        u16 RenderToonTable[32], RenderEdgeTable[8];
+        u8 RenderFogDensityTable[34];
+        u32 RenderNumPolygons;
+        Polygon* RenderPolygonRAM[2048];
+    } S {}, Next[2] {};
     GLuint DepthBufferTex {}, AttrBufferTex {};
     void AllocColorBuffers() noexcept;
 

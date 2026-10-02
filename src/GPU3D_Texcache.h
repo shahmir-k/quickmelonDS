@@ -92,13 +92,40 @@ public:
         return false;
     }
 
+    // Update() = Prepare() + Apply(). The hybrid renderer runs them on different threads:
+    // Prepare (VRAM coherence: reads emu-side dirty state, writes the flat texture VRAM) on the
+    // emu thread, Apply (cache invalidation against the flat VRAM) on its GL thread.
+    // slot: the hybrid keeps up to two prepared frames (one rendering, one queued).
+    // beforeWrite runs before the flat VRAM is modified, and only if it will be.
+    template <typename F>
+    void Prepare(int slot, F&& beforeWrite)
+    {
+        Pending& p = Pend[slot];
+        p.TexDirty = GPU.VRAMDirty_Texture.DeriveState(GPU.VRAMMap_Texture, GPU);
+        p.PalDirty = GPU.VRAMDirty_TexPal.DeriveState(GPU.VRAMMap_TexPal, GPU);
+        bool any = false;
+        for (u64 w : p.TexDirty.Data) any |= w != 0;
+        for (u64 w : p.PalDirty.Data) any |= w != 0;
+        if (any) beforeWrite();
+        p.TexChanged = GPU.MakeVRAMFlat_TextureCoherent(p.TexDirty);
+        p.PalChanged = GPU.MakeVRAMFlat_TexPalCoherent(p.PalDirty);
+    }
+    void Prepare() { Prepare(0, [] {}); }
+
+    bool PendingChanged(int slot) const { return Pend[slot].TexChanged || Pend[slot].PalChanged; }
+
     bool Update(u8& clrBitmapDirty)
     {
-        auto textureDirty = GPU.VRAMDirty_Texture.DeriveState(GPU.VRAMMap_Texture, GPU);
-        auto texPalDirty = GPU.VRAMDirty_TexPal.DeriveState(GPU.VRAMMap_TexPal, GPU);
+        Prepare();
+        return Apply(0, clrBitmapDirty);
+    }
 
-        bool textureChanged = GPU.MakeVRAMFlat_TextureCoherent(textureDirty);
-        bool texPalChanged = GPU.MakeVRAMFlat_TexPalCoherent(texPalDirty);
+    bool Apply(int slot, u8& clrBitmapDirty)
+    {
+        auto& textureDirty = Pend[slot].TexDirty;
+        auto& texPalDirty = Pend[slot].PalDirty;
+        const bool textureChanged = Pend[slot].TexChanged;
+        const bool texPalChanged = Pend[slot].PalChanged;
 
         clrBitmapDirty = 0;
 
@@ -339,6 +366,13 @@ private:
         u64 TexPalHash;
     };
     std::unordered_map<u64, TexCacheEntry> Cache;
+
+    struct Pending
+    {
+        NonStupidBitField<512*1024/VRAMDirtyGranularity> TexDirty;
+        NonStupidBitField<128*1024/VRAMDirtyGranularity> PalDirty;
+        bool TexChanged = false, PalChanged = false;
+    } Pend[2];
 
     TexLoaderT TexLoader;
 
