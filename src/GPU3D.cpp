@@ -305,8 +305,12 @@ void GPU3D::ResetRenderingState() noexcept
 
 void GPU3D::Reset() noexcept
 {
+#ifdef LITEV_GXFIFO_UNIFIED
+    CmdQHead = PipeN = FifoN = 0;
+#else
     CmdFIFO.Clear();
     CmdPIPE.Clear();
+#endif
 
     CmdStallQueue.Clear();
 
@@ -428,8 +432,30 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 {
     file->Section("GP3D");
 
+#ifdef LITEV_GXFIFO_UNIFIED
+    {
+        // same savestate layout as the two separate FIFOs
+        FIFO<CmdFIFOEntry, 256> fifo {};
+        FIFO<CmdFIFOEntry, 4> pipe {};
+        if (file->Saving)
+        {
+            for (u32 i = 0; i < PipeN; i++) pipe.Write(CmdQ[(CmdQHead + i) & 511]);
+            for (u32 i = 0; i < FifoN; i++) fifo.Write(CmdQ[(CmdQHead + PipeN + i) & 511]);
+        }
+        fifo.DoSavestate(file);
+        pipe.DoSavestate(file);
+        if (!file->Saving)
+        {
+            CmdQHead = 0;
+            PipeN = pipe.Level(); FifoN = fifo.Level();
+            for (u32 i = 0; i < PipeN; i++) CmdQ[i] = pipe.Read();
+            for (u32 i = 0; i < FifoN; i++) CmdQ[PipeN + i] = fifo.Read();
+        }
+    }
+#else
     CmdFIFO.DoSavestate(file);
     CmdPIPE.DoSavestate(file);
+#endif
 
     file->Var32(&NumCommands);
     file->Var32(&CurCommand);
@@ -2007,6 +2033,18 @@ void GPU3D::CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept
 
 GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 {
+#ifdef LITEV_GXFIFO_UNIFIED
+    // callers only read a non-empty PIPE
+    CmdFIFOEntry ret = CmdQ[CmdQHead];
+    CmdQHead = (CmdQHead + 1) & 511;
+    PipeN--;
+
+    if (PipeN <= 2)
+    {
+        u32 n = FifoN < 2 ? FifoN : 2;   // the first FIFO entries become PIPE entries in place
+        PipeN += n;
+        FifoN -= n;
+#else
     CmdFIFOEntry ret = CmdPIPE.Read();
 
     if (CmdPIPE.Level() <= 2)
@@ -2015,6 +2053,7 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
             CmdPIPE.Write(CmdFIFO.Read());
         if (!CmdFIFO.IsEmpty())
             CmdPIPE.Write(CmdFIFO.Read());
+#endif
 
         // empty stall queue if needed
         // CmdFIFO should not be full at this point.
@@ -2022,7 +2061,7 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
         {
             while (!CmdStallQueue.IsEmpty())
             {
-                if (CmdFIFO.IsFull()) break;
+                if (FifoFull()) break;
                 CmdFIFOEntry entry = CmdStallQueue.Read();
                 CmdFIFOWrite(entry);
             }
@@ -3230,7 +3269,7 @@ gxfifo_threaded_top:
     // Threaded loop-tail: instead of returning, re-run the whole ExecuteCommand
     // body for the next queued command (mirrors Run()'s drain-loop condition).
     // One call drains the batch -> no per-command bl/ret or prologue/epilogue.
-    if (CycleCount <= 0 && !CmdPIPE.IsEmpty())
+    if (CycleCount <= 0 && !PipeEmpty())
     {
         if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
         if (NumTestCommands == 0)    GXStat &= ~(1<<0);
@@ -3262,7 +3301,7 @@ void GPU3D::FinishWork(s32 cycles) noexcept
 void GPU3D::Run() noexcept
 {
     if (!GeometryEnabled || FlushRequest ||
-        (CmdPIPE.IsEmpty() && !(GXStat & (1<<27))))
+        (PipeEmpty() && !(GXStat & (1<<27))))
     {
         Timestamp = NDS.ARM9Timestamp >> NDS.ARM9ClockShift;
         return;
@@ -3275,7 +3314,7 @@ void GPU3D::Run() noexcept
 #ifdef LITEV_GXFIFO_THREADED
     // DraStic #3: one ExecuteCommand() call drains the whole batch via its threaded
     // loop-tail (no per-command call/ret). Equivalent to the while loop below.
-    if (CycleCount <= 0 && !CmdPIPE.IsEmpty())
+    if (CycleCount <= 0 && !PipeEmpty())
     {
         if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
         if (NumTestCommands == 0)    GXStat &= ~(1<<0);
@@ -3284,7 +3323,7 @@ void GPU3D::Run() noexcept
 #else
     if (CycleCount <= 0)
     {
-        while (CycleCount <= 0 && !CmdPIPE.IsEmpty())
+        while (CycleCount <= 0 && !PipeEmpty())
         {
             if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
             if (NumTestCommands == 0)    GXStat &= ~(1<<0);
@@ -3294,7 +3333,7 @@ void GPU3D::Run() noexcept
     }
 #endif
 
-    if (CycleCount <= 0 && CmdPIPE.IsEmpty())
+    if (CycleCount <= 0 && PipeEmpty())
     {
         if (GXStat & (1<<27)) FinishWork(-CycleCount);
         else                  CycleCount = 0;
@@ -3310,8 +3349,8 @@ void GPU3D::CheckFIFOIRQ() noexcept
     bool irq = false;
     switch (GXStat >> 30)
     {
-    case 1: irq = (CmdFIFO.Level() < 128); break;
-    case 2: irq = CmdFIFO.IsEmpty(); break;
+    case 1: irq = (FifoLevel() < 128); break;
+    case 2: irq = FifoEmpty(); break;
     }
 
     // Only touch the IRQ line when the GXFIFO IRQ state actually CHANGES. CmdFIFORead fires this
@@ -3340,7 +3379,7 @@ void GPU3D::CheckFIFOIRQ() noexcept
 
 void GPU3D::CheckFIFODMA() noexcept
 {
-    if (CmdFIFO.Level() < 128)
+    if (FifoLevel() < 128)
         NDS.CheckDMAs(0, 0x07);
 }
 
@@ -3507,7 +3546,7 @@ u8 GPU3D::Read8(u32 addr) noexcept
         {
             Run();
 
-            u32 fifolevel = CmdFIFO.Level();
+            u32 fifolevel = FifoLevel();
 
             return fifolevel & 0xFF;
         }
@@ -3515,7 +3554,7 @@ u8 GPU3D::Read8(u32 addr) noexcept
         {
             Run();
 
-            u32 fifolevel = CmdFIFO.Level();
+            u32 fifolevel = FifoLevel();
 
             return ((GXStat >> 24) & 0xFF) |
                    (fifolevel >> 8) |
@@ -3550,7 +3589,7 @@ u16 GPU3D::Read16(u32 addr) noexcept
         {
             Run();
 
-            u32 fifolevel = CmdFIFO.Level();
+            u32 fifolevel = FifoLevel();
 
             return (GXStat >> 16) |
                    fifolevel |
@@ -3586,7 +3625,7 @@ u32 GPU3D::Read32(u32 addr) noexcept
         {
             Run();
 
-            u32 fifolevel = CmdFIFO.Level();
+            u32 fifolevel = FifoLevel();
 
             return GXStat |
                    ((PosMatrixStackPointer & 0x1F) << 8) |

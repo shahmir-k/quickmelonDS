@@ -187,8 +187,26 @@ public:
     melonDS::NDS& NDS;
     melonDS::GPU& GPU;
 
+#ifdef LITEV_GXFIFO_UNIFIED
+    // The 4-entry PIPE and the 256-entry FIFO as one ring: the PIPE is the first PipeN
+    // entries, the FIFO the FifoN entries after them. Moving entries FIFO -> PIPE is
+    // then a counter update instead of a copy; every level stays the same.
+    CmdFIFOEntry CmdQ[512] {};
+    u32 CmdQHead = 0, PipeN = 0, FifoN = 0;
+    u32 FifoLevel() const noexcept { return FifoN; }
+    bool FifoEmpty() const noexcept { return FifoN == 0; }
+    bool FifoFull() const noexcept { return FifoN >= 256; }
+    bool PipeEmpty() const noexcept { return PipeN == 0; }
+    bool PipeFull() const noexcept { return PipeN >= 4; }
+#else
     FIFO<CmdFIFOEntry, 256> CmdFIFO {};
     FIFO<CmdFIFOEntry, 4> CmdPIPE {};
+    u32 FifoLevel() const noexcept { return CmdFIFO.Level(); }
+    bool FifoEmpty() const noexcept { return CmdFIFO.IsEmpty(); }
+    bool FifoFull() const noexcept { return CmdFIFO.IsFull(); }
+    bool PipeEmpty() const noexcept { return CmdPIPE.IsEmpty(); }
+    bool PipeFull() const noexcept { return CmdPIPE.IsFull(); }
+#endif
 
     FIFO<CmdFIFOEntry, 64> CmdStallQueue {};
 

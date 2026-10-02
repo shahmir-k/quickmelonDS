@@ -33,6 +33,26 @@ extern const u8 CmdNumParams[256];
 
 __attribute__((always_inline)) inline void GPU3D::CmdFIFOWrite_Inline(const CmdFIFOEntry& entry) noexcept
 {
+#ifdef LITEV_GXFIFO_UNIFIED
+    if (FifoN == 0 && PipeN < 4)
+    {
+        CmdQ[(CmdQHead + PipeN) & 511] = entry;
+        PipeN++;
+    }
+    else
+    {
+        if (FifoN >= 256)
+        {
+            // store it to the stall queue. stall the system.
+            CmdStallQueue.Write(entry);
+            NDS.GXFIFOStall();
+            return;
+        }
+
+        CmdQ[(CmdQHead + PipeN + FifoN) & 511] = entry;
+        FifoN++;
+    }
+#else
     if (CmdFIFO.IsEmpty() && !CmdPIPE.IsFull())
     {
         CmdPIPE.Write(entry);
@@ -49,6 +69,7 @@ __attribute__((always_inline)) inline void GPU3D::CmdFIFOWrite_Inline(const CmdF
 
         CmdFIFO.Write(entry);
     }
+#endif
 
     GXStat |= (1<<27);
 
