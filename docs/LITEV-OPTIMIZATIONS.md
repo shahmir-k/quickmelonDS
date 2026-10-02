@@ -671,7 +671,45 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 
 **Option.** LITEV_GEOM_PREFETCH2 (default OFF; enabled in the app's shipping build)
 
+### jit: batch per-instruction cycle adds until the next cycle read (LITEV_JIT_CYCLE_BATCH)
+
+**What.** The inline `add w28` of every unconditional ALU/Thumb instruction is summed at compile time and added where RCycles is read: SaveCycles, mid-block exits (on the exit path only) and the block-end add.
+
+**Why it works.** ~8 % of hot JIT code was cycle adds; 18.8k static adds become 357.
+
+**Exactness.** A.
+
+**Measured.** Device headless, emu thread, n = 3: instructions -0.79 %, cycles -0.89 %, L1I -1.75 %, stall_frontend -2.26 % (lib b189d618, 2026-10-02).
+
+**Option.** LITEV_JIT_CYCLE_BATCH (default OFF; enabled in the app's shipping build)
+
+### gx: PIPE and FIFO in one ring (LITEV_GXFIFO_UNIFIED)
+
+**What.** The 4-entry command PIPE and 256-entry FIFO share one ring; the FIFO-to-PIPE refill is a counter update. Savestates keep the two-FIFO layout.
+
+**Why it works.** Every one of ~11.5k entries per frame was copied FIFO -> PIPE before being read.
+
+**Exactness.** A (levels, IRQ, DMA trigger and stall points unchanged).
+
+**Measured.** Device headless, emu thread, n = 3: instructions -1.55 %, cycles -0.52 % (lib 4e558dad, 2026-10-02).
+
+**Option.** LITEV_GXFIFO_UNIFIED (default OFF; enabled in the app's shipping build)
+
 ## Unflagged optimizations
+
+### Renderer threading and draw-count changes (runtime props, 2026-10-02)
+
+All exactness **R** (local framebuffer only, MP-safe). Each has a `debug.litev.*` prop to turn it off.
+
+| Change | Prop (=0 disables) | Measured (RG DS, Shrek slot 2, uncapped) |
+|---|---|---|
+| GL 3D draws line polygons as thin quads (scale-factor px wide) so they batch with triangles | `linequads` | hybrid 3x draws/job 327 -> 187, GL job CPU 9.05 -> 6.64 ms, 65.5/66.0 -> 72.3/72.0 fps |
+| Hybrid descriptors uploaded straight from RAM (not via a 2D-thread-filled PBO) | `hybdirect` | 72.5/73.2 -> 75.0/75.5 fps |
+| Hybrid upload + merge + frame hand-off on a present thread (shared EGL context) | `hybasync` | 75.3/75.4 -> 80.3/79.5 fps |
+| GL hi-res: 3D on its own GL thread (GLThread3D) | `glhithread` | with `glhilate`: 1x 46.5 -> 58.5, 3x 31.8 -> 31.2 (GPU-bound) |
+| GL hi-res: show the 3D rendered one frame earlier, so the emu thread never waits for the newest render. **Trade-off: one extra frame of 3D display latency relative to the 2D layers** | `glhilate` | without it the emu waits 3.6 ms (1x) / 14.7 ms (3x) per frame: 1x 48.5, 3x 26.2 |
+| GL hi-res: frame copy-out on a present thread | `glhiasync` | 1x 58.4/58.4 -> 60.1/61.3 fps |
+
 
 These are byte-exact and always on; a few have a `debug.litev.*` Android property to turn them off for an A/B.
 
