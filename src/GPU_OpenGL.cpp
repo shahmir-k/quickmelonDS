@@ -20,6 +20,7 @@
 #include "NDS.h"
 #include "GPU_OpenGL.h"
 #include "GLThread3D.h"
+#include "GLWorker.h"
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
@@ -69,6 +70,67 @@ GLRenderer::GLRenderer(melonDS::NDS& nds, bool compute)
     }
 
     ScaleFactor = 0;
+}
+
+static bool GLHiAsync()
+{
+#ifdef __ANDROID__
+    static const bool on = [] { char b[92] = {}; return !(__system_property_get("debug.litev.glhiasync", b) > 0 && atoi(b) == 0); }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+void GLRenderer::BlitFront(int front, GLuint dstTex, int dstWidth, GLuint readFB, GLuint drawFB)
+{
+    const int perScreenH = 192 * (dstWidth / 256 > 0 ? dstWidth / 256 : 1);
+    const int gap = 2 * (dstWidth / 256 > 0 ? dstWidth / 256 : 1);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFB);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFB);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, FPOutputTex[front], 0, 0);
+    glBlitFramebuffer(0, 0, dstWidth, perScreenH, 0, 0, dstWidth, perScreenH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, FPOutputTex[front], 0, 1);
+    glBlitFramebuffer(0, 0, dstWidth, perScreenH, 0, perScreenH + gap, dstWidth, perScreenH + gap + perScreenH,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+}
+
+void GLRenderer::PresentIntoAsync(GLuint dstTex, int dstWidth, std::function<void()> pre, std::function<void()> post)
+{
+    const int front = BackBuffer ^ 1;
+    if (!Present)
+    {
+        Present = std::make_unique<GLWorker>();
+        if (GLHiAsync()) Present->StartThread("glhi-present");
+    }
+    if (!Present->Threaded)
+    {
+        if (!PresReadFB) { glGenFramebuffers(1, &PresReadFB); glGenFramebuffers(1, &PresDrawFB); }
+        pre(); BlitFront(front, dstTex, dstWidth, PresReadFB, PresDrawFB); post();
+        return;
+    }
+    GLsync written = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);   // this frame's output
+    glFlush();
+    const u64 seq = ++PresSeq;
+    BufPresSeq[front] = seq;   // RenderScreen waits for this copy before redrawing the buffer
+    Present->Run([this, front, dstTex, dstWidth, seq, written, pre = std::move(pre), post = std::move(post)] {
+        pre();
+        glWaitSync(written, 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(written);
+        if (!PresReadFB) { glGenFramebuffers(1, &PresReadFB); glGenFramebuffers(1, &PresDrawFB); }
+        BlitFront(front, dstTex, dstWidth, PresReadFB, PresDrawFB);
+        BufFence[front] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        post();
+        PresDone.store(seq, std::memory_order_release);
+    }, false);
+}
+
+void GLRenderer::WaitPresent()
+{
+    if (Present && PresDone.load(std::memory_order_acquire) < PresSeq) Present->Wait();
 }
 
 void GLRenderer::Start3DRendering()
@@ -294,6 +356,13 @@ bool GLRenderer::Init()
 
 GLRenderer::~GLRenderer()
 {
+    WaitPresent();
+    if (Present)
+    {
+        Present->Run([this] { glDeleteFramebuffers(1, &PresReadFB); glDeleteFramebuffers(1, &PresDrawFB); }, true);
+        Present.reset();
+    }
+    for (GLsync& f : BufFence) if (f) { glDeleteSync(f); f = nullptr; }
     glDeleteProgram(FPShader);
     glDeleteProgram(CaptureShader);
     glDeleteProgram(CapDownShader);
@@ -405,6 +474,7 @@ void GLRenderer::SetScaleFactor(int scale)
 {
     if (scale == ScaleFactor)
         return;
+    WaitPresent();   // the present thread may be reading FPOutputTex
 
     ScaleFactor = scale;
     ScreenW = 256 * scale;
@@ -582,6 +652,14 @@ void GLRenderer::DrawSprites(u32 line)
 void GLRenderer::RenderScreen(int ystart, int yend)
 {
     int backbuf = BackBuffer;
+    // the present thread may still be copying this buffer out (its previous frame)
+    if (Present && PresDone.load(std::memory_order_acquire) < BufPresSeq[backbuf]) Present->Wait();
+    if (BufFence[backbuf])
+    {
+        glWaitSync(BufFence[backbuf], 0, GL_TIMEOUT_IGNORED);
+        glDeleteSync(BufFence[backbuf]);
+        BufFence[backbuf] = nullptr;
+    }
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, FPOutputFB[backbuf]);
 

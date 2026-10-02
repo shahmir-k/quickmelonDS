@@ -19,6 +19,9 @@
 #ifndef GPU_OPENGL_H
 #define GPU_OPENGL_H
 
+#include <atomic>
+#include <functional>
+#include <memory>
 #include "OpenGLSupport.h"
 #include "GPU.h"
 #include "GPU2D_OpenGL.h"
@@ -29,6 +32,7 @@ namespace melonDS
 {
 
 class GLThread3D;
+class GLWorker;
 
 class GLRenderer : public Renderer
 {
@@ -59,7 +63,20 @@ public:
 
     void Start3DRendering() override;
 
+    // Copy the front buffer (top at row 0, bottom at row (192 + 2) * scale) into dstTex on a
+    // present thread with its own shared context: pre() runs there first, post() after the
+    // copy is issued (fence + hand-off). debug.litev.glhiasync=0: on the calling thread.
+    void PresentIntoAsync(GLuint dstTex, int dstWidth, std::function<void()> pre, std::function<void()> post);
+    void WaitPresent();
+
 private:
+    std::unique_ptr<GLWorker> Present;
+    GLuint PresReadFB = 0, PresDrawFB = 0;          // present-thread objects
+    u64 PresSeq = 0, BufPresSeq[2] {};
+    std::atomic<u64> PresDone { 0 };
+    GLsync BufFence[2] {};                          // the copy of FPOutputTex[i] (GPU-side)
+    void BlitFront(int front, GLuint dstTex, int dstWidth, GLuint readFB, GLuint drawFB);
+
     // 3D on its own GL thread (debug.litev.glhithread=0: inline). Get3DTex() returns the
     // 3D output the current frame shows, waiting (GPU-side) for its render on first use.
     GLThread3D* Thread3D = nullptr;
