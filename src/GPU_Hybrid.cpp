@@ -20,6 +20,7 @@
 #include <algorithm>
 #include "NDS.h"
 #include "GPU_Hybrid.h"
+#include <chrono>
 
 namespace melonDS
 {
@@ -150,6 +151,18 @@ void HybridRenderer::SetScale(int scale)
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
+static double HybNowMs()
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void HybridRenderer::Start3DRendering()
+{
+    double t0 = HybNowMs();
+    Rend3D->RenderFrame();
+    ProfGL3D += HybNowMs() - t0;
+}
+
 int HybridRenderer::HybridCurrentTag()
 {
     return GL3D()->GetCurColor();
@@ -160,6 +173,7 @@ int HybridRenderer::HybridCurrentTag()
 // submitted at the previous VCount 215, so the wait is short.
 void HybridRenderer::HybridReadback3D(u32* dst)
 {
+    double t0 = HybNowMs();
     GLuint tex = GL3D()->GetColorTex(GL3D()->GetCurColor());
     glBindFramebuffer(GL_READ_FRAMEBUFFER, ReadFB);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
@@ -187,12 +201,14 @@ void HybridRenderer::HybridReadback3D(u32* dst)
         dst[i] = ((r * 63 + 127) / 255) | (((g * 63 + 127) / 255) << 8) |
                  (((b * 63 + 127) / 255) << 16) | (((a * 31 + 127) / 255) << 24);
     }
+    ProfReadback += HybNowMs() - t0;
 }
 
 // Emu thread, after RunFrame: upload the last completed 2D frame's descriptors and
 // merge them with the 3D that frame pairs with, at Nx, into a 2-layer array texture.
 bool HybridRenderer::GetFramebuffers(void** top, void** bottom)
 {
+    const double t0 = HybNowMs();
     const int fb = AsyncPresentBuf;
 
     glBindTexture(GL_TEXTURE_2D_ARRAY, DescTex);
@@ -225,6 +241,15 @@ bool HybridRenderer::GetFramebuffers(void** top, void** bottom)
 
     *top = &OutTex[OutIdx];
     *bottom = nullptr;
+
+    ProfMerge += HybNowMs() - t0;
+    if (++ProfFrames == 60)
+    {
+        Platform::Log(Platform::Info, "LITEV_HYB 60f: gl3d=%.2f merge=%.2f readback=%.2f ms/frame (emu thread, scale %d)\n",
+                      ProfGL3D / 60, ProfMerge / 60, ProfReadback / 60, Scale);
+        ProfGL3D = ProfMerge = ProfReadback = 0;
+        ProfFrames = 0;
+    }
     return false;
 }
 

@@ -49,6 +49,7 @@ public:
     void SetRenderSettings(RendererSettings& settings) override;
 
     bool GetFramebuffers(void** top, void** bottom) override;
+    void Start3DRendering() override;
 
     bool NeedsShaderCompile() override { return Rend3D->NeedsShaderCompile(); }
     void ShaderCompileStep(int& current, int& count) override { Rend3D->ShaderCompileStep(current, count); }
@@ -71,6 +72,9 @@ private:
     int OutIdx = 0;
     GLuint ReadFB = 0, DownFB = 0, DownTex = 0;   // capture readback at 1x
     u8 ReadBuf[256 * 192 * 4];
+    // emu-thread CPU time per 60 frames (logged as LITEV_HYB)
+    double ProfGL3D = 0, ProfMerge = 0, ProfReadback = 0;
+    int ProfFrames = 0;
 };
 
 }
