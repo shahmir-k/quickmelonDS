@@ -168,6 +168,7 @@ private:
 
     bool NeedPartialRender;
     int LastLine;
+    int StatFrames = 0;
     int LastCapLine;
     int Aux0VRAMCap;
 

@@ -435,7 +435,7 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
         glUniform1i(SingleULoc, -1);
         glUniform2i(OriginULoc, 0, 0);
         glViewport(0, 0, 256 * Scale, 192 * Scale);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (!(OpenGL::GLSkip() & 64)) glDrawArrays(GL_TRIANGLES, 0, 3);
     }
     else
     {
@@ -445,7 +445,7 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
             glUniform1i(SingleULoc, sc);
             glUniform2i(OriginULoc, 0, y);
             glViewport(0, y, 256 * Scale, 192 * Scale);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
+            if (!(OpenGL::GLSkip() & 64)) glDrawArrays(GL_TRIANGLES, 0, 3);
         }
     }
     ProfSync += td - ts; ProfDraw += HybNowMs() - td;
@@ -477,6 +477,7 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
             Platform::Log(Platform::Info, "LITEV_HYB 3d-draws: %.1f draws %.1f polys per job\n",
                           (double)GL3D()->StatDraws / t->JobN, (double)GL3D()->StatPolys / t->JobN);
         GL3D()->StatDraws = GL3D()->StatPolys = 0;
+        OpenGL::GLStatLog(60);
         t->JobQueued = t->JobWall = t->JobCpu = t->PrepWait = t->PrepMs = t->JobTail = t->KickGap = t->JobEndFromKick = 0; t->JobN = 0;
     }
 }

@@ -1065,6 +1065,10 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
 
     glBindVertexArray(VertexArrayID);
 
+    OpenGL::GLStatAdd(OpenGL::GLStat3D);
+    if (flags) OpenGL::GLStatAdd(OpenGL::GLStatWBuf);
+    if (OpenGL::GLSkip() & 1) goto polygons_done;
+
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D_ARRAY, Parent ? Parent->CaptureOutput128Tex : 0);
     glActiveTexture(GL_TEXTURE2);
@@ -1258,6 +1262,7 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
             if (rp->PolyData->IsShadowMask)
             {
                 // clear shadow bits in stencil buffer
+                OpenGL::GLStatAdd(OpenGL::GLStatShadow);
 
                 glStencilMask(0x80);
                 glClear(GL_STENCIL_BUFFER_BIT);
@@ -1367,9 +1372,12 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
         }
     }
 
+polygons_done:
     glBindSampler(0, 0);   // polygon passes done (SetupPolygonTexture)
 
-    if (S.RenderDispCnt & 0x00A0) // fog/edge enabled
+    if (S.RenderDispCnt & (1<<5)) OpenGL::GLStatAdd(OpenGL::GLStatEdge);
+    if (S.RenderDispCnt & (1<<7)) OpenGL::GLStatAdd(OpenGL::GLStatFog);
+    if ((S.RenderDispCnt & 0x00A0) && !(OpenGL::GLSkip() & 2)) // fog/edge enabled
     {
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);

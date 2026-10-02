@@ -18,7 +18,12 @@
 
 #include "OpenGLSupport.h"
 
+#include <atomic>
+#include <stdlib.h>
 #include <unordered_map>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 #include <vector>
 
 #include <assert.h>
@@ -183,6 +188,27 @@ writeError:
     Platform::CloseFile(file);
 
     NewShaders.clear();
+}
+
+int GLSkip()
+{
+#ifdef __ANDROID__
+    static const int v = [] { char b[92] = {}; return __system_property_get("debug.litev.glskip", b) > 0 ? atoi(b) : 0; }();
+    return v;
+#else
+    return 0;
+#endif
+}
+
+static std::atomic<int> GLStat[GLStatN];
+void GLStatAdd(int i, int n) { GLStat[i].fetch_add(n, std::memory_order_relaxed); }
+void GLStatLog(int frames)
+{
+    int v[GLStatN];
+    for (int i = 0; i < GLStatN; i++) v[i] = GLStat[i].exchange(0);
+    Log(LogLevel::Info, "LITEV_GLSTAT %df: comp=%.2f sprites=%.2f final=%.2f per frame | 3d=%d fog=%d edge=%d shadowdraws=%d wbuf=%d (skip=%d)\n",
+        frames, (double)v[GLStatComp] / frames, (double)v[GLStatSprites] / frames, (double)v[GLStatFinal] / frames,
+        v[GLStat3D], v[GLStatFog], v[GLStatEdge], v[GLStatShadow], v[GLStatWBuf], GLSkip());
 }
 
 bool CompilerShader(GLuint& id, const std::string& source, const std::string& name, const std::string& type)

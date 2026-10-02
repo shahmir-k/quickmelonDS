@@ -46,6 +46,17 @@ bool CompileVertexFragmentProgram(GLuint& result,
 
 bool CompileComputeProgram(GLuint& result, const std::string& source, const std::string& name);
 
+// debug.litev.glskip (Android, read once): diagnostic GPU pass-skip bitmask, for a per-pass
+// GPU cost breakdown (wrong pixels by design). 1 3D polygons, 2 3D edge/fog, 4 2D compositor,
+// 8 2D sprites, 16 hi-res final pass, 32 hi-res present copy, 64 hybrid merge draw,
+// 128 compositor does not bind the 3D texture, 256 compositor uses a trivial shader.
+int GLSkip();
+
+// debug.litev.prof pass counters (any thread; logged by GLRenderer::VBlank every 120 frames)
+enum { GLStatComp, GLStatSprites, GLStatFinal, GLStat3D, GLStatFog, GLStatEdge, GLStatShadow, GLStatWBuf, GLStatN };
+void GLStatAdd(int i, int n = 1);
+void GLStatLog(int frames);
+
 }
 
 #endif // OPENGLSUPPORT_H

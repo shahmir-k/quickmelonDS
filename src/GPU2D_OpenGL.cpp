@@ -17,6 +17,8 @@
 */
 
 #include <assert.h>
+#include <vector>
+#include <algorithm>
 #include "GPU_OpenGL.h"
 #include "GPU2D_OpenGL.h"
 #include "GPU.h"
@@ -24,6 +26,20 @@
 
 namespace melonDS
 {
+
+// debug.litev.glcomp=0: the original compositor shader (default: 2DCompositorFastFS)
+// debug.litev.compcheck=1: also render the other one every 30th draw and log pixel diffs
+static int GLProp(const char* name, int def)
+{
+#ifdef __ANDROID__
+    char b[92] = {};
+    return __system_property_get(name, b) > 0 ? atoi(b) : def;
+#else
+    return def;
+#endif
+}
+static bool CompFast() { static const bool v = GLProp("debug.litev.glcomp", 1) != 0; return v; }
+static bool CompCheck() { static const bool v = GLProp("debug.litev.compcheck", 0) != 0; return v; }
 using Platform::Log;
 using Platform::LogLevel;
 
@@ -35,6 +51,10 @@ using Platform::LogLevel;
 #include "OpenGL_shaders/2DSpriteFS.h"
 #include "OpenGL_shaders/2DCompositorVS.h"
 #include "OpenGL_shaders/2DCompositorFS.h"
+#include "OpenGL_shaders/2DCompositorFastFS.h"
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 
 
@@ -78,11 +98,18 @@ bool GLRenderer2D::InitShaders()
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(CompositorShader,
-                                              k2DCompositorVS, k2DCompositorFS,
+                                              k2DCompositorVS, CompFast() ? k2DCompositorFastFS : k2DCompositorFS,
                                               "2DCompositorShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
+    CompositorRef = 0;
+    if (CompCheck() && !OpenGL::CompileVertexFragmentProgram(CompositorRef,
+                                              k2DCompositorVS, CompFast() ? k2DCompositorFS : k2DCompositorFastFS,
+                                              "2DCompositorRef",
+                                              {{"vPosition", 0}},
+                                              {{"oColor", 0}}))
+        CompositorRef = 0;
 
     // set up uniforms
 
@@ -127,32 +154,36 @@ bool GLRenderer2D::InitShaders()
     SpriteRenderTransULoc = glGetUniformLocation(SpriteShader, "uRenderTransparent");
 
 
-    glUseProgram(CompositorShader);
+    for (GLuint prog : {CompositorShader, CompositorRef})
+    {
+    if (!prog) continue;
+    glUseProgram(prog);
 
-    uniloc = glGetUniformLocation(CompositorShader, "BGLayerTex[0]");
+    uniloc = glGetUniformLocation(prog, "BGLayerTex[0]");
     glUniform1i(uniloc, 0);
-    uniloc = glGetUniformLocation(CompositorShader, "BGLayerTex[1]");
+    uniloc = glGetUniformLocation(prog, "BGLayerTex[1]");
     glUniform1i(uniloc, 1);
-    uniloc = glGetUniformLocation(CompositorShader, "BGLayerTex[2]");
+    uniloc = glGetUniformLocation(prog, "BGLayerTex[2]");
     glUniform1i(uniloc, 2);
-    uniloc = glGetUniformLocation(CompositorShader, "BGLayerTex[3]");
+    uniloc = glGetUniformLocation(prog, "BGLayerTex[3]");
     glUniform1i(uniloc, 3);
-    uniloc = glGetUniformLocation(CompositorShader, "OBJLayerTex");
+    uniloc = glGetUniformLocation(prog, "OBJLayerTex");
     glUniform1i(uniloc, 4);
-    uniloc = glGetUniformLocation(CompositorShader, "Capture128Tex");
+    uniloc = glGetUniformLocation(prog, "Capture128Tex");
     glUniform1i(uniloc, 5);
-    uniloc = glGetUniformLocation(CompositorShader, "Capture256Tex");
+    uniloc = glGetUniformLocation(prog, "Capture256Tex");
     glUniform1i(uniloc, 6);
-    uniloc = glGetUniformLocation(CompositorShader, "MosaicTex");
+    uniloc = glGetUniformLocation(prog, "MosaicTex");
     glUniform1i(uniloc, 7);
 
-    uniloc = glGetUniformBlockIndex(CompositorShader, "ubBGConfig");
-    glUniformBlockBinding(CompositorShader, uniloc, 20);
-    uniloc = glGetUniformBlockIndex(CompositorShader, "ubScanlineConfig");
-    glUniformBlockBinding(CompositorShader, uniloc, 22);
-    uniloc = glGetUniformBlockIndex(CompositorShader, "ubCompositorConfig");
-    glUniformBlockBinding(CompositorShader, uniloc, 23);
+    uniloc = glGetUniformBlockIndex(prog, "ubBGConfig");
+    glUniformBlockBinding(prog, uniloc, 20);
+    uniloc = glGetUniformBlockIndex(prog, "ubScanlineConfig");
+    glUniformBlockBinding(prog, uniloc, 22);
+    uniloc = glGetUniformBlockIndex(prog, "ubCompositorConfig");
+    glUniformBlockBinding(prog, uniloc, 23);
 
+    }
     CompositorScaleULoc = glGetUniformLocation(CompositorShader, "uScaleFactor");
 
     // generate mosaic lookup texture
@@ -187,6 +218,7 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     SpritePreShader = other.SpritePreShader;
     SpriteShader = other.SpriteShader;
     CompositorShader = other.CompositorShader;
+    CompositorRef = other.CompositorRef;
 
     LayerPreCurBGULoc = other.LayerPreCurBGULoc;
     SpriteRenderTransULoc = other.SpriteRenderTransULoc;
@@ -462,6 +494,11 @@ void GLRenderer2D::SetScaleFactor(int scale)
 
     glUseProgram(CompositorShader);
     glUniform1i(CompositorScaleULoc, ScaleFactor);
+    if (CompositorRef)
+    {
+        glUseProgram(CompositorRef);
+        glUniform1i(glGetUniformLocation(CompositorRef, "uScaleFactor"), ScaleFactor);
+    }
 
     glBindTexture(GL_TEXTURE_2D_ARRAY, OBJLayerTex);
     glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, ScreenW, ScreenH, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
@@ -1617,6 +1654,8 @@ void GLRenderer2D::DoRenderSprites(int line)
 {
     int ystart = LastSpriteLine;
     int yend = line;
+    OpenGL::GLStatAdd(OpenGL::GLStatSprites);
+    if (OpenGL::GLSkip() & 8) return;
 
     glUseProgram(SpriteShader);
 
@@ -1788,6 +1827,16 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
     }
 
     glUseProgram(CompositorShader);
+    if (OpenGL::GLSkip() & 256)
+    {
+        // diagnostic: trivial fragment shader (fill-rate floor of the compositor draw)
+        static GLuint triv = 0;
+        if (!triv)
+            OpenGL::CompileVertexFragmentProgram(triv, k2DCompositorVS,
+                "#version 140\nsmooth in vec4 fTexcoord;\nout vec4 oColor;\nvoid main() { oColor = vec4(fTexcoord.xy / 256.0, 0.5, 1.0); }\n",
+                "TrivComp", {{"vPosition", 0}}, {{"oColor", 0}});
+        glUseProgram(triv);
+    }
 
     glBindBufferBase(GL_UNIFORM_BUFFER, 20, LayerConfigUBO);
     glBindBufferBase(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO);
@@ -1805,7 +1854,7 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
     {
         glActiveTexture(GL_TEXTURE0 + i);
 
-        if ((i == 0) && (DispCnt & (1<<3)))
+        if ((i == 0) && (DispCnt & (1<<3)) && !(OpenGL::GLSkip() & 128))
             glBindTexture(GL_TEXTURE_2D, Parent.Get3DTex());
         else
             glBindTexture(GL_TEXTURE_2D, BGLayerTex[i]);
@@ -1829,9 +1878,55 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
 
     glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
     glBindVertexArray(Parent.RectVtxArray);
-    glDrawArrays(GL_TRIANGLES, 0, 2*3);
+    OpenGL::GLStatAdd(OpenGL::GLStatComp);
+    if (!(OpenGL::GLSkip() & 4)) glDrawArrays(GL_TRIANGLES, 0, 2*3);
+    if (CompositorRef && !(OpenGL::GLSkip() & 260)) CheckCompositor(ystart, yend);
 
     glDisable(GL_SCISSOR_TEST);
+}
+
+// debug.litev.compcheck: every 30th draw, render the reference compositor shader with the
+// same state into a scratch texture and compare the region with what was just drawn.
+void GLRenderer2D::CheckCompositor(int ystart, int yend)
+{
+    static int calls = 0, checks = 0;
+    static long px = 0, bad = 0, maxd = 0;
+    if (++calls % 30) return;
+    if (!CheckFB || CheckW != ScreenW)
+    {
+        if (!CheckFB) { glGenFramebuffers(1, &CheckFB); glGenTextures(1, &CheckTex); }
+        glBindTexture(GL_TEXTURE_2D, CheckTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CheckFB);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, CheckTex, 0);
+        CheckW = ScreenW;
+    }
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CheckFB);
+    glUseProgram(CompositorRef);
+    glEnable(GL_SCISSOR_TEST);
+    glDrawArrays(GL_TRIANGLES, 0, 2*3);
+    glDisable(GL_SCISSOR_TEST);
+    const int y0 = ystart * ScaleFactor, h = (yend - ystart) * ScaleFactor;
+    std::vector<u8> a((size_t)ScreenW * h * 4), r((size_t)ScreenW * h * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB);
+    glReadPixels(0, y0, ScreenW, h, GL_RGBA, GL_UNSIGNED_BYTE, a.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, CheckFB);
+    glReadPixels(0, y0, ScreenW, h, GL_RGBA, GL_UNSIGNED_BYTE, r.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+    glUseProgram(CompositorShader);
+    for (size_t i = 0; i < a.size(); i += 4)
+    {
+        int d = 0;
+        for (int c = 0; c < 3; c++) d = std::max(d, std::abs((int)a[i + c] - (int)r[i + c]));
+        if (d) { bad++; maxd = std::max<long>(maxd, d); }
+    }
+    px += a.size() / 4;
+    if (++checks % 20 == 0)
+    {
+        Platform::Log(Platform::Info, "LITEV_COMPCHECK %d checks: %ld px, %ld differ (max channel diff %ld)\n", checks, px, bad, maxd);
+        px = bad = maxd = 0;
+    }
 }
 
 void GLRenderer2D::DrawSprites(u32 line)

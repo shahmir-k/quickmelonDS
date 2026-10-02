@@ -7,6 +7,7 @@ set(OPENGL_SHADER_FILES
     2DSpriteFS.glsl
     2DCompositorVS.glsl
     2DCompositorFS.glsl
+    2DCompositorFastFS.glsl
 
     FinalPassVS.glsl
     FinalPassFS.glsl

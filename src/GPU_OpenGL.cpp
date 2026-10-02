@@ -86,6 +86,7 @@ void GLRenderer::BlitFront(int front, GLuint dstTex, int dstWidth, GLuint readFB
 {
     const int perScreenH = 192 * (dstWidth / 256 > 0 ? dstWidth / 256 : 1);
     const int gap = 2 * (dstWidth / 256 > 0 ? dstWidth / 256 : 1);
+    if (OpenGL::GLSkip() & 32) return;
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFB);
     glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, readFB);
@@ -743,7 +744,8 @@ void GLRenderer::RenderScreen(int ystart, int yend)
 
         glBindBuffer(GL_ARRAY_BUFFER, FPVertexBufferID);
         glBindVertexArray(FPVertexArrayID);
-        glDrawArrays(GL_TRIANGLES, 0, 2*3);
+        OpenGL::GLStatAdd(OpenGL::GLStatFinal);
+        if (!(OpenGL::GLSkip() & 16)) glDrawArrays(GL_TRIANGLES, 0, 2*3);
     }
 
     glDisable(GL_SCISSOR_TEST);
@@ -755,6 +757,18 @@ void GLRenderer::VBlank()
     Rend2D_B->VBlank();
 
     RenderScreen(LastLine, 192);
+    if (++StatFrames == 120)
+    {
+        StatFrames = 0;
+        static const bool prof = [] {
+#ifdef __ANDROID__
+            char b[92] = {}; return __system_property_get("debug.litev.prof", b) > 0 && atoi(b) != 0;
+#else
+            return false;
+#endif
+        }();
+        if (prof) OpenGL::GLStatLog(120);
+    }
 
     if (GPU.CaptureEnable)
         DoCapture(LastCapLine, 192);

@@ -73,6 +73,10 @@ private:
     u16* SpriteVtxData;
 
     GLuint CompositorShader;
+    GLuint CompositorRef = 0;   // debug.litev.compcheck reference program
+    GLuint CheckFB = 0, CheckTex = 0;
+    int CheckW = 0;
+    void CheckCompositor(int ystart, int yend);
     GLuint CompositorConfigUBO;
     GLint CompositorScaleULoc;
 
