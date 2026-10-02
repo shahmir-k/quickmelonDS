@@ -500,6 +500,7 @@ private:
     Platform::Thread* RenderThread;
     std::atomic_bool RenderThreadRunning;
     std::atomic_bool RenderThreadRendering;
+    int RendersInFlight = 0;   // emu thread: renders posted and not yet waited for
 
     // Used by the main thread to tell the render thread to start rendering a frame
     Platform::Semaphore* Sema_RenderStart;

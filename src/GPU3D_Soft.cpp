@@ -57,6 +57,7 @@ void SoftRenderer3D::StopRenderThread()
         Platform::Thread_Wait(RenderThread);
         Platform::Thread_Free(RenderThread);
         RenderThread = nullptr;
+        RendersInFlight = 0;
     }
 }
 
@@ -86,6 +87,7 @@ void SoftRenderer3D::SetupRenderThread()
         // "This is the signal you'll send when you're done with a frame."
         // "I'll listen for it when I need to show something to the frontend."
         Platform::Semaphore_Reset(Sema_RenderDone);
+        RendersInFlight = 0;
 
         // "This is the signal I'll send when I want you to start rendering."
         // "Don't do anything until you get the message."
@@ -106,6 +108,7 @@ void SoftRenderer3D::EnableRenderThread()
 {
     if (Threaded && Sema_RenderStart)
     {
+        RendersInFlight++;
         Platform::Semaphore_Post(Sema_RenderStart);
     }
 }
@@ -1766,7 +1769,10 @@ void SoftRenderer3D::FinishRendering()
             if (post > 0.0) LSP_ADD(EmuWindow, _t0 - post);
         }
 #endif
-        Platform::Semaphore_Wait(Sema_RenderDone);
+        // wait only for renders that were actually started (LITEV_SOFT3D_ASYNC skips some
+        // barriers, so a second wait for an already-consumed render would never return)
+        for (; RendersInFlight > 0; RendersInFlight--)
+            Platform::Semaphore_Wait(Sema_RenderDone);
         LSP_ADD(Emu3DBarrier, LSP_NOW() - _t0);
     }
 }
@@ -1809,6 +1815,7 @@ void SoftRenderer3D::RenderFrame()
         LitevSP::S.NPost.fetch_add(1, std::memory_order_relaxed);
 #endif
         // "Render thread, you're up! Get moving."
+        RendersInFlight++;
         Platform::Semaphore_Post(Sema_RenderStart);
     }
     else if (!FrameIdentical)
