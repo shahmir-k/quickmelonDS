@@ -478,6 +478,14 @@ if (LITEV_EVENT_SLICES)
     add_compile_definitions(LITEV_EVENT_SLICES=1)
 endif()
 
+# Scheduler drain: run consecutive DMA9 / GXFIFO-stall steps in one scheduler
+# iteration while ARM7 is halted (the skipped iteration tails are no-ops; see
+# NDS::SchedDrainContinue). Guest- and cycle-identical. Needs LITEV_EVENT_SLICES.
+option(LITEV_SCHED_DRAIN "Drain DMA9/GXFIFO-stall steps in one scheduler iteration while ARM7 is halted (exact)" OFF)
+if (LITEV_SCHED_DRAIN)
+    add_compile_definitions(LITEV_SCHED_DRAIN=1)
+endif()
+
 # Milestone 3 (M3): tiered memory fast paths. AArch64-only (the A64 JIT emits the
 # guarded raw accesses); the x64 JIT keeps the unmodified upstream helper paths.
 # These claim ZERO semantic change: every fast path adds EXACTLY the cycles the

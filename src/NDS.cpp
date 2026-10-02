@@ -928,6 +928,34 @@ u64 NDS::NextTimerDeadline()
 }
 #endif
 
+#if defined(LITEV_SCHED_DRAIN)
+// May the scheduler loop skip straight to the next ARM9-side step (DMA9 burst or
+// GXFIFO-stall advance) instead of finishing this iteration? Exact (guest- and
+// cycle-identical) when the skipped tail would change nothing:
+// - RunSystem(t): t < the slice target, and every event is >= the slice target
+//   (NextTarget bound it; an ARM9-side ScheduleEvent lowers ARM9Target through
+//   Reschedule), so no event fires; it would only set SysTimestamp, which
+//   nothing reads mid-frame. The next NextTarget() would return the same target.
+// - ARM7 catch-up: ARM7 is halted (Halted == 1) with no pending IRQ, no DMA7, so
+//   Execute would only set ARM7Timestamp = target; doing it once at the end gives
+//   the same final value. A halted ARM7 reads and writes nothing, so it cannot
+//   observe the ARM9-side work it now runs behind. Its wake-up sources are events
+//   (none fire), ARM7 timers (EVENT_SLICES bounds the slice by the next timer
+//   overflow) and ARM9 IPC/IO writes (HaltInterrupted is re-checked every step).
+// - RunTimers(1) is linear in the elapsed cycles and cannot overflow before the
+//   slice target, so one call at the end equals the skipped calls.
+#if !defined(LITEV_EVENT_SLICES)
+#error "LITEV_SCHED_DRAIN needs LITEV_EVENT_SLICES (timer-bounded slices)"
+#endif
+bool NDS::SchedDrainContinue()
+{
+    return (CPUStop & (CPUStop_GXStall|CPUStop_DMA9))
+        && !(CPUStop & (CPUStop_DMA7|CPUStop_Sleep))
+        && (ARM9Timestamp >> ARM9ClockShift) < (ARM9Target >> ARM9ClockShift)
+        && Running && ARM7.Halted == 1 && !HaltInterrupted(1);
+}
+#endif
+
 void NDS::RunSystem(u64 timestamp)
 {
     SysTimestamp = timestamp;
@@ -1083,6 +1111,12 @@ u32 NDS::RunFrame()
                 ARM9Target = target << ARM9ClockShift;
                 CurCPU = 0;
 
+#if defined(LITEV_SCHED_DRAIN)
+                // Drain the DMA9 <-> GXFIFO-stall ping-pong in one iteration while
+                // the iterations it replaces would be no-ops apart from the ARM9
+                // side: see SchedDrainContinue().
+                for (;;)
+#endif
                 {
                     if (CPUStop & CPUStop_GXStall)
                     {
@@ -1115,12 +1149,22 @@ u32 NDS::RunFrame()
                     }
 
                     RunTimers(0);
+#if defined(LITEV_SCHED_DRAIN)
+                    {
+                        LITE_PROFILE_SCOPE(_gpu3dtimer, LiteProfile::g_Frame.GPU3DNs);
+                        GPU.GPU3D.Run();
+                    }
+                    if (!SchedDrainContinue()) break;
+                    LITE_PROFILE_ADD(LiteProfile::g_Frame.SchedulerIterations);
+#endif
                 }
 
+#if !defined(LITEV_SCHED_DRAIN)
                 {
                     LITE_PROFILE_SCOPE(_gpu3dtimer, LiteProfile::g_Frame.GPU3DNs);
                     GPU.GPU3D.Run();
                 }
+#endif
 
                 target = ARM9Timestamp >> ARM9ClockShift;
                 CurCPU = 1;

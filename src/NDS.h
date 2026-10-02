@@ -551,6 +551,9 @@ protected:
     u64 LastSysClockCycles;
     u64 FrameStartTimestamp;
     u64 NextTarget();
+#if defined(LITEV_SCHED_DRAIN)
+    bool SchedDrainContinue();
+#endif
 #if defined(LITEV_EVENT_SLICES)
     // Unit 5: soonest cycle-clocked timer overflow (SysTimestamp domain), or
     // UINT64_MAX if no timer is running. Bounds the uncapped event-true slice so a
