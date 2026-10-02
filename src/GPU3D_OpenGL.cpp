@@ -809,6 +809,92 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
     NumEdgeIndices = eidx - EdgeIndicesOffset;
 }
 
+// ---- redundant GL state filter (SetupPolygonTexture .. RenderSceneChunk) ----
+// The scene issues ~300 draws per frame, each preceded by depth/stencil/mask/texture state
+// calls that are mostly unchanged; on Mali most of the GL thread's CPU time is driver work.
+// Skip calls that would not change the state. Reset at the start of RenderSceneChunk
+// (other code on the same context may have changed it).
+namespace
+{
+struct GLStateCache
+{
+    GLenum DepthFunc; GLenum StencilFunc; GLint StencilRef; GLuint StencilFuncMask;
+    GLenum SFail, DpFail, DpPass; GLuint StencilMask; GLboolean DepthMask;
+    GLboolean ColorMask[2][4]; GLenum ActiveTex; GLuint Tex0; GLuint Sampler0;
+    bool Valid;
+};
+GLStateCache SC {};
+inline void SC_DepthFunc(GLenum f) { if (!SC.Valid || SC.DepthFunc != f) { SC.DepthFunc = f; glDepthFunc(f); } }
+inline void SC_StencilFunc(GLenum f, GLint r, GLuint m)
+{
+    if (!SC.Valid || SC.StencilFunc != f || SC.StencilRef != r || SC.StencilFuncMask != m)
+    { SC.StencilFunc = f; SC.StencilRef = r; SC.StencilFuncMask = m; glStencilFunc(f, r, m); }
+}
+inline void SC_StencilOp(GLenum a, GLenum b, GLenum c)
+{
+    if (!SC.Valid || SC.SFail != a || SC.DpFail != b || SC.DpPass != c)
+    { SC.SFail = a; SC.DpFail = b; SC.DpPass = c; glStencilOp(a, b, c); }
+}
+inline void SC_StencilMask(GLuint m) { if (!SC.Valid || SC.StencilMask != m) { SC.StencilMask = m; glStencilMask(m); } }
+inline void SC_DepthMask(GLboolean m) { if (!SC.Valid || SC.DepthMask != m) { SC.DepthMask = m; glDepthMask(m); } }
+inline void SC_ColorMaski(GLuint i, GLboolean r, GLboolean g, GLboolean b, GLboolean a)
+{
+    GLboolean* c = SC.ColorMask[i & 1];
+    if (!SC.Valid || i > 1 || c[0] != r || c[1] != g || c[2] != b || c[3] != a)
+    { c[0] = r; c[1] = g; c[2] = b; c[3] = a; glColorMaski(i, r, g, b, a); }
+}
+inline void SC_ActiveTexture(GLenum t) { if (!SC.Valid || SC.ActiveTex != t) { SC.ActiveTex = t; glActiveTexture(t); } }
+inline void SC_BindTexture(GLenum target, GLuint t)
+{
+    if (SC.Valid && SC.ActiveTex == GL_TEXTURE0 && target == GL_TEXTURE_2D_ARRAY)
+    { if (SC.Tex0 == t) return; SC.Tex0 = t; }
+    else if (SC.ActiveTex == GL_TEXTURE0) SC.Tex0 = ~0u;
+    glBindTexture(target, t);
+}
+inline void SC_BindSampler(GLuint unit, GLuint s)
+{
+    if (unit == 0) { if (SC.Valid && SC.Sampler0 == s) return; SC.Sampler0 = s; }
+    glBindSampler(unit, s);
+}
+inline void SC_Reset()
+{
+    // impossible values: the first call of each kind always goes through
+    SC.DepthFunc = SC.StencilFunc = SC.SFail = SC.DpFail = SC.DpPass = SC.ActiveTex = ~0u;
+    SC.StencilRef = -1; SC.StencilFuncMask = SC.StencilMask = ~0u - 1;
+    SC.DepthMask = 2;
+    for (auto& m : SC.ColorMask) for (auto& c : m) c = 2;
+    SC.Tex0 = SC.Sampler0 = ~0u;
+    SC.Valid = true;
+}
+}
+#pragma push_macro("glDepthFunc")
+#undef glDepthFunc
+#define glDepthFunc SC_DepthFunc
+#pragma push_macro("glStencilFunc")
+#undef glStencilFunc
+#define glStencilFunc SC_StencilFunc
+#pragma push_macro("glStencilOp")
+#undef glStencilOp
+#define glStencilOp SC_StencilOp
+#pragma push_macro("glStencilMask")
+#undef glStencilMask
+#define glStencilMask SC_StencilMask
+#pragma push_macro("glDepthMask")
+#undef glDepthMask
+#define glDepthMask SC_DepthMask
+#pragma push_macro("glColorMaski")
+#undef glColorMaski
+#define glColorMaski SC_ColorMaski
+#pragma push_macro("glActiveTexture")
+#undef glActiveTexture
+#define glActiveTexture SC_ActiveTexture
+#pragma push_macro("glBindTexture")
+#undef glBindTexture
+#define glBindTexture SC_BindTexture
+#pragma push_macro("glBindSampler")
+#undef glBindSampler
+#define glBindSampler SC_BindSampler
+
 void GLRenderer3D::SetupPolygonTexture(const RendererPolygon* poly) const
 {
     bool iscap = (poly->TexID == (GLuint)-1 || poly->TexID == (GLuint)-2);
@@ -843,6 +929,7 @@ int GLRenderer3D::RenderSinglePolygon(int i) const
 
     SetupPolygonTexture(rp);
     glDrawElements(rp->PrimType, rp->NumIndices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2));
+    StatDraws++;
 
     return 1;
 }
@@ -871,6 +958,7 @@ int GLRenderer3D::RenderPolygonBatch(int i) const
 
     SetupPolygonTexture(rp);
     glDrawElements(primtype, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2));
+    StatDraws++;
     return numpolys;
 }
 
@@ -901,6 +989,7 @@ int GLRenderer3D::RenderPolygonEdgeBatch(int i) const
 
 void GLRenderer3D::RenderSceneChunk(int y, int h)
 {
+    SC_Reset();
     bool flags = S.RenderPolygonRAM[0]->WBuffer;
     UseRenderShader(flags);
 
@@ -1301,6 +1390,25 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
         }
     }
 }
+#undef glDepthFunc
+#pragma pop_macro("glDepthFunc")
+#undef glStencilFunc
+#pragma pop_macro("glStencilFunc")
+#undef glStencilOp
+#pragma pop_macro("glStencilOp")
+#undef glStencilMask
+#pragma pop_macro("glStencilMask")
+#undef glDepthMask
+#pragma pop_macro("glDepthMask")
+#undef glColorMaski
+#pragma pop_macro("glColorMaski")
+#undef glActiveTexture
+#pragma pop_macro("glActiveTexture")
+#undef glBindTexture
+#pragma pop_macro("glBindTexture")
+#undef glBindSampler
+#pragma pop_macro("glBindSampler")
+// ---- end of the state filter ----
 
 
 void GLRenderer3D::RenderFrame()
@@ -1552,6 +1660,7 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
         }
         NumFinalPolys = npolys;
         NumOpaqueFinalPolys = firsttrans;
+        StatPolys += npolys;
 
         BuildPolygons(&PolygonList[0], npolys, captureinfo);
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);

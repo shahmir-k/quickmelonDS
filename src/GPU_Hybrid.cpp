@@ -32,6 +32,8 @@
 #include <EGL/egl.h>
 #include <sched.h>
 #include <sys/system_properties.h>
+#include <sys/resource.h>
+#include <pthread.h>
 #endif
 
 namespace melonDS
@@ -208,6 +210,10 @@ private:
             cpu_set_t set; CPU_ZERO(&set);
             CPU_SET(0, &set); CPU_SET(1, &set); CPU_SET(2, &set);
             sched_setaffinity(0, sizeof(set), &set);
+            // the emu thread waits for this job when it falls a frame behind: let it win
+            // cores 0-2 against the 2D thread and the app's background threads
+            setpriority(PRIO_PROCESS, 0, -10);
+            pthread_setname_np(pthread_self(), "hyb-gl3d");
             {
                 std::lock_guard<std::mutex> l(M);
                 ok = cur; started = true;
@@ -602,6 +608,10 @@ void HybridRenderer::Merge(GLuint fbo, int single, int bottomY)
         if (t->JobN)
             Platform::Log(Platform::Info, "LITEV_HYB 3d-job: n=%d queued=%.2f wall=%.2f cpu=%.2f incl-flush=%.2f | emu: prev-job wait=%.2f prepare=%.2f kick-gap=%.2f job-end-from-kick=%.2f ms/job\n",
                           t->JobN, t->JobQueued / t->JobN, t->JobWall / t->JobN, t->JobCpu / t->JobN, t->JobTail / t->JobN, t->PrepWait / t->JobN, t->PrepMs / t->JobN, t->KickGap / t->JobN, t->JobEndFromKick / t->JobN);
+        if (t->JobN)
+            Platform::Log(Platform::Info, "LITEV_HYB 3d-draws: %.1f draws %.1f polys per job\n",
+                          (double)GL3D()->StatDraws / t->JobN, (double)GL3D()->StatPolys / t->JobN);
+        GL3D()->StatDraws = GL3D()->StatPolys = 0;
         t->JobQueued = t->JobWall = t->JobCpu = t->PrepWait = t->PrepMs = t->JobTail = t->KickGap = t->JobEndFromKick = 0; t->JobN = 0;
     }
 }

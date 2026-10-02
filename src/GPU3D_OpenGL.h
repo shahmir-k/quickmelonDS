@@ -60,6 +60,7 @@ public:
     // next of n colour textures, so a frame's 3D stays readable while later frames
     // render. n = 1 (the default) is the single buffer GLRenderer uses.
     static constexpr int MaxColorRing = 6;
+    mutable u32 StatDraws = 0, StatPolys = 0;   // diagnostic counters (LITEV_HYB log)
     void SetColorRing(int n) noexcept;
     [[nodiscard]] int GetCurColor() const noexcept { return CurColor; }
     [[nodiscard]] GLuint GetColorTex(int i) const noexcept { return ColorBufferTex[i]; }
