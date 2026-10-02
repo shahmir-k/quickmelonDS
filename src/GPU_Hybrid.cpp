@@ -304,6 +304,7 @@ HybridRenderer::~HybridRenderer()
     glDeleteBuffers(3, DescPBO);
     glDeleteTextures(2, OutTex);
     glDeleteFramebuffers(2, OutFB);
+    if (PresentFB) glDeleteFramebuffers(1, &PresentFB);
     glDeleteFramebuffers(1, &ReadFB);
     glDeleteFramebuffers(1, &DownFB);
     glDeleteTextures(1, &DownTex);
@@ -326,6 +327,8 @@ bool HybridRenderer::Init()
     glUniform1i(glGetUniformLocation(MergeShader, "DescTex"), 0);
     glUniform1i(glGetUniformLocation(MergeShader, "Tex3D"), 1);
     ScaleULoc = glGetUniformLocation(MergeShader, "uScale");
+    SingleULoc = glGetUniformLocation(MergeShader, "uSingle");
+    OriginULoc = glGetUniformLocation(MergeShader, "uOrigin");
 
     glGenVertexArrays(1, &EmptyVAO);
 
@@ -493,6 +496,32 @@ void HybridRenderer::HybridReadback3D(u32* dst)
 // merge them with the 3D that frame pairs with, at Nx, into a 2-layer array texture.
 bool HybridRenderer::GetFramebuffers(void** top, void** bottom)
 {
+    // merge into the 2-layer output array (the app blits it into its frame texture)
+    OutIdx ^= 1;
+    Merge(OutFB[OutIdx], -1, 0);
+    *top = &OutTex[OutIdx];
+    *bottom = nullptr;
+    return false;
+}
+
+// Merge straight into the app's frame texture: top screen at row 0, bottom screen at row
+// bottomY (both 256N x 192N), saving the blit of the output array.
+void HybridRenderer::PresentInto(GLuint dstTex, int bottomY)
+{
+    if (!PresentFB) glGenFramebuffers(1, &PresentFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, PresentFB);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dstTex, 0);
+    const GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_NONE};
+    glDrawBuffers(2, bufs);
+    Merge(PresentFB, 0, bottomY);
+}
+
+// Emu thread, after RunFrame: upload the last completed 2D frame's descriptors and
+// merge them with the 3D that frame pairs with, at Nx.
+//   single < 0: one draw, both screens into layers 0/1 of fbo's colour attachments 0/1
+//   single = 0: fbo has one target; top screen at row 0, bottom screen at row bottomY
+void HybridRenderer::Merge(GLuint fbo, int single, int bottomY)
+{
     const double t0 = HybNowMs();
     const int fb = AsyncPresentBuf;
 
@@ -511,9 +540,7 @@ bool HybridRenderer::GetFramebuffers(void** top, void** bottom)
     }
     ProfUpload += HybNowMs() - t0;
 
-    OutIdx ^= 1;
-    glBindFramebuffer(GL_FRAMEBUFFER, OutFB[OutIdx]);
-    glViewport(0, 0, 256 * Scale, 192 * Scale);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -532,14 +559,28 @@ bool HybridRenderer::GetFramebuffers(void** top, void** bottom)
     glBindTexture(GL_TEXTURE_2D, GL3D()->GetColorTex(HybTag[fb]));
     glBindVertexArray(EmptyVAO);
     const double td = HybNowMs();
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (single < 0)
+    {
+        glUniform1i(SingleULoc, -1);
+        glUniform2i(OriginULoc, 0, 0);
+        glViewport(0, 0, 256 * Scale, 192 * Scale);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+    else
+    {
+        for (int sc = 0; sc < 2; sc++)
+        {
+            const int y = sc ? bottomY : 0;
+            glUniform1i(SingleULoc, sc);
+            glUniform2i(OriginULoc, 0, y);
+            glViewport(0, y, 256 * Scale, 192 * Scale);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+    }
     ProfSync += td - ts; ProfDraw += HybNowMs() - td;
 
     glActiveTexture(GL_TEXTURE0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    *top = &OutTex[OutIdx];
-    *bottom = nullptr;
 
     ProfMerge += HybNowMs() - t0;
     if (++ProfFrames == 60)
@@ -553,7 +594,7 @@ bool HybridRenderer::GetFramebuffers(void** top, void** bottom)
             return getenv("LITEV_PROF") != nullptr;
 #endif
         }();
-        if (!on) { ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0; return false; }
+        if (!on) { ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0; return; }
         Platform::Log(Platform::Info, "LITEV_HYB 60f: gl3d=%.2f wait3d=%.2f merge=%.2f (upload=%.2f sync=%.2f draw=%.2f) readback=%.2f ms/frame (emu thread, scale %d)\n",
                       ProfGL3D / 60, ProfWait / 60, ProfMerge / 60, ProfUpload / 60, ProfSync / 60, ProfDraw / 60, ProfReadback / 60, Scale);
         ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0;
@@ -562,9 +603,7 @@ bool HybridRenderer::GetFramebuffers(void** top, void** bottom)
             Platform::Log(Platform::Info, "LITEV_HYB 3d-job: n=%d queued=%.2f wall=%.2f cpu=%.2f incl-flush=%.2f | emu: prev-job wait=%.2f prepare=%.2f kick-gap=%.2f job-end-from-kick=%.2f ms/job\n",
                           t->JobN, t->JobQueued / t->JobN, t->JobWall / t->JobN, t->JobCpu / t->JobN, t->JobTail / t->JobN, t->PrepWait / t->JobN, t->PrepMs / t->JobN, t->KickGap / t->JobN, t->JobEndFromKick / t->JobN);
         t->JobQueued = t->JobWall = t->JobCpu = t->PrepWait = t->PrepMs = t->JobTail = t->KickGap = t->JobEndFromKick = 0; t->JobN = 0;
-        ProfFrames = 0;
     }
-    return false;
 }
 
 }

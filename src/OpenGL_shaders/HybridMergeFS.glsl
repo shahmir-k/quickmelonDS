@@ -14,6 +14,8 @@
 uniform usampler2DArray DescTex;   // 513x192x2 RGBA8UI: 2 planes x 256 + control column
 uniform sampler2D Tex3D;           // Nx 3D colour buffer
 uniform int uScale;
+uniform int uSingle;     // -1: both screens (MRT); 0/1: only that screen, to output 0
+uniform ivec2 uOrigin;   // viewport origin of this draw in the target
 
 FRAGLOC(0) out vec4 oTopColor;
 FRAGLOC(1) out vec4 oBottomColor;
@@ -87,7 +89,15 @@ vec4 Screen(int layer, ivec2 P)
 
 void main()
 {
-    ivec2 P = ivec2(gl_FragCoord.xy);
-    oTopColor = Screen(0, P);
-    oBottomColor = Screen(1, P);
+    ivec2 P = ivec2(gl_FragCoord.xy) - uOrigin;
+    if (uSingle < 0)
+    {
+        oTopColor = Screen(0, P);
+        oBottomColor = Screen(1, P);
+    }
+    else
+    {
+        oTopColor = Screen(uSingle, P);
+        oBottomColor = vec4(0.0);
+    }
 }

@@ -52,6 +52,9 @@ public:
 
     bool GetFramebuffers(void** top, void** bottom) override;
     void Start3DRendering() override;
+    // Present directly into the app's frame texture (instead of GetFramebuffers + a blit):
+    // top screen at row 0, bottom screen at row bottomY.
+    void PresentInto(GLuint dstTex, int bottomY);
     void Finish3DRendering() override;
     void Restart3DRendering() override;
 
@@ -70,7 +73,9 @@ private:
 
     int Scale = 0;
     GLuint MergeShader = 0;
-    GLint ScaleULoc = -1;
+    GLint ScaleULoc = -1, SingleULoc = -1, OriginULoc = -1;
+    GLuint PresentFB = 0;
+    void Merge(GLuint fbo, int single, int bottomY);
     GLuint EmptyVAO = 0;
     // 513x192x2 RGBA8UI + staging buffer per framebuffer slot (a slot is reused 3 frames
     // later, so an upload never targets a texture an earlier merge may still be reading)
