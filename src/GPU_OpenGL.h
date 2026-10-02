@@ -28,6 +28,8 @@
 namespace melonDS
 {
 
+class GLThread3D;
+
 class GLRenderer : public Renderer
 {
 public:
@@ -55,7 +57,16 @@ public:
     bool NeedsShaderCompile() override;
     void ShaderCompileStep(int& current, int& count) override;
 
+    void Start3DRendering() override;
+
 private:
+    // 3D on its own GL thread (debug.litev.glhithread=0: inline). Get3DTex() returns the
+    // 3D output the current frame shows, waiting (GPU-side) for its render on first use.
+    GLThread3D* Thread3D = nullptr;
+    bool Synced3D = false;
+    int Prev3DColor = 0;
+    GLuint Get3DTex();
+
     friend class GLRenderer2D;
     friend class GLRenderer3D;
     friend class ComputeRenderer3D;

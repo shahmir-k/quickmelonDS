@@ -192,6 +192,7 @@ private:
         u16 RenderToonTable[32], RenderEdgeTable[8];
         u8 RenderFogDensityTable[34];
         u32 RenderNumPolygons;
+        int CaptureInfo[16];   // GLRenderer's captures that textures read (-1: plain VRAM)
         Polygon* RenderPolygonRAM[2048];
     } S {}, Next[2] {};
     GLuint DepthBufferTex {}, AttrBufferTex {};

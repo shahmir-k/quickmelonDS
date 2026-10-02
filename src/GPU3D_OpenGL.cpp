@@ -1477,6 +1477,11 @@ void GLRenderer3D::PrepareFrame(int slot, const std::function<void()>& beforeVRA
     memcpy(n.RenderEdgeTable, GPU3D.RenderEdgeTable, sizeof(n.RenderEdgeTable));
     memcpy(n.RenderFogDensityTable, GPU3D.RenderFogDensityTable, sizeof(n.RenderFogDensityTable));
     n.RenderNumPolygons = GPU3D.RenderNumPolygons;
+    // (only GLRenderer keeps captures as GL textures; without it they are plain VRAM)
+    if (Parent)
+        GPU.GetCaptureInfo_Texture(n.CaptureInfo);
+    else
+        for (int i = 0; i < 16; i++) n.CaptureInfo[i] = -1;
     memcpy(n.RenderPolygonRAM, GPU3D.RenderPolygonRAM.data(), n.RenderNumPolygons * sizeof(Polygon*));
 
     // decided here (not on the render thread) so the caller knows at once which colour
@@ -1498,11 +1503,7 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
 
     // figure out which chunks of texture memory contain display captures
     // (only GLRenderer keeps captures as GL textures; without it they are plain VRAM)
-    int captureinfo[16];
-    if (Parent)
-        GPU.GetCaptureInfo_Texture(captureinfo);
-    else
-        for (int i = 0; i < 16; i++) captureinfo[i] = -1;
+    int* captureinfo = S.CaptureInfo;   // snapshotted in PrepareFrame
 
     if (ColorRing > 1)
     {

@@ -1806,7 +1806,7 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
         glActiveTexture(GL_TEXTURE0 + i);
 
         if ((i == 0) && (DispCnt & (1<<3)))
-            glBindTexture(GL_TEXTURE_2D, Parent.OutputTex3D);
+            glBindTexture(GL_TEXTURE_2D, Parent.Get3DTex());
         else
             glBindTexture(GL_TEXTURE_2D, BGLayerTex[i]);
 

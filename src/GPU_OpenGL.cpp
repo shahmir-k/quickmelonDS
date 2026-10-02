@@ -19,6 +19,10 @@
 #include <string.h>
 #include "NDS.h"
 #include "GPU_OpenGL.h"
+#include "GLThread3D.h"
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 namespace melonDS
 {
@@ -47,9 +51,51 @@ GLRenderer::GLRenderer(melonDS::NDS& nds, bool compute)
     if (IsCompute)
         Rend3D = std::make_unique<ComputeRenderer3D>(GPU.GPU3D, *this);
     else
-        Rend3D = std::make_unique<GLRenderer3D>(GPU.GPU3D, this);
+    {
+#ifdef __ANDROID__
+        char b[92] = {};
+        const bool threaded = !(__system_property_get("debug.litev.glhithread", b) > 0 && atoi(b) == 0);
+#else
+        const bool threaded = false;
+#endif
+        if (threaded)
+        {
+            auto t = std::make_unique<GLThread3D>(GPU.GPU3D, this, "glhi-gl3d");
+            if (t->Threaded) Thread3D = t.get();
+            Rend3D = std::move(t);
+        }
+        else
+            Rend3D = std::make_unique<GLRenderer3D>(GPU.GPU3D, this);
+    }
 
     ScaleFactor = 0;
+}
+
+void GLRenderer::Start3DRendering()
+{
+    if (Thread3D) Prev3DColor = Thread3D->GL->GetCurColor();
+    Rend3D->RenderFrame();
+    Synced3D = false;
+}
+
+GLuint GLRenderer::Get3DTex()
+{
+    if (Thread3D && !Synced3D)
+    {
+        // Default: show the 3D one frame late (the render kicked a frame earlier), so the
+        // emu thread never waits for the GL thread to finish the newest one. Render-only
+        // approximation. debug.litev.glhilate=0: the newest render (waits for it).
+        static const bool late = [] {
+#ifdef __ANDROID__
+            char b[92] = {}; return !(__system_property_get("debug.litev.glhilate", b) > 0 && atoi(b) == 0);
+#else
+            return true;
+#endif
+        }();
+        OutputTex3D = Thread3D->SyncColor(late ? Prev3DColor : Thread3D->GL->GetCurColor());
+        Synced3D = true;
+    }
+    return OutputTex3D;
 }
 
 #define glTexParams(target, wrap) \
@@ -237,6 +283,10 @@ bool GLRenderer::Init()
     if (!Rend2D_A->Init()) return false;
     if (!Rend2D_B->Init()) return false;
     if (!Rend3D->Init()) return false;
+    if (Thread3D)
+        // a colour ring, so the frame shown keeps its 3D while the next one renders;
+        // glFinish: the storage must be complete before this context uses it
+        Thread3D->Run([this] { Thread3D->GL->SetColorRing(4); glFinish(); }, true);
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return true;
@@ -336,8 +386,17 @@ void GLRenderer::SetRenderSettings(RendererSettings& settings)
     }
     else
     {
-        auto rend3d = dynamic_cast<GLRenderer3D *>(Rend3D.get());
-        rend3d->SetRenderSettings(settings.ScaleFactor, settings.BetterPolygons);
+        if (Thread3D)
+        {
+            const int scale = settings.ScaleFactor; const bool better = settings.BetterPolygons;
+            Thread3D->Run([this, scale, better] { Thread3D->GL->SetRenderSettings(scale, better); glFinish(); }, true);
+            Synced3D = false;
+        }
+        else
+        {
+            auto rend3d = dynamic_cast<GLRenderer3D *>(Rend3D.get());
+            rend3d->SetRenderSettings(settings.ScaleFactor, settings.BetterPolygons);
+        }
     }
 }
 
@@ -672,7 +731,7 @@ void GLRenderer::DoCapture(int ystart, int yend)
 
     GLuint inputA;
     if (srcA)
-        inputA = OutputTex3D;
+        inputA = Get3DTex();
     else
         inputA = OutputTex2D[0];
 
