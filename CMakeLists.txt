@@ -562,6 +562,11 @@ if (LITEV_JIT_LDMSTM)
     endif()
 endif()
 
+option(LITEV_JIT_LDM_FASTMEM "Fault-backed fastmem path for LDM/POP block loads, not only stores (AArch64)" OFF)
+if (LITEV_JIT_LDM_FASTMEM)
+    add_compile_definitions(LITEV_JIT_LDM_FASTMEM=1)
+endif()
+
 # Hoist the per-element region dispatch out of SlowBlockTransfer9 for blocks that lie
 # wholly inside one no-side-effect TCM (ITCM/DTCM) — classify once and loop directly
 # instead of re-running the ITCM/DTCM/region classification per word (SlowBlockTransfer9

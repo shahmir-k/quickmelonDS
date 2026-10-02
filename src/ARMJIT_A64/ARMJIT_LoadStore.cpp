@@ -556,8 +556,18 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         ? NDS.JIT.Memory.ClassifyAddress9(CurInstr.DataRegion)
         : NDS.JIT.Memory.ClassifyAddress7(CurInstr.DataRegion);
 
+#ifdef LITEV_JIT_LDM_FASTMEM
+    // Loads take the fault-backed fastmem path too (LDP straight into the guest registers,
+    // the helper call out of line in the far region), not only stores. A fault mid-transfer
+    // re-runs the whole transfer through the slow path from W0 (the start address, never a
+    // loaded register), which rewrites every destination, so a partially loaded block leaves
+    // no trace. Cycles were added above, identically for both paths.
+    bool compileFastPath = NDS.JIT.FastMemoryEnabled()
+        && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+#else
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
         && store && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+#endif
 
     {
         s32 offset = decrement
