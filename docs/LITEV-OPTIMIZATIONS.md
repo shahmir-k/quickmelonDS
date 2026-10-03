@@ -86,6 +86,8 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 | sched: compute the sqrt result on read, from the FPU (LITEV_LAZY_SQRT) | `LITEV_LAZY_SQRT` | A (vs INSTANT_DIVSQRT) |
 | geom: skip the copy passes of clip planes no vertex crosses (LITEV_GEOM_CLIP_PLANESKIP) | `LITEV_GEOM_CLIP_PLANESKIP` | A |
 | hybrid: stage texture VRAM updates for the GL 3D thread (LITEV_HYB_TEXSTAGE) | `LITEV_HYB_TEXSTAGE` | A (renderer-side only) |
+| gx: inline the command FIFO pop, refill out of line (LITEV_GXFIFO_READ_INLINE) | `LITEV_GXFIFO_READ_INLINE` | A |
+| dma: CheckDMAs visits only channels armed for that start mode (LITEV_DMA_ARMED_MASK) | `LITEV_DMA_ARMED_MASK` | A |
 | build: add LITEV_AUTO_FRAMESKIP option (adaptive real-time frameskip) | `LITEV_AUTO_FRAMESKIP` | A (UX feature; see section) |
 
 ## Performance options
@@ -787,6 +789,30 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 **Measured.** App, uncapped, frameskip prefs off, ABBA against the build without it. PW overworld slot 2, hybrid 3x: 70.4/71.4/71.3/71.1 to 78.9/78.2/78.8/78.6 fps (+10.6 %). runFrame wall 13.6 to 12.25 ms. Emu run-queue wait 83 to 59 ms/s. Shrek slot 2, hybrid 3x: 84.6/83.9 to 86.5/84.2 fps (+1.3 %, within the leg spread; Shrek rarely writes texture VRAM mid-frame) (2026-10-03).
 
 **Option.** LITEV_HYB_TEXSTAGE (default OFF; only the threaded hybrid without a parent GLRenderer turns it on; 1.9 MB; enabled in the app's shipping build)
+
+### gx: inline the command FIFO pop, refill out of line (LITEV_GXFIFO_READ_INLINE)
+
+**What.** `CmdFIFORead` becomes an always-inline pop in GPU3D.h. The PIPE refill (FIFO entries into the PIPE, stall-queue drain, FIFO DMA and IRQ checks) becomes a noinline `CmdFIFORefill`, called under the same condition (PIPE at 2 or fewer entries).
+
+**Why it works.** There is one caller (ExecuteCommand), one call per command. In the PW overworld the samples sat on the prologue and the return: 1.5 of the function's 2.5 % of the emu thread.
+
+**Exactness.** A. Same code in the same order; the guest trace is identical.
+
+**Measured.** Device headless emu thread, 500 f, n = 3. PW overworld: cycles -1.06 %, instructions -0.99 %. Shrek slot 2: cycles -0.75 %, instructions -0.99 % (2026-10-03).
+
+**Option.** LITEV_GXFIFO_READ_INLINE (default OFF; needs LITEV_GXFIFO_UNIFIED; enabled in the app's shipping build)
+
+### dma: CheckDMAs visits only channels armed for that start mode (LITEV_DMA_ARMED_MASK)
+
+**What.** `NDS::DMAArmed[cpu][StartMode & 7]` has bit n set while channel n is enabled with that start mode. `DMA::SyncArmed` updates it wherever Cnt bit 31 or StartMode changes: Reset, savestate load, WriteCnt (before its immediate Start / CheckFIFODMA, and at the end), the end of Run9/Run7, and StopIfNeeded. `CheckDMAs` returns at once on an empty mask and otherwise calls `StartIfNeeded`, which keeps its exact test, for the masked channels in the original order.
+
+**Why it works.** The GX FIFO refill calls `CheckDMAs(0, 7)` about every other command while the FIFO is below half. Each call loaded StartMode and Cnt from four DMA channel objects. PW overworld: `CheckDMAs` was 1.7 % of the emu thread, 1.0 % of it on those loads.
+
+**Exactness.** A. The mask may only over-approximate. The guest trace is identical. A mutation that drops the early SyncArmed in WriteCnt mismatches at frame 0-1 (Shrek, race-fresh).
+
+**Measured.** On top of READ_INLINE: PW overworld cycles -0.40 %, instructions -1.04 %; Shrek cycles -0.50 %, instructions -0.49 %. Both together against the tip: PW overworld cycles -1.46 %, instructions -2.03 %; Shrek cycles -1.25 %, instructions -1.48 % (2026-10-03). Not measured as app fps; at about 1.4 % it is below what a single app leg resolves.
+
+**Option.** LITEV_DMA_ARMED_MASK (default OFF; enabled in the app's shipping build)
 
 ## Unflagged optimizations
 
