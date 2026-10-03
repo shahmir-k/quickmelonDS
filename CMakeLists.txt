@@ -461,6 +461,17 @@ if (LITEV_JIT_IRQMASK_CONT)
     endif()
 endif()
 
+# GX FIFO read inline: CmdFIFORead's pop is inlined into ExecuteCommand; the PIPE refill
+# (stall-queue drain, FIFO DMA/IRQ checks) stays out of line. Same order, exact.
+option(LITEV_GXFIFO_READ_INLINE "Inline the GX command FIFO pop, refill out of line (exact)" OFF)
+if (LITEV_GXFIFO_READ_INLINE)
+    if (LITEV_GXFIFO_UNIFIED)
+        add_compile_definitions(LITEV_GXFIFO_READ_INLINE=1)
+    else()
+        message(FATAL_ERROR "LITEV_GXFIFO_READ_INLINE requires LITEV_GXFIFO_UNIFIED.")
+    endif()
+endif()
+
 # Hybrid texture staging: the emu thread keeps its own flat texture/palette VRAM mirror and
 # hands each frame's dirty chunks to the hybrid's GL thread, which applies them before the
 # frame renders. The emu no longer waits for the running 3D job before writing texture VRAM.

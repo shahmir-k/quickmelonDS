@@ -2054,9 +2054,16 @@ void GPU3D::CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept
     CmdFIFOWrite_Inline(entry);
 }
 
+#if defined(LITEV_GXFIFO_UNIFIED) && defined(LITEV_GXFIFO_READ_INLINE)
+void GPU3D::CmdFIFORefill() noexcept
+{
+    {
+#else
 GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 {
+#endif
 #ifdef LITEV_GXFIFO_UNIFIED
+#ifndef LITEV_GXFIFO_READ_INLINE
     // callers only read a non-empty PIPE
     CmdFIFOEntry ret = CmdQ[CmdQHead];
     CmdQHead = (CmdQHead + 1) & 511;
@@ -2064,6 +2071,7 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 
     if (PipeN <= 2)
     {
+#endif
         u32 n = FifoN < 2 ? FifoN : 2;   // the first FIFO entries become PIPE entries in place
         PipeN += n;
         FifoN -= n;
@@ -2096,8 +2104,9 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
         CheckFIFODMA();
         CheckFIFOIRQ();
     }
-
+#if !(defined(LITEV_GXFIFO_UNIFIED) && defined(LITEV_GXFIFO_READ_INLINE))
     return ret;
+#endif
 }
 
 void GPU3D::ExecuteCommand() noexcept

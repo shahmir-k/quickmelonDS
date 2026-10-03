@@ -149,7 +149,19 @@ private:
     // LITEV_GXFIFO_DMA_INLINE: always-inline twin of CmdFIFOWrite (body in GPU3D_GXFIFO_inl.h);
     // private (takes the private CmdFIFOEntry) — only WriteToGXFIFO_Inline calls it.
     void CmdFIFOWrite_Inline(const CmdFIFOEntry& entry) noexcept;
+#if defined(LITEV_GXFIFO_UNIFIED) && defined(LITEV_GXFIFO_READ_INLINE)
+    // Inline pop; the PIPE refill (about every other read) stays out of line.
+    __attribute__((always_inline)) CmdFIFOEntry CmdFIFORead() noexcept
+    {
+        CmdFIFOEntry ret = CmdQ[CmdQHead];
+        CmdQHead = (CmdQHead + 1) & 511;
+        if (--PipeN <= 2) CmdFIFORefill();
+        return ret;
+    }
+    __attribute__((noinline)) void CmdFIFORefill() noexcept;
+#else
     CmdFIFOEntry CmdFIFORead() noexcept;
+#endif
     void FinishWork(s32 cycles) noexcept;
     void VertexPipelineSubmitCmd() noexcept
     {
