@@ -461,6 +461,13 @@ if (LITEV_JIT_IRQMASK_CONT)
     endif()
 endif()
 
+# Clip plane skip: ClipAgainstPlane returns early for a plane no vertex crosses (the two
+# copy passes would leave the vertices unchanged; only the colour fix-up remains). Exact.
+option(LITEV_GEOM_CLIP_PLANESKIP "Skip the copy passes of clip planes no vertex crosses (exact)" OFF)
+if (LITEV_GEOM_CLIP_PLANESKIP)
+    add_compile_definitions(LITEV_GEOM_CLIP_PLANESKIP=1)
+endif()
+
 option(LITEV_JIT_REGION_CACHE "Dispatcher-side multi-region block lookup (exact)" OFF)
 if (LITEV_JIT_REGION_CACHE)
     if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")

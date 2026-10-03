@@ -1043,6 +1043,29 @@ void ClipSegment(Vertex* outbuf, Vertex* vin, Vertex* vout)
 template<int comp, bool attribs>
 int ClipAgainstPlane(const GPU3D& gpu, Vertex* vertices, int nverts, int clipstart)
 {
+#ifdef LITEV_GEOM_CLIP_PLANESKIP
+    // No vertex beyond either side of this plane: both passes below would copy every
+    // vertex through `temp` and back unchanged, leaving only the colour fix-up.
+    {
+        bool any = false;
+        for (int i = clipstart; i < nverts; i++)
+        {
+            s32 p = vertices[i].Position[comp], w = vertices[i].Position[3];
+            any |= (p > w) | (p < -w);
+        }
+        if (!any)
+        {
+            for (int i = 0; i < nverts; i++)
+            {
+                Vertex* vtx = &vertices[i];
+                vtx->Color[0] &= ~0xFFF; vtx->Color[0] += 0xFFF;
+                vtx->Color[1] &= ~0xFFF; vtx->Color[1] += 0xFFF;
+                vtx->Color[2] &= ~0xFFF; vtx->Color[2] += 0xFFF;
+            }
+            return nverts;
+        }
+    }
+#endif
     Vertex temp[10];
     int prev, next;
     int c = clipstart;
