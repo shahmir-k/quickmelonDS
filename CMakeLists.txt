@@ -723,6 +723,19 @@ if (LITEV_INSTANT_DIVSQRT)
     add_compile_definitions(LITEV_INSTANT_DIVSQRT=1)
 endif()
 
+# Lazy sqrt on top of INSTANT_DIVSQRT: SQRTCNT/SQRT_PARAM writes only mark the result
+# stale (a 64-bit sqrt writes three registers, each ran the 32-step bit loop); it is
+# computed on the next read of SQRTCNT/SQRT_RESULT or at a savestate, from the FPU with an
+# exact integer correction. Same values as INSTANT_DIVSQRT wherever they can be read.
+option(LITEV_LAZY_SQRT "Compute the sqrt unit's result on read, with an exact FPU root (exact vs INSTANT_DIVSQRT)" OFF)
+if (LITEV_LAZY_SQRT)
+    if (LITEV_INSTANT_DIVSQRT)
+        add_compile_definitions(LITEV_LAZY_SQRT=1)
+    else()
+        message(FATAL_ERROR "LITEV_LAZY_SQRT requires LITEV_INSTANT_DIVSQRT.")
+    endif()
+endif()
+
 # DraStic batched audio ring (teardown doc 11): SPU::Mix generates N samples per
 # scheduled Event_SPU instead of one, cutting the SPU scheduler-event flood
 # (547/frame) by ~N x. Sample generation is bit-identical per iteration; only

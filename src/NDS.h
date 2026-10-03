@@ -545,6 +545,9 @@ protected:
     u16 SqrtCnt;
     alignas(u64) u32 SqrtVal[2];
     u32 SqrtRes;
+#ifdef LITEV_LAZY_SQRT
+    bool SqrtDirty = false;
+#endif
     u16 KeyCnt[2];
     bool Running;
     bool RunningGame;

@@ -511,6 +511,9 @@ void NDS::Reset()
 
     DivCnt = 0;
     SqrtCnt = 0;
+#ifdef LITEV_LAZY_SQRT
+    SqrtDirty = false;
+#endif
 
     ARM9.Reset();
     ARM7.Reset();
@@ -635,6 +638,10 @@ u32 NDS::GetSavestateConfig()
 
 bool NDS::DoSavestate(Savestate* file)
 {
+#ifdef LITEV_LAZY_SQRT
+    // SQRTCNT is in the state and SQRT_RESULT must be what the eager path left.
+    if (SqrtDirty) { SqrtDirty = false; SqrtDone(0); }
+#endif
     file->Section("NDSG");
 
     u32 config = GetSavestateConfig();
@@ -2100,6 +2107,23 @@ void NDS::SqrtDone(u32 param)
 
     SqrtCnt &= ~0x8000;
 
+#ifdef LITEV_LAZY_SQRT
+    // floor(sqrt(val)) from the FPU, corrected to the exact integer root. The bitwise loop
+    // below gives the same value only while its u32 `prod` cannot overflow (root < 2^31,
+    // i.e. val < 2^62); larger inputs keep the loop. r < 2^31 here, so r*r cannot overflow.
+    {
+        u64 v = (SqrtCnt & 0x0001) ? *(u64*)&SqrtVal[0] : (u64)SqrtVal[0];
+        if (v < (1ull << 62))
+        {
+            u64 r = (u64)__builtin_sqrt((double)v);
+            while (r * r > v) r--;
+            while ((r + 1) * (r + 1) <= v) r++;
+            SqrtRes = (u32)r;
+            return;
+        }
+    }
+#endif
+
     if (SqrtCnt & 0x0001)
     {
         val = *(u64*)&SqrtVal[0];
@@ -2132,7 +2156,11 @@ void NDS::SqrtDone(u32 param)
 
 void NDS::StartSqrt()
 {
-#ifdef LITEV_INSTANT_DIVSQRT
+#if defined(LITEV_LAZY_SQRT)
+    // Lazy: SqrtDone (a pure function of the SQRTCNT mode bit and SQRT_PARAM) runs on the
+    // next read of SQRTCNT/SQRT_RESULT or at a savestate.
+    SqrtDirty = true;
+#elif defined(LITEV_INSTANT_DIVSQRT)
     // Instant sqrt: compute now, skip Event_Sqrt. SqrtDone clears the busy bit
     // (0x8000) and fills SqrtRes; result ready same-cycle.
     SqrtDone(0);
@@ -3033,6 +3061,9 @@ bool NDS::ARM7GetMemRegion(u32 addr, bool write, MemRegion* region)
 
 u8 NDS::ARM9IORead8(u32 addr)
 {
+#ifdef LITEV_LAZY_SQRT
+    if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
+#endif
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[0] & 0xFF;
@@ -3124,6 +3155,9 @@ u8 NDS::ARM9IORead8(u32 addr)
 
 u16 NDS::ARM9IORead16(u32 addr)
 {
+#ifdef LITEV_LAZY_SQRT
+    if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
+#endif
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[0];
@@ -3250,6 +3284,9 @@ u16 NDS::ARM9IORead16(u32 addr)
 
 u32 NDS::ARM9IORead32(u32 addr)
 {
+#ifdef LITEV_LAZY_SQRT
+    if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
+#endif
 #ifdef LITEV_IO_DISPATCH_TABLE
     // Fast O(1) dispatch for word-aligned accesses in the primary 8 KB I/O window
     // (0x04000000-0x04001FFF). (addr & 0xFFFFE003) == 0x04000000 is true iff addr is
