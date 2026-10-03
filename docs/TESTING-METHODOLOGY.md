@@ -278,7 +278,7 @@ report frame time and cap share. Never use fast-forward or any frameskip to get 
   - Gate visuals with PPM **plus a same-binary control** (`abtest.sh --control` / `--control-on`)
     showing 0 px. Re-run any 1-frame PPM diff before believing it.
   - Do not use record/verify runs for performance (trace and hashing overhead).
-- **Trace modes and savestates (fixed 2026-10-02, lib 8d86ce48):** before that commit
+- **Trace modes and savestates (fixed 2026-10-02, commit "headless: trace modes honour --savestate"):** before that commit
   `--record-trace` / `--verify-trace` ignored `--savestate` and booted the ROM intro, so every
   earlier "trace identical on Shrek slot 2 / race-fresh / PW" gate compared the intro, not the
   scene. The session's exact levers (LDM_FASTMEM, CYCLE_BATCH, GXFIFO_UNIFIED, the ASYNC deadlock
