@@ -82,6 +82,9 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 | sched: drain DMA9/GXFIFO-stall steps in one iteration while ARM7 is halted (LITEV_SCHED_DRAIN) | `LITEV_SCHED_DRAIN` | A |
 | jit: region-aware dispatcher, keep the last 4 code regions per CPU (LITEV_JIT_REGION_CACHE) | `LITEV_JIT_REGION_CACHE` | A |
 | jit: keep the slice budget in W15 across block hops (LITEV_JIT_BUDGET_REG) | `LITEV_JIT_BUDGET_REG` | A |
+| jit: dispatcher continues past IRQs the guest has masked (LITEV_JIT_IRQMASK_CONT) | `LITEV_JIT_IRQMASK_CONT` | A |
+| sched: compute the sqrt result on read, from the FPU (LITEV_LAZY_SQRT) | `LITEV_LAZY_SQRT` | A (vs INSTANT_DIVSQRT) |
+| geom: skip the copy passes of clip planes no vertex crosses (LITEV_GEOM_CLIP_PLANESKIP) | `LITEV_GEOM_CLIP_PLANESKIP` | A |
 | build: add LITEV_AUTO_FRAMESKIP option (adaptive real-time frameskip) | `LITEV_AUTO_FRAMESKIP` | A (UX feature; see section) |
 
 ## Performance options
@@ -733,6 +736,44 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 **Measured.** Device headless, emu thread, 500 f, vs SCHED_DRAIN + REGION_CACHE: PW overworld cycles -1.66 % (n = 6), Shrek slot 2 -2.70 % (n = 3), PW pw.ml1 -1.07 % (n = 2). App PW overworld software uncapped ABBA: 63.3/63.0 -> 63.8/63.8 fps, runFrame CPU 11.87 -> 11.59 ms (2026-10-02).
 
 **Option.** LITEV_JIT_BUDGET_REG (default OFF; needs LITEV_JIT_DISPATCH; enabled in the app's shipping build)
+
+### jit: dispatcher continues past IRQs the guest has masked (LITEV_JIT_IRQMASK_CONT)
+
+**What.** The dispatcher's StopExecution check continues the hop when the only stop reason is an IRQ (StopExecution == 0x100) and ARM::CPSR has the I bit set, instead of returning to C++.
+
+**Why it works.** StopExecution includes the IRQ line, which follows IME/IE/IF regardless of CPSR.I. While an IRQ is pending but masked (IRQ handlers, OS critical sections) every block hop bounced to C++, where TriggerIRQ returns at once and the loop re-dispatches. Pokemon White overworld: 2,642 of 3,505 ARM9 C++ re-entries per frame (pw.ml1 343 of 931, Shrek 2 of 598).
+
+**Exactness.** A. The C++ round trip did nothing but the same Timestamp/budget arithmetic.
+
+**Measured.** Device headless, emu thread, 500 f, n = 3: PW overworld cycles -0.87 %, instructions -1.45 %; Shrek flat (2026-10-02).
+
+**Option.** LITEV_JIT_IRQMASK_CONT (default OFF; needs LITEV_JIT_DISPATCH; enabled in the app's shipping build)
+
+### sched: compute the sqrt result on read, from the FPU (LITEV_LAZY_SQRT)
+
+**What.** With INSTANT_DIVSQRT, writes to SQRTCNT / SQRT_PARAM only mark the result stale; SqrtDone runs on the next ARM9 read of 0x040002B0-0x040002B7 or at a savestate. The root comes from the FPU with an exact integer correction below 2^62; the original bit loop stays above it (its u32 `prod` overflows there and differs from the true root).
+
+**Why it works.** A 64-bit sqrt writes three registers and each write ran the 32-step loop. PW overworld: ~300 sqrts per frame.
+
+**Exactness.** A relative to INSTANT_DIVSQRT: every value the ARM9 reads from 0x280-0x2BF hashes identically (probe, 4 scenes, JIT + interp).
+
+**Measured.** Device headless, emu thread, 500 f, n = 3: PW overworld instructions -1.31 %, cycles -0.48 %; Shrek flat (2026-10-02).
+
+**Option.** LITEV_LAZY_SQRT (default OFF; needs LITEV_INSTANT_DIVSQRT; enabled in the app's shipping build)
+
+### geom: skip the copy passes of clip planes no vertex crosses (LITEV_GEOM_CLIP_PLANESKIP)
+
+**What.** ClipAgainstPlane returns early (after the colour fix-up) for a plane no vertex crosses, instead of copying every Vertex through a temporary and back in two passes.
+
+**Why it works.** Only polygons that cross some plane reach the clipper, but they paid all three planes. ClipAgainstPlane was 3.3-3.8 % of the emu thread in the PW overworld.
+
+**Exactness.** A. Output after every plane hashes identically to the parent (probe, 4 scenes); a differential build found no difference.
+
+**Measured.** Device headless, emu thread, 500 f, n = 3: PW overworld instructions -0.97 %, cycles -0.66 %; Shrek instructions -0.22 % (2026-10-02).
+
+**Option.** LITEV_GEOM_CLIP_PLANESKIP (default OFF; enabled in the app's shipping build)
+
+**All three together (app, PW overworld slot 2, uncapped, frameskip prefs off, ABBA).** Software: 63.5/63.9 -> 64.6/64.2 fps, runFrame CPU 11.66/11.61 -> 11.34/11.38 ms. Hybrid 3x: 71.7/71.0 -> 71.0/71.1 fps (flat; runFrame CPU 11.56/11.57 -> 11.38/11.38 ms, but emu-thread run-queue wait 71 -> 81-85 ms/s in those legs). Device headless with them plus MSR_SAMEMODE (later dropped): PW overworld cycles -1.70 %, pw.ml1 -0.80 %, Shrek flat.
 
 ## Unflagged optimizations
 
