@@ -85,6 +85,7 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 | jit: dispatcher continues past IRQs the guest has masked (LITEV_JIT_IRQMASK_CONT) | `LITEV_JIT_IRQMASK_CONT` | A |
 | sched: compute the sqrt result on read, from the FPU (LITEV_LAZY_SQRT) | `LITEV_LAZY_SQRT` | A (vs INSTANT_DIVSQRT) |
 | geom: skip the copy passes of clip planes no vertex crosses (LITEV_GEOM_CLIP_PLANESKIP) | `LITEV_GEOM_CLIP_PLANESKIP` | A |
+| hybrid: stage texture VRAM updates for the GL 3D thread (LITEV_HYB_TEXSTAGE) | `LITEV_HYB_TEXSTAGE` | A (renderer-side only) |
 | build: add LITEV_AUTO_FRAMESKIP option (adaptive real-time frameskip) | `LITEV_AUTO_FRAMESKIP` | A (UX feature; see section) |
 
 ## Performance options
@@ -774,6 +775,18 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 **Option.** LITEV_GEOM_CLIP_PLANESKIP (default OFF; enabled in the app's shipping build)
 
 **All three together (app, PW overworld slot 2, uncapped, frameskip prefs off, ABBA).** Software: 63.5/63.9 -> 64.6/64.2 fps, runFrame CPU 11.66/11.61 -> 11.34/11.38 ms. Hybrid 3x: 71.7/71.0 -> 71.0/71.1 fps (flat; runFrame CPU 11.56/11.57 -> 11.38/11.38 ms, but emu-thread run-queue wait 71 -> 81-85 ms/s in those legs). Device headless with them plus MSR_SAMEMODE (later dropped): PW overworld cycles -1.70 %, pw.ml1 -0.80 %, Shrek flat.
+
+### hybrid: stage texture VRAM updates for the GL 3D thread (LITEV_HYB_TEXSTAGE)
+
+**What.** The emu thread keeps its own flat texture/palette VRAM mirror and copies each frame's dirty 512-byte chunks into a per-slot stage buffer. The hybrid's GL 3D thread copies them into `GPU.VRAMFlat_*` at the start of that frame's job (`Texcache::Apply`). Before, `PrepareFrame` waited for the running GL job whenever any texture or palette VRAM was dirty, because that job decodes textures from the shared flat copy.
+
+**Why it works.** PW overworld, hybrid 3x: the emu thread slept 85 ms/s voluntarily, and 55 ms/s of that was this wait (16 waits/s, about 3.4 ms each, woken by hyb-gl3d). Found with sched_switch/sched_waking pairs with call stacks. The GL job (about 10 ms wall, 6.7 ms CPU) fits in the emu frame, so the emu thread no longer stalls on it. Preemption on core 3 (about 82 ms/s) is all system: SurfaceFlinger binder threads, a per-CPU kworker for the input poller, Mali job-done and display flips, audio and system_server. None of the app's own threads run there.
+
+**Exactness.** A. Guest state is untouched, and each frame renders the texture VRAM as of its own PrepareFrame, as before. The host guest trace is identical (4 scenes, JIT and interp). Display 1 screenshots after each leg (PW overworld, Shrek race) are identical to the build without it, apart from moving sprites. No stale or garbled textures.
+
+**Measured.** App, uncapped, frameskip prefs off, ABBA against the build without it. PW overworld slot 2, hybrid 3x: 70.4/71.4/71.3/71.1 to 78.9/78.2/78.8/78.6 fps (+10.6 %). runFrame wall 13.6 to 12.25 ms. Emu run-queue wait 83 to 59 ms/s. Shrek slot 2, hybrid 3x: 84.6/83.9 to 86.5/84.2 fps (+1.3 %, within the leg spread; Shrek rarely writes texture VRAM mid-frame) (2026-10-03).
+
+**Option.** LITEV_HYB_TEXSTAGE (default OFF; only the threaded hybrid without a parent GLRenderer turns it on; 1.9 MB; enabled in the app's shipping build)
 
 ## Unflagged optimizations
 
