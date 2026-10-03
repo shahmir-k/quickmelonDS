@@ -1165,7 +1165,30 @@ void* Compiler::Gen_Dispatcher(u32 num)
     // (a) StopExecution first — bounce out leaving RCycles = block K's cycles and Timestamp
     //     untouched (C++ handles IRQ/halt/idle with the pre-block Timestamp, then adds Cycles).
     LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
+#ifdef LITEV_JIT_IRQMASK_CONT
+    // (a') A pending IRQ the guest has masked (CPSR.I) is the only stop reason: C++ would
+    //      call TriggerIRQ, which returns at once on CPSR.I, and re-dispatch with the same
+    //      Timestamp/budget arithmetic as (b)-(c) below. So continue here instead of the
+    //      round trip. StopExecution == 0x100 <=> IRQ = 1, Halted = IdleLoop = 0. ARM::CPSR
+    //      memory is canonical at every exit under LAZYFLAGS (see (d)). The exit's site
+    //      register W9 is not set on the stop paths of linked exits / guard stubs, so this
+    //      hop opts out of the per-site cache.
+    FixupBranch noStop = CBZ(W2);
+    CMP(W2, 0x100);
+    FixupBranch exitStop = B(CC_NEQ);
+  #ifdef LITEV_JIT_LAZYFLAGS
+    LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, CPSR));
+    FixupBranch exitStopUnmasked = TBZ(W3, 7);
+  #else
+    FixupBranch exitStopUnmasked = TBZ(RCPSR, 7);
+  #endif
+  #ifdef LITEV_JIT_ICACHE
+    MOVI2R(W9, 0);
+  #endif
+    SetJumpTarget(noStop);
+#else
     FixupBranch exitStop = CBNZ(W2);
+#endif
 
 #ifdef LITEV_JIT_BUDGET_REG
     // (b) budget register: consume block K (Timestamp stays JitTsBase - budget; it is
@@ -1429,6 +1452,9 @@ void* Compiler::Gen_Dispatcher(u32 num)
 #endif
 
     SetJumpTarget(exitStop);
+#ifdef LITEV_JIT_IRQMASK_CONT
+    SetJumpTarget(exitStopUnmasked);
+#endif
     SetJumpTarget(exitBudget);
     SetJumpTarget(exitRegion);
     SetJumpTarget(miss);

@@ -449,6 +449,18 @@ if (LITEV_JIT_BUDGET_REG)
     endif()
 endif()
 
+# Masked-IRQ continue: when the only stop reason at a block hop is an IRQ the guest has
+# masked with CPSR.I, the dispatcher keeps going instead of returning to C++ (where
+# TriggerIRQ would return at once and the loop would re-dispatch). Exact (category A).
+option(LITEV_JIT_IRQMASK_CONT "Dispatcher continues past IRQs masked by CPSR.I (exact)" OFF)
+if (LITEV_JIT_IRQMASK_CONT)
+    if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_IRQMASK_CONT=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_IRQMASK_CONT requires LITEV_JIT_DISPATCH and an AArch64 target.")
+    endif()
+endif()
+
 option(LITEV_JIT_REGION_CACHE "Dispatcher-side multi-region block lookup (exact)" OFF)
 if (LITEV_JIT_REGION_CACHE)
     if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
