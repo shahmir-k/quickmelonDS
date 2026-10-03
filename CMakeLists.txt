@@ -461,6 +461,14 @@ if (LITEV_JIT_IRQMASK_CONT)
     endif()
 endif()
 
+# Hybrid texture staging: the emu thread keeps its own flat texture/palette VRAM mirror and
+# hands each frame's dirty chunks to the hybrid's GL thread, which applies them before the
+# frame renders. The emu no longer waits for the running 3D job before writing texture VRAM.
+option(LITEV_HYB_TEXSTAGE "Hybrid: stage texture VRAM updates for the GL thread instead of waiting for it (exact)" OFF)
+if (LITEV_HYB_TEXSTAGE)
+    add_compile_definitions(LITEV_HYB_TEXSTAGE=1)
+endif()
+
 # Clip plane skip: ClipAgainstPlane returns early for a plane no vertex crosses (the two
 # copy passes would leave the vertices unchanged; only the colour fix-up remains). Exact.
 option(LITEV_GEOM_CLIP_PLANESKIP "Skip the copy passes of clip planes no vertex crosses (exact)" OFF)

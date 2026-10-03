@@ -34,6 +34,9 @@ public:
     {
         StartThread(name);
         Run([this, &gpu3D] { GL = std::make_unique<GLRenderer3D>(gpu3D, Parent); }, true);
+#ifdef LITEV_HYB_TEXSTAGE
+        if (Threaded && !Parent) GL->EnableTexStaging();
+#endif
     }
     ~GLThread3D() override
     {

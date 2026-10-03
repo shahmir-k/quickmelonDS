@@ -5,6 +5,8 @@
 #include "GPU.h"
 
 #include <assert.h>
+#include <memory>
+#include <cstring>
 #include <unordered_map>
 #include <vector>
 
@@ -103,6 +105,19 @@ public:
         Pending& p = Pend[slot];
         p.TexDirty = GPU.VRAMDirty_Texture.DeriveState(GPU.VRAMMap_Texture, GPU);
         p.PalDirty = GPU.VRAMDirty_TexPal.DeriveState(GPU.VRAMMap_TexPal, GPU);
+#ifdef LITEV_HYB_TEXSTAGE
+        if (EmuTex)
+        {
+            // Staged: the emu keeps its own flat mirror and hands this frame's dirty chunks
+            // to the GL thread in Stage[slot]; Apply copies them into GPU.VRAMFlat_* before
+            // the frame renders. The running job never sees a write, so no wait.
+            p.TexChanged = GPU.MakeVRAMFlat_TextureCoherent(p.TexDirty, EmuTex.get());
+            p.PalChanged = GPU.MakeVRAMFlat_TexPalCoherent(p.PalDirty, EmuPal.get());
+            CopyChunks(StageTex[slot].get(), EmuTex.get(), p.TexDirty);
+            CopyChunks(StagePal[slot].get(), EmuPal.get(), p.PalDirty);
+            return;
+        }
+#endif
         bool any = false;
         for (u64 w : p.TexDirty.Data) any |= w != 0;
         for (u64 w : p.PalDirty.Data) any |= w != 0;
@@ -110,6 +125,28 @@ public:
         p.TexChanged = GPU.MakeVRAMFlat_TextureCoherent(p.TexDirty);
         p.PalChanged = GPU.MakeVRAMFlat_TexPalCoherent(p.PalDirty);
     }
+#ifdef LITEV_HYB_TEXSTAGE
+    // Hybrid GL thread: turn on staging. Call while no job runs; seeds the emu mirror
+    // from the flat VRAM (identical until now; ResetVRAMCache later re-arms full copies).
+    void EnableStaging()
+    {
+        EmuTex.reset(new u8[sizeof(GPU.VRAMFlat_Texture)]); EmuPal.reset(new u8[sizeof(GPU.VRAMFlat_TexPal)]);
+        memcpy(EmuTex.get(), GPU.VRAMFlat_Texture, sizeof(GPU.VRAMFlat_Texture));
+        memcpy(EmuPal.get(), GPU.VRAMFlat_TexPal, sizeof(GPU.VRAMFlat_TexPal));
+        for (int i = 0; i < 2; i++)
+        {
+            StageTex[i].reset(new u8[sizeof(GPU.VRAMFlat_Texture)]);
+            StagePal[i].reset(new u8[sizeof(GPU.VRAMFlat_TexPal)]);
+        }
+    }
+    template <u32 N>
+    static void CopyChunks(u8* dst, const u8* src, NonStupidBitField<N>& dirty)
+    {
+        for (auto it = dirty.Begin(); it != dirty.End(); it++)
+            memcpy(dst + *it * VRAMDirtyGranularity, src + *it * VRAMDirtyGranularity, VRAMDirtyGranularity);
+    }
+    std::unique_ptr<u8[]> EmuTex, EmuPal, StageTex[2], StagePal[2];
+#endif
     void Prepare() { Prepare(0, [] {}); }
 
     bool PendingChanged(int slot) const { return Pend[slot].TexChanged || Pend[slot].PalChanged; }
@@ -126,6 +163,13 @@ public:
         auto& texPalDirty = Pend[slot].PalDirty;
         const bool textureChanged = Pend[slot].TexChanged;
         const bool texPalChanged = Pend[slot].PalChanged;
+#ifdef LITEV_HYB_TEXSTAGE
+        if (EmuTex)
+        {
+            CopyChunks(GPU.VRAMFlat_Texture, StageTex[slot].get(), textureDirty);
+            CopyChunks(GPU.VRAMFlat_TexPal, StagePal[slot].get(), texPalDirty);
+        }
+#endif
 
         clrBitmapDirty = 0;
 

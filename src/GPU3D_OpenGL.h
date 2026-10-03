@@ -54,6 +54,9 @@ public:
     // beforeVRAMWrite runs before PrepareFrame modifies the flat texture VRAM a running
     // frame may still be reading (the caller waits for it there).
     void PrepareFrame(int slot = 0, const std::function<void()>& beforeVRAMWrite = {});
+#ifdef LITEV_HYB_TEXSTAGE
+    void EnableTexStaging() { Texcache.EnableStaging(); }
+#endif
     void RenderPreparedFrame(int slot = 0);
 
     // Colour output ring (hybrid renderer): with n > 1 every rendered frame goes to the
