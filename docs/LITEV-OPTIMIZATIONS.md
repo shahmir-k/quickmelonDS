@@ -757,6 +757,7 @@ All exactness **R** (local framebuffer only, MP-safe). Each has a `debug.litev.*
 | GL hi-res compositor drawn per run of lines whose per-line config differs only by a linear BG-offset step (text BG Y +1/line, rotscale reference +(B,D)/line), with the run's config in a single-struct UBO block: constant offsets instead of a per-pixel indexed load of the 192-line array. Falls back to the array shader above 16 runs. `compcheck=1`: 0 px differ | `glcomprun` | hi-res 3x 43.9/43.9 -> 45.0/45.0 fps (1 run per engine per frame on Shrek) |
 | GL 3D render shader: colour maths in mediump float (texcoords, depth and the 32-bit polygon attribute ints stay highp) | `gl3dmp` | hybrid 4x (GPU-bound) ABBA 61.6/61.6 -> 63.1/63.0 fps; hi-res 3x neutral (45.0 -> 45.3 with it off, 3D at 30 Hz is a small share there) |
 | Hybrid merge: the native (1x) position comes from an interpolated varying instead of a per-pixel `P / uScale` integer divide (no integer divide unit on Mali; emulated in ALU) | `hybdiv` | hybrid 4x (GPU-bound) ABBA 63.1/63.0 -> 67.0/67.0 fps; hybrid 3x GPU load 91 % -> 79 % at 85 fps |
+| GL 3D plain clear (no clear bitmap) by `glClearBuffer` with the same colour/attribute/depth/stencil values instead of a full-screen shaded draw (Mali applies it at tile load) | `gl3dclr` | hybrid 4x (GPU-bound) ABBA 67.0/67.1 -> 68.5/68.6 fps |
 
 
 ### jit: pass the ARM* to slow-memory and region helpers

@@ -1731,11 +1731,29 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
         glUniform1ui(ClearUniformLoc[1], z);
         glUniform1ui(ClearUniformLoc[2], polyid);
         glUniform1ui(ClearUniformLoc[3], fog);
+
+        // debug.litev.gl3dclr (default on): the same constant values as glClearBuffer, which
+        // Mali applies at tile load for free, instead of a full-screen shaded draw
+        static const bool clr = OpenGL::Prop("gl3dclr", 1) != 0;
+        if (clr)
+        {
+#ifdef __ANDROID__
+            const GLfloat col[4] = {b / 31.f, g / 31.f, r / 31.f, a / 31.f};   // 3D layer is BGRA on GLES
+#else
+            const GLfloat col[4] = {r / 31.f, g / 31.f, b / 31.f, a / 31.f};
+#endif
+            const GLfloat attr[4] = {polyid / 63.f, 0.f, (GLfloat)fog, 1.f};
+            glClearBufferfv(GL_COLOR, 0, col);
+            glClearBufferfv(GL_COLOR, 1, attr);
+            glClearBufferfi(GL_DEPTH_STENCIL, 0, z / 16777216.f, 0xFF);
+            goto cleared;
+        }
     }
 
     glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
     glBindVertexArray(ClearVertexArrayID);
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
+cleared:
 
     if (S.RenderNumPolygons)
     {
