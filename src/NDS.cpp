@@ -1985,6 +1985,16 @@ bool NDS::DMAsRunning(u32 cpu) const
 
 void NDS::CheckDMAs(u32 cpu, u32 mode)
 {
+#ifdef LITEV_DMA_ARMED_MASK
+    const u32 armed = DMAArmed[cpu][mode & 7];
+    if (!armed) return;
+    cpu <<= 2;
+    if (armed & 1) DMAs[cpu+0].StartIfNeeded(mode);
+    if (armed & 2) DMAs[cpu+1].StartIfNeeded(mode);
+    if (armed & 4) DMAs[cpu+2].StartIfNeeded(mode);
+    if (armed & 8) DMAs[cpu+3].StartIfNeeded(mode);
+    return;
+#endif
     cpu <<= 2;
     DMAs[cpu+0].StartIfNeeded(mode);
     DMAs[cpu+1].StartIfNeeded(mode);

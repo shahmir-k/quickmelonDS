@@ -532,6 +532,12 @@ protected:
     bool TimerDeadlineDirty;
 #endif
     DMA DMAs[8];
+#ifdef LITEV_DMA_ARMED_MASK
+    // [cpu][StartMode & 7]: bit n set when DMA n of that CPU is enabled with that start
+    // mode (kept by DMA::SyncArmed). CheckDMAs only visits those channels.
+    u8 DMAArmed[2][8] {};
+    friend class DMA;
+#endif
     u32 DMA9Fill[4];
     u16 IPCSync9, IPCSync7;
     u16 IPCFIFOCnt9, IPCFIFOCnt7;

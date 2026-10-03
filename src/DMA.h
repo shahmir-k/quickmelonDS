@@ -66,8 +66,17 @@ public:
     void StopIfNeeded(u32 mode)
     {
         if (mode == StartMode)
+        {
             Cnt &= ~0x80000000;
+#ifdef LITEV_DMA_ARMED_MASK
+            SyncArmed();
+#endif
+        }
     }
+#ifdef LITEV_DMA_ARMED_MASK
+    // publish (StartMode, Cnt bit 31) to NDS::DMAArmed, which CheckDMAs uses as a filter
+    void SyncArmed();
+#endif
 
     void StallIfRunning()
     {

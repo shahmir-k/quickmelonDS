@@ -86,6 +86,9 @@ void DMA::Reset()
     Cnt = 0;
 
     StartMode = 0;
+#ifdef LITEV_DMA_ARMED_MASK
+    SyncArmed();
+#endif
     CurSrcAddr = 0;
     CurDstAddr = 0;
     RemCount = 0;
@@ -128,7 +131,18 @@ void DMA::DoSavestate(Savestate* file)
     file->Bool32(&Stall);
 
     file->VarArray(MRAMBurstTable.data(), sizeof(MRAMBurstTable));
+#ifdef LITEV_DMA_ARMED_MASK
+    if (!file->Saving) SyncArmed();
+#endif
 }
+
+#ifdef LITEV_DMA_ARMED_MASK
+void DMA::SyncArmed()
+{
+    for (u8& m : NDS.DMAArmed[CPU]) m &= ~(1 << Num);
+    if (Cnt & 0x80000000) NDS.DMAArmed[CPU][StartMode & 7] |= 1 << Num;
+}
+#endif
 
 void DMA::WriteCnt(u32 val)
 {
@@ -160,6 +174,9 @@ void DMA::WriteCnt(u32 val)
             StartMode = (Cnt >> 27) & 0x7;
         else
             StartMode = ((Cnt >> 28) & 0x3) | 0x10;
+#ifdef LITEV_DMA_ARMED_MASK
+        SyncArmed();   // before Start/CheckFIFODMA below, which may call CheckDMAs
+#endif
 
         if ((StartMode & 0x7) == 0)
             Start();
@@ -171,6 +188,9 @@ void DMA::WriteCnt(u32 val)
         if (StartMode==0x06 || StartMode==0x13)
             Log(LogLevel::Warn, "UNIMPLEMENTED ARM%d DMA%d START MODE %02X, %08X->%08X\n", CPU?7:9, Num, StartMode, SrcAddr, DstAddr);
     }
+#ifdef LITEV_DMA_ARMED_MASK
+    SyncArmed();
+#endif
 }
 
 void DMA::Start()
@@ -781,6 +801,9 @@ void DMA::Run9()
 
     if (!(Cnt & (1<<25)))
         Cnt &= ~(1<<31);
+#ifdef LITEV_DMA_ARMED_MASK
+    SyncArmed();
+#endif
 
     if (Cnt & (1<<30))
         NDS.SetIRQ(0, IRQ_DMA0 + Num);
@@ -854,6 +877,9 @@ void DMA::Run7()
 
     if (!(Cnt & (1<<25)))
         Cnt &= ~(1<<31);
+#ifdef LITEV_DMA_ARMED_MASK
+    SyncArmed();
+#endif
 
     if (Cnt & (1<<30))
         NDS.SetIRQ(1, IRQ_DMA0 + Num);

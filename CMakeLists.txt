@@ -461,6 +461,14 @@ if (LITEV_JIT_IRQMASK_CONT)
     endif()
 endif()
 
+# DMA armed mask: NDS keeps, per CPU and start mode, which DMA channels are enabled
+# (updated wherever a channel's Cnt bit 31 or StartMode changes); CheckDMAs visits only
+# those instead of loading all four channels. Same channels, same order. Exact.
+option(LITEV_DMA_ARMED_MASK "CheckDMAs visits only channels enabled with that start mode (exact)" OFF)
+if (LITEV_DMA_ARMED_MASK)
+    add_compile_definitions(LITEV_DMA_ARMED_MASK=1)
+endif()
+
 # GX FIFO read inline: CmdFIFORead's pop is inlined into ExecuteCommand; the PIPE refill
 # (stall-queue drain, FIFO DMA/IRQ checks) stays out of line. Same order, exact.
 option(LITEV_GXFIFO_READ_INLINE "Inline the GX command FIFO pop, refill out of line (exact)" OFF)
