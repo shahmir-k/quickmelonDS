@@ -440,11 +440,17 @@ void Compiler::Comp_MaterializeFlags()
         MRS(X0, FIELD_NZCV);
         STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));
         LFV3_STAT(PartialFlushUpgraded);
+#ifdef LITEV_EXIT_PROTO_NZCV
+        LastFlushFull = true;   // the slot is now exactly the host nibble
+#endif
     }
     else if (m == 0xF)
     {
         MRS(X0, FIELD_NZCV);
         STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));
+#ifdef LITEV_EXIT_PROTO_NZCV
+        LastFlushFull = true;
+#endif
     }
     else
     {

@@ -273,6 +273,16 @@ public:
     // instead of LDR slot + UBFX + CMP. Reset per instruction in CompileBlock.
     bool CarryInHostResident = false;
 
+#ifdef LITEV_EXIT_PROTO_NZCV
+    // EXIT_PROTO NZCV part. NZCVHostSynced: at this point of the emitted code, on every path
+    // reaching it, host NZCV equals the JitNZCV slot's nibble, so CheckCondition can branch
+    // on host NZCV instead of reloading the slot. Set only at an instruction boundary that
+    // follows a full MRS+STR flush (LastFlushFull) and kept only across bodies that are
+    // flag-transparent; cleared everywhere else (block entry included).
+    bool NZCVHostSynced = false;
+    bool LastFlushFull = false;
+#endif
+
     // FULL LAZY-FLAGS. RCPSR (W27) is no longer a CPSR carrier (it is repurposed as the
     // 8th GLOBALREG pin, guest r7). The guest CPSR is now split into two stores:
     //   * CONTROL word (bits [27:0] — mode / T / I,F / Q): ALWAYS canonical in ARM::CPSR

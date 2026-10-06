@@ -928,6 +928,9 @@ void Compiler::SaveCPSR(bool markClean)
 
 FixupBranch Compiler::CheckCondition(u32 cond)
 {
+#ifdef LITEV_EXIT_PROTO_NZCV
+    const bool deferredAtEntry = NZCVDeferred != 0;
+#endif
 #ifdef LITEV_JIT_FIXEDREG
     if (NZCVDeferred)
     {
@@ -959,6 +962,12 @@ FixupBranch Compiler::CheckCondition(u32 cond)
     // the RCPSR path did — MSR NZCV consumes [31:28] and TBNZ/TBZ test a single bit in
     // [28..31], so the zero low bits are irrelevant. LAZYFLAGS requires CONDFOLD.
     {
+#ifdef LITEV_EXIT_PROTO_NZCV
+        // Host NZCV == the slot (and nothing was deferred, so the slot is canonical):
+        // evaluate natively, exactly like the FR_HOST_FULL path above.
+        if (NZCVHostSynced && !deferredAtEntry)
+            return B((CCFlags)(cond ^ 1));
+#endif
         LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
         if (cond >= 0x8)
         {
@@ -1997,6 +2006,9 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     NZCVDeferred = 0;
     NZCVCondValid = false;
 #endif
+#ifdef LITEV_EXIT_PROTO_NZCV
+    NZCVHostSynced = false;   // entered from anywhere: dispatcher, C++, links
+#endif
 #ifdef LITEV_JIT_LAZYFLAGS
     // V3 item 1: precompute the block's per-instruction flag LiveIn (barrier-conservative,
     // block exit all-live). Used by Comp_MaterializeFlags' item-1b upgrade to prove the
@@ -2241,8 +2253,24 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         // N/Z-only deferral is retained, so most of the lazy-flags win is kept. Validated
         // byte-identical to the interpreter on Pokémon White (professor renders) and Shrek
         // (no regression). The slot structure and the r7->W27 global pin are untouched.
+#ifdef LITEV_EXIT_PROTO_NZCV
+        LastFlushFull = false;
+#endif
         if (NZCVDeferred & 0x3)
             Comp_MaterializeFlags();
+#ifdef LITEV_EXIT_PROTO_NZCV
+        // Host NZCV equals the slot after this instruction if it just ended with a full
+        // MRS+STR flush (the deferral contract already requires nothing between the producer
+        // and that flush to touch host NZCV), or if it already did before and this
+        // instruction is an unconditional, compiled, non-branching body that the Stage 2b
+        // classifier proves never writes host NZCV nor the slot.
+        {
+            bool uncond = Thumb ? CurInstr.Info.Kind != ARMInstrInfo::tk_BCOND : CurInstr.Cond() == 0xE;
+            bool neutral = comp != NULL && uncond && !CurInstr.Info.Branches()
+                && Comp_BodyIsNZCVTransparent(CurInstr.Info.Kind, CurInstr.Info.WriteFlags, CurInstr.Info.ReadFlags);
+            NZCVHostSynced = LastFlushFull || (NZCVHostSynced && neutral);
+        }
+#endif
 #endif
     }
 
