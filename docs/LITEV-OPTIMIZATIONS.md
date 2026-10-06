@@ -88,6 +88,7 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 | hybrid: stage texture VRAM updates for the GL 3D thread (LITEV_HYB_TEXSTAGE) | `LITEV_HYB_TEXSTAGE` | A (renderer-side only) |
 | gx: inline the command FIFO pop, refill out of line (LITEV_GXFIFO_READ_INLINE) | `LITEV_GXFIFO_READ_INLINE` | A |
 | dma: CheckDMAs visits only channels armed for that start mode (LITEV_DMA_ARMED_MASK) | `LITEV_DMA_ARMED_MASK` | A |
+| jit: DraStic-style exit protocol on linked hops (LITEV_JIT_EXIT_PROTO) | `LITEV_JIT_EXIT_PROTO`, `LITEV_EXIT_PROTO_PC`, `LITEV_EXIT_PROTO_STOP`, `LITEV_EXIT_PROTO_NZCV` | A |
 | build: add LITEV_AUTO_FRAMESKIP option (adaptive real-time frameskip) | `LITEV_AUTO_FRAMESKIP` | A (UX feature; see section) |
 
 ## Performance options
@@ -813,6 +814,32 @@ See also: [NEGATIVE-RESULTS.md](NEGATIVE-RESULTS.md) (levers that were tried and
 **Measured.** On top of READ_INLINE: PW overworld cycles -0.40 %, instructions -1.04 %; Shrek cycles -0.50 %, instructions -0.49 %. Both together against the tip: PW overworld cycles -1.46 %, instructions -2.03 %; Shrek cycles -1.25 %, instructions -1.48 % (2026-10-03). Not measured as app fps; at about 1.4 % it is below what a single app leg resolves.
 
 **Option.** LITEV_DMA_ARMED_MASK (default OFF; enabled in the app's shipping build)
+
+### jit: DraStic-style exit protocol on linked hops (LITEV_JIT_EXIT_PROTO)
+
+**What.** Three parts on top of BUDGET_REG and the link machinery, each with its own switch. Every link site gets its own stub after the patch slot (`[mov w9, #0] ; [store R[15]] ; b dispatcher`), and an unlinked site branches to it instead of the dispatcher.
+- **PC** (`LITEV_EXIT_PROTO_PC`). An exit that is certainly a link exit no longer stores the next guest PC in the hot stream. That covers the taken edge of a conditional branch followed not-taken, the not-taken edge of one followed taken, and an unconditional static branch or compiled fall-through ending the block. The stub stores it, and every path to the dispatcher (unlinked site, budget end, pending stop) goes through the stub. EmitBlockExit aborts compilation if a dispatcher exit ever follows a skipped store.
+- **STOP** (`LITEV_EXIT_PROTO_STOP`). Linked hops and DIRECTPATCH guard stubs no longer load StopExecution. `ARM::JitStopToBudget` forces the budget to 0 whenever the dispatcher would take its stop exit (any stop except an IRQ masked by CPSR.I, which IRQMASK_CONT continues past). It runs before every slice, in `ARM::Halt`, and at the top of `ARM::UpdateMode`, which every C++ write of the CPSR control byte reaches; UpdateIRQ already forced the exit. The cold path adds block K's cycles back before the dispatcher, so a stop exit still leaves K uncommitted.
+- **NZCV** (`LITEV_EXIT_PROTO_NZCV`, needs LAZYFLAGS). The compiler tracks whether host NZCV equals the JitNZCV slot. That holds right after a full MRS+STR flush, and through unconditional, compiled, non-branching bodies that `Comp_BodyIsNZCVTransparent` clears. While it holds, CheckCondition branches on host NZCV instead of reloading the slot.
+
+A linked hop is now `subs w15, w15, w28 ; b.le cold ; mov w28, #0 ; b target`: 4 instructions, no memory access. Before it was 10, with 1 load and 1 store: the PC store (MOVZ/MOVK/STR), LDR StopExecution, CBNZ, SUBS, B.LE, MOV W28, MOV W9, B.
+
+**Why it works.** These are the per-hop costs BUDGET_REG left (BIG-GAINS #2: the PC store is ~5 % and the JitNZCV slot ~4.8 % of hot JIT bytes) and the store-to-load round trip of `CMP; Bcc` through the slot. The NZCV part removes 1,883 of 5,682 static slot reloads in the PW overworld code cache. PC+STOP shrink the cache by 1.06 %, all three parts by 1.65 %.
+
+**Exactness.** A. R[15] in memory is read only by the dispatcher and by C++ at exits, plus ARM7 BIOS read protection and DSi-only checks. So PC elision is DS-mode only, and for ARM7 only between blocks at or above 0x4000. The STOP hot path is taken only when the dispatcher would have continued. NZCV relies on two invariants LAZYFLAGS already depends on, and keeps the eager C/V store. Gates (app flag set, ON vs OFF from the same commit): guest traces identical for 600 and 1800 frames on PW .ml1/.ml2/.ml3 and Shrek .ml2, and in interpreter mode. Sync-render PPMs (`LITEV_3DTHREAD=0 LITEV_PIPEDEPTH=1`) of JIT match the interpreter on PW .ml1/.ml3 at frames 100/250/299/599; the only non-identical captures, in 3 repeats, are byte-equal to the flag-OFF build's own capture jitter. Mutations caught: wrong stub PC, +1 cycle per hop, a missing UpdateMode or slice-entry hook, a cold path that commits K. Two NZCV mutations are caught by both gates (PW .ml1 loses the professor's 3D polygons): keeping "synced" across non-transparent bodies, and skipping the eager C/V flush.
+
+**Measured.** Host only (Apple Silicon, headless `app` flag set, 600 f, n = 10 interleaved, emu-thread instructions from `thread_selfcounts`; measurement-only harness patch). The table gives the change vs flag OFF, sd 0.1-0.6 %. Host cycles were within noise (sd 3-7 %). Device UNMEASURED (2026-10-06).
+
+| Parts | PW overworld | PW .ml1 | Shrek slot 2 |
+|---|---|---|---|
+| PC | -0.31 % | -0.11 % | -0.25 % |
+| STOP | -0.29 % | -0.19 % | -0.22 % |
+| NZCV | -0.27 % | -0.35 % | -0.11 % |
+| PC+STOP+NZCV | **-0.86 %** (-118k instr/frame) | **-0.50 %** | **-0.57 %** |
+
+Not done. A flag-free `sub + tbnz` hop on a budget biased by -1, with a pending stop poisoning the register, was exact. But it cost +0.7 to +1.45 % process instructions, because of its bookkeeping on the 25-40k helper calls per frame (NEGATIVE-RESULTS). Keeping guest NZCV in host flags across linked hops, as DraStic does, was also left out. The eager C/V rule keeps the slot store, the hop's budget compare sets flags, and only 3.9 % of blocks reload the slot before their first flag write.
+
+**Option.** LITEV_JIT_EXIT_PROTO (default OFF; needs LITEV_JIT_BUDGET_REG and all three LITEV_LINK_* classes). Sub-switches LITEV_EXIT_PROTO_PC, LITEV_EXIT_PROTO_STOP and LITEV_EXIT_PROTO_NZCV default ON under it; NZCV also needs LITEV_JIT_LAZYFLAGS. Not in the app's shipping build yet.
 
 ## Unflagged optimizations
 
