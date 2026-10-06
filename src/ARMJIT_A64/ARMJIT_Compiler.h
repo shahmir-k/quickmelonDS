@@ -404,11 +404,34 @@ public:
     // (initially -> dispatcher) for a static, same-mode exit whose next PC is the
     // compile-time constant targetAddr. Records the patch site + target into
     // LinkExits[] for the C++ registry to resolve after the block is registered.
-    void EmitLinkExit(u32 targetAddr);
+    // newPC is the R[15] value the exit leaves for the dispatcher (target + 4, or + 2
+    // for a Thumb target); only used when the PC store was elided (PCElided).
+    void EmitLinkExit(u32 targetAddr, u32 newPC);
     // Rewrite the 4-byte `B` at RX offset rxOffset to branch to RX offset
     // targetRxOffset. Caller owns the W^X (JitEnableWrite/Execute) bracket.
     void PatchLinkSite(u32 rxOffset, u32 targetRxOffset);
     u32 DispatcherRXOffset(u32 num) { return (u32)((u8*)DispatcherEntry[num] - GetRXBase()); }
+    // Where an unlinked link site branches: its own stub right after the slot under
+    // EXIT_PROTO (it stores the PC / site register first), else the dispatcher.
+    u32 UnlinkedSiteTarget(u32 num, u32 rxOffset)
+    {
+#ifdef LITEV_JIT_EXIT_PROTO
+        (void)num;
+        return rxOffset + 4;
+#else
+        (void)rxOffset;
+        return DispatcherRXOffset(num);
+#endif
+    }
+#ifdef LITEV_EXIT_PROTO_PC
+    // May the linked exit to `target` leave R[15] unwritten? See ARMJIT_Compiler.cpp.
+    bool ExitPCElidable(u32 target);
+    // An R[15] store was skipped for an exit that must be a link exit; EmitLinkExit
+    // consumes it (its cold path stores the PC), EmitBlockExit refuses to see it.
+    bool PCElided = false;
+    u32 BlockStartAddr = 0;
+#endif
+    u32 StaticExitNewPC = 0;
 
     // Populated during CompileBlock; copied into the JitBlock by ARMJIT::CompileBlock.
     u8 NumLinkExits = 0;

@@ -449,6 +449,23 @@ if (LITEV_JIT_BUDGET_REG)
     endif()
 endif()
 
+# Exit protocol (DraStic-style linked hops). Builds on BUDGET_REG and the link machinery.
+# Each part has its own kill switch so a regression can be bisected to it:
+#   PC   - linked exits do not store the guest PC; only the paths that leave the chain do.
+# Exact (category A). Default OFF; the sub-switches default ON and only take effect with it.
+option(LITEV_JIT_EXIT_PROTO "DraStic-style exit protocol on linked hops (exact)" OFF)
+option(LITEV_EXIT_PROTO_PC "Exit protocol: no PC store on linked exits" ON)
+if (LITEV_JIT_EXIT_PROTO)
+    if (LITEV_JIT_BUDGET_REG AND LITEV_LINK_UNCOND AND LITEV_LINK_COND AND LITEV_LINK_FALLTHROUGH)
+        add_compile_definitions(LITEV_JIT_EXIT_PROTO=1)
+        if (LITEV_EXIT_PROTO_PC)
+            add_compile_definitions(LITEV_EXIT_PROTO_PC=1)
+        endif()
+    else()
+        message(FATAL_ERROR "LITEV_JIT_EXIT_PROTO requires LITEV_JIT_BUDGET_REG and all three LITEV_LINK_* classes.")
+    endif()
+endif()
+
 # Masked-IRQ continue: when the only stop reason at a block hop is an IRQ the guest has
 # masked with CPSR.I, the dispatcher keeps going instead of returning to C++ (where
 # TriggerIRQ would return at once and the loop would re-dispatch). Exact (category A).

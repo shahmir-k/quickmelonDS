@@ -171,6 +171,20 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
         cpu7->CodeCycles = addr >> 15;
     }
 
+#ifdef LITEV_JIT_LINK
+    StaticExitNewPC = newPC;
+#endif
+#ifdef LITEV_EXIT_PROTO_PC
+    // Skip the store when this exit is certainly a link exit: the taken edge of a
+    // conditional branch followed not-taken (Comp_BranchSpecialBehaviour), or an
+    // unconditional static branch ending the block (block-end tail). EmitLinkExit's
+    // cold path stores newPC instead; EmitBlockExit aborts if this guess is ever wrong.
+    bool linkExit = (CurInstr.BranchFlags & branch_FollowCondNotTaken)
+        || !(Thumb ? (CurInstr.Info.Kind == ARMInstrInfo::tk_BCOND) : (CurInstr.Cond() < 0xE));
+    if (Exit && linkExit && ExitPCElidable(addr))
+        PCElided = true;
+    else
+#endif
     if (Exit)
     {
         MOVI2R(W0, newPC);

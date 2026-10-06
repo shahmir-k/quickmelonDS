@@ -711,14 +711,13 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
 
     JitEnableWrite();
 
-    u32 dispOff = JITCompiler.DispatcherRXOffset(block->Num);
-
-    // (a) rewrite every incoming site back to the dispatcher and re-pend it so a
-    //     recompile at this StartAddr re-arms the link.
+    // (a) rewrite every incoming site back to its unlinked target (the dispatcher, or
+    //     the site's own stub under EXIT_PROTO) and re-pend it so a recompile at this
+    //     StartAddr re-arms the link.
     for (int i = 0; i < block->Incoming.Length; i++)
     {
         LinkSite site = block->Incoming[i];
-        JITCompiler.PatchLinkSite(site.PatchOffset, dispOff);
+        JITCompiler.PatchLinkSite(site.PatchOffset, JITCompiler.UnlinkedSiteTarget(block->Num, site.PatchOffset));
         pending.insert({block->StartAddr, site});
         LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksUnlinked);
     }
@@ -763,7 +762,7 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
 
         // Reset our own slot: our RX is preserved until ResetBlockCache, but a stale
         // B->dead-target must never survive a restore (LinkBlock re-drives it).
-        JITCompiler.PatchLinkSite(link.PatchOffset, dispOff);
+        JITCompiler.PatchLinkSite(link.PatchOffset, JITCompiler.UnlinkedSiteTarget(block->Num, link.PatchOffset));
     }
 
     JitEnableExecute();
@@ -792,7 +791,11 @@ void ARMJIT::ValidateLinkSites() noexcept
         u32 targetOff = patchOffset + (u32)imm;
         // Use abort() not assert(): the shadow build is Release (NDEBUG), matching
         // the LiteV_ShadowAssertBudget convention.
-        if ((instr & 0xFC000000u) != 0x14000000u || valid.count(targetOff) != 1)
+        bool unlinkedStub = false;
+#ifdef LITEV_JIT_EXIT_PROTO
+        unlinkedStub = targetOff == patchOffset + 4;
+#endif
+        if ((instr & 0xFC000000u) != 0x14000000u || (valid.count(targetOff) != 1 && !unlinkedStub))
         {
             fprintf(stderr,
                 "[LITEV_SHADOW_ASSERT] stale link site: srcBlock=%08x off=%x "

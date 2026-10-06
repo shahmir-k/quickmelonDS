@@ -307,6 +307,24 @@ void Compiler::EmitBudgetSpill(ARM64Reg t0, ARM64Reg t1, ARM64Reg t2)
 }
 #endif
 
+#ifdef LITEV_EXIT_PROTO_PC
+// A linked hop may skip the R[15] store only if nothing can read the stale value before
+// the chain leaves to C++ (every path to the dispatcher stores it). C++ reads ARM::R[15]
+// mid-slice only in: exception entry and the C++ loop (at exits), ARM7 BIOS read
+// protection (NDS::ARM7Read*: R[15] vs 0x4000 / ARM7BIOSProt), the DSi ARM9 loader check
+// and DSi ARM7 BIOS protection, and log messages. So: DS mode only; ARM9 always; ARM7
+// only between blocks outside the BIOS, where a stale R[15] (the start of some earlier
+// block of the same chain, also >= 0x4000) gives the same protection answer.
+bool Compiler::ExitPCElidable(u32 target)
+{
+    if (NDS.ConsoleType != 0)
+        return false;
+    if (Num == 0)
+        return true;
+    return BlockStartAddr >= 0x4000 && target >= 0x4000;
+}
+#endif
+
 void Compiler::MovePC()
 {
     ADD(MapReg(15), MapReg(15), Thumb ? 2 : 4);
@@ -1485,6 +1503,14 @@ void Compiler::EmitBlockExit()
     // makes the invariant explicit / robust rather than implicit.
     Comp_MaterializeFlags();
 #endif
+#ifdef LITEV_EXIT_PROTO_PC
+    // The dispatcher reads R[15]: an elided PC store must have been for a link exit.
+    if (PCElided)
+    {
+        Log(LogLevel::Error, "JIT: PC store elided for a dispatcher exit (block %08x)\n", BlockStartAddr);
+        abort();
+    }
+#endif
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.DispatchOnlyExits);
 #ifdef LITEV_JIT_ICACHE
     // Hand this dynamic exit its own per-site cache slot; the dispatcher (d.5-ICACHE)
@@ -1522,7 +1548,7 @@ void Compiler::EmitBlockExit()
 //       target); LINKED it is rewritten to branch straight into the target block.
 // Because the slot only ever holds an unconditional `B`, it can be re-patched
 // (link / unlink) concurrently with execution on ARMv8 without synchronisation.
-void Compiler::EmitLinkExit(u32 targetAddr)
+void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
 {
 #ifdef LITEV_JIT_LAZYFLAGS
     // A linked hop bypasses the dispatcher AND (under LAZYFLAGS) neither the stub nor the
@@ -1531,6 +1557,44 @@ void Compiler::EmitLinkExit(u32 targetAddr)
     // flushed, and the block-end after 1419), so this guarded flush is a compile-time no-op.
     Comp_MaterializeFlags();
 #endif
+#ifdef LITEV_JIT_EXIT_PROTO
+    // EXIT_PROTO hop. Hot path (linked):
+    //     ldr w2, [StopExecution] ; cbnz w2, stub ; subs w15, w15, w28 ; b.le cold ;
+    //     mov w28, #0 ; b <target>
+    // The slot's own stub follows it; it is the unlinked target (UnlinkedSiteTarget):
+    //     [mov w9, #0] ; [store R[15]] ; b dispatcher
+    // and the cold path undoes the subtraction and joins the stub, so the dispatcher
+    // sees exactly what an unlinked hop always gave it and runs (a)-(c) itself: a pending
+    // stop still exits with block K's cycles uncommitted, a spent budget still commits.
+    LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
+    FixupBranch toStop = CBNZ(W2);
+    SUBS(RBudget, RBudget, RCycles);
+    FixupBranch toCold = B(CC_LE);
+    MOVI2R(RCycles, 0);
+    u32 patchOffset = (u32)((u8*)GetRXPtr() - GetRXBase());
+    FixupBranch slot = B();   // the patch slot; unlinked it branches to the stub below
+    SetJumpTarget(slot);
+    const void* stub = GetRXPtr();
+  #ifdef LITEV_JIT_ICACHE
+    MOVI2R(W9, 0);   // a linkable exit opts out of the per-site cache (0 = no cache)
+  #endif
+  #ifdef LITEV_EXIT_PROTO_PC
+    if (PCElided)
+    {
+        MOVI2R(W0, newPC);
+        STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
+        PCElided = false;
+    }
+  #else
+    (void)newPC;
+  #endif
+    B(DispatcherEntry[Num]);
+    SetJumpTarget(toCold);
+    ADD(RBudget, RBudget, RCycles);
+    SetJumpTarget(toStop);
+    B(stub);
+#else
+    (void)newPC;
     void* tsPtr = (Num == 0) ? (void*)&NDS.ARM9Timestamp : (void*)&NDS.ARM7Timestamp;
 
     // (a)
@@ -1580,6 +1644,7 @@ void Compiler::EmitLinkExit(u32 targetAddr)
     SetJumpTarget(toDispatchBudget);
 #endif
     B(DispatcherEntry[Num]);
+#endif  // LITEV_JIT_EXIT_PROTO
 
     if (NumLinkExits < 2)
     {
@@ -1853,11 +1918,11 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
         // false on the taken edge -> fall back to the dispatcher for that edge.
         if (taken && HasStaticExit)
         {
-            EmitLinkExit(StaticExitTarget);
+            EmitLinkExit(StaticExitTarget, StaticExitNewPC);
         }
         else if (!taken)
         {
-            EmitLinkExit(CurInstr.Addr + (Thumb ? 2 : 4));
+            EmitLinkExit(CurInstr.Addr + (Thumb ? 2 : 4), CurInstr.Addr + (Thumb ? 4 : 8));
         }
         else
         {
@@ -1926,6 +1991,10 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     HasStaticExit = false;
     LastInstrCompiledNonBranch = false;
 #endif
+#ifdef LITEV_EXIT_PROTO_PC
+    PCElided = false;
+    BlockStartAddr = instrs[0].Addr;
+#endif
 
     if (hasMemInstr)
         MOVP2R(RMemBase, Num == 0 ? NDS.JIT.Memory.FastMem9Start : NDS.JIT.Memory.FastMem7Start);
@@ -1976,8 +2045,22 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 #endif
         if (comp == NULL || (CurInstr.BranchFlags & branch_FollowCondTaken) || (i == instrsCount - 1 && (!CurInstr.Info.Branches() || isConditional)))
         {
-            MOVI2R(W0, R15);
-            STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
+#ifdef LITEV_EXIT_PROTO_PC
+            // This R15 is only read by the not-taken edge of a followed-taken branch or the
+            // block-end fall-through. Both are link exits for a compiled instruction (see
+            // Comp_BranchSpecialBehaviour and the block-end tail), whose cold path stores it.
+            bool fallthroughLinks = comp != NULL
+                && ((CurInstr.BranchFlags & branch_FollowCondTaken)
+                    || (i == instrsCount - 1 && !CurInstr.Info.Branches()))
+                && ExitPCElidable(CurInstr.Addr + (Thumb ? 2 : 4));
+            if (fallthroughLinks)
+                PCElided = true;
+            else
+#endif
+            {
+                MOVI2R(W0, R15);
+                STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
+            }
             if (comp == NULL)
             {
                 MOVI2R(W0, CurInstr.Instr);
@@ -2182,14 +2265,14 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     if (HasStaticExit && !StaticExitCond)
     {
     #ifdef LITEV_LINK_UNCOND
-        EmitLinkExit(StaticExitTarget);
+        EmitLinkExit(StaticExitTarget, StaticExitNewPC);
         linked = true;
     #endif
     }
     else if (!HasStaticExit && LastInstrCompiledNonBranch)
     {
     #ifdef LITEV_LINK_FALLTHROUGH
-        EmitLinkExit(LastInstrFallthroughAddr);
+        EmitLinkExit(LastInstrFallthroughAddr, LastInstrFallthroughAddr + (Thumb ? 2 : 4));
         linked = true;
     #endif
     }
