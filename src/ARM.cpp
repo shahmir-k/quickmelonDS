@@ -507,6 +507,12 @@ void ARM::RestoreCPSR()
 
 void ARM::UpdateMode(u32 oldmode, u32 newmode, bool phony)
 {
+#ifdef LITEV_EXIT_PROTO_STOP
+    // Every C++ write of the CPSR control byte (MSR, RestoreCPSR, exception entry) ends
+    // here, so this is where clearing CPSR.I can unmask a pending IRQ mid-slice. Before the
+    // early return: an I-only change keeps the mode.
+    JitStopToBudget();
+#endif
     if ((oldmode & 0x1F) == (newmode & 0x1F)) return;
 
     switch (oldmode & 0x1F)
@@ -733,6 +739,9 @@ void ARMv5::Execute()
             JitTsPtr = &NDS.ARM9Timestamp;
             JitTsBase = NDS.ARM9Timestamp + CyclesBudget;
 #endif
+#ifdef LITEV_EXIT_PROTO_STOP
+            JitStopToBudget();   // a stop already pending: exit at the first hop
+#endif
 
             if (block)
             {
@@ -928,6 +937,9 @@ void ARMv4::Execute()
 #ifdef LITEV_JIT_BUDGET_REG
             JitTsPtr = &NDS.ARM7Timestamp;
             JitTsBase = NDS.ARM7Timestamp + CyclesBudget;
+#endif
+#ifdef LITEV_EXIT_PROTO_STOP
+            JitStopToBudget();   // a stop already pending: exit at the first hop
 #endif
 
             if (block)

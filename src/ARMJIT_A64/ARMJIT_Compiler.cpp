@@ -1558,16 +1558,19 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
     Comp_MaterializeFlags();
 #endif
 #ifdef LITEV_JIT_EXIT_PROTO
-    // EXIT_PROTO hop. Hot path (linked):
-    //     ldr w2, [StopExecution] ; cbnz w2, stub ; subs w15, w15, w28 ; b.le cold ;
-    //     mov w28, #0 ; b <target>
+    // EXIT_PROTO hop. Hot path (linked, with the STOP part):
+    //     subs w15, w15, w28 ; b.le cold ; mov w28, #0 ; b <target>
     // The slot's own stub follows it; it is the unlinked target (UnlinkedSiteTarget):
     //     [mov w9, #0] ; [store R[15]] ; b dispatcher
     // and the cold path undoes the subtraction and joins the stub, so the dispatcher
     // sees exactly what an unlinked hop always gave it and runs (a)-(c) itself: a pending
     // stop still exits with block K's cycles uncommitted, a spent budget still commits.
+  #ifndef LITEV_EXIT_PROTO_STOP
     LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
     FixupBranch toStop = CBNZ(W2);
+  #endif
+    // STOP: a stop the dispatcher would exit on has already forced the budget to 0
+    // (ARM::JitStopToBudget), so this one compare covers it.
     SUBS(RBudget, RBudget, RCycles);
     FixupBranch toCold = B(CC_LE);
     MOVI2R(RCycles, 0);
@@ -1591,7 +1594,9 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
     B(DispatcherEntry[Num]);
     SetJumpTarget(toCold);
     ADD(RBudget, RBudget, RCycles);
+  #ifndef LITEV_EXIT_PROTO_STOP
     SetJumpTarget(toStop);
+  #endif
     B(stub);
 #else
     (void)newPC;
@@ -1718,6 +1723,15 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
     void* dispatcher = DispatcherEntry[num];
     void* tsPtr = (num == 0) ? (void*)&NDS.ARM9Timestamp : (void*)&NDS.ARM7Timestamp;
 
+#ifdef LITEV_EXIT_PROTO_STOP
+    // (a)-(c) as one budget compare: a stop the dispatcher would exit on has already
+    // zeroed the budget (ARM::JitStopToBudget). The cold path below adds block K back, so
+    // the dispatcher still sees it uncommitted and checks the stop first.
+    (void)tsPtr;
+    SUBS(RBudget, RBudget, RCycles);
+    FixupBranch toCold = B(CC_LE);
+    MOVI2R(RCycles, 0);
+#else
     // (a) StopExecution -> dispatcher (bounce to C++, block K's Cycles intact).
     LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, StopExecution));
     FixupBranch toDispStop = CBNZ(W2);
@@ -1744,6 +1758,7 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
     CMP(W1, 0);
     FixupBranch toDispBudget = B(CC_LE);
 #endif
+#endif  // LITEV_EXIT_PROTO_STOP
 
     // (d) instrAddr = R[15] - ((CPSR&0x20)?2:4)  (== dispatcher step (d), byte for byte).
     LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
@@ -1785,8 +1800,14 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
     ADD(X5, X5, 1);
     STR(INDEX_UNSIGNED, X5, X4, 0);
 #endif
+#ifdef LITEV_EXIT_PROTO_STOP
+    B(dispatcher);
+    SetJumpTarget(toCold);
+    ADD(RBudget, RBudget, RCycles);
+#else
     SetJumpTarget(toDispStop);
     SetJumpTarget(toDispBudget);
+#endif
     B(dispatcher);
 
     FlushIcache();                        // covers the align padding + the whole stub

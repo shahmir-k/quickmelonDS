@@ -83,6 +83,9 @@ public:
     {
         if (halt==2 && Halted==1) return;
         Halted = halt;
+#ifdef LITEV_EXIT_PROTO_STOP
+        JitStopToBudget();
+#endif
     }
 
     // liteDS-v2 Unit 2 (shadow mode): force the current execution slice to end
@@ -98,6 +101,24 @@ public:
     void ForceExecutionExit() { JitTsBase -= (s64)CyclesBudget; CyclesBudget = 0; }
 #else
     void ForceExecutionExit() { CyclesBudget = 0; }
+#endif
+#ifdef LITEV_EXIT_PROTO_STOP
+    // LITEV_EXIT_PROTO_STOP: linked hops and guard stubs no longer load StopExecution, only
+    // the budget. So whenever the emitted dispatcher would take its stop exit (any stop
+    // except an IRQ the guest has masked, which LITEV_JIT_IRQMASK_CONT continues past), the
+    // budget must be <= 0, sending the next hop to the dispatcher, which checks the stop
+    // first. Called before every slice and wherever a stop or CPSR.I can change in C++
+    // (Halt, UpdateMode; UpdateIRQ already forces the exit). Forcing when not needed is
+    // exact too: a budget exit followed by re-dispatch is the same as a continue.
+    void JitStopToBudget()
+    {
+        if (StopExecution
+#ifdef LITEV_JIT_IRQMASK_CONT
+            && !(StopExecution == 0x100 && (CPSR & 0x80))
+#endif
+            )
+            ForceExecutionExit();
+    }
 #endif
 
     void NocashPrint(u32 addr) noexcept;
