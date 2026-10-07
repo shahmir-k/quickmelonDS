@@ -892,6 +892,21 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     printf("peak_connected:  0x%x\n", peakConnected.load());
     printf("first_assoc_frame: %d\n", firstAssocFrame);
     printf("cmd_frames:      %llu\n", (unsigned long long)cmd);
+#if LITEV_PROFILE
+    {   // JIT transition counters over the whole run, both consoles (LITEV_PROFILE builds)
+        using namespace melonDS::LiteProfile;
+        auto v = [](std::atomic<uint64_t>& a) { return (unsigned long long)a.load(); };
+        printf("jit: cpp_reentries=%llu dispatcher_hits=%llu icache_hits=%llu commit_stub=%llu"
+#ifdef LITEV_JIT_DIRECTPATCH
+               " direct_guard_hits=%llu"
+#endif
+               "\n", v(g_Frame.CppReentries), v(g_Frame.DispatcherHits), v(g_Frame.ICacheHits), v(g_Frame.CommitStubEntries)
+#ifdef LITEV_JIT_DIRECTPATCH
+               , v(g_Frame.DirectGuardHits)
+#endif
+               );
+    }
+#endif
     printf("reply_frames:    %llu\n", (unsigned long long)reply);
     printf("packets:         %llu\n", (unsigned long long)pkt);
     printf("ran_clean:       %s\n", ranClean ? "yes" : "no");
