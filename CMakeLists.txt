@@ -804,6 +804,11 @@ endif()
 # (547/frame) by ~N x. Sample generation is bit-identical per iteration; only
 # scheduler granularity + SPU-IRQ/capture latency coarsen (FPS-first). N is the
 # batch factor (default 8 -> 547/frame -> ~68/frame). Default OFF.
+option(LITEV_WIFI_BATCH "Up to LITEV_WIFI_BATCH_N 8us Wi-Fi ticks per Event_Wifi while the Wi-Fi hardware is idle (Category B, deterministic)" OFF)
+set(LITEV_WIFI_BATCH_N "4" CACHE STRING "Wi-Fi ticks per event while idle")
+if (LITEV_WIFI_BATCH)
+    add_compile_definitions(LITEV_WIFI_BATCH=1 LITEV_WIFI_BATCH_N=${LITEV_WIFI_BATCH_N})
+endif()
 option(LITEV_SPU_BATCH "DraStic #11: batch N audio samples per Event_SPU (coarsen SPU event flood)" OFF)
 set(LITEV_SPU_BATCH_N "8" CACHE STRING "SPU batch factor (samples generated per scheduled Event_SPU)")
 if (LITEV_SPU_BATCH)

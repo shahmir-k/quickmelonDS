@@ -336,16 +336,22 @@ void Wifi::DoSavestate(Savestate* file)
 }
 
 
-void Wifi::ScheduleTimer(bool first)
+void Wifi::ScheduleTimer(bool first, int ticks)
 {
     if (first) TimerError = 0;
 
-    s32 cycles = 33513982 * kTimerInterval;
-    cycles -= TimerError;
-    s32 delay = (cycles + 999999) / 1000000;
-    TimerError = (delay * 1000000) - cycles;
+    // the next event comes `ticks` 8us ticks later, each tick's length exactly as if scheduled one by one
+    s32 total = 0;
+    for (int i = 0; i < ticks; i++)
+    {
+        s32 cycles = 33513982 * kTimerInterval;
+        cycles -= TimerError;
+        s32 delay = (cycles + 999999) / 1000000;
+        TimerError = (delay * 1000000) - cycles;
+        total += delay;
+    }
 
-    NDS.ScheduleEvent(Event_Wifi, !first, delay, 0, 0);
+    NDS.ScheduleEvent(Event_Wifi, !first, total, 0, 0);
 }
 
 void Wifi::UpdatePowerOn()
@@ -1883,6 +1889,26 @@ void Wifi::MSTimer()
 
 void Wifi::USTimer(u32 param)
 {
+    int ticks = 0;
+    do
+    {
+        USTick();
+        ticks++;
+    }
+#ifdef LITEV_WIFI_BATCH
+    // While the hardware is idle (no transfer, no power-up pending), run the next few ticks now
+    // and wake up less often: each Wi-Fi event pulls both CPUs out of their JIT code, and these
+    // 8us ticks were ~78% of all scheduler events in a multiplayer race. Deterministic, but the
+    // idle ticks land up to (N-1)*8us early.
+    while (ticks < LITEV_WIFI_BATCH_N && ComStatus == 0 && !IOPORT(W_TXBusy) && USUntilPowerOn >= 0);
+#else
+    while (false);
+#endif
+    ScheduleTimer(false, ticks);
+}
+
+void Wifi::USTick()
+{
     USTimestamp += kTimerInterval;
 
     if (IsMPClient && (!ComStatus))
@@ -2068,8 +2094,6 @@ void Wifi::USTimer(u32 param)
             }
         }
     }
-
-    ScheduleTimer(false);
 }
 
 

@@ -166,6 +166,7 @@ public:
     void SetPowerCnt(u32 val);
 
     void USTimer(u32 param);
+    void USTick();
 
     u16 Read(u32 addr);
     void Write(u32 addr, u16 val);
@@ -251,7 +252,7 @@ private:
 
     class WifiAP* WifiAP;
 
-    void ScheduleTimer(bool first);
+    void ScheduleTimer(bool first, int ticks = 1);
     void UpdatePowerOn();
 
     void CheckIRQ(u16 oldflags);
