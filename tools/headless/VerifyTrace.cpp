@@ -822,6 +822,10 @@ int MPTest(const TraceRunConfig& cfg, int frames,
                     fflush(stdout);
                     lastSwaps = sw;
                 }
+                if (getenv("LITEV_MP_DUMP7") && inst == 1 && f + 1 == atoi(getenv("LITEV_MP_DUMP7")))
+                {   // diagnostics: ARM7 WRAM (0x037F8000, 64 KB) to disassemble the hot ARM7 code
+                    if (FILE* fp = fopen("arm7wram.bin", "wb")) { fwrite(b.nds->ARM7WRAM, 1, 0x10000, fp); fclose(fp); }
+                }
                 if (dumpDir && dumpEvery > 0 && ((f + 1) % dumpEvery) == 0)
                 {
                     void* top = nullptr; void* bot = nullptr;
