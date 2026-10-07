@@ -67,6 +67,12 @@ public:
     // The input of `player` for emulated frame `frame`; blocks until known.
     NetplayFrameInput Get(int player, int frame);
 
+    // Desync check: each device sends the hash of its own console's state every so often; the
+    // other device compares it with its copy of that console (PeerHash). Unreliable: a lost
+    // report only skips one check.
+    void SendHash(int frame, u64 hash);
+    bool PeerHash(int frame, u64& hash);
+
     // Total time spent blocked in Get() waiting for the remote player (ms).
     double StallMs() const { return StallUs.load() / 1000.0; }
 
@@ -83,6 +89,7 @@ private:
     std::mutex Lock;
     std::condition_variable Changed;
     std::map<int, NetplayFrameInput> Inputs[2];    // by applied frame
+    std::map<int, u64> PeerHashes;  // the peer's own console, by frame
     std::deque<std::pair<int, NetplayFrameInput>> Unacked; // (applied frame, input), oldest first
     int PeerAck;            // the peer has all our inputs up to this applied frame
     int RemoteUpTo;         // we have all the peer's inputs up to this applied frame

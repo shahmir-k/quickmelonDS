@@ -34,6 +34,7 @@ namespace melonDS
 namespace
 {
 constexpr u32 kMagic = 0x4E504932; // "NPI2"
+constexpr u32 kHashMagic = 0x4E504831; // "NPH1"
 
 #pragma pack(push, 1)
 struct WireEntry
@@ -50,6 +51,14 @@ struct WireHeader
     s32 Ack;    // the sender has all of the receiver's inputs up to this applied frame
 };
 #pragma pack(pop)
+
+struct WireHash
+{
+    u32 Magic;
+    u8 Player;
+    s32 Frame;
+    u64 Hash;
+};
 
 u64 NowUs()
 {
@@ -128,6 +137,21 @@ void NetplayInput::Send()
     sendto(Socket, packet.data(), packet.size(), 0, (sockaddr*)PeerAddr, sizeof(sockaddr_in));
 }
 
+void NetplayInput::SendHash(int frame, u64 hash)
+{
+    WireHash h {kHashMagic, (u8)Local, frame, hash};
+    sendto(Socket, &h, sizeof(h), 0, (sockaddr*)PeerAddr, sizeof(sockaddr_in));
+}
+
+bool NetplayInput::PeerHash(int frame, u64& hash)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    auto it = PeerHashes.find(frame);
+    if (it == PeerHashes.end()) return false;
+    hash = it->second;
+    return true;
+}
+
 NetplayFrameInput NetplayInput::Get(int player, int frame)
 {
     if (frame < DelayFrames) return {}; // nobody has input before the delay has elapsed
@@ -167,6 +191,15 @@ void NetplayInput::ReceiveLoop()
         while (!pending.empty() && pending.front().first <= now)
         {
             std::vector<u8>& packet = pending.front().second;
+            WireHash wh;
+            if (packet.size() == sizeof(WireHash) && (memcpy(&wh, packet.data(), sizeof(wh)), wh.Magic == kHashMagic))
+            {
+                std::lock_guard<std::mutex> lk(Lock);
+                PeerHashes[wh.Frame] = wh.Hash;
+                while (PeerHashes.size() > 64) PeerHashes.erase(PeerHashes.begin());
+                pending.pop_front();
+                continue;
+            }
             WireHeader header;
             memcpy(&header, packet.data(), sizeof(header));
             if (header.Magic == kMagic && header.Player < 2 && header.Player != Local &&
