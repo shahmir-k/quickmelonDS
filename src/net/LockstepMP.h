@@ -51,7 +51,7 @@ namespace melonDS
 // with a clock, a console only reads frames sent after its latest Begin, and every wait is on the
 // clocks of all of them (a console with Wi-Fi off simply never sends or replies).
 //
-// kDelay (2 ms) is longer than any MP reply window (~0.5 ms). Deadlock freedom: every wait is
+// kDelay (4 ms; measured fastest on the RG DS, 2 ms makes the consoles wait on each other more) is longer than any MP reply window (~0.5 ms). Deadlock freedom: every wait is
 // either "peer clock > my clock - kDelay" (regular frames) or "peer clock >= my clock + kDelay"
 // (host frames, reply deadline): one strict, one inclusive, so two consoles can never both be
 // waiting on each other (that would need each to be at least kDelay ahead of the other).
@@ -85,7 +85,7 @@ public:
 
 private:
     static constexpr int kMaxInst = 16;
-    static constexpr u64 kDelay = 33514 * 2; // 2 ms in system clock cycles (33.514 MHz)
+    static constexpr u64 kDelay = 33514 * 4; // 4 ms in system clock cycles (33.514 MHz)
 
     struct Packet
     {
