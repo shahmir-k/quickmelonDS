@@ -1434,7 +1434,7 @@ void GPU3D::SubmitPolygon() noexcept
 
         // hi-res positions
         // to consider: only do this when using the GL renderer? apply the aforementioned quirk to this?
-        if (w != 0)
+        if (w != 0 && !Headless)   // (two 64-bit divides per vertex, only for the hi-res renderer)
         {
             posX = ((((s64)(vtx->Position[0] + w) * Viewport[4]) << 4) / (((s64)w) << 1)) + (Viewport[0] << 4);
             posY = ((((s64)(-vtx->Position[1] + w) * Viewport[5]) << 4) / (((s64)w) << 1)) + (Viewport[3] << 4);
@@ -1550,12 +1550,21 @@ void GPU3D::SubmitPolygon() noexcept
         NumVertices++;
         poly->NumVertices++;
 
+        if (Headless) continue;  // colours below only feed rendering
         vtx->FinalColor[0] = vtx->Color[0] >> 12;
         if (vtx->FinalColor[0]) vtx->FinalColor[0] = ((vtx->FinalColor[0] << 4) + 0xF);
         vtx->FinalColor[1] = vtx->Color[1] >> 12;
         if (vtx->FinalColor[1]) vtx->FinalColor[1] = ((vtx->FinalColor[1] << 4) + 0xF);
         vtx->FinalColor[2] = vtx->Color[2] >> 12;
         if (vtx->FinalColor[2]) vtx->FinalColor[2] = ((vtx->FinalColor[2] << 4) + 0xF);
+    }
+
+    // A console nobody watches stops here: bounds, sort key and per-vertex depth (a 64-bit
+    // divide each) only feed rendering. Counts, clipping and strip linking above are emulated.
+    if (Headless)
+    {
+        LastStripPolygon = (PolygonMode >= 2) ? poly : NULL;
+        return;
     }
 
     // determine bounds of the polygon
