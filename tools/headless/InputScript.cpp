@@ -110,6 +110,7 @@ bool InputScript::LoadFile(const std::string& path, std::string& err)
         }
 
         u32 pressed = 0;
+        int touchX = -1, touchY = -1;
         std::string keyUpper = Upper(keyTok);
         if (keyTok.empty() || keyUpper == "NONE")
         {
@@ -134,6 +135,13 @@ bool InputScript::LoadFile(const std::string& path, std::string& err)
         {
             for (const std::string& tok : SplitCommas(keyTok))
             {
+                // "T:x:y" = hold the touch screen at DS pixel (x, y)
+                int tx, ty;
+                if (sscanf(tok.c_str(), "%*1[Tt]:%d:%d", &tx, &ty) == 2 && tx >= 0 && tx < 256 && ty >= 0 && ty < 192)
+                {
+                    touchX = tx; touchY = ty; hasTouch_ = true;
+                    continue;
+                }
                 u32 bit;
                 if (!NameToBit(tok, bit))
                 {
@@ -148,7 +156,7 @@ bool InputScript::LoadFile(const std::string& path, std::string& err)
             }
         }
 
-        directives_.push_back({ (int)frame, pressed });
+        directives_.push_back({ (int)frame, pressed, touchX, touchY });
     }
     fclose(f);
 
@@ -166,6 +174,11 @@ bool InputScript::LoadFile(const std::string& path, std::string& err)
     {
         struct { s32 frame; u32 pressed; } packed = { (s32)d.frame, d.pressed };
         XXH3_64bits_update(st, &packed, sizeof(packed));
+        if (d.touchX >= 0)
+        {
+            s32 t[2] = { d.touchX, d.touchY };
+            XXH3_64bits_update(st, t, sizeof(t));
+        }
     }
     hash_ = XXH3_64bits_digest(st);
     XXH3_freeState(st);
@@ -191,3 +204,19 @@ u32 InputScript::PressedMaskForFrame(int frame) const
 }
 
 } // namespace liteds
+
+namespace liteds
+{
+bool InputScript::TouchForFrame(int frame, int& x, int& y) const
+{
+    const Directive* cur = nullptr;
+    for (const Directive& d : directives_)
+    {
+        if (d.frame > frame) break;
+        cur = &d;
+    }
+    if (!cur || cur->touchX < 0) return false;
+    x = cur->touchX; y = cur->touchY;
+    return true;
+}
+}

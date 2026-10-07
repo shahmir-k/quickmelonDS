@@ -2458,6 +2458,7 @@ gxfifo_threaded_top:
         gxf_50: // flush
             VertexPipelineCmdDelayed4();
             FlushRequest = 1;
+            SwapCount++;
             FlushAttributes = entry.Param & 0x3;
             CycleCount = 325;
             VertexPipeline = 0;
@@ -2806,6 +2807,7 @@ gxfifo_threaded_top:
         case 0x50: // flush
             VertexPipelineCmdDelayed4();
             FlushRequest = 1;
+            SwapCount++;
             FlushAttributes = entry.Param & 0x3;
             CycleCount = 325;
             // probably safe to just reset all pipelines

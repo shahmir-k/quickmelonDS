@@ -146,6 +146,12 @@ struct BuiltNDS
     {
         if (inputScript.Loaded())
             nds->SetKeyMask(inputScript.KeyMaskForFrame(frame));
+        int tx, ty;
+        if (inputScript.HasTouch())
+        {
+            if (inputScript.TouchForFrame(frame, tx, ty)) nds->TouchScreen(tx, ty);
+            else                                          nds->ReleaseScreen();
+        }
     }
 };
 
@@ -613,8 +619,16 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     std::atomic<bool> crashed{false};
     std::atomic<u32>  peakConnected{0};  // highest ConnectedBitmask seen
 
+    // LITEV_MP_DUMP_DIR + LITEV_MP_DUMP_EVERY=N: write both screens of each instance every N frames
+    // (instN_fFRAME.ppm, top over bottom) to find where the menus are. Every 60 frames each
+    // instance also prints how many 3D frames the game finished (SwapBuffers), i.e. the game's own
+    // frame rate, which the emulator frame count does not show.
+    const char* dumpDir = getenv("LITEV_MP_DUMP_DIR");
+    int dumpEvery = getenv("LITEV_MP_DUMP_EVERY") ? atoi(getenv("LITEV_MP_DUMP_EVERY")) : 0;
     auto runInstance = [&](BuiltNDS& b, std::atomic<int>& doneCounter)
     {
+        int inst = (&b == &b0) ? 0 : 1;
+        u32 lastSwaps = 0;
         try
         {
             for (int f = 0; f < frames; f++)
@@ -622,6 +636,35 @@ int MPTest(const TraceRunConfig& cfg, int frames,
                 b.ApplyInput(f);
                 b.nds->RunFrame();
                 doneCounter.store(f + 1, std::memory_order_relaxed);
+                if (((f + 1) % 60) == 0)
+                {
+                    u32 sw = b.nds->GPU.GPU3D.SwapCount;
+                    printf("inst%d frame %d: game 3D frames=%u/60 ram=%016llx\n", inst, f + 1, sw - lastSwaps,
+                           (unsigned long long)XXH3_64bits(b.nds->MainRAM, b.nds->MainRAMMask + 1));
+                    fflush(stdout);
+                    lastSwaps = sw;
+                }
+                if (dumpDir && dumpEvery > 0 && ((f + 1) % dumpEvery) == 0)
+                {
+                    void* top = nullptr; void* bot = nullptr;
+                    if (b.nds->GPU.GetFramebuffers(&top, &bot) && top && bot)
+                    {
+                        char path[512];
+                        snprintf(path, sizeof(path), "%s/inst%d_f%05d.ppm", dumpDir, inst, f + 1);
+                        if (FILE* fp = fopen(path, "wb"))
+                        {
+                            fprintf(fp, "P6\n256 384\n255\n");
+                            for (const void* scr : { top, bot })
+                                for (int i = 0; i < 256 * 192; i++)
+                                {
+                                    u32 px = ((const u32*)scr)[i];
+                                    u8 rgb[3] = { (u8)px, (u8)(px >> 8), (u8)(px >> 16) };
+                                    fwrite(rgb, 1, 3, fp);
+                                }
+                            fclose(fp);
+                        }
+                    }
+                }
             }
         }
         catch (...) { crashed.store(true); }

@@ -104,6 +104,10 @@ public:
     // can flag replay under a different (or missing) script.
     melonDS::u64 Hash() const { return hash_; }
 
+    // Touch-screen position in effect at `frame` (from a "T:x:y" key token); false = not touching.
+    bool TouchForFrame(int frame, int& x, int& y) const;
+    bool HasTouch() const { return hasTouch_; }
+
     // Number of parsed directives (diagnostics).
     size_t DirectiveCount() const { return directives_.size(); }
 
@@ -112,9 +116,10 @@ public:
     static bool NameToBit(const std::string& name, melonDS::u32& bitOut);
 
 private:
-    struct Directive { int frame; melonDS::u32 pressed; };
+    struct Directive { int frame; melonDS::u32 pressed; int touchX = -1, touchY = -1; };
 
     bool loaded_ = false;
+    bool hasTouch_ = false;
     melonDS::u64 hash_ = 0;
     // Sorted ascending by frame after LoadFile().
     std::vector<Directive> directives_;

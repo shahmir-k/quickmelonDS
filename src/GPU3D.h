@@ -385,6 +385,8 @@ public:
 
     u32 FlushRequest = 0;
     u32 FlushAttributes = 0;
+    // Diagnostics only: SwapBuffers commands seen (the game finishing a 3D frame). Not serialized.
+    u32 SwapCount = 0;
 };
 
 class Renderer3D
