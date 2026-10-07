@@ -655,6 +655,7 @@ public:
 
     u32 CaptureCnt;
     bool CaptureEnable;
+    u32 CaptureCount = 0; // diagnostics only: display captures started (not serialized)
 
     alignas(u64) u8 Palette[2*1024] {};
     alignas(u64) u8 OAM[2*1024] {};

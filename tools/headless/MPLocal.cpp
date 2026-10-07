@@ -12,6 +12,7 @@
 
 #include "MPInterface.h"
 #include "LocalMP.h"
+#include "LockstepMP.h"
 
 namespace melonDS
 {
@@ -40,6 +41,8 @@ void MPInterface::Set(MPInterfaceType type)
 {
     if (type == MPInterface_Local)
         Current = std::make_unique<LocalMP>();
+    else if (type == MPInterface_Netplay)
+        Current = std::make_unique<LockstepMP>(); // deterministic in-process link (Netplay)
     else
         Current = std::make_unique<HeadlessDummyMP>();
     CurrentType = type;

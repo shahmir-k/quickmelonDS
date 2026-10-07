@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include "VerifyTrace.h"
+#include "LockstepMP.h"
 
 #include <cstdio>
 #include <cstring>
@@ -582,6 +583,44 @@ int VerifyInterpConverge(const TraceRunConfig& cfg, int frames)
 // non-MP ROM (e.g. shrek) nothing associates and the run behaves like Phase 0 --
 // proving the MP wiring is inert until a game actually uses wireless.
 // ---------------------------------------------------------------------------
+// Draws nothing: stands in for a console whose screens nobody looks at (LITEV_MP_NORENDER1).
+// Display captures are skipped too, so that console's VRAM differs from a rendered one.
+class NullRenderer3D : public Renderer3D
+{
+public:
+    explicit NullRenderer3D(melonDS::GPU3D& gpu3D) : Renderer3D(gpu3D) {}
+    void Reset() override {}
+    void RenderFrame() override {}
+    u32* GetLine(int) override { return Line; }
+private:
+    u32 Line[256] = {};
+};
+
+class NullRenderer : public Renderer
+{
+public:
+    explicit NullRenderer(melonDS::GPU& gpu) : Renderer(gpu) { Rend3D = std::make_unique<NullRenderer3D>(gpu.GPU3D); }
+    bool Init() override { return true; }
+    void Reset() override {}
+    void Stop() override {}
+    void SetRenderSettings(RendererSettings&) override {}
+    void DrawScanline(u32) override {}
+    void DrawSprites(u32) override {}
+    void VBlank() override {}
+    void VBlankEnd() override {}
+    void AllocCapture(u32, u32, u32) override {}
+    void SyncVRAMCapture(u32, u32, u32, bool) override {}
+    bool GetFramebuffers(void**, void**) override { return false; }
+};
+
+// The real 2D renderer with the 3D renderer replaced by NullRenderer3D (LITEV_MP_NO3D1): bisects
+// which half of rendering feeds back into emulated state.
+class SoftNo3DRenderer : public SoftRenderer
+{
+public:
+    explicit SoftNo3DRenderer(NDS& nds) : SoftRenderer(nds) { Rend3D = std::make_unique<NullRenderer3D>(nds.GPU.GPU3D); }
+};
+
 int MPTest(const TraceRunConfig& cfg, int frames,
            const std::string& script0, const std::string& script1)
 {
@@ -595,9 +634,35 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     std::string err;
     if (!BuildAndBoot(c0, true, b0, err)) { fprintf(stderr, "error (mp0): %s\n", err.c_str()); return 1; }
     if (!BuildAndBoot(c1, true, b1, err)) { fprintf(stderr, "error (mp1): %s\n", err.c_str()); return 1; }
+    // LITEV_MP_NORENDER1: instance 1 draws nothing; LITEV_MP_NORENDER0: instance 0 too
+    if (getenv("LITEV_MP_NORENDER0"))
+    {
+        b0.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b0.nds->GPU));
+        printf("instance 0: renderer off\n");
+    }
+    if (getenv("LITEV_MP_NO3D1"))
+    {
+        b1.nds->GPU.SetRenderer(std::make_unique<SoftNo3DRenderer>(*b1.nds));
+        printf("instance 1: 3D renderer off\n");
+    }
+    if (getenv("LITEV_MP_NORENDER1"))
+    {
+        b1.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b1.nds->GPU));
+        printf("instance 1: renderer off\n");
+    }
 
-    // Install one shared in-process LocalMP and give each instance a distinct id.
-    MPInterface::Set(MPInterface_Local);
+    // Install one shared in-process link and give each instance a distinct id.
+    // LITEV_MP_LOCKSTEP=1: the deterministic LockstepMP (Netplay) instead of LocalMP.
+    bool lockstep = getenv("LITEV_MP_LOCKSTEP") != nullptr;
+    MPInterface::Set(lockstep ? MPInterface_Netplay : MPInterface_Local);
+    LockstepMP* lockstepMP = lockstep ? dynamic_cast<LockstepMP*>(&MPInterface::Get()) : nullptr;
+    printf("link: %s\n", lockstep ? "LockstepMP (deterministic)" : "LocalMP");
+    if (lockstepMP)
+    {
+        NDS* n0 = b0.nds.get(); NDS* n1 = b1.nds.get();
+        lockstepMP->SetClock(0, [n0] { return n0->GetSysTimestamp(); });
+        lockstepMP->SetClock(1, [n1] { return n1->GetSysTimestamp(); });
+    }
     b0.udata->instanceID = 0;
     b1.udata->instanceID = 1;
 
@@ -628,19 +693,29 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     auto runInstance = [&](BuiltNDS& b, std::atomic<int>& doneCounter)
     {
         int inst = (&b == &b0) ? 0 : 1;
+        std::atomic<int>& otherDone = (inst == 0) ? done1 : done0;
         u32 lastSwaps = 0;
+        auto lastT = std::chrono::steady_clock::now();
         try
         {
-            for (int f = 0; f < frames; f++)
+            // Keep emulating past `frames` until the other instance is done too: it may still need
+            // this one's MP frames, and without a partner it stalls a full receive timeout per tick.
+            for (int f = 0; f < frames || otherDone.load() < frames; f++)
             {
                 b.ApplyInput(f);
                 b.nds->RunFrame();
+                if (f >= frames) continue;
                 doneCounter.store(f + 1, std::memory_order_relaxed);
                 if (((f + 1) % 60) == 0)
                 {
                     u32 sw = b.nds->GPU.GPU3D.SwapCount;
-                    printf("inst%d frame %d: game 3D frames=%u/60 ram=%016llx\n", inst, f + 1, sw - lastSwaps,
+                    auto now = std::chrono::steady_clock::now();
+                    printf("inst%d frame %d: sys=%llu pc9=%08x pc7=%08x game 3D frames=%u/60 captures=%u ms=%.0f ram=%016llx\n", inst, f + 1,
+                           (unsigned long long)b.nds->GetSysTimestamp(), b.nds->ARM9.R[15], b.nds->ARM7.R[15],
+                           sw - lastSwaps, b.nds->GPU.CaptureCount,
+                           std::chrono::duration<double, std::milli>(now - lastT).count(),
                            (unsigned long long)XXH3_64bits(b.nds->MainRAM, b.nds->MainRAMMask + 1));
+                    lastT = now;
                     fflush(stdout);
                     lastSwaps = sw;
                 }
@@ -668,6 +743,8 @@ int MPTest(const TraceRunConfig& cfg, int frames,
             }
         }
         catch (...) { crashed.store(true); }
+        // leave the link, so a peer still finishing a frame does not wait on this clock forever
+        if (lockstepMP) lockstepMP->End(inst);
     };
 
     std::thread t0(runInstance, std::ref(b0), std::ref(done0));

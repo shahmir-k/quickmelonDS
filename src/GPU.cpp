@@ -1304,6 +1304,7 @@ void GPU::StartScanline(u32 line) noexcept
         if (CaptureCnt & (1<<31))
         {
             CaptureEnable = true;
+            CaptureCount++;
             CheckCaptureStart();
         }
     }

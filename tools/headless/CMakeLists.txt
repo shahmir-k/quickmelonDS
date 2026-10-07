@@ -25,6 +25,7 @@ add_executable(liteDS-headless
     # the harness (NOT the net-utils lib, which drags in ENet/Slirp for LAN/Netplay).
     # LocalMP only needs Platform mutex/semaphore from core.
     "${CMAKE_SOURCE_DIR}/src/net/LocalMP.cpp"
+    "${CMAKE_SOURCE_DIR}/src/net/LockstepMP.cpp"
     ${LITEV_HEADLESS_MP_SOURCES}
 )
 

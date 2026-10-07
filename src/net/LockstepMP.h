@@ -1,0 +1,116 @@
+/*
+    Copyright 2016-2025 melonDS team
+
+    This file is part of melonDS.
+
+    melonDS is free software: you can redistribute it and/or modify it under
+    the terms of the GNU General Public License as published by the Free
+    Software Foundation, either version 3 of the License, or (at your option)
+    any later version.
+
+    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with melonDS. If not, see http://www.gnu.org/licenses/.
+*/
+
+#ifndef LOCKSTEPMP_H
+#define LOCKSTEPMP_H
+
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <vector>
+#include <cstdio>
+
+#include "MPInterface.h"
+
+namespace melonDS
+{
+
+// Deterministic in-process wireless link between several emulated consoles, each running on its
+// own thread (Netplay runs every player's console on every device, so every device must compute
+// exactly the same thing). Unlike LocalMP, nothing depends on thread timing or wall-clock time.
+// Every decision is made on the consoles' emulated system clocks (SysTimestamp, the same time base
+// for consoles booted together), read through SetClock():
+//
+// - A regular frame (beacon, auth/association, data) sent at emulated time S is visible to the
+//   others from their time S + kDelay. A console polling at time R first waits until every peer's
+//   clock has reached R - kDelay, so it always sees exactly the same frames, in (time, sender)
+//   order.
+// - MP frames (CMD, ACK from the host; replies to it) are delivered immediately, as the protocol
+//   needs, and the waits for them end on a clock condition instead of a timeout: a client that
+//   has run kDelay past the CMD without replying never will; a client waiting for the host gets
+//   nothing once the host's clock has passed its own.
+//
+// kDelay (2 ms) is longer than any MP reply window (~0.5 ms). Deadlock freedom: every wait is
+// either "peer clock > my clock - kDelay" (regular frames) or "peer clock >= my clock + kDelay"
+// (host frames, reply deadline): one strict, one inclusive, so two consoles can never both be
+// waiting on each other (that would need each to be at least kDelay ahead of the other).
+// ponytail: waits poll the peers' clocks every 100 us; a per-peer wake threshold if that costs fps.
+class LockstepMP : public MPInterface
+{
+public:
+    LockstepMP() noexcept = default;
+
+    void Process() override {}
+    void Begin(int inst) override;
+    void End(int inst) override;
+
+    // How to read instance `inst`'s emulated clock (NDS::GetSysTimestamp), from any thread.
+    void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = std::move(clock); }
+
+    u16 ObserveConnectedBitmask() const noexcept override { return Connected; }
+    u64 ObserveCmdCount() const noexcept override { return CmdCount; }
+    u64 ObserveReplyCount() const noexcept override { return ReplyCount; }
+    u64 ObservePacketCount() const noexcept override { return PacketCount; }
+
+    int SendPacket(int inst, u8* data, int len, u64 timestamp) override;
+    int RecvPacket(int inst, u8* data, u64* timestamp) override;
+    int SendCmd(int inst, u8* data, int len, u64 timestamp) override;
+    int SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid) override;
+    int SendAck(int inst, u8* data, int len, u64 timestamp) override;
+    int RecvHostPacket(int inst, u8* data, u64* timestamp) override;
+    u16 RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask) override;
+
+private:
+    static constexpr int kMaxInst = 16;
+    static constexpr u64 kDelay = 33514 * 2; // 2 ms in system clock cycles (33.514 MHz)
+
+    struct Packet
+    {
+        int Sender;
+        u32 Type;
+        u64 Timestamp;      // the sender's wifi timestamp, passed through to the receiver
+        u64 Time;           // the sender's system clock when it was sent
+        std::vector<u8> Data;
+    };
+
+    std::mutex Lock;
+    std::condition_variable Changed;
+
+    u16 Connected = 0;
+    std::function<u64()> Clock[kMaxInst];
+    FILE* Trace[kMaxInst] {};   // LITEV_MP_TRACE=<dir>: one line per link call, per instance
+    void Log(int inst, const char* call, int result, u64 extra);
+    std::deque<Packet> Regular[kMaxInst];   // regular frames, per receiver, in send order per sender
+    std::deque<Packet> FromHost[kMaxInst];  // CMD/ACK, per receiver
+    std::deque<Packet> Replies[kMaxInst];   // replies, per host
+    int HostID = -1;
+
+    u64 CmdCount = 0, ReplyCount = 0, PacketCount = 0;
+
+    void Broadcast(int inst, u32 type, u8* data, int len, u64 timestamp, std::deque<Packet>* queues);
+    u64 Now(int inst) const { return Clock[inst] ? Clock[inst]() : 0; }
+    bool PeersReached(int inst, u64 time) const;
+    // waits (lock held) until pred(); peers' clocks advance without notifying, so also re-check
+    // every 100 us
+    template <typename Pred> void WaitFor(std::unique_lock<std::mutex>& lk, Pred pred);
+};
+
+}
+
+#endif
