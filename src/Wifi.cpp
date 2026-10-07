@@ -23,6 +23,26 @@
 #include "Wifi.h"
 #include "WifiAP.h"
 #include "Platform.h"
+#ifdef LITEV_LAN_STATS
+#include <chrono>
+// Measurement only: real-time timeline of the MP sync, per exchange (us, steady clock).
+static melonDS::u64 MPNowUs()
+{
+    return (melonDS::u64)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static struct
+{
+    // client: ACK received -> reached the sync point -> CMD arrives -> reply sent
+    melonDS::u64 tAck, tBlock, tCmd, usAtBlock;
+    bool waiting;
+    melonDS::u64 segSum, waitSum, catchRealSum, catchEmuSum, runaheadSum;
+    melonDS::u32 nSeg, nWait, nCatch, nRun, nCmd;
+    // host: ACK sent -> next CMD sent -> replies in hand
+    melonDS::u64 tAckSent, tCmdSent, hostSegSum, cmdToReplySum;
+    melonDS::u32 nHostSeg, nCmdToReply;
+} MPT;
+#endif
 
 namespace melonDS
 {
@@ -662,6 +682,10 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
 
     case 1:
         *(u16*)&TXBuffer[12 + 24+2] = MPClientMask;
+#ifdef LITEV_LAN_STATS
+        MPT.tCmdSent = MPNowUs();
+        if (MPT.tAckSent) { MPT.hostSegSum += MPT.tCmdSent - MPT.tAckSent; MPT.nHostSeg++; MPT.tAckSent = 0; }
+#endif
         Platform::MP_SendCmd(TXBuffer, 12+len, USTimestamp, NDS.UserData);
         break;
 
@@ -834,6 +858,9 @@ void Wifi::SendMPDefaultReply()
 
 void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
 {
+#ifdef LITEV_LAN_STATS
+    if (MPT.tCmd) { MPT.catchRealSum += MPNowUs() - MPT.tCmd; MPT.nCatch++; MPT.tCmd = 0; }
+#endif
     TXSlot* slot = &TXSlots[5];
 
     // mark the last packet as success. dunno what the MSB is, it changes.
@@ -868,6 +895,21 @@ void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
 
     // this seems to be set upon IRQ0
     // TODO: how does it behave if the packet addr is changed before it gets sent? (maybe just not possible)
+#ifdef LITEV_LAN_STATS
+    {
+        static u32 n, valid, lenSum;
+        if (slot->Valid) { valid++; lenSum += slot->Length; }
+        if (++n == 180)
+        {
+            static u32 lastSwaps;
+            Log(LogLevel::Info, "MP_GAMEFRAMES client: %u game 3D frames per 180 CMDs (~60 frames)\n", NDS.GPU.GPU3D.SwapCount - lastSwaps);
+            lastSwaps = NDS.GPU.GPU3D.SwapCount;
+            Log(LogLevel::Info, "MP_CLIENTREPLY 180: clienttime=%u us data replies=%u avg len=%u B (rest = empty default replies)\n",
+                clienttime, valid, valid ? lenSum / valid : 0);
+            n = 0; valid = 0; lenSum = 0;
+        }
+    }
+#endif
     if (slot->Valid)
     {
         slot->CurPhase = 0;
@@ -932,12 +974,26 @@ void Wifi::SendMPAck(u16 cmdcount, u16 clientfail)
         int runahead = std::min(CmdCounter, nextbeacon);
         if (CmdCounter < 1000) runahead -= 210;
         *(u32*)&ack[0] = std::max(runahead - (32*(TXSlots[1].Rate==2?4:8)), 0);
+#ifdef LITEV_LAN_STATS
+        {
+            static u64 sum; static u32 n, mn = ~0u, mx;
+            u32 ra = *(u32*)&ack[0]; sum += ra; mn = std::min(mn, ra); mx = std::max(mx, ra);
+            if (++n == 180)
+            {
+                Log(LogLevel::Info, "MP_ACK 180: client runahead avg=%llu min=%u max=%u us (CmdCounter=%u nextbeacon=%u)\n", sum / n, mn, mx, CmdCounter, nextbeacon);
+                sum = 0; n = 0; mn = ~0u; mx = 0;
+            }
+        }
+#endif
     }
     else
     {
         *(u32*)&ack[0] = PreambleLen(TXSlots[1].Rate);
     }
 
+#ifdef LITEV_LAN_STATS
+    MPT.tAckSent = MPNowUs();
+#endif
     int txlen = Platform::MP_SendAck(ack, 12+32, USTimestamp, NDS.UserData);
     WIFI_LOG("wifi: sent %d/44 bytes of MP ack, %d %d\n", txlen, ComStatus, RXTime);
 }
@@ -1063,6 +1119,31 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                 if (MPClientMask)
                     res = Platform::MP_RecvReplies(MPClientReplies, USTimestamp, MPClientMask, NDS.UserData);
                 MPClientFail &= ~res;
+#ifdef LITEV_LAN_STATS
+                if (MPT.tCmdSent) { MPT.cmdToReplySum += MPNowUs() - MPT.tCmdSent; MPT.nCmdToReply++; MPT.tCmdSent = 0; }
+                // measurement: the host's MP CMD parameters, as the game programs them
+                {
+                    static u64 lastTS, gapSum; static u32 n, fails, lenSum;
+                    if (lastTS) gapSum += USTimestamp - lastTS;
+                    lastTS = USTimestamp;
+                    lenSum += slot->Length;
+                    if ((res & MPClientMask) != MPClientMask) fails++;
+                    if (++n == 180)
+                    {
+                        static u32 lastSwaps;
+                        Log(LogLevel::Info, "MP_GAMEFRAMES host: %u game 3D frames per 180 CMDs (~60 frames)\n", NDS.GPU.GPU3D.SwapCount - lastSwaps);
+                        lastSwaps = NDS.GPU.GPU3D.SwapCount;
+                        Log(LogLevel::Info, "MP_HOSTCMD 180: gap=%llu us len=%u B rate=%s preamble=%d replytime=%u us clients=%d mask=%04X window=%u us cmdcount=%u fails=%u\n",
+                            gapSum / 179, lenSum / n, slot->Rate == 2 ? "2M" : "1M", PreambleLen(slot->Rate), IOPORT(W_CmdReplyTime),
+                            NumClients(MPClientMask), MPClientMask, 112 + ((10 + IOPORT(W_CmdReplyTime)) * NumClients(MPClientMask)),
+                            CmdCounter, fails);
+                        Log(LogLevel::Info, "MP_HOSTLINE 180 cmds: ACK sent->next CMD sent %.0f us real | CMD sent->replies in hand %.0f us real\n",
+                            MPT.nHostSeg ? (double)MPT.hostSegSum / MPT.nHostSeg : 0.0, MPT.nCmdToReply ? (double)MPT.cmdToReplySum / MPT.nCmdToReply : 0.0);
+                        MPT.hostSegSum = MPT.cmdToReplySum = 0; MPT.nHostSeg = MPT.nCmdToReply = 0;
+                        gapSum = 0; n = 0; fails = 0; lenSum = 0;
+                    }
+                }
+#endif
 
                 // TODO: 112 likely includes the ack preamble, which needs adjusted
                 // for long-preamble settings
@@ -1700,6 +1781,25 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
         // we also need to determine how far we can run after having received this frame
 
         RXTimestamp = timestamp;
+#ifdef LITEV_LAN_STATS
+        // measurement: frames from the host that arrive after the client already ran past their time
+        {
+            static u32 n, late, cmds, lateCmds; static u64 lateSum, lateMax;
+            bool cmd = MACEqual(&RXBuffer[12 + 4], MPCmdMAC);
+            n++; if (cmd) cmds++;
+            if (timestamp < USTimestamp)
+            {
+                u64 d = USTimestamp - timestamp;
+                late++; if (cmd) lateCmds++; lateSum += d; if (d > lateMax) lateMax = d;
+            }
+            if (n >= 360)
+            {
+                Log(LogLevel::Info, "MP_LATE 360 host frames: late=%u (cmds %u/%u) avg late=%llu us max=%llu us\n",
+                    late, lateCmds, cmds, late ? lateSum / late : 0, lateMax);
+                n = late = cmds = lateCmds = 0; lateSum = lateMax = 0;
+            }
+        }
+#endif
         if (RXTimestamp < USTimestamp) RXTimestamp = USTimestamp;
         NextSync = RXTimestamp + (framelen * (txrate==0x14 ? 4:8));
 
@@ -1707,6 +1807,27 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
         {
             u16 clienttime = *(u16*)&RXBuffer[12+24];
             u16 clientmask = *(u16*)&RXBuffer[12+26];
+#ifdef LITEV_LAN_STATS
+            {
+                u64 now = MPNowUs();
+                MPT.tCmd = now;
+                if (MPT.waiting)
+                {
+                    MPT.waitSum += now - MPT.tBlock; MPT.nWait++;
+                    if (timestamp > MPT.usAtBlock) MPT.catchEmuSum += timestamp - MPT.usAtBlock;
+                }
+                MPT.waiting = false;
+                if (++MPT.nCmd == 180)
+                {
+                    Log(LogLevel::Info, "MP_CLIENTLINE 180 cmds: ACK->sync point %.0f us real (runahead %.0f us emu) | wait at sync point %.0f us (n=%u) | CMD is %.0f us emu past the sync point | CMD->reply sent %.0f us real\n",
+                        MPT.nSeg ? (double)MPT.segSum / MPT.nSeg : 0.0, MPT.nRun ? (double)MPT.runaheadSum / MPT.nRun : 0.0,
+                        MPT.nWait ? (double)MPT.waitSum / MPT.nWait : 0.0, MPT.nWait, MPT.nWait ? (double)MPT.catchEmuSum / MPT.nWait : 0.0,
+                        MPT.nCatch ? (double)MPT.catchRealSum / MPT.nCatch : 0.0);
+                    MPT.segSum = MPT.waitSum = MPT.catchRealSum = MPT.catchEmuSum = MPT.runaheadSum = 0;
+                    MPT.nSeg = MPT.nWait = MPT.nCatch = MPT.nRun = MPT.nCmd = 0;
+                }
+            }
+#endif
 
             // include the MP reply time window
             NextSync += 112 + ((clienttime + 10) * NumClients(clientmask));
@@ -1716,6 +1837,10 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
             u32 runahead = *(u32*)&RXBuffer[0];
 
             NextSync += runahead;
+#ifdef LITEV_LAN_STATS
+            MPT.tAck = MPNowUs(); MPT.waiting = false;
+            MPT.runaheadSum += runahead; MPT.nRun++;
+#endif
         }
     }
     else
@@ -1770,6 +1895,13 @@ void Wifi::USTimer(u32 param)
 
         if (USTimestamp >= NextSync)
         {
+#ifdef LITEV_LAN_STATS
+            if (!MPT.waiting)
+            {
+                MPT.waiting = true; MPT.tBlock = MPNowUs(); MPT.usAtBlock = USTimestamp;
+                if (MPT.tAck) { MPT.segSum += MPT.tBlock - MPT.tAck; MPT.nSeg++; MPT.tAck = 0; }
+            }
+#endif
             // TODO: not do this every tick if it fails to receive a frame!
             CheckRX(2);
         }

@@ -43,10 +43,50 @@
 #endif
 
 #include "LAN.h"
+#ifdef LITEV_LAN_STATS
+#include <chrono>
+#include <time.h>
+#endif
 
 
 namespace melonDS
 {
+
+#ifdef LITEV_LAN_STATS
+// Measurement only (LITEV_LAN_STATS): where LAN multiplayer blocks. Waits are timed in us and
+// bucketed by position in the DS frame (MP timestamp modulo one frame, 8 buckets); the totals
+// are logged and reset every 60 Process() calls (~1 s of emulation).
+static struct
+{
+    u64 HostWaitUs, ClientWaitUs;
+    u32 HostWaits, ClientWaits, HostMisses, ClientMisses, Cmds, Replies, Packets;
+    u32 HostPos[8], ClientPos[8];
+    // per-stage breakdown of one exchange (kernel receive times from SO_TIMESTAMPNS in ENet)
+    u64 CmdWakeUs, TurnUs, ReplyWakeUs, SpanUs;   // sums, us
+    u32 CmdWakeN, TurnN, ReplyWakeN, SpanN;
+} LanStats;
+// Kernel receive timestamps need ENet patched to read SO_TIMESTAMPNS
+// (melonDS-profiler tools/profiler/enet-rx-timestamps.patch) and LITEV_LAN_KTIME; without them
+// the per-stage numbers stay 0.
+#ifdef LITEV_LAN_KTIME
+extern "C" unsigned long long enet_litev_last_rx_ns;
+#else
+static const unsigned long long enet_litev_last_rx_ns = 0;
+#endif
+static u64 LanRealNs()
+{
+    timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+static u64 LanCmdKernelNs;  // client: kernel receive time of the CMD being answered
+static u64 LanCmdSendNs;    // host: when the current CMD was handed to the socket
+static u64 LanNowUs()
+{
+    return (u64) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static int LanFramePos(u64 timestamp) { return (int) ((timestamp % 16715) / 2090) & 7; }
+#endif
 
 const u32 kDiscoveryMagic = 0x444E414C; // LAND
 const u32 kLANMagic = 0x504E414C; // LANP
@@ -860,6 +900,25 @@ void LAN::ProcessLAN(int type)
             }
             else
             {
+#ifdef LITEV_LAN_STATS
+                {
+                    u64 now = LanRealNs(), k = enet_litev_last_rx_ns;
+                    if (k && now > k && now - k < 1000000000ull)
+                    {
+                        if (header->Type == 1)
+                        {
+                            LanStats.CmdWakeUs += (now - k) / 1000; LanStats.CmdWakeN++;
+                            LanCmdKernelNs = k;
+                        }
+                        else if (IsHost && (header->Type & 0xFFFF) == 2)
+                        {
+                            LanStats.ReplyWakeUs += (now - k) / 1000; LanStats.ReplyWakeN++;
+                            if (LanCmdSendNs && k > LanCmdSendNs) { LanStats.SpanUs += (k - LanCmdSendNs) / 1000; LanStats.SpanN++; }
+                            LanCmdSendNs = 0;
+                        }
+                    }
+                }
+#endif
                 // mark this packet with the time it was received
                 header->Magic = (u32)Platform::GetMSCount();
 
@@ -898,6 +957,21 @@ void LAN::Process()
     if (FrameCount >= 60)
     {
         FrameCount = 0;
+#ifdef LITEV_LAN_STATS
+        auto& st = LanStats;
+        Platform::Log(Platform::LogLevel::Info,
+            "LAN_STATS 60f: host waits=%u miss=%u %.1f ms (pos %u %u %u %u %u %u %u %u) | client waits=%u miss=%u %.1f ms (pos %u %u %u %u %u %u %u %u) | sent cmd=%u reply=%u pkt=%u\n",
+            st.HostWaits, st.HostMisses, st.HostWaitUs / 1000.0,
+            st.HostPos[0], st.HostPos[1], st.HostPos[2], st.HostPos[3], st.HostPos[4], st.HostPos[5], st.HostPos[6], st.HostPos[7],
+            st.ClientWaits, st.ClientMisses, st.ClientWaitUs / 1000.0,
+            st.ClientPos[0], st.ClientPos[1], st.ClientPos[2], st.ClientPos[3], st.ClientPos[4], st.ClientPos[5], st.ClientPos[6], st.ClientPos[7],
+            st.Cmds, st.Replies, st.Packets);
+        Platform::Log(Platform::LogLevel::Info,
+            "LAN_STAGES 60f: host cmd-send->reply-kernel=%.0f us (n=%u) reply kernel->app=%.0f us | client cmd kernel->app=%.0f us (n=%u) cmd kernel->reply-send=%.0f us\n",
+            st.SpanN ? (double)st.SpanUs / st.SpanN : 0.0, st.SpanN, st.ReplyWakeN ? (double)st.ReplyWakeUs / st.ReplyWakeN : 0.0,
+            st.CmdWakeN ? (double)st.CmdWakeUs / st.CmdWakeN : 0.0, st.CmdWakeN, st.TurnN ? (double)st.TurnUs / st.TurnN : 0.0);
+        st = {};
+#endif
 
         Platform::Mutex_Lock(PlayersMutex);
 
@@ -1002,6 +1076,9 @@ int LAN::RecvPacketGeneric(u8* packet, bool block, u64* timestamp)
 
 int LAN::SendPacket(int inst, u8* packet, int len, u64 timestamp)
 {
+#ifdef LITEV_LAN_STATS
+    LanStats.Packets++;
+#endif
     return SendPacketGeneric(0, packet, len, timestamp);
 }
 
@@ -1013,11 +1090,23 @@ int LAN::RecvPacket(int inst, u8* packet, u64* timestamp)
 
 int LAN::SendCmd(int inst, u8* packet, int len, u64 timestamp)
 {
+#ifdef LITEV_LAN_STATS
+    LanStats.Cmds++;
+    LanCmdSendNs = LanRealNs();
+#endif
     return SendPacketGeneric(1, packet, len, timestamp);
 }
 
 int LAN::SendReply(int inst, u8* packet, int len, u64 timestamp, u16 aid)
 {
+#ifdef LITEV_LAN_STATS
+    LanStats.Replies++;
+    if (LanCmdKernelNs)
+    {
+        LanStats.TurnUs += (LanRealNs() - LanCmdKernelNs) / 1000; LanStats.TurnN++;
+        LanCmdKernelNs = 0;
+    }
+#endif
     return SendPacketGeneric(2 | (aid<<16), packet, len, timestamp);
 }
 
@@ -1036,14 +1125,40 @@ int LAN::RecvHostPacket(int inst, u8* packet, u64* timestamp)
             return -1;
     }
 
+#ifdef LITEV_LAN_STATS
+    u64 t0 = LanNowUs();
+    int r = RecvPacketGeneric(packet, true, timestamp);
+    LanStats.ClientWaitUs += LanNowUs() - t0;
+    LanStats.ClientWaits++;
+    if (r <= 0) LanStats.ClientMisses++;
+    else if (timestamp) LanStats.ClientPos[LanFramePos(*timestamp)]++;
+    return r;
+#else
     return RecvPacketGeneric(packet, true, timestamp);
+#endif
 }
 
 u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 {
     if (!Host) return 0;
+#ifdef LITEV_LAN_STATS
+    struct Timer
+    {
+        u64 t0 = LanNowUs(); u64 ts; u16 mask; u16* ret;
+        ~Timer()
+        {
+            LanStats.HostWaitUs += LanNowUs() - t0;
+            LanStats.HostWaits++;
+            LanStats.HostPos[LanFramePos(ts)]++;
+            if ((*ret & mask) != mask) LanStats.HostMisses++;
+        }
+    };
+#endif
 
     u16 ret = 0;
+#ifdef LITEV_LAN_STATS
+    Timer timer{LanNowUs(), timestamp, aidmask, &ret};
+#endif
     u16 myinstmask = 1 << MyPlayer.ID;
 
     if ((myinstmask & ConnectedBitmask) == ConnectedBitmask)
@@ -1095,3 +1210,4 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 }
 
 }
+
