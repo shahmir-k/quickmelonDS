@@ -1761,6 +1761,14 @@ void GPU3D::CalculateLighting() noexcept
 {
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LightingCalls);
 
+    if (Headless)
+    {
+        s32 c = __builtin_popcount(CurPolygonAttr & 0xF);
+        NormalPipeline = 7;
+        AddCycles(c < 1 ? 1 : c);
+        return;
+    }
+
     if ((TexParam >> 30) == 2)
     {
 #if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)

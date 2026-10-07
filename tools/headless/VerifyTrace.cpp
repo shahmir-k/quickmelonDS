@@ -690,6 +690,7 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     if (getenv("LITEV_MP_HEADLESS1"))
     {
         b1.nds->GPU.Headless = true; // what Netplay does to the other player's console
+        b1.nds->GPU.GPU3D.Headless = true;
         printf("instance 1: headless (draws only once the game uses display capture)\n");
     }
 #endif

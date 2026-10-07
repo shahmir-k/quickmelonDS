@@ -196,6 +196,9 @@ private:
     }
 
 public:
+    // Netplay: a console nobody watches. Vertex colours and texgen only feed rendering, so
+    // lighting just accounts its cycles (which depend only on the enabled lights).
+    bool Headless = false;
     melonDS::NDS& NDS;
     melonDS::GPU& GPU;
 
