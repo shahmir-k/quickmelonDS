@@ -740,15 +740,9 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
 #endif
                     ARM64Reg rdMapped = (ARM64Reg)reg;
                     PatchedStoreFuncs[consoleType][num][size][reg] = GetRXPtr();
-                    if (num == 0)
-                    {
-                        MOV(X1, RCPU);
-                        MOV(W2, rdMapped);
-                    }
-                    else
-                    {
-                        MOV(W1, rdMapped);
-                    }
+                    // ARM9 and ARM7 slow helpers share the layout: W0=addr, X1=cpu, W2=val
+                    MOV(X1, RCPU);
+                    MOV(W2, rdMapped);
                     ABI_PushRegisters(BitSet32({30}) | CallerSavedPushRegs);
                     if (consoleType == 0)
                     {
@@ -786,8 +780,7 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
                     for (int signextend = 0; signextend < 2; signextend++)
                     {
                         PatchedLoadFuncs[consoleType][num][size][signextend][reg] = GetRXPtr();
-                        if (num == 0)
-                            MOV(X1, RCPU);
+                        MOV(X1, RCPU);
                         ABI_PushRegisters(BitSet32({30}) | CallerSavedPushRegs);
                         if (consoleType == 0)
                         {
