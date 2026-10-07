@@ -622,6 +622,17 @@ public:
     explicit SoftNo3DRenderer(NDS& nds) : SoftRenderer(nds) { Rend3D = std::make_unique<NullRenderer3D>(nds.GPU.GPU3D); }
 };
 
+#ifdef LITEV_EVENT_TRACE
+// LITEV_MP_EVTRACE=<file>: every scheduler event of instance 1 (time, event id) from frame
+// LITEV_MP_EVTRACE_FROM on, to diff two runs and find the first event that differs.
+}
+namespace melonDS { extern void (*LitevEventTrace)(NDS*, int, u64, u64); }
+namespace liteds {
+static FILE* gEvTrace;
+static melonDS::NDS* gEvTraceNDS;
+static std::atomic<bool> gEvTraceOn {false};
+#endif
+
 int MPTest(const TraceRunConfig& cfg, int frames,
            const std::string& script0, const std::string& script1)
 {
@@ -640,6 +651,25 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     {
         b0.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b0.nds->GPU));
         printf("instance 0: renderer off\n");
+    }
+#ifdef LITEV_EVENT_TRACE
+    if (const char* ev = getenv("LITEV_MP_EVTRACE"))
+    {
+        gEvTrace = fopen(ev, "w");
+        gEvTraceNDS = b1.nds.get();
+        melonDS::LitevEventTrace = [](NDS* n, int id, u64 et, u64 st) {
+            if (n == gEvTraceNDS && gEvTraceOn.load(std::memory_order_relaxed))
+                fprintf(gEvTrace, "%llu %d %llu pc9=%08x pc7=%08x\n", (unsigned long long)et, id, (unsigned long long)st, n->ARM9.R[15], n->ARM7.R[15]);
+        };
+    }
+#endif
+    if (getenv("LITEV_MP_ACC3D1")) // instance 1 on the reference SoftRenderer3D instead of the tile renderer
+    {
+        RendererSettings rs{};
+        rs.ScaleFactor = 1;
+        rs.Accurate3D = true;
+        b1.nds->GPU.GetRenderer().SetRenderSettings(rs);
+        printf("instance 1: accurate 3D renderer\n");
     }
     if (getenv("LITEV_MP_NO3D1"))
     {
@@ -747,10 +777,14 @@ int MPTest(const TraceRunConfig& cfg, int frames,
                     if (in.TouchX >= 0) b.nds->TouchScreen(in.TouchX, in.TouchY);
                     else                b.nds->ReleaseScreen();
                 }
+#ifdef LITEV_EVENT_TRACE
+                if (inst == 1 && getenv("LITEV_MP_EVTRACE_FROM")) gEvTraceOn = f + 1 >= atoi(getenv("LITEV_MP_EVTRACE_FROM"));
+#endif
                 b.nds->RunFrame();
                 if (f >= frames) continue;
                 doneCounter.store(f + 1, std::memory_order_relaxed);
-                if (((f + 1) % 60) == 0)
+                static const int every = getenv("LITEV_MP_EVERY") ? atoi(getenv("LITEV_MP_EVERY")) : 60;
+                if (((f + 1) % every) == 0)
                 {
                     u32 sw = b.nds->GPU.GPU3D.SwapCount;
                     auto now = std::chrono::steady_clock::now();
@@ -759,6 +793,18 @@ int MPTest(const TraceRunConfig& cfg, int frames,
                            sw - lastSwaps, b.nds->GPU.CaptureCount,
                            std::chrono::duration<double, std::milli>(now - lastT).count(),
                            (unsigned long long)XXH3_64bits(b.nds->MainRAM, b.nds->MainRAMMask + 1));
+                    if (getenv("LITEV_MP_STATE"))
+                    {
+                        // diagnostics: more of the console's state, to find what diverges first
+                        GPU& g = b.nds->GPU;
+                        u64 vram = 0;
+                        for (int k = 0; k < 9; k++)
+                            vram ^= XXH3_64bits(g.VRAM[k], g.VRAMMask[k] + 1) * (k + 1);
+                        printf("inst%d state %d: vram=%016llx gxstat=%08x fifo=%u polys=%u verts=%u arm9r=%016llx arm7r=%016llx\n", inst, f + 1,
+                               (unsigned long long)vram, g.GPU3D.GXStat, g.GPU3D.FifoLevel(), g.GPU3D.NumPolygons, g.GPU3D.NumVertices,
+                               (unsigned long long)XXH3_64bits(b.nds->ARM9.R, sizeof(b.nds->ARM9.R)),
+                               (unsigned long long)XXH3_64bits(b.nds->ARM7.R, sizeof(b.nds->ARM7.R)));
+                    }
                     lastT = now;
                     fflush(stdout);
                     lastSwaps = sw;

@@ -967,6 +967,10 @@ bool NDS::SchedDrainContinue()
 }
 #endif
 
+#ifdef LITEV_EVENT_TRACE
+void (*LitevEventTrace)(NDS* nds, int id, u64 eventTime, u64 sysTime) = nullptr;
+#endif
+
 void NDS::RunSystem(u64 timestamp)
 {
     SysTimestamp = timestamp;
@@ -987,6 +991,9 @@ void NDS::RunSystem(u64 timestamp)
                 LITE_PROFILE_ADD(LiteProfile::g_Frame.SchedEventByType[i]);
 
                 EventFunc func = evt.Funcs[evt.FuncID];
+#ifdef LITEV_EVENT_TRACE
+                if (LitevEventTrace) LitevEventTrace(this, i, evt.Timestamp, SysTimestamp);
+#endif
                 func(evt.That, evt.Param);
             }
         }
