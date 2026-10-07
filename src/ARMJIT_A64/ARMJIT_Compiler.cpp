@@ -65,6 +65,7 @@ namespace melonDS
 #include <cstring>
 #include <cstdint>
 #include <string>
+#include <mutex>
 #include <vector>
 #include <unistd.h>
 #ifdef __ANDROID__
@@ -75,6 +76,7 @@ namespace litev_perfmap
 {
     struct Region { unsigned long long addr; unsigned long long size; std::string name; };
 
+    static std::mutex         g_lock;    // several consoles (Netplay) compile concurrently
     static std::string        g_path;
     static FILE*              g_file  = nullptr;
     static int                g_state = 0;   // 0=unresolved, 1=armed, -1=disabled
@@ -92,7 +94,7 @@ namespace litev_perfmap
         std::string dirbuf;
 #ifdef __ANDROID__
         char prop[PROP_VALUE_MAX] = {0};
-        if ((!dir || !dir[0]) && __system_property_get("debug.litev.perfmap", prop) > 0 && prop[0])
+        if ((!dir || !dir[0]) && __system_property_get("debug.litev.perfmap", prop) > 0 && prop[0] && strcmp(prop, "0") != 0)
         {
             if (prop[0] == '/') { dirbuf = prop; dir = dirbuf.c_str(); }
             else
@@ -123,6 +125,7 @@ namespace litev_perfmap
     // only; flushed to the file by BeginEpoch (their RX addresses never change).
     static void AddStatic(const char* name, void* rxstart, void* rxend)
     {
+        std::lock_guard<std::mutex> lk(g_lock);
         if ((u8*)rxend <= (u8*)rxstart) return;
         g_static.push_back({ (unsigned long long)(uintptr_t)rxstart,
                              (unsigned long long)((u8*)rxend - (u8*)rxstart),
@@ -133,6 +136,7 @@ namespace litev_perfmap
     // regions. Called at the top of Compiler::Reset() (== every ResetBlockCache).
     static void BeginEpoch()
     {
+        std::lock_guard<std::mutex> lk(g_lock);
         if (g_state == 0) g_state = ResolvePath() ? 1 : -1;
         if (g_state < 0) return;
         if (g_file) fclose(g_file);
@@ -160,7 +164,9 @@ namespace litev_perfmap
         // Only accumulate/emit when ARMED (prop set) — otherwise a normal play
         // session would grow g_dynamic unbounded per block-compile. Unarmed
         // (g_state != 1) this is a cheap early-out.
-        if (g_state != 1 || !g_file) return;
+        if (g_state != 1) return;
+        std::lock_guard<std::mutex> lk(g_lock);
+        if (!g_file) return;
         if ((u8*)rxend <= (u8*)rxstart) return;
         g_dynamic.push_back({ (unsigned long long)(uintptr_t)rxstart,
                               (unsigned long long)((u8*)rxend - (u8*)rxstart),

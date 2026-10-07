@@ -834,7 +834,7 @@ int MPTest(const TraceRunConfig& cfg, int frames,
         }
         catch (...) { crashed.store(true); }
         // leave the link, so a peer still finishing a frame does not wait on this clock forever
-        if (lockstepMP) lockstepMP->End(inst);
+        if (lockstepMP) { lockstepMP->End(inst); lockstepMP->Stop(); }
     };
 
     std::thread t0(runInstance, std::ref(b0), std::ref(done0));

@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <vector>
@@ -32,7 +33,7 @@ namespace melonDS
 
 namespace
 {
-constexpr u32 kMagic = 0x4E504931; // "NPI1"
+constexpr u32 kMagic = 0x4E504932; // "NPI2"
 
 #pragma pack(push, 1)
 struct WireEntry
@@ -46,6 +47,7 @@ struct WireHeader
     u32 Magic;
     u8 Player;
     u8 Count;
+    s32 Ack;    // the sender has all of the receiver's inputs up to this applied frame
 };
 #pragma pack(pop)
 
@@ -57,7 +59,8 @@ u64 NowUs()
 }
 
 NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::string& peer, int latencyMs)
-    : Local(localPlayer), DelayFrames(delayFrames), LatencyMs(latencyMs)
+    : Local(localPlayer), DelayFrames(delayFrames), LatencyMs(latencyMs),
+      PeerAck(delayFrames - 1), RemoteUpTo(delayFrames - 1) // frames before Delay are never sent
 {
     Socket = socket(AF_INET, SOCK_DGRAM, 0);
     if (Socket < 0) return;
@@ -96,24 +99,31 @@ NetplayInput::~NetplayInput()
 void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
 {
     int applied = frame + DelayFrames;
-    std::vector<u8> packet;
     {
         std::lock_guard<std::mutex> lk(Lock);
         Inputs[Local][applied] = input;
-        Sent.emplace_back(applied, input);
-        while ((int)Sent.size() > kRedundancy) Sent.pop_front();
+        Unacked.emplace_back(applied, input);
+        Changed.notify_all();
+    }
+    Send();
+}
 
-        WireHeader header {kMagic, (u8)Local, (u8)Sent.size()};
-        packet.resize(sizeof(header) + Sent.size() * sizeof(WireEntry));
+void NetplayInput::Send()
+{
+    std::vector<u8> packet;
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        int count = std::min<int>((int)Unacked.size(), kMaxPerPacket);
+        WireHeader header {kMagic, (u8)Local, (u8)count, RemoteUpTo};
+        packet.resize(sizeof(header) + count * sizeof(WireEntry));
         memcpy(packet.data(), &header, sizeof(header));
         u8* p = packet.data() + sizeof(header);
-        for (auto& [f, in] : Sent)
+        for (int i = 0; i < count; i++, p += sizeof(WireEntry))
         {
+            auto& [f, in] = Unacked[i];
             WireEntry e {f, in.Keys, in.TouchX, in.TouchY};
             memcpy(p, &e, sizeof(e));
-            p += sizeof(e);
         }
-        Changed.notify_all();
     }
     sendto(Socket, packet.data(), packet.size(), 0, (sockaddr*)PeerAddr, sizeof(sockaddr_in));
 }
@@ -139,8 +149,16 @@ void NetplayInput::ReceiveLoop()
 {
     std::deque<std::pair<u64, std::vector<u8>>> pending; // artificial latency: (due time, packet)
     u8 buf[2048];
+    u64 lastSend = 0;
     while (Running)
     {
+        // heartbeat: re-sends what the peer has not acknowledged, and our acknowledgement
+        if (NowUs() - lastSend >= kResendMs * 1000)
+        {
+            Send();
+            lastSend = NowUs();
+        }
+
         ssize_t len = recv(Socket, buf, sizeof(buf), 0);
         u64 now = NowUs();
         if (len >= (ssize_t)sizeof(WireHeader))
@@ -155,13 +173,18 @@ void NetplayInput::ReceiveLoop()
                 packet.size() >= sizeof(header) + header.Count * sizeof(WireEntry))
             {
                 std::lock_guard<std::mutex> lk(Lock);
+                auto& inputs = Inputs[header.Player];
                 const u8* p = packet.data() + sizeof(header);
                 for (int i = 0; i < header.Count; i++, p += sizeof(WireEntry))
                 {
                     WireEntry e;
                     memcpy(&e, p, sizeof(e));
-                    Inputs[header.Player].emplace(e.Frame, NetplayFrameInput {e.Keys, e.TouchX, e.TouchY});
+                    if (e.Frame > RemoteUpTo) // older ones were received (and maybe consumed) already
+                        inputs.emplace(e.Frame, NetplayFrameInput {e.Keys, e.TouchX, e.TouchY});
                 }
+                while (inputs.count(RemoteUpTo + 1)) RemoteUpTo++;
+                PeerAck = std::max(PeerAck, header.Ack);
+                while (!Unacked.empty() && Unacked.front().first <= PeerAck) Unacked.pop_front();
                 Changed.notify_all();
             }
             pending.pop_front();

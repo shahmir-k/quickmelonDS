@@ -46,6 +46,11 @@ namespace melonDS
 //   has run kDelay past the CMD without replying never will; a client waiting for the host gets
 //   nothing once the host's clock has passed its own.
 //
+// Wi-Fi on/off (Begin/End) happens at a console's own time, which another thread may not have
+// reached yet, so no decision depends on who is connected right now: frames go to every console
+// with a clock, a console only reads frames sent after its latest Begin, and every wait is on the
+// clocks of all of them (a console with Wi-Fi off simply never sends or replies).
+//
 // kDelay (2 ms) is longer than any MP reply window (~0.5 ms). Deadlock freedom: every wait is
 // either "peer clock > my clock - kDelay" (regular frames) or "peer clock >= my clock + kDelay"
 // (host frames, reply deadline): one strict, one inclusive, so two consoles can never both be
@@ -61,7 +66,9 @@ public:
     void End(int inst) override;
 
     // How to read instance `inst`'s emulated clock (NDS::GetSysTimestamp), from any thread.
-    void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = std::move(clock); }
+    void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = std::move(clock); Members |= (1 << inst); }
+    // Ends every wait (the session is shutting down).
+    void Stop();
 
     u16 ObserveConnectedBitmask() const noexcept override { return Connected; }
     u64 ObserveCmdCount() const noexcept override { return CmdCount; }
@@ -92,7 +99,10 @@ private:
     std::mutex Lock;
     std::condition_variable Changed;
 
-    u16 Connected = 0;
+    u16 Connected = 0;      // Wi-Fi on right now (observation only)
+    u16 Members = 0;        // consoles with a clock: everything waits on these
+    u64 BeginTime[kMaxInst] {};
+    bool Stopped = false;
     std::function<u64()> Clock[kMaxInst];
     FILE* Trace[kMaxInst] {};   // LITEV_MP_TRACE=<dir>: one line per link call, per instance
     void Log(int inst, const char* call, int result, u64 extra);

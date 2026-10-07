@@ -45,8 +45,10 @@ struct NetplayFrameInput
 // local device sends it at once, so the network has Delay frames to deliver it and nobody waits.
 // When an input is late, Get() blocks until it arrives (a stutter, never a desync).
 //
-// UDP, one socket per device. Each packet carries the sender's last kRedundancy frames, so a lost
-// packet is covered by the next one. Two players for now (peer = the other device).
+// UDP, one socket per device. Each packet carries every input the peer has not acknowledged yet
+// (up to kMaxPerPacket, oldest first) and acknowledges the peer's inputs received so far; the
+// receive thread also re-sends every kResendMs, so nothing is lost even if the peer starts late
+// or this side is blocked. Two players for now (peer = the other device).
 class NetplayInput
 {
 public:
@@ -69,7 +71,8 @@ public:
     double StallMs() const { return StallUs.load() / 1000.0; }
 
 private:
-    static constexpr int kRedundancy = 8;
+    static constexpr int kMaxPerPacket = 64;
+    static constexpr int kResendMs = 10;
 
     int Local, DelayFrames, LatencyMs;
     int Socket = -1;
@@ -80,10 +83,13 @@ private:
     std::mutex Lock;
     std::condition_variable Changed;
     std::map<int, NetplayFrameInput> Inputs[2];    // by applied frame
-    std::deque<std::pair<int, NetplayFrameInput>> Sent; // last frames sent (applied frame, input)
+    std::deque<std::pair<int, NetplayFrameInput>> Unacked; // (applied frame, input), oldest first
+    int PeerAck;            // the peer has all our inputs up to this applied frame
+    int RemoteUpTo;         // we have all the peer's inputs up to this applied frame
     std::atomic<u64> StallUs {0};
 
     void ReceiveLoop();
+    void Send();
 };
 
 }

@@ -29,9 +29,14 @@ void LockstepMP::Begin(int inst)
 {
     std::lock_guard<std::mutex> lk(Lock);
     Connected |= (1 << inst);
-    Regular[inst].clear();
-    FromHost[inst].clear();
-    Replies[inst].clear();
+    BeginTime[inst] = Now(inst);
+    Changed.notify_all();
+}
+
+void LockstepMP::Stop()
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    Stopped = true;
     Changed.notify_all();
 }
 
@@ -39,7 +44,6 @@ void LockstepMP::End(int inst)
 {
     std::lock_guard<std::mutex> lk(Lock);
     Connected &= ~(1 << inst);
-    if (HostID == inst) HostID = -1;
     Changed.notify_all();
 }
 
@@ -62,7 +66,7 @@ bool LockstepMP::PeersReached(int inst, u64 time) const
 {
     for (int i = 0; i < kMaxInst; i++)
     {
-        if (i == inst || !(Connected & (1 << i))) continue;
+        if (i == inst || !(Members & (1 << i))) continue;
         // strictly past: a console still at `time` can send more frames stamped `time`
         if (Now(i) <= time) return false;
     }
@@ -73,7 +77,7 @@ template <typename Pred> void LockstepMP::WaitFor(std::unique_lock<std::mutex>& 
 {
     auto start = std::chrono::steady_clock::now();
     bool reported = false;
-    while (!pred())
+    while (!pred() && !Stopped)
     {
         Changed.wait_for(lk, std::chrono::microseconds(100));
         if (!reported && std::chrono::steady_clock::now() - start > std::chrono::seconds(1))
@@ -81,7 +85,7 @@ template <typename Pred> void LockstepMP::WaitFor(std::unique_lock<std::mutex>& 
             reported = true; // diagnostics: a wait this long is a deadlock
             fprintf(stderr, "LockstepMP: long wait: host=%d connected=%x clocks:", HostID, Connected);
             for (int i = 0; i < kMaxInst; i++)
-                if (Connected & (1 << i))
+                if (Members & (1 << i))
                     fprintf(stderr, " [%d]=%llu reg=%zu fromhost=%zu replies=%zu", i, (unsigned long long)Now(i),
                             Regular[i].size(), FromHost[i].size(), Replies[i].size());
             fprintf(stderr, "\n");
@@ -93,8 +97,13 @@ void LockstepMP::Broadcast(int inst, u32 type, u8* data, int len, u64 timestamp,
 {
     for (int i = 0; i < kMaxInst; i++)
     {
-        if (i == inst || !(Connected & (1 << i))) continue;
-        queues[i].push_back({inst, type, timestamp, Now(inst), std::vector<u8>(data, data + len)});
+        if (i == inst || !(Members & (1 << i))) continue;
+        u64 now = Now(inst);
+        // a console with Wi-Fi off can only Begin at or after its current time, and then never
+        // reads anything sent before that
+        if (!(Connected & (1 << i)))
+            while (!queues[i].empty() && queues[i].front().Time < Now(i)) queues[i].pop_front();
+        queues[i].push_back({inst, type, timestamp, now, std::vector<u8>(data, data + len)});
     }
 }
 
@@ -122,9 +131,10 @@ int LockstepMP::RecvPacket(int inst, u8* data, u64* timestamp)
     // earliest visible frame by (send time, sender), first-sent among equals
     std::deque<Packet>& q = Regular[inst];
     int best = -1;
+    while (!q.empty() && q.front().Time < BeginTime[inst]) q.pop_front(); // sent before our Begin
     for (int i = 0; i < (int)q.size(); i++)
     {
-        if (q[i].Time > visible) continue;
+        if (q[i].Time > visible || q[i].Time < BeginTime[inst]) continue;
         if (best < 0 || q[i].Time < q[best].Time || (q[i].Time == q[best].Time && q[i].Sender < q[best].Sender))
             best = i;
     }
@@ -169,7 +179,7 @@ int LockstepMP::SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid)
     std::lock_guard<std::mutex> lk(Lock);
     Log(inst, "SendReply", len, timestamp);
     PacketCount++; ReplyCount++;
-    if (HostID >= 0 && HostID != inst)
+    if (HostID >= 0 && HostID != inst && (Members & (1 << HostID)))
         Replies[HostID].push_back({inst, 2u | ((u32)aid << 16), timestamp, Now(inst), std::vector<u8>(data, data + len)});
     Changed.notify_all();
     return len;
@@ -178,9 +188,6 @@ int LockstepMP::SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid)
 int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
 {
     std::unique_lock<std::mutex> lk(Lock);
-    if (HostID >= 0 && !(Connected & (1 << HostID)))
-        return -1;
-
     // The next host frame if it was sent by our time + kDelay, else nothing. Host frames arrive in
     // send order, so once the host's clock is past that limit the answer can no longer change.
     u64 limit = Now(inst) + kDelay;
@@ -189,6 +196,7 @@ int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
         // (a console that was the last host itself waits on the others, never on its own clock)
         return !FromHost[inst].empty() || (HostID >= 0 && HostID != inst ? Now(HostID) >= limit : PeersReached(inst, limit - 1));
     });
+    while (!FromHost[inst].empty() && FromHost[inst].front().Time < BeginTime[inst]) FromHost[inst].pop_front();
     if (FromHost[inst].empty() || FromHost[inst].front().Time >= limit) { Log(inst, "RecvHost", 0, 0); return 0; }
 
     Packet p = std::move(FromHost[inst].front());
@@ -213,7 +221,7 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
         // deadline is queued before its sender's clock passes it, so it is then always seen
         u16 passed = 0;
         for (int i = 0; i < kMaxInst; i++)
-            if ((Connected & (1 << i)) && Now(i) >= deadline) passed |= (1 << i);
+            if ((Members & (1 << i)) && Now(i) >= deadline) passed |= (1 << i);
 
         std::deque<Packet>& q = Replies[inst];
         while (!q.empty())
@@ -231,14 +239,14 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
             replied |= (1 << p.Sender);
         }
 
-        if ((replied & Connected) == Connected || (ret & aidmask) == aidmask)
+        if ((replied & Members) == Members || (ret & aidmask) == aidmask || Stopped)
         { Log(inst, "RecvReplies", ret, replied); return ret; }
 
         // a client that has run kDelay past the CMD without replying never will for this CMD
-        if (((replied | passed) & Connected) == Connected)
+        if (((replied | passed) & Members) == Members)
         {
             // diagnostics: client clocks vs the deadline, and what is queued
-            u64 other = 0; for (int i = 0; i < kMaxInst; i++) if (i != inst && (Connected & (1 << i))) other = Now(i);
+            u64 other = 0; for (int i = 0; i < kMaxInst; i++) if (i != inst && (Members & (1 << i))) other = Now(i);
             Log(inst, "RecvRepliesGiveUp", (int)q.size(), other - deadline);
             Log(inst, "RecvReplies", ret, replied); return ret;
         }
