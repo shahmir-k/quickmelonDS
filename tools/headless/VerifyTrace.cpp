@@ -681,6 +681,11 @@ int MPTest(const TraceRunConfig& cfg, int frames,
         b1.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b1.nds->GPU));
         printf("instance 1: renderer off\n");
     }
+    if (getenv("LITEV_MP_SILENT1"))
+    {
+        b1.nds->SPU.Silent = true;  // what Netplay does to the other player's console
+        printf("instance 1: silent (no audio mix)\n");
+    }
 #ifdef LITEV_AGGRESSIVE_SKIP
     if (getenv("LITEV_MP_HEADLESS1"))
     {

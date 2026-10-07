@@ -908,6 +908,14 @@ void SPU::Mix(u32 spucycles)
         for (int i = 0; i < 16; i++) cv[i] = Channels[i].DoRun(spucycles);
         const s32 ch1 = cv[1], ch3 = cv[3];   // raw values for the routing switch below
 
+        // A console nobody hears (Netplay's other players): the mix only feeds the speakers,
+        // unless sound capture records it into memory, so skip it.
+        if (Silent && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7)) && NDS.ConsoleType == 0)
+        {
+            NDS.Mic.Advance(spucycles << 1);
+            goto mixed;
+        }
+
         // Channels 1 and 3 are conditionally muted from the MAIN mix (Cnt bits 12/13). Zero their
         // mix contribution (PanOutput of 0 == skipping it); the routing switch still uses raw ch1/ch3.
         s32 mv[16];
@@ -1080,6 +1088,7 @@ void SPU::Mix(u32 spucycles)
 
     if (BlipTimer >= 512 * 128)
         BufferAudio();
+mixed:;
 
 #ifdef LITEV_SPU_BATCH
     }

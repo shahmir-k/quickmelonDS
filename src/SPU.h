@@ -241,6 +241,8 @@ public:
 
     void SetBias(u16 bias);
     void SetDegrade10Bit(bool enable);
+    // Netplay: nobody hears this console; Mix skips the output path (state unchanged)
+    bool Silent = false;
     void SetDegrade10Bit(AudioBitDepth depth);
     void SetApplyBias(bool enable);
 
