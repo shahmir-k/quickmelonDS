@@ -681,6 +681,13 @@ int MPTest(const TraceRunConfig& cfg, int frames,
         b1.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b1.nds->GPU));
         printf("instance 1: renderer off\n");
     }
+#ifdef LITEV_AGGRESSIVE_SKIP
+    if (getenv("LITEV_MP_HEADLESS1"))
+    {
+        b1.nds->GPU.Headless = true; // what Netplay does to the other player's console
+        printf("instance 1: headless (draws only once the game uses display capture)\n");
+    }
+#endif
 
     // Install one shared in-process link and give each instance a distinct id.
     // LITEV_MP_LOCKSTEP=1: the deterministic LockstepMP (Netplay) instead of LocalMP.

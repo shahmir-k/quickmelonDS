@@ -1158,6 +1158,9 @@ void GPU::StartFrame() noexcept
     {
         SkipThisFrame = false;
     }
+    if (CaptureCnt & (1u << 31)) CaptureSeen = true;
+    if (Headless)
+        SkipThisFrame = !CaptureSeen;
 #endif
 
     TotalScanlines = 0;

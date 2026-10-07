@@ -631,6 +631,14 @@ public:
     bool SkipThisFrame = false;
     static constexpr int LITEV_FRAMESKIP_MAX = 9;
 
+    // Netplay: a console nobody looks at (another player's) draws nothing. Rendering does not
+    // feed back into emulation, except through display capture, so once the game has used
+    // capture it renders fully from then on.
+    // ponytail: the very first capture's 3D layer is the stale one (3D for a frame is drawn
+    // during the previous one); render 3D every frame for that if a game desyncs on it.
+    bool Headless = false;
+    bool CaptureSeen = false;   // the game has used display capture (Netplay then renders identically everywhere)
+
     void SetFrameskipTarget(int target) noexcept
     {
         if (target < 0) target = 0;
