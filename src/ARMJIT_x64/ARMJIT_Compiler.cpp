@@ -363,16 +363,9 @@ Compiler::Compiler(melonDS::NDS& nds) : XEmitter(), NDS(nds)
                     PatchedStoreFuncs[consoleType][num][size][reg] = GetWritableCodePtr();
                     if (RSCRATCH3 != ABI_PARAM1)
                         MOV(32, R(ABI_PARAM1), R(RSCRATCH3));
-                    if (num == 0)
-                    {
-                        MOV(64, R(ABI_PARAM2), R(RCPU));
-                        if (rdMapped != ABI_PARAM3)
-                            MOV(32, R(ABI_PARAM3), R(rdMapped));
-                    }
-                    else
-                    {
-                        MOV(32, R(ABI_PARAM2), R(rdMapped));
-                    }
+                    MOV(64, R(ABI_PARAM2), R(RCPU));
+                    if (rdMapped != ABI_PARAM3)
+                        MOV(32, R(ABI_PARAM3), R(rdMapped));
                     ABI_PushRegistersAndAdjustStack(CallerSavedPushRegs, 8);
                     if (consoleType == 0)
                     {
@@ -410,8 +403,7 @@ Compiler::Compiler(melonDS::NDS& nds) : XEmitter(), NDS(nds)
                         PatchedLoadFuncs[consoleType][num][size][signextend][reg] = GetWritableCodePtr();
                         if (RSCRATCH3 != ABI_PARAM1)
                             MOV(32, R(ABI_PARAM1), R(RSCRATCH3));
-                        if (num == 0)
-                            MOV(64, R(ABI_PARAM2), R(RCPU));
+                        MOV(64, R(ABI_PARAM2), R(RCPU));
                         ABI_PushRegistersAndAdjustStack(CallerSavedPushRegs, 8);
                         if (consoleType == 0)
                         {

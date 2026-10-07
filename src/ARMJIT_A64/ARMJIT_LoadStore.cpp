@@ -343,9 +343,10 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
             }
             else
             {
+                MOV(X1, RCPU);
                 if (flags & memop_Store)
                 {
-                    MOV(W1, rdMapped);
+                    MOV(W2, rdMapped);
                     switch (size | NDS.ConsoleType)
                     {
                     case 32: QuickCallFunction(X3, SlowWrite7<u32, 0>); break;

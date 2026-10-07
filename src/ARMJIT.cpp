@@ -156,18 +156,20 @@ T SlowRead9(u32 addr, ARMv5* cpu)
 }
 
 template <typename T, int ConsoleType>
-T SlowRead7(u32 addr)
+T SlowRead7(u32 addr, ARM* cpu)
 {
     u32 offset = addr & 0x3;
     addr &= ~(sizeof(T) - 1);
 
+    // cpu->NDS, not the thread_local NDS::Current (a TLS resolver call per access; the ARM7 is
+    // busy in Netplay: two consoles' Wi-Fi drivers)
     T val;
     if (std::is_same<T, u32>::value)
-        val = NDS::Current->ARM7Read32(addr);
+        val = cpu->NDS.ARM7Read32(addr);
     else if (std::is_same<T, u16>::value)
-        val = NDS::Current->ARM7Read16(addr);
+        val = cpu->NDS.ARM7Read16(addr);
     else
-        val = NDS::Current->ARM7Read8(addr);
+        val = cpu->NDS.ARM7Read8(addr);
 
     if (std::is_same<T, u32>::value)
         return ROR(val, offset << 3);
@@ -207,16 +209,16 @@ void SlowWrite9(u32 addr, ARMv5* cpu, u32 val)
 }
 
 template <typename T, int ConsoleType>
-void SlowWrite7(u32 addr, u32 val)
+void SlowWrite7(u32 addr, ARM* cpu, u32 val)
 {
     addr &= ~(sizeof(T) - 1);
 
     if (std::is_same<T, u32>::value)
-        NDS::Current->ARM7Write32(addr, val);
+        cpu->NDS.ARM7Write32(addr, val);
     else if (std::is_same<T, u16>::value)
-        NDS::Current->ARM7Write16(addr, val);
+        cpu->NDS.ARM7Write16(addr, val);
     else
-        NDS::Current->ARM7Write8(addr, val);
+        cpu->NDS.ARM7Write8(addr, val);
 }
 
 template <bool Write, int ConsoleType>
@@ -284,12 +286,13 @@ template <bool Write, int ConsoleType>
 void SlowBlockTransfer7(u32 addr, u64* data, u32 num)
 {
     addr &= ~0x3;
+    ARM* cpu = &NDS::Current->ARM7;  // one TLS read per block transfer, not per word
     for (u32 i = 0; i < num; i++)
     {
         if (Write)
-            SlowWrite7<u32, ConsoleType>(addr, data[i]);
+            SlowWrite7<u32, ConsoleType>(addr, cpu, data[i]);
         else
-            data[i] = SlowRead7<u32, ConsoleType>(addr);
+            data[i] = SlowRead7<u32, ConsoleType>(addr, cpu);
         addr += 4;
     }
 }
@@ -303,13 +306,13 @@ void SlowBlockTransfer7(u32 addr, u64* data, u32 num)
     template u16 SlowRead9<u16, consoleType>(u32, ARMv5*); \
     template u8 SlowRead9<u8, consoleType>(u32, ARMv5*); \
     \
-    template void SlowWrite7<u32, consoleType>(u32, u32); \
-    template void SlowWrite7<u16, consoleType>(u32, u32); \
-    template void SlowWrite7<u8, consoleType>(u32, u32); \
+    template void SlowWrite7<u32, consoleType>(u32, ARM*, u32); \
+    template void SlowWrite7<u16, consoleType>(u32, ARM*, u32); \
+    template void SlowWrite7<u8, consoleType>(u32, ARM*, u32); \
     \
-    template u32 SlowRead7<u32, consoleType>(u32); \
-    template u16 SlowRead7<u16, consoleType>(u32); \
-    template u8 SlowRead7<u8, consoleType>(u32); \
+    template u32 SlowRead7<u32, consoleType>(u32, ARM*); \
+    template u16 SlowRead7<u16, consoleType>(u32, ARM*); \
+    template u8 SlowRead7<u8, consoleType>(u32, ARM*); \
     \
     template void SlowBlockTransfer9<false, consoleType>(u32, u64*, u32, ARMv5*); \
     template void SlowBlockTransfer9<true, consoleType>(u32, u64*, u32, ARMv5*); \
