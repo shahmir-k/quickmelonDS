@@ -1158,7 +1158,7 @@ void GPU::StartFrame() noexcept
     {
         SkipThisFrame = false;
     }
-    if (CaptureCnt & (1u << 31)) CaptureSeen = true;
+    if (CaptureCnt & (1u << 31)) { CaptureSeen = true; GPU3D.Headless = false; }
     if (Headless)
         SkipThisFrame = !CaptureSeen;
 #endif

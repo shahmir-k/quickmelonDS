@@ -3442,7 +3442,9 @@ void GPU3D::VBlank() noexcept
 {
     if (GeometryEnabled)
     {
-        if (RenderingEnabled)
+        // a console nobody watches skips preparing the frame for the renderer (polygon sort,
+        // Render* copies): only the renderer reads that state
+        if (RenderingEnabled && !Headless)
         {
 #ifdef LITEV_SOFT3D_ASYNC
         // LITEV_SOFT3D_ASYNC: if this VBlank changes nothing the renderer reads, skip

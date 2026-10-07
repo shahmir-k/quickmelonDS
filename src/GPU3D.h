@@ -197,7 +197,8 @@ private:
 
 public:
     // Netplay: a console nobody watches. Vertex colours and texgen only feed rendering, so
-    // lighting just accounts its cycles (which depend only on the enabled lights).
+    // lighting just accounts its cycles (which depend only on the enabled lights), and VBlank
+    // skips preparing the frame for the renderer. Cleared once the game uses display capture.
     bool Headless = false;
     melonDS::NDS& NDS;
     melonDS::GPU& GPU;
