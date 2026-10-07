@@ -893,6 +893,9 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
 
             u64* entry = &FastBlockLookupRegions[localAddr >> 27][(localAddr & 0x7FFFFFF) / 2];
             *entry = ((u64)blockAddr | cpu->Num) << 32;
+#ifdef LITEV_JIT_ICACHE
+            cpu->ICacheEpoch++;   // an entry now points at a different block: drop cached ones
+#endif
             *entry |= JITCompiler.SubEntryOffset(existingBlockIt->second->EntryPoint);
             return;
         }

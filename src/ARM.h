@@ -271,6 +271,14 @@ public:
     // asserted hot field (Cycles/StopExecution/CPSR/CyclesBudget/FastBlockLookup*/
     // JitNZCV) so it disturbs no baked offset; transient -> never serialized.
     u32 ICacheEpoch = 0;
+#ifdef LITEV_JIT_ICACHE
+    // Last block entered from C++ (Execute): the ARM7 mostly re-enters the same idle-loop block
+    // on every event, so this skips the cache-cold FastBlockLookup load. Valid while
+    // ICacheEpoch is unchanged (bumped whenever a FastBlockLookup entry is replaced or cleared).
+    u32 LastEnterAddr = ~0u;
+    u32 LastEnterEpoch = 0;
+    void* LastEnterBlock = nullptr;
+#endif
 #endif
 
 #ifdef LITEV_JIT_BUDGET_REG

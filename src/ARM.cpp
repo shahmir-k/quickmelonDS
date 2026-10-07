@@ -728,8 +728,19 @@ void ARMv5::Execute()
                 return;
             }
 
+#ifdef LITEV_JIT_ICACHE
+            JitBlockEntry block;
+            if (instrAddr == LastEnterAddr && ICacheEpoch == LastEnterEpoch)
+                block = (JitBlockEntry)LastEnterBlock;
+            else
+            {
+                block = NDS.JIT.LookUpBlock(0, FastBlockLookup, instrAddr - FastBlockLookupStart, instrAddr);
+                if (block) { LastEnterAddr = instrAddr; LastEnterEpoch = ICacheEpoch; LastEnterBlock = (void*)block; }
+            }
+#else
             JitBlockEntry block = NDS.JIT.LookUpBlock(0, FastBlockLookup,
                 instrAddr - FastBlockLookupStart, instrAddr);
+#endif
 
             // liteDS-v2 Unit 2 (shadow): maintain the slice budget in the exact same
             // unit as Cycles. The loop guarantees ARM9Timestamp < ARM9Target here, so
@@ -928,8 +939,19 @@ void ARMv4::Execute()
                 return;
             }
 
+#ifdef LITEV_JIT_ICACHE
+            JitBlockEntry block;
+            if (instrAddr == LastEnterAddr && ICacheEpoch == LastEnterEpoch)
+                block = (JitBlockEntry)LastEnterBlock;
+            else
+            {
+                block = NDS.JIT.LookUpBlock(1, FastBlockLookup, instrAddr - FastBlockLookupStart, instrAddr);
+                if (block) { LastEnterAddr = instrAddr; LastEnterEpoch = ICacheEpoch; LastEnterBlock = (void*)block; }
+            }
+#else
             JitBlockEntry block = NDS.JIT.LookUpBlock(1, FastBlockLookup,
                 instrAddr - FastBlockLookupStart, instrAddr);
+#endif
 
             // liteDS-v2 Unit 2 (shadow): ARM7 analog. ARM7 timestamps carry no clock
             // shift, so budget = ARM7Target - ARM7Timestamp is already in Cycles units.
