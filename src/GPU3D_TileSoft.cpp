@@ -39,14 +39,18 @@
 
 #if defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
 #include <sched.h>
-// Pin each tile band-worker to its OWN core among {0,1,2}, off the emu's core (3). The shared
-// {0,1,2} mask let the scheduler double two workers onto one core and leave another idle (measured:
-// all 3 rarely on distinct cores), so the 3-way raster ran ~2-wide and inflated the render gate the
-// emu waits on. A distinct core per worker guarantees the parallel spread.
+#include "LitevCores.h"
+// Pin each tile band-worker to its OWN core, off the emu's (the fastest remaining cores first;
+// on the RG DS: 0, 1, 2, with the emu on 3). A shared mask let the scheduler double two workers
+// onto one core and leave another idle (measured: all 3 rarely on distinct cores), so the 3-way
+// raster ran ~2-wide and inflated the render gate the emu waits on. A distinct core per worker
+// guarantees the parallel spread.
 static void litevPinTileWorker(int idx)
 {
+    const std::vector<int>& others = melonDS::LitevCores::Get().Others;
+    if (others.empty()) return;
     cpu_set_t set; CPU_ZERO(&set);
-    CPU_SET(idx % 3, &set);
+    CPU_SET(others[idx % others.size()], &set);
     sched_setaffinity(0, sizeof(set), &set);
 }
 #else
