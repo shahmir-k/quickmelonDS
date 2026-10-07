@@ -162,6 +162,15 @@ For host CMake builds made from zsh, never use `cmake … $FLAGS`. zsh does not 
 whole string becomes the value of the first `-D`. Use an array (`"${flags[@]}"`) or `${=FLAGS}`,
 then `grep LITEV_X:BOOL $builddir/CMakeCache.txt`.
 
+### 4.3 App-level build options (in the app's CMakeLists, not this repo)
+
+The SereneDS app (`app-clean`) adds compile/link options around this core that are not LITEV
+core options: `LITEV_THINLTO` (ThinLTO; this repo's own LTO only applies to
+`CMAKE_BUILD_TYPE=Release`, which the app's RelWithDebInfo never was), `LITEV_MTUNE_A55`,
+and two **game-trained** ones, `LITEV_HOT_ORDER` (`hot-symbols.order`) and `LITEV_PGO_USE`
+(`pgo/core-cs.profdata`). How to retrain those on new games, gate and measure them:
+`melonDS-profiler/docs/PROFILE-GUIDED-BUILD.md` (tools: `hot-order.py`, `pgo-train.sh`).
+
 ## 5. Build the APK
 
 **[V] 6 min 38 s** cold (fresh tree, warm Gradle caches, 71 tasks):
