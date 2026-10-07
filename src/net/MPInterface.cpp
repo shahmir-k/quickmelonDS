@@ -19,6 +19,7 @@
 #include "MPInterface.h"
 #include "LocalMP.h"
 #include "LAN.h"
+#include "LockstepMP.h"
 
 namespace melonDS
 {
@@ -55,6 +56,11 @@ void MPInterface::Set(MPInterfaceType type)
 
     case MPInterface_LAN:
         Current = std::make_unique<LAN>();
+        break;
+
+    case MPInterface_Netplay:
+        // every player's console runs in this process (Netplay): deterministic in-process link
+        Current = std::make_unique<LockstepMP>();
         break;
 
     default:
