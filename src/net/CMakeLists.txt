@@ -7,6 +7,7 @@ add_library(net-utils STATIC
     PacketDispatcher.cpp
     LocalMP.cpp
     LockstepMP.cpp
+    NetplayInput.cpp
     LAN.cpp
     Netplay.cpp
     MPInterface.cpp

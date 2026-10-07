@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include "VerifyTrace.h"
 #include "LockstepMP.h"
+#include "NetplayInput.h"
 
 #include <cstdio>
 #include <cstring>
@@ -657,6 +658,33 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     MPInterface::Set(lockstep ? MPInterface_Netplay : MPInterface_Local);
     LockstepMP* lockstepMP = lockstep ? dynamic_cast<LockstepMP*>(&MPInterface::Get()) : nullptr;
     printf("link: %s\n", lockstep ? "LockstepMP (deterministic)" : "LocalMP");
+
+    // LITEV_NETPLAY="player=P,delay=D,port=N,peer=IP:PORT[,latency=MS]": Netplay. This process is
+    // player P's device: it emulates both consoles, but only player P's input comes from its
+    // script; the other player's arrives over UDP from the peer process, applied D frames late.
+    std::unique_ptr<NetplayInput> net;
+    if (const char* np = getenv("LITEV_NETPLAY"))
+    {
+        int player = 0, delay = 3, port = 7100, latency = 0;
+        std::string peer = "127.0.0.1:7101", spec = np;
+        for (size_t pos = 0; pos < spec.size();)
+        {
+            size_t end = spec.find(',', pos);
+            std::string kv = spec.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+            size_t eq = kv.find('=');
+            std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+            if (k == "player") player = atoi(v.c_str());
+            else if (k == "delay") delay = atoi(v.c_str());
+            else if (k == "port") port = atoi(v.c_str());
+            else if (k == "peer") peer = v;
+            else if (k == "latency") latency = atoi(v.c_str());
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        net = std::make_unique<NetplayInput>(player, delay, port, peer, latency);
+        if (!net->Ok()) { fprintf(stderr, "netplay: socket setup failed\n"); return 1; }
+        printf("netplay: player %d, delay %d frames, port %d, peer %s, artificial latency %d ms\n", player, delay, port, peer.c_str(), latency);
+    }
     if (lockstepMP)
     {
         NDS* n0 = b0.nds.get(); NDS* n1 = b1.nds.get();
@@ -702,7 +730,23 @@ int MPTest(const TraceRunConfig& cfg, int frames,
             // this one's MP frames, and without a partner it stalls a full receive timeout per tick.
             for (int f = 0; f < frames || otherDone.load() < frames; f++)
             {
-                b.ApplyInput(f);
+                if (!net)
+                    b.ApplyInput(f);
+                else if (f < frames)
+                {
+                    if (inst == net->LocalPlayer())
+                    {
+                        NetplayFrameInput local;
+                        local.Keys = b.inputScript.Loaded() ? b.inputScript.KeyMaskForFrame(f) : 0xFFF;
+                        int tx, ty;
+                        if (b.inputScript.HasTouch() && b.inputScript.TouchForFrame(f, tx, ty)) { local.TouchX = tx; local.TouchY = ty; }
+                        net->SubmitLocal(f, local);
+                    }
+                    NetplayFrameInput in = net->Get(inst, f);
+                    b.nds->SetKeyMask(in.Keys);
+                    if (in.TouchX >= 0) b.nds->TouchScreen(in.TouchX, in.TouchY);
+                    else                b.nds->ReleaseScreen();
+                }
                 b.nds->RunFrame();
                 if (f >= frames) continue;
                 doneCounter.store(f + 1, std::memory_order_relaxed);
@@ -775,6 +819,7 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     u64 cmd = MPInterface::Get().ObserveCmdCount();
     u64 reply = MPInterface::Get().ObserveReplyCount();
     u64 pkt = MPInterface::Get().ObservePacketCount();
+    if (net) printf("netplay stall: %.1f ms waiting for the remote player's input\n", net->StallMs());
     bool ranClean = !crashed.load() && done0.load() == frames && done1.load() == frames;
     bool associated = (peakConnected.load() == 0x3);
     bool exchanged = (cmd > 0 || reply > 0 || pkt > 0);

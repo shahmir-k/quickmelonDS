@@ -26,6 +26,7 @@ add_executable(liteDS-headless
     # LocalMP only needs Platform mutex/semaphore from core.
     "${CMAKE_SOURCE_DIR}/src/net/LocalMP.cpp"
     "${CMAKE_SOURCE_DIR}/src/net/LockstepMP.cpp"
+    "${CMAKE_SOURCE_DIR}/src/net/NetplayInput.cpp"
     ${LITEV_HEADLESS_MP_SOURCES}
 )
 
