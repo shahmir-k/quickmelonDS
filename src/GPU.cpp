@@ -1184,7 +1184,7 @@ void GPU::StartHBlank(u32 line) noexcept
         // note: this should start 48 cycles after the scanline start
         // (CheckDMAs below always runs; only the renderer draw calls are gated)
 #ifdef LITEV_AGGRESSIVE_SKIP
-        if (!SkipThisFrame)
+        if (!SkipThisFrame && !(DiagNoDraw & 1))
 #endif
         {
             if (line < 192)
@@ -1198,7 +1198,7 @@ void GPU::StartHBlank(u32 line) noexcept
     else if (VCount == 215)
     {
 #ifdef LITEV_AGGRESSIVE_SKIP
-        if (!SkipThisFrame)
+        if (!SkipThisFrame && !(DiagNoDraw & 2))
 #endif
         Rend->Start3DRendering();
     }

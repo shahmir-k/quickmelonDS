@@ -637,7 +637,8 @@ public:
     // ponytail: the very first capture's 3D layer is the stale one (3D for a frame is drawn
     // during the previous one); render 3D every frame for that if a game desyncs on it.
     bool Headless = false;
-    bool CaptureSeen = false;   // the game has used display capture (Netplay then renders identically everywhere)
+    bool CaptureSeen = false;
+    int DiagNoDraw = 0;         // TEMP diagnostic: bit0 skip 2D drawing, bit1 skip 3D rendering   // the game has used display capture (Netplay then renders identically everywhere)
 
     void SetFrameskipTarget(int target) noexcept
     {
