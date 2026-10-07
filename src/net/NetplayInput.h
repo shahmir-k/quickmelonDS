@@ -75,6 +75,8 @@ public:
 
     // Total time spent blocked in Get() waiting for the remote player (ms).
     double StallMs() const { return StallUs.load() / 1000.0; }
+    // Time since the last packet from the peer (ms); huge before the first one.
+    double MsSincePeer() const;
 
 private:
     static constexpr int kMaxPerPacket = 64;
@@ -94,6 +96,7 @@ private:
     int PeerAck;            // the peer has all our inputs up to this applied frame
     int RemoteUpTo;         // we have all the peer's inputs up to this applied frame
     std::atomic<u64> StallUs {0};
+    std::atomic<u64> LastPeerUs {0};
 
     void ReceiveLoop();
     void Send();

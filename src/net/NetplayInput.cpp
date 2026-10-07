@@ -152,6 +152,11 @@ bool NetplayInput::PeerHash(int frame, u64& hash)
     return true;
 }
 
+double NetplayInput::MsSincePeer() const
+{
+    return (NowUs() - LastPeerUs.load()) / 1000.0;
+}
+
 NetplayFrameInput NetplayInput::Get(int player, int frame)
 {
     if (frame < DelayFrames) return {}; // nobody has input before the delay has elapsed
@@ -185,6 +190,7 @@ void NetplayInput::ReceiveLoop()
 
         ssize_t len = recv(Socket, buf, sizeof(buf), 0);
         u64 now = NowUs();
+        if (len > 0) LastPeerUs = now;
         if (len >= (ssize_t)sizeof(WireHeader))
             pending.emplace_back(now + (u64)LatencyMs * 1000, std::vector<u8>(buf, buf + len));
 
