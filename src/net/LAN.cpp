@@ -95,7 +95,6 @@ LAN::LAN() noexcept : Inited(false)
 
     ConnectedBitmask = 0;
 
-    MPRecvTimeout = 25;
     LastHostID = -1;
     LastHostPeer = nullptr;
 
@@ -834,7 +833,10 @@ void LAN::ProcessLAN(int type)
         }
     }
 
-    int timeout = (type == 2) ? MPRecvTimeout : 0;
+    // MPInterface::RecvTimeout (frontend-settable, default 25 ms): LAN used to hardcode 25 ms,
+    // too short for Wi-Fi, where poll/reply round trips plus the peers' frame-pacing phase
+    // offset (up to a frame) regularly exceed it and in-game joins fail.
+    int timeout = (type == 2) ? RecvTimeout : 0;
     time_last = (u32)Platform::GetMSCount();
 
     ENetEvent event;

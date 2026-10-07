@@ -130,7 +130,6 @@ private:
 
     u16 ConnectedBitmask;
 
-    int MPRecvTimeout;
     int LastHostID;
     ENetPeer* LastHostPeer;
     std::queue<ENetPacket*> RXQueue;
