@@ -64,8 +64,10 @@ public:
     // The local player's input sampled at `frame` (applied at frame + Delay everywhere).
     void SubmitLocal(int frame, const NetplayFrameInput& input);
 
-    // The input of `player` for emulated frame `frame`; blocks until known.
+    // The input of `player` for emulated frame `frame`; blocks until known (or Abort()).
     NetplayFrameInput Get(int player, int frame);
+    // Session ending: Get() stops waiting and returns no input from now on.
+    void Abort();
 
     // Desync check: each device sends the hash of its own console's state every so often; the
     // other device compares it with its copy of that console (PeerHash). Unreliable: a lost

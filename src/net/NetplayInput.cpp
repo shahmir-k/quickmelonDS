@@ -157,6 +157,13 @@ double NetplayInput::MsSincePeer() const
     return (NowUs() - LastPeerUs.load()) / 1000.0;
 }
 
+void NetplayInput::Abort()
+{
+    Running = false;
+    std::lock_guard<std::mutex> lk(Lock);
+    Changed.notify_all();
+}
+
 NetplayFrameInput NetplayInput::Get(int player, int frame)
 {
     if (frame < DelayFrames) return {}; // nobody has input before the delay has elapsed
