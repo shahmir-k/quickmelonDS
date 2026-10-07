@@ -38,6 +38,11 @@
 #include "LiteProfile.h"
 #include "VerifyTrace.h"
 #include "InputScript.h"
+#ifdef LITEV_HEADLESS_LAN
+#include <thread>
+#include "MPInterface.h"
+#include "LAN.h"
+#endif
 
 using namespace melonDS;
 
@@ -76,6 +81,10 @@ struct Options
     bool accurate3d = false;            // --soft3d accurate: SoftRenderer3D instead of the tile renderer
 
     std::string inputScript;            // --input-script: scripted button input
+    std::string lanJoin;                // --lan-join <host>: join a LAN session (LITEV_HEADLESS_LAN)
+    int lanHost = 0;                    // --lan-host <maxplayers>: host a LAN session instead
+    int macXor = 0;                     // --mac-xor <n>: distinct firmware MAC per headless instance
+    std::string lanName = "Headless";   // --lan-name: player name shown in the host's lobby
 
     // --bench-window <start>:<end>: measure avg FPS ONLY over frames [start,end]
     // (inclusive), while the total run still executes all --frames frames. Lets a
@@ -113,6 +122,12 @@ struct Options
         "  --profile-json <path>     write per-run totals as JSON\n"
         "  --data-dir <path>         local firmware/save directory (default ./headless-data)\n"
         "  --fixed-rtc <unix-ts>     fixed RTC epoch for determinism (default 946684800)\n"
+        "  --lan-join <host>         join the LAN multiplayer session at <host> (e.g. a SereneDS\n"
+        "                            device); runs paced at 60 fps (LITEV_HEADLESS_LAN build)\n"
+        "  --lan-host <maxplayers>   host a LAN session instead (others --lan-join this machine)\n"
+        "  --lan-name <name>         player name for --lan-join/--lan-host (default Headless)\n"
+        "  --mac-xor <n>             XOR the generated firmware's last MAC byte with n, so several\n"
+        "                            headless instances are distinct wireless players\n"
         "  --input-script <path>     scripted button input: lines '<frame> <keys>'\n"
         "                            keys = comma list (A,B,SELECT,START,RIGHT,LEFT,UP,\n"
         "                            DOWN,R,L,X,Y), NONE, or a 0x hex pressed-mask; held\n"
@@ -201,6 +216,10 @@ bool ParseArgs(int argc, char** argv, Options& o)
         else if (a == "--data-dir") o.dataDir = next("--data-dir");
         else if (a == "--fixed-rtc") o.fixedRtc = std::atoll(next("--fixed-rtc").c_str());
         else if (a == "--input-script") o.inputScript = next("--input-script");
+        else if (a == "--lan-join") o.lanJoin = next("--lan-join");
+        else if (a == "--lan-host") o.lanHost = std::atoi(next("--lan-host").c_str());
+        else if (a == "--mac-xor") o.macXor = std::atoi(next("--mac-xor").c_str());
+        else if (a == "--lan-name") o.lanName = next("--lan-name");
         else if (a == "--bench-window")
         {
             std::string spec = next("--bench-window");
@@ -525,6 +544,46 @@ int main(int argc, char** argv)
     uint64_t profFrames = 0;
 #endif
 
+    if (opt.macXor)
+    {
+        melonDS::Firmware& fw = nds->GetFirmware();
+        fw.GetHeader().MacAddr[5] ^= (melonDS::u8) opt.macXor;
+        fw.UpdateChecksums();
+    }
+
+#ifdef LITEV_HEADLESS_LAN
+    // LAN client: join a session hosted elsewhere (the SereneDS app's Multiplayer lobby, or
+    // desktop melonDS on the same core version) before the game boots, then run in real time:
+    // the other end is a live 60 fps instance, and DS wireless timing assumes both advance at
+    // the same rate.
+    const bool lan = !opt.lanJoin.empty() || opt.lanHost > 0;
+    auto lanNext = std::chrono::steady_clock::now();
+    if (lan)
+    {
+        melonDS::MPInterface::Set(melonDS::MPInterface_LAN);
+        auto& l = (melonDS::LAN&) melonDS::MPInterface::Get();
+        if (opt.lanHost > 0)
+        {
+            if (!l.StartHost(opt.lanName.c_str(), opt.lanHost))
+            {
+                fprintf(stderr, "LAN: could not host\n");
+                return 1;
+            }
+            printf("LAN: hosting as '%s' (max %d players)\n", opt.lanName.c_str(), opt.lanHost);
+        }
+        else if (!l.StartClient(opt.lanName.c_str(), opt.lanJoin.c_str()))
+        {
+            fprintf(stderr, "LAN: could not join %s\n", opt.lanJoin.c_str());
+            return 1;
+        }
+        else
+            printf("LAN: joined %s as '%s'\n", opt.lanJoin.c_str(), opt.lanName.c_str());
+    }
+#else
+    if (!opt.lanJoin.empty())
+        fprintf(stderr, "warning: --lan-join ignored (build lacks LITEV_HEADLESS_LAN)\n");
+#endif
+
     for (int frame = 0; frame < opt.frames; frame++)
     {
         if (inputScript.Loaded())
@@ -535,6 +594,27 @@ int main(int argc, char** argv)
 
         LITE_PROFILE_RESET_FRAME();
         nds->RunFrame();
+
+#ifdef LITEV_HEADLESS_LAN
+        if (lan)
+        {
+            melonDS::MPInterface::Get().Process();
+            if (frame % 120 == 0)
+            {
+                auto players = ((melonDS::LAN&) melonDS::MPInterface::Get()).GetPlayerList();
+                printf("LAN f%d:", frame);
+                for (const auto& p : players)
+                    printf(" [%d %s status=%d ping=%u%s]", p.ID, p.Name, (int) p.Status, p.Ping, p.IsLocalPlayer ? " local" : "");
+                printf("\n");
+                fflush(stdout);
+            }
+            if (!getenv("LITEV_LAN_NOPACE"))
+            {
+                lanNext += std::chrono::microseconds(16667);
+                std::this_thread::sleep_until(lanNext);
+            }
+        }
+#endif
 
         if (haveWindow && frame == opt.benchWindowEnd)
             windowEnd = std::chrono::steady_clock::now();
