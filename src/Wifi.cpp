@@ -1085,7 +1085,7 @@ int Wifi::SendLateMPReply(u8* data, int len, u16 aid)
 
 void Wifi::SendMPAck(u16 cmdcount, u16 clientfail)
 {
-    u8 ack[12 + 32];
+    u8 ack[12 + 32] {}; // zeroed: bytes 4-5 are never set but reach the client's RXBuffer (savestated)
 
     *(u16*)&ack[0xA] = 32; // length
 

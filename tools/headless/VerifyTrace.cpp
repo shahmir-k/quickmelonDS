@@ -889,8 +889,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #endif
 
     // Install one shared in-process link and give each instance a distinct id.
-    // LITEV_MP_LOCKSTEP=1: the deterministic LockstepMP (Netplay) instead of LocalMP.
-    bool lockstep = getenv("LITEV_MP_LOCKSTEP") != nullptr || hostedSpec || recordDir;
+    // LITEV_MP_LOCKSTEP=1: the deterministic LockstepMP (Netplay) instead of LocalMP. Netplay
+    // always uses it, as the app does: LocalMP's replies depend on thread timing, so two devices
+    // running the same consoles diverge.
+    bool lockstep = np || getenv("LITEV_MP_LOCKSTEP") != nullptr || hostedSpec || recordDir;
     MPInterface::Set(lockstep ? MPInterface_Netplay : MPInterface_Local);
     LockstepMP* lockstepMP = lockstep ? dynamic_cast<LockstepMP*>(&MPInterface::Get()) : nullptr;
     printf("link: %s\n", lockstep ? "LockstepMP (deterministic)" : "LocalMP");
