@@ -111,6 +111,15 @@ private:
     std::function<u64()> Clock[kMaxInst];
     FILE* Trace[kMaxInst] {};   // LITEV_MP_TRACE=<dir>: one line per link call, per instance
     void Log(int inst, const char* call, int result, u64 extra);
+    // LITEV_MP_STATS / debug.litev.mpstats=1: per CMD, where the host's wait for the replies goes
+    struct
+    {
+        int On = -1;
+        long long T0 = 0, T1 = 0, T2 = 0, Enter = 0;   // ns: CMD sent, CMD delivered, reply sent, host starts waiting
+        double Deliver = 0, Reply = 0, Wake = 0, Wait = 0, Notify = 0;
+        u32 N = 0, Lead[4] {};
+    } St;
+    bool StatsOn();
     std::deque<Packet> Regular[kMaxInst];   // regular frames, per receiver, in send order per sender
     std::deque<Packet> FromHost[kMaxInst];  // CMD/ACK, per receiver
     std::deque<Packet> Replies[kMaxInst];   // replies, per host

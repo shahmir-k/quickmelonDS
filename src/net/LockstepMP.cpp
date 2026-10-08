@@ -21,6 +21,8 @@
 #include <cstdlib>
 
 #include "LockstepMP.h"
+#include "../Platform.h"
+#include <chrono>
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
@@ -72,6 +74,22 @@ void LockstepMP::Log(int inst, const char* call, int result, u64 extra)
     }
     fprintf(Trace[inst], "%llu %s %d %llu\n", (unsigned long long)Now(inst), call, result, (unsigned long long)extra);
     fflush(Trace[inst]);
+}
+
+static long long NowNs() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+bool LockstepMP::StatsOn()
+{
+    if (St.On < 0)
+    {
+        const char* e = getenv("LITEV_MP_STATS");
+        St.On = e && atoi(e);
+#ifdef __ANDROID__
+        char v[92] = {0};
+        if (!St.On && __system_property_get("debug.litev.mpstats", v) > 0) St.On = atoi(v);
+#endif
+    }
+    return St.On > 0;
 }
 
 bool LockstepMP::PeersReached(int inst, u64 time) const
@@ -171,6 +189,17 @@ int LockstepMP::SendCmd(int inst, u8* data, int len, u64 timestamp)
     PacketCount++; CmdCount++;
     HostID = inst;
     Replies[inst].clear();
+    if (StatsOn())
+    {
+        St.T0 = NowNs(); St.T1 = St.T2 = 0;
+        for (int i = 0; i < kMaxInst; i++)
+            if (i != inst && (Members & (1 << i)))
+            {
+                long long lead = (long long)Now(i) - (long long)Now(inst);
+                St.Lead[lead < 0 ? 0 : lead < (long long)kHostDelay / 2 ? 1 : lead < (long long)kHostDelay ? 2 : 3]++;
+                break;
+            }
+    }
     Broadcast(inst, 1, data, len, timestamp, FromHost);
     Changed.notify_all();
     return len;
@@ -190,6 +219,7 @@ int LockstepMP::SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid)
 {
     std::lock_guard<std::mutex> lk(Lock);
     Log(inst, "SendReply", len, timestamp);
+    if (St.On > 0 && St.T1 && !St.T2) St.T2 = NowNs();
     PacketCount++; ReplyCount++;
     if (HostID >= 0 && HostID != inst && (Members & (1 << HostID)))
         Replies[HostID].push_back({inst, 2u | ((u32)aid << 16), timestamp, Now(inst), std::vector<u8>(data, data + len)});
@@ -224,6 +254,7 @@ int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
 
     Packet p = std::move(FromHost[inst].front());
     FromHost[inst].pop_front();
+    if (St.On > 0 && p.Type == 1 && St.T0 && !St.T1) St.T1 = NowNs();
     int len = (int)p.Data.size();
     if (len) memcpy(data, p.Data.data(), len);
     // advanced by the delay, as for regular frames (the client syncs its Wi-Fi clock to it)
@@ -238,6 +269,26 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
     u16 ret = 0;
     u16 replied = (1 << inst);
     u64 deadline = Now(inst) + kDelay;
+    if (St.On > 0) St.Enter = NowNs();
+    auto stats = [&] {
+        if (St.On <= 0 || !St.T0) return;
+        long long t3 = NowNs();
+        St.Wait += t3 - St.Enter;
+        if (St.T1 && St.T2)
+        {
+            St.Deliver += St.T1 - St.T0; St.Reply += St.T2 - St.T1;
+            St.Wake += t3 - std::max(St.T2, St.Enter);
+            St.Notify += St.T2 > St.Enter ? 1 : 0;
+        }
+        St.T0 = 0;
+        if (++St.N == 600)
+        {
+            Platform::Log(Platform::LogLevel::Info, "LITEV_MPSTATS 600 CMDs: host wait %.0f us/CMD | CMD sent->client has it %.0f us, ->reply sent %.0f us, reply->host running %.0f us | host already waiting at reply %.0f%% | client lead at CMD: behind %u, <D/2 %u, <D %u, >=D %u\n",
+                St.Wait / 600e3, St.Deliver / 600e3, St.Reply / 600e3, St.Wake / 600e3, St.Notify / 6.0, St.Lead[0], St.Lead[1], St.Lead[2], St.Lead[3]);
+            St.Wait = St.Deliver = St.Reply = St.Wake = St.Notify = 0; St.N = 0;
+            for (auto& l : St.Lead) l = 0;
+        }
+    };
 
     for (;;)
     {
@@ -264,7 +315,7 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
         }
 
         if ((replied & Members) == Members || (ret & aidmask) == aidmask || Stopped)
-        { Log(inst, "RecvReplies", ret, replied); return ret; }
+        { Log(inst, "RecvReplies", ret, replied); stats(); return ret; }
 
         // a client that has run kDelay past the CMD without replying never will for this CMD
         if (((replied | passed) & Members) == Members)
@@ -272,7 +323,7 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
             // diagnostics: client clocks vs the deadline, and what is queued
             u64 other = 0; for (int i = 0; i < kMaxInst; i++) if (i != inst && (Members & (1 << i))) other = Now(i);
             Log(inst, "RecvRepliesGiveUp", (int)q.size(), other - deadline);
-            Log(inst, "RecvReplies", ret, replied); return ret;
+            Log(inst, "RecvReplies", ret, replied); stats(); return ret;
         }
 
         Changed.wait_for(lk, std::chrono::microseconds(100));
