@@ -1162,6 +1162,15 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     {
         double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
         printf("perf: %d frames, wall %.2f ms/frame, process CPU %.2f ms/frame (%d consoles)\n", frames, wall / frames, (CpuMs() - cpu0) / frames, n);
+#ifdef LITEV_HOSTED_NETPLAY
+        for (int k = 0; hostedServer && k < n; k++)
+        {
+            u64 sent, resent;
+            hostedServer->Traffic(k, sent, resent);
+            if (sent) printf("hosted: console %d stream: %.0f KB sent (%.0f KB re-sent), %.0f B/frame, %.1f KB/s\n", k, sent / 1024.0, resent / 1024.0,
+                             (double)sent / frames, sent / 1024.0 / (wall / 1000));
+        }
+#endif
     }
 #ifdef LITEV_HOSTED_NETPLAY
     for (FILE* f : recordFiles) if (f) fclose(f);

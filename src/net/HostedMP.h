@@ -184,6 +184,8 @@ public:
     int DrainMs = 10000;    // how long the destructor waits for the clients
     // append to console's stream and send it
     void Push(int console, const u8* data, size_t len);
+    // bytes sent to console's client so far (headers included), and how many of them were re-sends
+    void Traffic(int console, u64& sent, u64& resent);
 
 private:
     struct Stream
@@ -192,6 +194,8 @@ private:
         u64 Acked = 0;
         u8 Addr[16] {};         // sockaddr_in
         bool Known = false;
+        u64 SentTo = 0;         // stream bytes sent at least once
+        u64 SentBytes = 0, ResentBytes = 0;
     };
     int Socket = -1;
     NetFaults Faults;

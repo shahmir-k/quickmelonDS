@@ -443,7 +443,17 @@ void HostedServer::SendRange(int console, u64 from, u64 to)
         memcpy(packet, &h, sizeof(h));
         memcpy(packet + sizeof(h), s.Bytes.data() + (o - s.Acked), h.Len);
         sendto(Socket, packet, sizeof(h) + h.Len, 0, (sockaddr*)s.Addr, sizeof(sockaddr_in));
+        s.SentBytes += sizeof(h) + h.Len;
+        if (o < s.SentTo) s.ResentBytes += sizeof(h) + h.Len;
+        s.SentTo = std::max(s.SentTo, o + h.Len);
     }
+}
+
+void HostedServer::Traffic(int console, u64& sent, u64& resent)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    sent = Streams[console].SentBytes;
+    resent = Streams[console].ResentBytes;
 }
 
 void HostedServer::Push(int console, const u8* data, size_t len)
