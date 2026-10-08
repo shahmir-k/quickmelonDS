@@ -1174,7 +1174,7 @@ void GPU::StartFrame() noexcept
     if (LITEV_HEADLESS(Headless))
         SkipThisFrame = !CaptureSeen;
 #ifdef LITEV_SKIP_REPEAT_FRAMES
-    SkipRepeat = NextSkipRepeat;
+    SkipRepeat = NextSkipRepeat && !(CaptureCnt & (1u << 31));   // never drop a frame a capture records
     NextSkipRepeat = false;
 #endif
 #endif
@@ -1227,7 +1227,8 @@ void GPU::StartHBlank(u32 line) noexcept
 #ifdef LITEV_SKIP_REPEAT_FRAMES
         // RenderFrameIdentical (set at this frame's VBlank): next frame's 3D repeats this one's
         const bool repeat = GPU3D.RenderFrameIdentical;
-        NextSkipRepeat = SkipRepeatEnabled && repeat && !LastRepeat3D && !CaptureSeen && !LITEV_HEADLESS(Headless);
+        NextSkipRepeat = SkipRepeatEnabled && repeat && !LastRepeat3D && !CaptureSeen && !LITEV_HEADLESS(Headless)
+                         && !(CaptureCnt & (1u << 31));
         LastRepeat3D = repeat;
 #endif
         // sprites are pre-rendered one scanline in advance
