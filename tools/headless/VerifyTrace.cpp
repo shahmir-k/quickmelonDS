@@ -7,6 +7,11 @@
 #include "VerifyTrace.h"
 #include "LockstepMP.h"
 #include "NetplayInput.h"
+#ifdef LITEV_HOSTED_NETPLAY
+#include "HostedMP.h"
+#endif
+#include <map>
+#include <sys/resource.h>
 
 #include <cstdio>
 #include <cstring>
@@ -157,6 +162,36 @@ struct BuiltNDS
     }
 };
 
+// "k=v,k=v" (LITEV_NETPLAY-style specs)
+std::map<std::string, std::string> ParseSpec(const char* spec)
+{
+    std::map<std::string, std::string> kv;
+    std::string s = spec ? spec : "";
+    for (size_t pos = 0; pos < s.size();)
+    {
+        size_t end = s.find(',', pos);
+        std::string one = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        size_t eq = one.find('=');
+        kv[one.substr(0, eq)] = eq == std::string::npos ? "1" : one.substr(eq + 1);
+        if (end == std::string::npos) break;
+        pos = end + 1;
+    }
+    return kv;
+}
+
+int SpecInt(std::map<std::string, std::string>& kv, const char* k, int def)
+{
+    return kv.count(k) ? atoi(kv[k].c_str()) : def;
+}
+
+// process CPU time so far (user + system), ms
+double CpuMs()
+{
+    rusage ru {};
+    getrusage(RUSAGE_SELF, &ru);
+    return (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1e3 + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e3;
+}
+
 // Build, reset, direct-boot and start an NDS from `cfg`. Returns false + err on
 // failure. `jitOverride`, when set, wins over cfg.jit (used by the converge
 // path to build one JIT and one interp instance from the same config).
@@ -236,6 +271,47 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
     }
     return true;
 }
+
+// What BuiltNDS::ApplyInput applies at `frame`, as one input (no script = nothing pressed).
+NetplayFrameInput ScriptInput(BuiltNDS& b, int frame)
+{
+    NetplayFrameInput in;
+    in.Keys = b.inputScript.Loaded() ? b.inputScript.KeyMaskForFrame(frame) : 0xFFFF;
+    int tx, ty;
+    if (b.inputScript.HasTouch() && b.inputScript.TouchForFrame(frame, tx, ty)) { in.TouchX = tx; in.TouchY = ty; }
+    return in;
+}
+
+// Netplay's way to apply an input
+void ApplyNetInput(NDS& nds, const NetplayFrameInput& in)
+{
+    nds.SetKeyMask(in.Keys);
+    if (in.TouchX >= 0) nds.TouchScreen(in.TouchX, in.TouchY);
+    else                nds.ReleaseScreen();
+}
+
+// Hosted Netplay frame marker state: the input applied this frame, the clock, and every 60
+// frames the RAM (the replica must compute the same from its own console)
+u64 HostedState(NDS& nds, const NetplayFrameInput& in, int frame)
+{
+    u64 v[4] = { in.Keys | ((u64)(u16)in.TouchX << 32) | ((u64)(u16)in.TouchY << 48), nds.GetSysTimestamp(),
+                 ((frame + 1) % 60) == 0 ? XXH3_64bits(nds.MainRAM, nds.MainRAMMask + 1) : 0, (u64)frame };
+    return XXH3_64bits(v, sizeof(v));
+}
+
+#ifdef LITEV_HOSTED_NETPLAY
+// Hosted Netplay: the server's NetplayInput player index (the consoles are 0..14)
+constexpr int kHostedServerId = NetplayInput::kMaxPlayers - 1;
+
+NetFaults FaultsFrom(std::map<std::string, std::string>& kv)
+{
+    NetFaults f;
+    f.LatencyMs = SpecInt(kv, "latency", 0);
+    f.JitterMs = SpecInt(kv, "jitter", 0);
+    f.LossPct = SpecInt(kv, "loss", 0);
+    return f;
+}
+#endif
 
 // Fill a trace record from the current emulator state after a frame.
 void CaptureRecord(NDS& nds, int frame, TraceRecord& rec)
@@ -676,6 +752,27 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         if (players == 0 && peer.empty()) peer = "127.0.0.1:7101";
     }
 
+#ifdef LITEV_HOSTED_NETPLAY
+    // LITEV_HOSTED="players=N,port=X[,play][,delay=D][,latency=MS][,jitter=MS][,loss=PCT]": Hosted
+    // Netplay server. Emulates every console (as Netplay does) and sends each console's records to
+    // the replica client that runs it (--replay-console, LITEV_HOSTED=host=...), whose input comes
+    // back here, applied D frames late. play: this device also plays console 0 (input from
+    // --mp-script0, applied at once); else a dedicated server. Session setup on TCP X + 1, inputs
+    // on UDP X, records on UDP X + 2. latency/jitter/loss: simulated network faults on receive.
+    // LITEV_MP_RECORD=<dir>: write each console's records to <dir>/console<K>.rec.
+    const char* hostedSpec = getenv("LITEV_HOSTED");
+    const char* recordDir = getenv("LITEV_MP_RECORD");
+    auto hosted = ParseSpec(hostedSpec);
+    const bool hostedPlay = hosted.count("play") > 0;
+    if (hostedSpec) players = SpecInt(hosted, "players", 2);
+    if (hostedSpec && np) { fprintf(stderr, "error: LITEV_HOSTED and LITEV_NETPLAY\n"); return 1; }
+    if (hostedSpec && players > kHostedServerId) { fprintf(stderr, "error: Hosted Netplay: at most %d consoles\n", kHostedServerId); return 1; }
+#else
+    const char* hostedSpec = nullptr;
+    const char* recordDir = nullptr;
+    const bool hostedPlay = false;
+#endif
+
     // LITEV_MP_PLAYERS=N: N consoles (default 2; Netplay: its player count)
     int n = players ? players : getenv("LITEV_MP_PLAYERS") ? atoi(getenv("LITEV_MP_PLAYERS")) : 2;
     if (n < 2 || n > LockstepMP::kMaxInst) { fprintf(stderr, "error: %d instances (2..%d)\n", n, LockstepMP::kMaxInst); return 1; }
@@ -757,12 +854,58 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 
     // Install one shared in-process link and give each instance a distinct id.
     // LITEV_MP_LOCKSTEP=1: the deterministic LockstepMP (Netplay) instead of LocalMP.
-    bool lockstep = getenv("LITEV_MP_LOCKSTEP") != nullptr;
+    bool lockstep = getenv("LITEV_MP_LOCKSTEP") != nullptr || hostedSpec || recordDir;
     MPInterface::Set(lockstep ? MPInterface_Netplay : MPInterface_Local);
     LockstepMP* lockstepMP = lockstep ? dynamic_cast<LockstepMP*>(&MPInterface::Get()) : nullptr;
     printf("link: %s\n", lockstep ? "LockstepMP (deterministic)" : "LocalMP");
+#ifdef LITEV_HOSTED_NETPLAY
+    // Hosted Netplay: the same link, with what it returns to each console recorded
+    RecordMP* record = nullptr;
+    std::vector<FILE*> recordFiles(n, nullptr);
+    std::unique_ptr<HostedServer> hostedServer;
+    if (hostedSpec || recordDir)
+    {
+        auto r = std::make_unique<RecordMP>(std::make_unique<LockstepMP>());
+        record = r.get();
+        lockstepMP = &r->Link();
+        MPInterface::Set(std::move(r), MPInterface_Netplay);
+        printf("link: recording each console's link results\n");
+    }
+    for (int k = 0; recordDir && k < n; k++)
+    {
+        std::string path = std::string(recordDir) + "/console" + std::to_string(k) + ".rec";
+        recordFiles[k] = fopen(path.c_str(), "wb");
+        if (!recordFiles[k]) { fprintf(stderr, "error: cannot write %s\n", path.c_str()); return 1; }
+    }
+#endif
 
     std::unique_ptr<NetplayInput> net;
+#ifdef LITEV_HOSTED_NETPLAY
+    if (hostedSpec)
+    {
+        int hport = SpecInt(hosted, "port", 7100);
+        NetplaySetup setup;
+        setup.Player = 0;
+        setup.NumPlayers = n;
+        setup.Port = hport;
+        setup.RomId = b[0].romHash;
+        setup.Delay = SpecInt(hosted, "delay", 0);
+        setup.Hosted = true;
+        setup.HostPlays = hostedPlay;
+        bool ok = NetplayHandshake(setup);
+        printf("%s", setup.Log.c_str());
+        if (!ok) { fprintf(stderr, "hosted: session setup failed\n"); return 1; }
+        for (auto& [p, addr] : setup.Peers)
+            if (p >= n) { fprintf(stderr, "hosted: player %d outside 0..%d\n", p, n - 1); return 1; }
+        NetFaults faults = FaultsFrom(hosted);
+        net = std::make_unique<NetplayInput>(kHostedServerId, setup.Delay, hport, setup.Peers, faults.LatencyMs, faults);
+        hostedServer = std::make_unique<HostedServer>(hport + 2, faults);
+        if (!net->Ok() || !hostedServer->Ok()) { fprintf(stderr, "hosted: socket setup failed\n"); return 1; }
+        printf("hosted: server for %d consoles (%s), delay %d frames, ports %d (inputs) %d (records), faults latency %d jitter %d loss %d%%\n",
+               n, hostedPlay ? "plays console 0" : "dedicated", setup.Delay, hport, hport + 2, faults.LatencyMs, faults.JitterMs, faults.LossPct);
+    }
+    else
+#endif
     if (np && players == 0)
     {
         if (delay < 0) delay = 3;
@@ -802,6 +945,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         if (lockstepMP)
         {
             NDS* nd = b[k].nds.get();
+#ifdef LITEV_HOSTED_NETPLAY
+            if (record) record->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
+            else
+#endif
             lockstepMP->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
         }
         b[k].udata->instanceID = k;
@@ -843,8 +990,20 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             // need this one's MP frames, and without a partner they stall a full receive timeout per tick.
             for (int f = 0; f < frames || minDone() < frames; f++)
             {
-                if (!net)
+                NetplayFrameInput applied;  // for the Hosted Netplay frame marker
+                if (hostedSpec)
+                {
+                    if (f < frames)
+                    {
+                        applied = hostedPlay && inst == 0 ? ScriptInput(bi, f) : net->Get(inst, f);
+                        ApplyNetInput(*bi.nds, applied);
+                    }
+                }
+                else if (!net)
+                {
                     bi.ApplyInput(f);
+                    applied = ScriptInput(bi, f);
+                }
                 else if (f < frames)
                 {
                     if (inst == net->LocalPlayer())
@@ -859,11 +1018,22 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                     bi.nds->SetKeyMask(in.Keys);
                     if (in.TouchX >= 0) bi.nds->TouchScreen(in.TouchX, in.TouchY);
                     else                bi.nds->ReleaseScreen();
+                    applied = in;
                 }
 #ifdef LITEV_EVENT_TRACE
                 if (inst == 1 && getenv("LITEV_MP_EVTRACE_FROM")) gEvTraceOn = f + 1 >= atoi(getenv("LITEV_MP_EVTRACE_FROM"));
 #endif
                 bi.nds->RunFrame();
+#ifdef LITEV_HOSTED_NETPLAY
+                if (record && f < frames)
+                {
+                    record->EndFrame(inst, f, HostedState(*bi.nds, applied, f));
+                    std::vector<u8> out;
+                    record->TakeRecords(inst, out);
+                    if (recordFiles[inst]) fwrite(out.data(), 1, out.size(), recordFiles[inst]);
+                    if (hostedServer && !(hostedPlay && inst == 0)) hostedServer->Push(inst, out.data(), out.size());
+                }
+#endif
                 if (f >= frames) continue;
                 done[inst].store(f + 1, std::memory_order_relaxed);
                 static const int every = getenv("LITEV_MP_EVERY") ? atoi(getenv("LITEV_MP_EVERY")) : 60;
@@ -925,6 +1095,8 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     };
 
     std::vector<std::thread> threads;
+    auto wall0 = std::chrono::steady_clock::now();
+    double cpu0 = CpuMs();
     for (int k = 0; k < n; k++) threads.emplace_back(runInstance, k);
 
     // Poll MP health from the main thread while the instances run, and log the
@@ -947,6 +1119,14 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     for (std::thread& t : threads) t.join();
+    {
+        double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
+        printf("perf: %d frames, wall %.2f ms/frame, process CPU %.2f ms/frame (%d consoles)\n", frames, wall / frames, (CpuMs() - cpu0) / frames, n);
+    }
+#ifdef LITEV_HOSTED_NETPLAY
+    for (FILE* f : recordFiles) if (f) fclose(f);
+    hostedServer.reset();   // every client has its whole stream
+#endif
 
     u64 cmd = MPInterface::Get().ObserveCmdCount();
     u64 reply = MPInterface::Get().ObserveReplyCount();
@@ -984,5 +1164,143 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     // Success (for now, the Phase-2 milestone) = ran clean AND every instance associated.
     return (ranClean && associated) ? 0 : 1;
 }
+
+// ---------------------------------------------------------------------------
+// --replay-console K : Hosted Netplay replica of --mp-test's console K.
+// ---------------------------------------------------------------------------
+#ifdef LITEV_HOSTED_NETPLAY
+int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts, int k, const std::string& logDir)
+{
+    if (k < 0 || k >= kHostedServerId) { fprintf(stderr, "error: --replay-console %d (0..%d)\n", k, kHostedServerId - 1); return 1; }
+    // LITEV_HOSTED="host=IP:PORT,port=N[,latency=MS][,jitter=MS][,loss=PCT]" (no --replay-log):
+    // join the server at IP:PORT (its LITEV_HOSTED port); inputs from UDP port N.
+    auto spec = ParseSpec(getenv("LITEV_HOSTED"));
+    if (logDir.empty() && !spec.count("host")) { fprintf(stderr, "error: --replay-console needs --replay-log or LITEV_HOSTED=host=...\n"); return 1; }
+
+    // console K exactly as --mp-test builds it
+    TraceRunConfig c = cfg;
+    c.instanceTag = "mp" + std::to_string(k);
+    c.inputScript = (k < (int)scripts.size() && !scripts[k].empty()) ? scripts[k] : cfg.inputScript;
+    BuiltNDS b;
+    std::string err;
+    if (!BuildAndBoot(c, true, b, err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+    b.udata->instanceID = k;
+    if (k)
+    {
+        Firmware& fw = b.nds->GetFirmware();
+        fw.GetHeader().MacAddr[5] ^= (u8)k;
+        fw.UpdateChecksums();
+    }
+    if (getenv("LITEV_MP_NORENDER0")) b.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b.nds->GPU));
+
+    auto replayOwned = std::make_unique<ReplayMP>(k);
+    ReplayMP* replay = replayOwned.get();
+    NDS* nd = b.nds.get();
+    replay->SetClock([nd] { return nd->GetSysTimestamp(); });
+    MPInterface::Set(std::move(replayOwned), MPInterface_Netplay);
+
+    std::unique_ptr<NetplayInput> net;
+    std::unique_ptr<HostedClient> client;
+    if (!logDir.empty())
+    {
+        u32 len = 0;
+        std::string path = logDir + "/console" + std::to_string(k) + ".rec";
+        auto data = ReadFile(path, len);
+        if (!data) { fprintf(stderr, "error: cannot read %s\n", path.c_str()); return 1; }
+        replay->Feed(data.get(), len);
+        printf("replay: console %d from %s (%u bytes)\n", k, path.c_str(), len);
+    }
+    else
+    {
+        NetplaySetup setup;
+        setup.Player = k;
+        setup.Port = SpecInt(spec, "port", 7110 + k);
+        setup.Host = spec["host"];
+        setup.Join = true;
+        setup.RomId = b.romHash;
+        bool ok = NetplayHandshake(setup);
+        printf("%s", setup.Log.c_str());
+        if (!ok) { fprintf(stderr, "hosted: session setup failed\n"); return 1; }
+        NetFaults faults = FaultsFrom(spec);
+        net = std::make_unique<NetplayInput>(k, setup.Delay, setup.Port, std::vector<std::pair<int, std::string>>{{kHostedServerId, setup.Host}}, faults.LatencyMs, faults);
+        std::string host = setup.Host.substr(0, setup.Host.rfind(':'));
+        int hport = atoi(setup.Host.substr(setup.Host.rfind(':') + 1).c_str());
+        client = std::make_unique<HostedClient>(k, host + ":" + std::to_string(hport + 2), [replay](const u8* d, size_t l) { replay->Feed(d, l); }, faults);
+        if (!net->Ok() || !client->Ok()) { fprintf(stderr, "hosted: socket setup failed\n"); return 1; }
+        printf("hosted: replica of console %d, server %s, delay %d frames, faults latency %d jitter %d loss %d%%\n",
+               k, setup.Host.c_str(), setup.Delay, faults.LatencyMs, faults.JitterMs, faults.LossPct);
+    }
+
+    // LITEV_REPLAY_INJECT=<frame>: negative test, toggle the A button at that frame on this replica
+    // only. LITEV_REPLAY_INJECT_HIDDEN=1: the frame marker gets the uninjected input (a divergence
+    // the input check cannot see, so the call hash / clock / RAM must catch it).
+    int inject = getenv("LITEV_REPLAY_INJECT") ? atoi(getenv("LITEV_REPLAY_INJECT")) : -1;
+    bool hidden = getenv("LITEV_REPLAY_INJECT_HIDDEN") != nullptr;
+    int every = getenv("LITEV_MP_EVERY") ? atoi(getenv("LITEV_MP_EVERY")) : 60;
+
+    int firstDesync = -1;
+    auto wall0 = std::chrono::steady_clock::now();
+    double cpu0 = CpuMs();
+    double maxFrameMs = 0;
+    for (int f = 0; f < frames; f++)
+    {
+        auto t0 = std::chrono::steady_clock::now();
+        NetplayFrameInput in;
+        if (net)
+        {
+            NetplayFrameInput local = ScriptInput(b, f);
+            if (!b.inputScript.Loaded()) local.Keys = 0xFFF;
+            net->SubmitLocal(f, local);
+            in = net->Get(k, f);
+        }
+        else
+            in = ScriptInput(b, f);
+        NetplayFrameInput marker = in;
+        if (f == inject) { in.Keys ^= 1; if (!hidden) marker = in; printf("replay: injected A toggle at frame %d%s\n", f, hidden ? " (hidden from the marker)" : ""); }
+        if (net) ApplyNetInput(*b.nds, in);
+        else
+        {
+            b.ApplyInput(f);
+            if (f == inject) b.nds->SetKeyMask(in.Keys);
+        }
+        b.nds->RunFrame();
+        bool ok = replay->EndFrame(f, HostedState(*b.nds, marker, f));
+        if (const char* sh = getenv("LITEV_REPLAY_STATEHASH")) // diagnostics: full-state hash after these frames ("f1,f2,...")
+            if (("," + std::string(sh) + ",").find("," + std::to_string(f) + ",") != std::string::npos)
+            {
+                Savestate st;
+                b.nds->DoSavestate(&st);
+                printf("statehash frame %d: %016llx (%u bytes)\n", f, (unsigned long long)XXH3_64bits(st.Buffer(), st.Length()), st.Length());
+            }
+        maxFrameMs = std::max(maxFrameMs, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        if (((f + 1) % every) == 0)
+        {
+            printf("inst%d frame %d: sys=%llu ram=%016llx\n", k, f + 1, (unsigned long long)b.nds->GetSysTimestamp(),
+                   (unsigned long long)XXH3_64bits(b.nds->MainRAM, b.nds->MainRAMMask + 1));
+            fflush(stdout);
+        }
+        if (!ok)
+        {
+            firstDesync = f;
+            printf("DESYNC at frame %d: %s\n", f, replay->Error().c_str());
+            break;
+        }
+    }
+    double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
+    printf("perf: wall %.2f ms/frame (max %.1f), process CPU %.2f ms/frame, waited for records %.0f ms, for input %.0f ms\n",
+           wall / frames, maxFrameMs, (CpuMs() - cpu0) / frames, replay->StallMs(), net ? net->StallMs() : 0.0);
+    printf("replay: %s\n", firstDesync < 0 ? "MATCH (every frame)" : ("DESYNC first at frame " + std::to_string(firstDesync)).c_str());
+    fflush(stdout);
+    replay->Stop();
+    if (net) net->Abort();
+    return firstDesync < 0 ? 0 : 2;
+}
+#else
+int ReplayConsole(const TraceRunConfig&, int, const std::vector<std::string>&, int, const std::string&)
+{
+    fprintf(stderr, "error: --replay-console needs a LITEV_HOSTED_NETPLAY build\n");
+    return 1;
+}
+#endif
 
 } // namespace liteds

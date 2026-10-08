@@ -59,4 +59,9 @@ int VerifyInterpConverge(const TraceRunConfig& cfg, int frames);
 // LITEV_MP_PLAYERS=N (default 2) runs N instances; scripts[k] = instance k's input script.
 int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts);
 
+// --replay-console K: Hosted Netplay replica of --mp-test's console K (scripts[K] = its input),
+// its link served from the records in logDir (LITEV_MP_RECORD) or, logDir empty, from a server
+// (LITEV_HOSTED). Returns 0 iff every frame matched the server's console; 2 on a desync.
+int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts, int console, const std::string& logDir);
+
 } // namespace liteds

@@ -49,7 +49,7 @@ using namespace melonDS;
 
 namespace {
 
-enum class RunMode { Benchmark, RecordTrace, VerifyTrace, VerifyInterpConverge, MPTest };
+enum class RunMode { Benchmark, RecordTrace, VerifyTrace, VerifyInterpConverge, MPTest, Replay };
 
 // Native DS screen dimensions; the software renderer writes 256x192 u32 per screen.
 constexpr int kScreenW = 256;
@@ -74,6 +74,8 @@ struct Options
     RunMode mode = RunMode::Benchmark;
     std::string tracePath;
     std::vector<std::string> mpScripts; // --mp-test: --mp-scriptK = instance K's input script (0 = host)
+    int replayConsole = -1;             // --replay-console K (Hosted Netplay replica)
+    std::string replayLog;              // --replay-log <dir>: the records LITEV_MP_RECORD wrote
     long long fixedRtc = liteds::kDefaultRtcEpoch;
 
     AudioInterpolation interp = AudioInterpolation::None;
@@ -136,7 +138,11 @@ struct Options
         "  Unit 1 oracle modes (mutually exclusive; run --frames frames):\n"
         "  --record-trace <path>     record a per-frame binary state trace to <path>\n"
         "  --verify-trace <path>     replay and compare against a golden trace <path>\n"
-        "  --verify-interp-converge  run JIT + interp side by side, report convergence\n",
+        "  --verify-interp-converge  run JIT + interp side by side, report convergence\n"
+        "  --replay-console K        Hosted Netplay replica (LITEV_HOSTED_NETPLAY build): run only\n"
+        "                            --mp-test's console K, its link fed by the server's records:\n"
+        "  --replay-log <dir>        ... from the files LITEV_MP_RECORD=<dir> wrote (else from a\n"
+        "                            server over the network: LITEV_HOSTED=host=IP:PORT,port=N)\n",
         argv0);
     exit(code);
 }
@@ -232,6 +238,8 @@ bool ParseArgs(int argc, char** argv, Options& o)
         else if (a == "--verify-trace") { o.mode = RunMode::VerifyTrace; o.tracePath = next("--verify-trace"); }
         else if (a == "--verify-interp-converge") o.mode = RunMode::VerifyInterpConverge;
         else if (a == "--mp-test") o.mode = RunMode::MPTest;
+        else if (a == "--replay-console") { o.mode = RunMode::Replay; o.replayConsole = std::atoi(next("--replay-console").c_str()); }
+        else if (a == "--replay-log") o.replayLog = next("--replay-log");
         else if (a.rfind("--mp-script", 0) == 0 && a.size() > 11 && isdigit((unsigned char)a[11]))
         {
             size_t k = std::stoul(a.substr(11));
@@ -375,6 +383,8 @@ int main(int argc, char** argv)
             return liteds::VerifyInterpConverge(cfg, opt.frames);
         case RunMode::MPTest:
             return liteds::MPTest(cfg, opt.frames, opt.mpScripts);
+        case RunMode::Replay:
+            return liteds::ReplayConsole(cfg, opt.frames, opt.mpScripts, opt.replayConsole, opt.replayLog);
         default:
             break;
         }

@@ -29,6 +29,9 @@ add_executable(liteDS-headless
     "${CMAKE_SOURCE_DIR}/src/net/NetplayInput.cpp"
     ${LITEV_HEADLESS_MP_SOURCES}
 )
+if (LITEV_HOSTED_NETPLAY)
+    target_sources(liteDS-headless PRIVATE "${CMAKE_SOURCE_DIR}/src/net/HostedMP.cpp")
+endif()
 
 target_link_libraries(liteDS-headless PRIVATE core)
 
