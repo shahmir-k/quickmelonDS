@@ -884,6 +884,17 @@ u64 NDS::NextTarget()
     if (timerDeadline < minEvent)
         minEvent = timerDeadline;
 
+    // The other polled (non-event) deadline: the GXFIFO dropping below half-full. That
+    // starts a GXFIFO-mode DMA9 or raises the GXFIFO IRQ, but is only noticed when
+    // GPU3D.Run() drains commands at the end of the slice. With geometry queued and one
+    // of those armed, an uncapped slice starves the FIFO for the whole slice (Super
+    // Mario 64 DS: the title-screen face swaps with ~2 polygons -> white bottom screen).
+    // Keep the old cap for exactly that window.
+    if (minEvent > SysTimestamp + kMaxIterationCycles && !GPU.GPU3D.PipeEmpty()
+        && ((GPU.GPU3D.GXStat >> 30) || DMAs[0].IsInMode(0x07) || DMAs[1].IsInMode(0x07)
+            || DMAs[2].IsInMode(0x07) || DMAs[3].IsInMode(0x07)))
+        minEvent = SysTimestamp + kMaxIterationCycles;
+
     // Never emit a zero-length (or backwards) slice: it would spin the scheduler
     // loop forever without advancing time.
     if (minEvent <= SysTimestamp)

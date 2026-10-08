@@ -587,7 +587,12 @@ int main(int argc, char** argv)
     for (int frame = 0; frame < opt.frames; frame++)
     {
         if (inputScript.Loaded())
+        {
             nds->SetKeyMask(inputScript.KeyMaskForFrame(frame));
+            int tx, ty;
+            if (inputScript.TouchForFrame(frame, tx, ty)) nds->TouchScreen(tx, ty);
+            else if (inputScript.HasTouch()) nds->ReleaseScreen();
+        }
 
         if (haveWindow && frame == opt.benchWindowStart)
             windowStart = std::chrono::steady_clock::now();
