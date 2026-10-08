@@ -310,10 +310,10 @@ bool DumpPPM(const std::string& path, const u32* top, const u32* bottom)
             for (int x = 0; x < W; x++)
             {
                 u32 px = src[y * W + x];
-                // melonDS software framebuffer is stored as 0xFFBBGGRR (little-endian RGBA8).
-                row[x*3+0] = (u8)(px & 0xFF);         // R
+                // the software framebuffer is 0xFFRRGGBB (BGRA in memory; GPU_Soft.cpp ConvertToBGRA)
+                row[x*3+0] = (u8)((px >> 16) & 0xFF); // R
                 row[x*3+1] = (u8)((px >> 8) & 0xFF);  // G
-                row[x*3+2] = (u8)((px >> 16) & 0xFF); // B
+                row[x*3+2] = (u8)(px & 0xFF);         // B
             }
             fwrite(row.data(), 1, row.size(), f);
         }

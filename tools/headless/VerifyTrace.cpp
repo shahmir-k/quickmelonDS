@@ -1163,7 +1163,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                                 for (int i = 0; i < 256 * 192; i++)
                                 {
                                     u32 px = ((const u32*)scr)[i];
-                                    u8 rgb[3] = { (u8)px, (u8)(px >> 8), (u8)(px >> 16) };
+                                    u8 rgb[3] = { (u8)(px >> 16), (u8)(px >> 8), (u8)px };   // 0xFFRRGGBB
                                     fwrite(rgb, 1, 3, fp);
                                 }
                             fclose(fp);
