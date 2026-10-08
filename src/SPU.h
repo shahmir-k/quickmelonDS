@@ -134,24 +134,25 @@ public:
     void NextSample_PSG();
     void NextSample_Noise();
 
-    template<u32 type> s32 Run(u32 cycles);
+    // out=false: advance and decode exactly, but skip the output value (nobody hears it)
+    template<u32 type> s32 Run(u32 cycles, bool out = true);
 
-    s32 DoRun(u32 cycles)
+    s32 DoRun(u32 cycles, bool out = true)
     {
         switch ((Cnt >> 29) & 0x3)
         {
-        case 0: return Run<0>(cycles); break;
-        case 1: return Run<1>(cycles); break;
-        case 2: return Run<2>(cycles); break;
+        case 0: return Run<0>(cycles, out); break;
+        case 1: return Run<1>(cycles, out); break;
+        case 2: return Run<2>(cycles, out); break;
         case 3:
             if (Num >= 14)
             {
-                return Run<4>(cycles);
+                return Run<4>(cycles, out);
                 break;
             }
             else if (Num >= 8)
             {
-                return Run<3>(cycles);
+                return Run<3>(cycles, out);
                 break;
             }
             [[fallthrough]];

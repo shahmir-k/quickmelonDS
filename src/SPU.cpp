@@ -640,7 +640,7 @@ void SPUChannel::NextSample_Noise()
 }
 
 template<u32 type>
-s32 SPUChannel::Run(u32 cycles)
+s32 SPUChannel::Run(u32 cycles, bool out)
 {
     if (!(Cnt & (1<<31))) return 0;
 
@@ -681,6 +681,8 @@ s32 SPUChannel::Run(u32 cycles)
 
         if (!(Cnt & (1<<31))) break;
     }
+
+    if (!out) return 0;
 
     // Volume-0 skip: the channel already decoded (position/finish advanced above), but its output is
     // CurSample*Volume = 0, so the interpolation below is wasted work. Return 0 now. Bit-exact (the
@@ -904,13 +906,14 @@ void SPU::Mix(u32 spucycles)
     {
         // Decode all 16 channels first (sequential; each advances its own position/finish exactly),
         // then accumulate the pan mix. Channel order is unchanged (0..15).
+        // A console nobody hears (Netplay's other players): the mix only feeds the speakers,
+        // unless sound capture records it into memory, so skip it (and each channel's output value).
+        const bool quiet = LITEV_HEADLESS(Silent) && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7)) && NDS.ConsoleType == 0;
         s32 cv[16];
-        for (int i = 0; i < 16; i++) cv[i] = Channels[i].DoRun(spucycles);
+        for (int i = 0; i < 16; i++) cv[i] = Channels[i].DoRun(spucycles, !quiet);
         const s32 ch1 = cv[1], ch3 = cv[3];   // raw values for the routing switch below
 
-        // A console nobody hears (Netplay's other players): the mix only feeds the speakers,
-        // unless sound capture records it into memory, so skip it.
-        if (LITEV_HEADLESS(Silent) && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7)) && NDS.ConsoleType == 0)
+        if (quiet)
         {
             NDS.Mic.Advance(spucycles << 1);
             goto mixed;
