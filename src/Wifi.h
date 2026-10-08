@@ -236,6 +236,8 @@ private:
     u32 RXCounter;
 
     int MPReplyTimer;
+    bool MPRepliesPending;  // host: replies to the last CMD not collected yet (CollectMPReplies)
+    u64 MPReplyTS;
     u16 MPClientMask, MPClientFail;
 
     u8 MPClientReplies[15*1024];
@@ -268,6 +270,7 @@ private:
     int PreambleLen(int rate) const;
     u32 NumClients(u16 bitmask) const;
     void IncrementTXCount(const TXSlot* slot);
+    void CollectMPReplies();
     void ReportMPReplyErrors(u16 clientfail);
 
     void TXSendFrame(const TXSlot* slot, int num);

@@ -40,6 +40,7 @@ static struct
     melonDS::u32 nSeg, nWait, nCatch, nRun, nCmd;
     // host: ACK sent -> next CMD sent -> replies in hand
     melonDS::u64 tAckSent, tCmdSent, hostSegSum, cmdToReplySum;
+    melonDS::u32 replyFails;
     melonDS::u32 nHostSeg, nCmdToReply;
 } MPT;
 #endif
@@ -244,6 +245,7 @@ void Wifi::Reset()
     MPReplyTimer = 0;
     MPClientMask = 0;
     MPClientFail = 0;
+    MPRepliesPending = false;
     memset(MPClientReplies, 0, sizeof(MPClientReplies));
 
     MPLastSeqno = 0xFFFF;
@@ -615,6 +617,17 @@ void Wifi::IncrementTXCount(const TXSlot* slot)
     u8 cnt = RAM[slot->Addr + 0x4];
     if (cnt < 0xFF) cnt++;
     *(u16*)&RAM[slot->Addr + 0x4] = cnt;
+}
+
+void Wifi::CollectMPReplies()
+{
+    if (!MPRepliesPending) return;
+    MPRepliesPending = false;
+    u16 res = Platform::MP_RecvReplies(MPClientReplies, MPReplyTS, MPClientMask, NDS.UserData);
+    MPClientFail &= ~res;
+#ifdef LITEV_LAN_STATS
+    if ((res & MPClientMask) != MPClientMask) MPT.replyFails++;
+#endif
 }
 
 void Wifi::ReportMPReplyErrors(u16 clientfail)
@@ -1024,6 +1037,7 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
 
                 u32 curclient = 1 << nclient;
 
+                CollectMPReplies();
                 if (!(MPClientFail & curclient))
                     MPClientReplyRX(nclient);
 
@@ -1121,10 +1135,11 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
 
                 MPReplyTimer = 16 + PreambleLen(slot->Rate);
 
-                u16 res = 0;
-                if (MPClientMask)
-                    res = Platform::MP_RecvReplies(MPClientReplies, USTimestamp, MPClientMask, NDS.UserData);
-                MPClientFail &= ~res;
+                // the replies are collected when first needed (the first reply slot, see
+                // CollectMPReplies), not now: the client gets that long to answer before this
+                // console waits on it (with Netplay, a thread hand-off per CMD)
+                MPReplyTS = USTimestamp;
+                MPRepliesPending = MPClientMask != 0;
 #ifdef LITEV_LAN_STATS
                 if (MPT.tCmdSent) { MPT.cmdToReplySum += MPNowUs() - MPT.tCmdSent; MPT.nCmdToReply++; MPT.tCmdSent = 0; }
                 // measurement: the host's MP CMD parameters, as the game programs them
@@ -1133,7 +1148,7 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                     if (lastTS) gapSum += USTimestamp - lastTS;
                     lastTS = USTimestamp;
                     lenSum += slot->Length;
-                    if ((res & MPClientMask) != MPClientMask) fails++;
+                    fails = MPT.replyFails;
                     if (++n == 180)
                     {
                         static u32 lastSwaps;
@@ -1146,7 +1161,7 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                         Log(LogLevel::Info, "MP_HOSTLINE 180 cmds: ACK sent->next CMD sent %.0f us real | CMD sent->replies in hand %.0f us real\n",
                             MPT.nHostSeg ? (double)MPT.hostSegSum / MPT.nHostSeg : 0.0, MPT.nCmdToReply ? (double)MPT.cmdToReplySum / MPT.nCmdToReply : 0.0);
                         MPT.hostSegSum = MPT.cmdToReplySum = 0; MPT.nHostSeg = MPT.nCmdToReply = 0;
-                        gapSum = 0; n = 0; fails = 0; lenSum = 0;
+                        gapSum = 0; n = 0; fails = 0; MPT.replyFails = 0; lenSum = 0;
                     }
                 }
 #endif
@@ -1219,6 +1234,7 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
             if (slot->Rate == 2) slot->CurPhaseTime = 32 * 4;
             else                 slot->CurPhaseTime = 32 * 8;
 
+            CollectMPReplies();
             ReportMPReplyErrors(MPClientFail);
 
             // send
