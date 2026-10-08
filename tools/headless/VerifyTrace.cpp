@@ -145,6 +145,7 @@ struct BuiltNDS
     std::unique_ptr<NDS> nds;
     std::unique_ptr<HeadlessHost::InstanceUserData> udata;
     u64 romHash = 0;
+    u64 romId = 0;             // Netplay session ROM id: XXH3 of the first 4 KB, as the app computes it
     u32 romSize = 0;
     InputScript inputScript;   // optional scripted input (empty => none)
 
@@ -203,6 +204,7 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
     if (!romdata) { err = "cannot read ROM '" + cfg.rom + "'"; return false; }
 
     out.romHash = XXH3_64bits(romdata.get(), romlen);
+    out.romId = XXH3_64bits(romdata.get(), std::min<u32>(romlen, 0x1000));
     out.romSize = romlen;
 
     auto cart = NDSCart::ParseROM(std::move(romdata), romlen, nullptr, std::nullopt);
@@ -219,6 +221,30 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
     args.JIT = std::nullopt;
 #endif
 
+    // LITEV_APP_MAC=AA:BB:CC:DD:EE:FF: console mpK built as the Android app builds Netplay player K's
+    // console (EmulatorArgsBuilder customizeFirmware with the default firmware settings, that device's
+    // internal MAC + the per-instance offsets; RTC pinned to 2026-01-01), so a Mac server matches an
+    // app guest. Without it the harness's own firmware/MAC/RTC (Mac-only sessions).
+    const char* appMac = getenv("LITEV_APP_MAC");
+    if (appMac)
+    {
+        int k = cfg.instanceTag.rfind("mp", 0) == 0 ? atoi(cfg.instanceTag.c_str() + 2) : 0;
+        auto& u = args.Firmware.GetEffectiveUserData();
+        const std::u16string name = u"Player", msg = u"Hello!";
+        u.NameLength = (u16)name.size(); memcpy(u.Nickname, name.data(), name.size() * 2);
+        u.MessageLength = (u16)msg.size(); memcpy(u.Message, msg.data(), msg.size() * 2);
+        u.Settings &= ~Firmware::Language::Reserved; u.Settings |= Firmware::Language::English;
+        u.FavoriteColor = 0; u.BirthdayMonth = 1; u.BirthdayDay = 1;
+        unsigned m[6];
+        if (sscanf(appMac, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) { err = "bad LITEV_APP_MAC"; return false; }
+        auto& h = args.Firmware.GetHeader();
+        for (int i = 0; i < 6; i++) h.MacAddr[i] = (u8)m[i];
+        h.MacAddr[3] += k; h.MacAddr[4] += k * 0x44; h.MacAddr[5] += k * 0x10;
+        h.MacAddr[0] &= 0xFC;
+        h.UpdateChecksum();
+        args.Firmware.UpdateChecksums();
+    }
+
     out.udata = std::make_unique<HeadlessHost::InstanceUserData>();
     out.udata->savePrefix = cfg.instanceTag;
 
@@ -231,6 +257,15 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
         out.nds->GPU.GPU3D.Headless = true;
     }
 #endif
+    if (appMac)
+    {   // the app's order: Reset without a cart, battery + RTC, then insert the cart (no second Reset)
+        out.nds->Reset();
+        out.nds->SPI.GetPowerMan()->SetBatteryLevelOkay(true);
+        out.nds->RTC.SetDateTime(2026, 1, 1, 0, 0, 0);   // what the app's Netplay pins
+        out.nds->SetNDSCart(std::move(cart));
+    }
+    else
+    {
     out.nds->SetNDSCart(std::move(cart));
     out.nds->Reset();
 
@@ -245,6 +280,7 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
 #endif
         out.nds->RTC.SetDateTime(g.tm_year + 1900, g.tm_mon + 1, g.tm_mday,
                                  g.tm_hour, g.tm_min, g.tm_sec);
+    }
     }
 
     out.nds->SetupDirectBoot("headless.nds");
@@ -888,7 +924,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         setup.Player = 0;
         setup.NumPlayers = n;
         setup.Port = hport;
-        setup.RomId = b[0].romHash;
+        setup.RomId = b[0].romId;
         setup.Delay = SpecInt(hosted, "delay", 0);
         setup.Hosted = true;
         setup.HostPlays = hostedPlay;
@@ -897,6 +933,8 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         if (!ok) { fprintf(stderr, "hosted: session setup failed\n"); return 1; }
         for (auto& [p, addr] : setup.Peers)
             if (p >= n) { fprintf(stderr, "hosted: player %d outside 0..%d\n", p, n - 1); return 1; }
+        for (auto& [p, save] : setup.Saves)   // each guest's save in its console, as the app host does
+            if (p < n && !save.empty()) { b[p].nds->SetNDSSave(save.data(), (u32)save.size()); printf("hosted: console %d: guest's save, %zu bytes\n", p, save.size()); }
         NetFaults faults = FaultsFrom(hosted);
         net = std::make_unique<NetplayInput>(kHostedServerId, setup.Delay, hport, setup.Peers, faults.LatencyMs, faults);
         hostedServer = std::make_unique<HostedServer>(hport + 2, faults);
@@ -920,7 +958,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         setup.NumPlayers = players;
         setup.Port = port;
         setup.Host = host;
-        setup.RomId = b[0].romHash;
+        setup.RomId = b[0].romId;
         setup.Save.assign(1000 + player, (u8)(0xA0 + player)); // a recognisable stand-in save
         setup.Delay = delay > 0 ? delay : 0;
         bool ok = NetplayHandshake(setup);
@@ -953,7 +991,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         }
         b[k].udata->instanceID = k;
         // Distinct MAC per instance so they associate as different wireless players.
-        if (k)
+        if (k && !getenv("LITEV_APP_MAC"))
         {
             Firmware& fw = b[k].nds->GetFirmware();
             fw.GetHeader().MacAddr[5] ^= (u8)k;
@@ -1185,7 +1223,7 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
     std::string err;
     if (!BuildAndBoot(c, true, b, err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
     b.udata->instanceID = k;
-    if (k)
+    if (k && !getenv("LITEV_APP_MAC"))
     {
         Firmware& fw = b.nds->GetFirmware();
         fw.GetHeader().MacAddr[5] ^= (u8)k;
@@ -1217,7 +1255,7 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
         setup.Port = SpecInt(spec, "port", 7110 + k);
         setup.Host = spec["host"];
         setup.Join = true;
-        setup.RomId = b.romHash;
+        setup.RomId = b.romId;
         bool ok = NetplayHandshake(setup);
         printf("%s", setup.Log.c_str());
         if (!ok) { fprintf(stderr, "hosted: session setup failed\n"); return 1; }
