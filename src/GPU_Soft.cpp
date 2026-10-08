@@ -786,6 +786,9 @@ void SoftRenderer::StopAsyncThread()
         Platform::Thread_Free(AsyncThread);
         AsyncThread = nullptr;
     }
+#ifdef LITEV_SOFT2D_DEPTH2
+    GPU.SetBGOBJReadShadow(false, 0);   // back to the live mirrors (e.g. a GL renderer next)
+#endif
 }
 
 // Barrier: wait for the in-flight render (frame N-1) to finish, then publish the

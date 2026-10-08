@@ -1422,15 +1422,23 @@ void SoftRenderer2D::DrawSprites(u32 line)
     if (!GPU2D.Enabled)
         return;
 
-    if (GPU2D.Num == 0)
+#ifdef LITEV_SOFT2D_THREADED
+    // A band unit (private GPU2D copy) rasters on the async 2D thread: the emu thread already
+    // made the flat OBJ VRAM coherent at VBlank (SyncVRAM_OBJ). Doing it here raced the emu
+    // thread's VRAM writes/dirty bits and pulled a later frame's OBJ VRAM into this raster.
+    if (&GPU2D == &GPU.GPU2D_A || &GPU2D == &GPU.GPU2D_B)
+#endif
     {
-        auto objDirty = GPU.VRAMDirty_AOBJ.DeriveState(GPU.VRAMMap_AOBJ, GPU);
-        GPU.MakeVRAMFlat_AOBJCoherent(objDirty);
-    }
-    else
-    {
-        auto objDirty = GPU.VRAMDirty_BOBJ.DeriveState(GPU.VRAMMap_BOBJ, GPU);
-        GPU.MakeVRAMFlat_BOBJCoherent(objDirty);
+        if (GPU2D.Num == 0)
+        {
+            auto objDirty = GPU.VRAMDirty_AOBJ.DeriveState(GPU.VRAMMap_AOBJ, GPU);
+            GPU.MakeVRAMFlat_AOBJCoherent(objDirty);
+        }
+        else
+        {
+            auto objDirty = GPU.VRAMDirty_BOBJ.DeriveState(GPU.VRAMMap_BOBJ, GPU);
+            GPU.MakeVRAMFlat_BOBJCoherent(objDirty);
+        }
     }
 
     NumSprites = 0;
