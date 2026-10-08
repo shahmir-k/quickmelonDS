@@ -27,6 +27,7 @@ add_executable(liteDS-headless
     "${CMAKE_SOURCE_DIR}/src/net/LocalMP.cpp"
     "${CMAKE_SOURCE_DIR}/src/net/LockstepMP.cpp"
     "${CMAKE_SOURCE_DIR}/src/net/NetplayInput.cpp"
+    "${CMAKE_SOURCE_DIR}/src/teakra/src/makedsp1/sha256.cpp"
     ${LITEV_HEADLESS_MP_SOURCES}
 )
 if (LITEV_HOSTED_NETPLAY)

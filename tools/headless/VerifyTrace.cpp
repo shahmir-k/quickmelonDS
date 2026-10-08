@@ -751,6 +751,22 @@ static melonDS::NDS* gEvTraceNDS;
 static std::atomic<bool> gEvTraceOn {false};
 #endif
 
+// ROM transfer in session setup. LITEV_NP_CACHE=<dir>: where ROMs received from the others go
+// (unset = this process receives none); LITEV_NP_CACHE_MB: its size cap (2048);
+// LITEV_NP_CONSENT=yes|no: the answer to "send / receive this game?" (unset = no).
+// Test switches (NetplayInput.cpp): LITEV_NP_XFER_CUT=<bytes>, LITEV_NP_XFER_CORRUPT=1.
+static void NetplayHarnessXfer(NetplaySetup& setup)
+{
+    if (const char* d = getenv("LITEV_NP_CACHE")) setup.CacheDir = d;
+    if (const char* mb = getenv("LITEV_NP_CACHE_MB")) setup.CacheMaxBytes = strtoull(mb, nullptr, 10) << 20;
+    const char* yes = getenv("LITEV_NP_CONSENT");
+    bool answer = yes && !strcmp(yes, "yes");
+    setup.Consent = [answer](const std::string& q) {
+        printf("netplay consent (%s): %s", answer ? "yes" : "no", q.c_str());
+        return answer;
+    };
+}
+
 int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts)
 {
     // LITEV_NETPLAY="player=P,delay=D,port=N,peer=IP:PORT[,latency=MS]": two-player Netplay (fixed
@@ -825,8 +841,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     {
         std::vector<std::string> library {cfg.rom};
         for (const std::string& r : cfg.roms) if (!r.empty()) library.push_back(r);
-        setup.Rom = NetplayDescribeRom(romPaths[hostedSpec ? 0 : player]);
+        setup.RomPath = romPaths[hostedSpec ? 0 : player];
+        setup.Rom = NetplayDescribeRom(setup.RomPath);
         setup.FindRom = [library](const NetplayRom& r) { return NetplayFindRom(r, library); };
+        NetplayHarnessXfer(setup);
         if (hostedSpec)
         {
             setup.Player = 0;
@@ -1286,7 +1304,9 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
         setup.Port = SpecInt(spec, "port", 7110 + k);
         setup.Host = spec["host"];
         setup.Join = true;
-        setup.Rom = NetplayDescribeRom(c.rom);   // a replica needs only its own ROM
+        setup.RomPath = c.rom;                   // a replica needs only its own ROM
+        setup.Rom = NetplayDescribeRom(c.rom);
+        NetplayHarnessXfer(setup);
         bool ok = NetplayHandshake(setup);
         printf("%s", setup.Log.c_str());
         if (!ok) { fprintf(stderr, "hosted: session setup failed\n"); return 1; }

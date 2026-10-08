@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <map>
@@ -150,15 +151,18 @@ private:
 };
 
 // A ROM's identity. Every player may run a different game (Pokemon White with Pokemon Black):
-// console j runs player j's ROM on every device that runs it, found there by this.
+// console j runs player j's ROM on every device that runs it, found there by this. SHA-256, as a
+// ROM received from a peer is cached under it: a forged file must not take a real ROM's place.
 struct NetplayRom
 {
-    u64 Hash[2] {};         // XXH3-128 of the whole file
+    u8 Sha[32] {};          // SHA-256 of the whole file
     u64 Size = 0;           // 0 = no ROM (unreadable)
     char GameCode[4] {};    // header 0x0C
     char Title[12] {};      // header 0x00
-    bool operator==(const NetplayRom& o) const { return Hash[0] == o.Hash[0] && Hash[1] == o.Hash[1] && Size == o.Size; }
+    bool operator==(const NetplayRom& o) const { return !memcmp(Sha, o.Sha, 32) && Size == o.Size; }
     bool operator!=(const NetplayRom& o) const { return !(*this == o); }
+    std::string Hex() const;    // the SHA-256 in hex (the cache file name)
+    std::string GameTitle() const;  // the header title, trimmed
     std::string Name() const;   // for logs: game code, title, hash, size
 };
 // The ROM at `path` (Platform::OpenFile: a file or, on Android, a document URI). The whole file is
@@ -168,14 +172,38 @@ NetplayRom NetplayDescribeRom(const std::string& path);
 // candidates that pass are hashed.
 std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths);
 
+// ROM transfer during session setup, for the UI: what is happening, the consent question, cancel.
+struct NetplayXferStatus
+{
+    enum { Idle, Asking, Sending, Receiving, Done, Failed };
+    int State = Idle;
+    u64 Bytes = 0, Total = 0;   // Sending/Receiving: this ROM's bytes so far (resumed ones too) / size
+    std::string Title;          // Sending/Receiving: the game
+    std::string Question;       // Asking: what to say yes or no to
+};
+NetplayXferStatus NetplayGetXferStatus();
+// A NetplaySetup::Consent for a UI: shows `question` in the status (Asking) and waits for
+// NetplayAnswer (or a cancel = no).
+bool NetplayAskUser(const std::string& question);
+void NetplayAnswer(bool yes);
+// Ends a session setup in progress (any thread): it fails at once on this device, and the others
+// see the connection drop. Received bytes stay in the cache's .part files for the next attempt.
+void NetplayCancelSetup();
+
 // Netplay session start (TCP, host-centric): the host (player 0) listens on Port + 1 and waits for
 // NumPlayers - 1 guests; each guest connects to it and sends its player index, UDP port, ROM and
 // save. The host times round trips to every guest, picks the input delay, and sends every guest
 // the full player list (addresses as the host sees them, each player's ROM), every other player's
 // save and the delay. Each device then finds every other console it runs (Netplay: all; Hosted:
 // the server all, a replica none) a local copy of that player's ROM; if any device lacks one, the
-// session fails on every device, naming the game. Everyone thus agrees on the players, the delay,
-// every console's ROM and every console's starting save.
+// session fails on every device, naming the game.
+// Unless a device can receive it (CacheDir): then, once every device involved said yes (Consent:
+// the owner to sending, the receiver to receiving), the ROM travels over the setup connection
+// (star: a guest's ROM goes to the host, which keeps a copy and passes it on), into
+// CacheDir/<sha256>.part, which becomes <sha256>.nds once its SHA-256 matches (a mismatch is
+// retried once from the start). An interrupted transfer resumes from its .part next session.
+// Everyone thus agrees on the players, the delay, every console's ROM and every console's
+// starting save.
 struct NetplaySetup
 {
     // in
@@ -184,10 +212,15 @@ struct NetplaySetup
     int Port = 7100;            // this device's UDP input port
     std::string Host;           // guests: the host's "ip:port" (its UDP port; TCP = port + 1)
     NetplayRom Rom;             // this player's ROM (unused on a dedicated Hosted server)
+    std::string RomPath;        // where it is (to send it to a player who lacks it)
     // where this device has `rom` ("" = it does not), asked for every other console it runs;
     // unset = it has none
     std::function<std::string(const NetplayRom& rom)> FindRom;
     std::vector<u8> Save;       // this player's save
+    std::string CacheDir;       // ROMs received from the others: <CacheDir>/<sha256>.nds ("" = none)
+    u64 CacheMaxBytes = 2ull << 30;     // the cache's size cap: least recently used files go first
+    // asked before any ROM byte moves (what and to or from whom); unset = no
+    std::function<bool(const std::string& question)> Consent;
     int Delay = 0;              // host: fixed input delay, 0 = from the measured round trips
     bool Hosted = false;        // host: Hosted Netplay server (the guests' inputs only travel to the
                                 // host and back: delay from twice the slowest one-way time)
@@ -199,7 +232,8 @@ struct NetplaySetup
     // out
     std::vector<std::pair<int, std::string>> Peers;     // every other player: (player, "ip:port")
     std::map<int, std::vector<u8>> Saves;               // every other player's save
-    std::map<int, std::string> RomPaths;                // every other console this device runs: its ROM (FindRom)
+    std::map<int, std::string> RomPaths;                // every other console this device runs: its ROM
+    std::map<int, NetplayRom> Roms;                     // every player's ROM
     std::string Log;            // what happened (errors included), one line per event
 };
 bool NetplayHandshake(NetplaySetup& s);
