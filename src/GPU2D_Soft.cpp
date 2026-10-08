@@ -581,13 +581,19 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
     LastLineHas3D = true;
     const u32 blendCnt = GPU2D.BlendCnt;
 #if defined(LITEV_HYB_COMPOSITE_NEON) && defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
-    // The two ColorComposite calls most pixels need, a whole line at a time with the bit-exact
-    // NEON compositor (Under3D[0] and [1] are contiguous like BGOBJLine's two halves).
-    alignas(16) u32 ccTop[256], ccUnder[256];
-    GPU2DNeon::ColorCompositeLine(ccTop, BGOBJLine, WindowMask, blendCnt, GPU2D.EVA, GPU2D.EVB, GPU2D.EVY);
-    GPU2DNeon::ColorCompositeLine(ccUnder, Under3D[0], WindowMask, blendCnt, GPU2D.EVA, GPU2D.EVB, GPU2D.EVY);
-#define CC_TOP(i) ccTop[i]
-#define CC_UNDER(i) ccUnder[i]
+    // The ColorComposite each pixel needs, a whole line at a time with the bit-exact NEON
+    // compositor. A pixel needs exactly one: of the two layers under the 3D when the 3D is on
+    // top, else of its own two layers. So pick each pixel's inputs, then composite once.
+    alignas(16) u32 ccIn[512], cc[256];
+    for (int i = 0; i < 256; i++)
+    {
+        const bool top3D = (BGOBJLine[i] >> 24 & 0xC0) == 0x40;
+        ccIn[i]       = top3D ? Under3D[0][i] : BGOBJLine[i];
+        ccIn[256 + i] = top3D ? Under3D[1][i] : BGOBJLine[256 + i];
+    }
+    GPU2DNeon::ColorCompositeLine(cc, ccIn, WindowMask, blendCnt, GPU2D.EVA, GPU2D.EVB, GPU2D.EVY);
+#define CC_TOP(i) cc[i]
+#define CC_UNDER(i) cc[i]
 #else
 #define CC_TOP(i) ColorComposite(i, BGOBJLine[i], BGOBJLine[256+i])
 #define CC_UNDER(i) ColorComposite(i, Under3D[0][i], Under3D[1][i])
