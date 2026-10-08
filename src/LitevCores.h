@@ -171,6 +171,17 @@ struct Placement
         return all;
     }
 
+    // Where the role goes when its cores are unavailable now (parked by the vendor's core
+    // control, or offline): its own cores, then the fast non-emu cores, then every core. The
+    // little cores come last, so they never get the emu while a bigger core is awake.
+    std::vector<std::vector<int>> Chain(CoreRole r, int idx = -1) const
+    {
+        std::vector<std::vector<int>> c{CoresFor(r, idx)};
+        if (pin && c[0] != critical && r != CoreRole::Background) c.push_back(critical);
+        if (c.back() != all) c.push_back(all);
+        return c;
+    }
+
     std::string Describe() const
     {
         auto list = [](const std::vector<int>& v) {
@@ -411,12 +422,39 @@ inline void Register(pid_t tid, CoreRole r, int idx = -1)
     Registry().push_back({tid, r, idx});
 }
 
+// Pin tid to the first mask of its role's Chain the kernel accepts: sched_setaffinity fails
+// (EINVAL) when no core of the mask is active, which is how a parked core shows up without root.
+// Logged once per change of the step used (fallback, and back to the preferred cores).
+inline void Apply(pid_t tid, CoreRole r, int idx, const cpu_set_t& allowed)
+{
+    const std::vector<std::vector<int>> chain = Get().Chain(r, idx);
+    size_t step = 0;
+    std::string used;
+    for (; step < chain.size(); step++)
+    {
+        cpu_set_t set; CPU_ZERO(&set);
+        used.clear();
+        for (int c : chain[step]) if (CPU_ISSET(c, &allowed)) { CPU_SET(c, &set); used += (used.empty() ? "" : ",") + std::to_string(c); }
+        if (CPU_COUNT(&set) && sched_setaffinity(tid, sizeof set, &set) == 0) break;
+    }
+    if (step == chain.size()) return;   // nothing accepted: leave it where it is
+    static std::mutex m;
+    static std::vector<std::pair<pid_t, size_t>> last;   // tid -> step used
+    std::lock_guard<std::mutex> l(m);
+    auto it = std::find_if(last.begin(), last.end(), [tid](const auto& x) { return x.first == tid; });
+    size_t prev = it == last.end() ? 0 : it->second;
+    if (it == last.end()) { if (step == 0) return; last.push_back({tid, step}); }
+    else if (prev == step) return;
+    else it->second = step;
+    Platform::Log(Platform::Info, "LITEV_TOPO %s thread %d -> %s%s\n", RoleName(r), (int)tid, used.c_str(),
+                  step ? " (its preferred cores are parked/offline)" : " (preferred cores available again)");
+}
+
 // Register the calling thread and apply its role mask now.
 inline void PinSelf(CoreRole r, int idx = -1)
 {
     Register(gettid(), r, idx);
-    cpu_set_t set = MaskFor(r, idx, Allowed());
-    sched_setaffinity(0, sizeof set, &set);
+    Apply(gettid(), r, idx, Allowed());
 }
 
 // The app's periodic sweep: emuTid -> Emu, each registered thread -> its own role mask, every
@@ -425,8 +463,7 @@ inline void Reassert(pid_t emuTid)
 {
     static const bool distinct = Prop("debug.litev.tilepin", 0) != 0;
     const cpu_set_t allowed = Allowed();
-    cpu_set_t set = MaskFor(CoreRole::Emu, -1, allowed);
-    sched_setaffinity(emuTid, sizeof set, &set);
+    Apply(emuTid, CoreRole::Emu, -1, allowed);
     std::vector<Entry> reg, live;
     { std::lock_guard<std::mutex> l(RegMutex()); reg = Registry(); }
     DIR* d = opendir("/proc/self/task");
@@ -440,8 +477,7 @@ inline void Reassert(pid_t emuTid)
         // Tile workers start on distinct cores (PinSelf); the sweep re-masks them to the shared
         // render mask unless debug.litev.tilepin=1 (= the old blanket sweep's steady state).
         if (en.role == CoreRole::RenderParallel && !distinct) en.idx = -1;
-        set = MaskFor(en.role, en.idx, allowed);
-        sched_setaffinity(tid, sizeof set, &set);
+        Apply(tid, en.role, en.idx, allowed);
     }
     closedir(d);
     // ponytail: prune by "not in /proc/self/task now"; a tid reused between sweeps keeps the

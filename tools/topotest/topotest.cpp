@@ -54,5 +54,15 @@ int main()
     p = show("hypothetical 2x in-order 3.2 GHz + 2x OoO 2.0 GHz", {{0, 0, 3200000, IN}, {1, 0, 3200000, IN}, {2, 0, 2000000, OOO}, {3, 0, 2000000, OOO}});
     assert(p.emu == 1);
 
+    // fallback chains (a parked/offline core): emu -> the fast non-emu cores -> every core
+    using C = std::vector<V>;
+    assert(show("RG DS", rgds).Chain(CoreRole::Emu) == C({V{3}, V{0, 1, 2}, V{0, 1, 2, 3}}));
+    p = Place(thor);
+    assert(p.Chain(CoreRole::Emu) == C({V{7}, V{3, 4, 5, 6}, V{0, 1, 2, 3, 4, 5, 6, 7}}));
+    assert(p.Chain(CoreRole::RenderParallel, 3) == C({V{6}, V{3, 4, 5, 6}, V{0, 1, 2, 3, 4, 5, 6, 7}}));
+    assert(p.Chain(CoreRole::RemoteConsole) == C({V{3, 4, 5, 6}, V{0, 1, 2, 3, 4, 5, 6, 7}}));
+    assert(p.Chain(CoreRole::Background) == C({V{0, 1, 2}, V{0, 1, 2, 3, 4, 5, 6, 7}}));
+    assert(Place({{0, 1024, 2000000, IN}}).Chain(CoreRole::Emu) == C({V{0}}));
+
     puts("all placement checks passed");
 }
