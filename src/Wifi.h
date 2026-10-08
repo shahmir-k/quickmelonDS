@@ -250,6 +250,7 @@ private:
     bool IsMP;
     bool IsMPClient;
     u64 NextSync;           // for clients: timestamp for next sync point
+    bool MPInExchange;      // for clients: got a CMD, not its ACK yet. ponytail: not in savestates (a state taken mid-exchange may take one beacon early); add on the next savestate version bump
     u64 RXTimestamp;
 
     class WifiAP* WifiAP;

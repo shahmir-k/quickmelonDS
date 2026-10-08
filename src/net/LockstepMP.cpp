@@ -212,6 +212,13 @@ int LockstepMP::SendAck(int inst, u8* data, int len, u64 timestamp)
     std::lock_guard<std::mutex> lk(Lock);
     Log(inst, "SendAck", len, timestamp);
     PacketCount++;
+    // The ACK's first word (melonDS frame header) tells clients how long they may run without
+    // polling for host frames: the rest of the host's CMD window (W_CmdCount, ~13-15 ms in Mario
+    // Kart DS). But the host's game can start another CMD inside that window (MKDS does with 6+
+    // consoles, ~1.5 ms after the ACK); a client running ahead then takes that CMD late, replies
+    // past the host's deadline and is dropped from the session. Here a polling client waits on the
+    // host's clock anyway, so it polls every tick instead: no runahead.
+    if (len >= 4) memset(data, 0, 4);
     Broadcast(inst, 3, data, len, timestamp, FromHost);
     Changed.notify_all();
     return len;

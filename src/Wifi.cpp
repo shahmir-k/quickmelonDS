@@ -258,6 +258,7 @@ void Wifi::Reset()
     IsMP = false;
     IsMPClient = false;
     NextSync = 0;
+    MPInExchange = false;
     RXTimestamp = 0;
 #ifdef LITEV_LAN_EARLY_REPLY
     EarlyReplyLen = -1;
@@ -1918,6 +1919,7 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
             IsMPClient = true;
             USTimestamp = timestamp;
             NextSync = RXTimestamp + (framelen * (txrate==0x14 ? 4:8));
+            MPInExchange = false;
         }
 
         RXTimestamp = 0;
@@ -1993,9 +1995,11 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
 #endif
             // include the MP reply time window
             NextSync += 112 + ((clienttime + 10) * NumClients(clientmask));
+            MPInExchange = true;
         }
         else if (MACEqual(&RXBuffer[12 + 4], MPAckMAC))
         {
+            MPInExchange = false;
             u32 runahead = *(u32*)&RXBuffer[0];
 
             NextSync += runahead;
@@ -2055,8 +2059,11 @@ void Wifi::USTimer(u32 param)
     // While the hardware is idle (no transfer, no power-up pending), run the next few ticks now
     // and wake up less often: each Wi-Fi event pulls both CPUs out of their JIT code, and these
     // 8us ticks were ~78% of all scheduler events in a multiplayer race. Deterministic, but the
-    // idle ticks land up to (N-1)*8us early.
-    while (ticks < LITEV_WIFI_BATCH_N && ComStatus == 0 && !IOPORT(W_TXBusy) && USUntilPowerOn >= 0);
+    // idle ticks land up to (N-1)*8us early. Not on an MP client: it polls for host frames on
+    // every tick, and the ticks of a batch all poll at the batch's start time, so a CMD that came
+    // during one was taken up to (N-1)*8us late (Mario Kart DS with 8 consoles: the host dropped
+    // AID 7 and the session ended in a communication error).
+    while (ticks < LITEV_WIFI_BATCH_N && ComStatus == 0 && !IOPORT(W_TXBusy) && USUntilPowerOn >= 0 && !IsMPClient);
 #else
     while (false);
 #endif
@@ -2165,7 +2172,11 @@ void Wifi::USTick()
         }
         else
         {
-            if ((!IsMPClient) || (USTimestamp > NextSync))
+            // (an MP client takes regular frames only between the host's ACK and its next CMD:
+            // they reach it late (Netplay delivers them kDelay after they were sent), and a beacon
+            // taken between a CMD and its ACK delayed the ACK and the client dropped out of the
+            // session, Mario Kart DS with 6+ consoles)
+            if ((!IsMPClient) || (USTimestamp > NextSync && !MPInExchange))
             {
                 if ((!(RXCounter & 0x1FF & kTimeCheckMask)) && (!ComStatus))
                 {
