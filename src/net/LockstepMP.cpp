@@ -188,7 +188,9 @@ int LockstepMP::SendCmd(int inst, u8* data, int len, u64 timestamp)
     Log(inst, "SendCmd", len, timestamp);
     PacketCount++; CmdCount++;
     HostID = inst;
-    Replies[inst].clear();
+    // (no clearing the reply queue here: what is in it now depends on thread timing; RecvReplies
+    // drops replies sent before this CMD instead)
+    CmdTime[inst] = Now(inst);
     if (StatsOn())
     {
         St.T0 = NowNs(); St.T1 = St.T2 = 0;
@@ -313,31 +315,57 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
         for (int i = 0; i < kMaxInst; i++)
             if ((Members & (1 << i)) && Now(i) >= deadline) passed |= (1 << i);
 
+        // Only replies sent in [this CMD, deadline) count, the first one per client. Which of them
+        // are already queued depends on thread timing, so the result is taken only from a set that
+        // cannot change any more: every client's first reply once all replied or passed the
+        // deadline, or, as soon as every addressed AID has replied, only those replies. Nothing
+        // else is consumed; replies sent before this CMD answer an older one and are dropped.
         std::deque<Packet>& q = Replies[inst];
-        while (!q.empty())
+        q.erase(std::remove_if(q.begin(), q.end(), [&](const Packet& p) {
+            if (p.Time >= CmdTime[inst] && p.Sender != inst) return false;
+            Log(inst, "ReplyOld", 0, CmdTime[inst] - p.Time);
+            return true;
+        }), q.end());
+        int first[kMaxInst];
+        std::fill(std::begin(first), std::end(first), -1);
+        u16 seen = (1 << inst), seenAids = 0, addressedSenders = 0;
+        for (int k = 0; k < (int)q.size(); k++)
         {
-            Packet p = std::move(q.front());
-            q.pop_front();
-            if (p.Sender == inst || p.Timestamp < timestamp - 32) { Log(inst, "ReplyStale", (int)(timestamp - p.Timestamp), p.Time); continue; } // stale
-            if (p.Time >= deadline) { Log(inst, "ReplyLate", 0, p.Time - deadline); continue; } // too late for this CMD
+            const Packet& p = q[k];
+            if (p.Time >= deadline || first[p.Sender] >= 0 || p.Timestamp < timestamp - 32) continue; // late / not first / stale
+            first[p.Sender] = k;
+            seen |= (1 << p.Sender);
             if (!p.Data.empty())
             {
                 u32 aid = p.Type >> 16;
-                memcpy(&data[(aid - 1) * 1024], p.Data.data(), std::min<size_t>(p.Data.size(), 1024));
-                ret |= (1 << aid);
+                seenAids |= (1 << aid);
+                if (aidmask & (1 << aid)) addressedSenders |= (1 << p.Sender);
             }
-            replied |= (1 << p.Sender);
         }
-
-        if ((replied & Members) == Members || (ret & aidmask) == aidmask || Stopped)
-        { Log(inst, "RecvReplies", ret, replied); stats(); return ret; }
-
-        // a client that has run kDelay past the CMD without replying never will for this CMD
-        if (((replied | passed) & Members) == Members)
+        const bool addressed = (seenAids & aidmask) == aidmask;
+        if (addressed || (seen & Members) == Members || ((seen | passed) & Members) == Members || Stopped)
         {
-            // diagnostics: client clocks vs the deadline, and what is queued
-            u64 other = 0; for (int i = 0; i < kMaxInst; i++) if (i != inst && (Members & (1 << i))) other = Now(i);
-            Log(inst, "RecvRepliesGiveUp", (int)q.size(), other - deadline);
+            u16 take = addressed ? addressedSenders : seen;
+            for (int i = 0; i < kMaxInst; i++)
+            {
+                int k = first[i];
+                if (k < 0 || !(take & (1 << i))) continue;
+                Packet p = std::move(q[k]);
+                q.erase(q.begin() + k);
+                for (int j = 0; j < kMaxInst; j++) if (first[j] > k) first[j]--;
+                if (!p.Data.empty())
+                {
+                    u32 aid = p.Type >> 16;
+                    memcpy(&data[(aid - 1) * 1024], p.Data.data(), std::min<size_t>(p.Data.size(), 1024));
+                    ret |= (1 << aid);
+                }
+                replied |= (1 << p.Sender);
+            }
+            if (!addressed && ((replied & Members) != Members))
+            {
+                u64 other = 0; for (int i = 0; i < kMaxInst; i++) if (i != inst && (Members & (1 << i))) other = Now(i);
+                Log(inst, "RecvRepliesGiveUp", (int)q.size(), other - deadline);
+            }
             Log(inst, "RecvReplies", ret, replied); stats(); return ret;
         }
 

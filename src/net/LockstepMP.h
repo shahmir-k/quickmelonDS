@@ -115,6 +115,7 @@ private:
     u16 Connected = 0;      // Wi-Fi on right now (observation only)
     u16 Members = 0;        // consoles with a clock: everything waits on these
     u64 BeginTime[kMaxInst] {};
+    u64 CmdTime[kMaxInst] {};   // when each console last sent a CMD (its clock)
     bool Stopped = false;
     std::function<u64()> Clock[kMaxInst];
     FILE* Trace[kMaxInst] {};   // LITEV_MP_TRACE=<dir>: one line per link call, per instance
