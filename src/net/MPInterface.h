@@ -75,8 +75,6 @@ public:
     virtual int SendAck(int inst, u8* data, int len, u64 timestamp) = 0;
     virtual int RecvHostPacket(int inst, u8* data, u64* timestamp) = 0;
     virtual u16 RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask) = 0;
-    // called by instance `inst` as its Wi-Fi clock advances (every Wi-Fi timer event)
-    virtual void Tick(int inst) {}
 
 protected:
     int RecvTimeout = 25;

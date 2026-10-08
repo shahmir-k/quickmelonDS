@@ -511,12 +511,6 @@ u16 MP_RecvReplies(u8* data, u64 timestamp, u16 aidmask, void* userdata)
     return MPInterface::Get().RecvReplies(inst, data, timestamp, aidmask);
 }
 
-void MP_Tick(void* userdata)
-{
-    int inst = ((EmuInstance*)userdata)->getInstanceID();
-    MPInterface::Get().Tick(inst);
-}
-
 
 int Net_SendPacket(u8* data, int len, void* userdata)
 {

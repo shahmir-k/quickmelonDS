@@ -426,7 +426,6 @@ int MP_SendReply(u8* d, int l, u64 t, u16 aid, void* u) { return MPInterface::Ge
 int MP_SendAck(u8* d, int l, u64 t, void* u)    { return MPInterface::Get().SendAck(MPInst(u), d, l, t); }
 int MP_RecvHostPacket(u8* d, u64* t, void* u)   { return MPInterface::Get().RecvHostPacket(MPInst(u), d, t); }
 u16 MP_RecvReplies(u8* d, u64 t, u16 aidmask, void* u) { return MPInterface::Get().RecvReplies(MPInst(u), d, t, aidmask); }
-void MP_Tick(void* u) { MPInterface::Get().Tick(MPInst(u)); }
 
 // ---------------------------------------------------------------------------
 // Networking (Net_*) - STUBS
