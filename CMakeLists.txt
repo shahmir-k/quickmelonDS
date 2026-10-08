@@ -922,6 +922,15 @@ if (LITEV_PIN_RENDER)
     add_compile_definitions(LITEV_PIN_RENDER=1)
 endif()
 
+# Role-based thread placement from the device topology (src/LitevCores.h, LitevTopo): threads
+# ask for a role (Emu / RenderParallel / RenderCritical / RemoteConsole / Background), cores come
+# from cpu_capacity (else cpuinfo_max_freq) + the CPU type; tile worker count follows the fastest
+# non-emu cluster. Replaces the hard-coded {0,1,2} masks. OFF = the fixed RG DS masks as before.
+option(LITEV_TOPO_PIN "Place threads by role from the CPU topology instead of fixed core masks" OFF)
+if (LITEV_TOPO_PIN)
+    add_compile_definitions(LITEV_TOPO_PIN=1)
+endif()
+
 # DraStic-style aggressive idle-loop recognition (teardown doc 01 item 6). Stock
 # melonDS's IsIdleLoop (ARMJIT.cpp) rejects any loop with a cross-iteration
 # register recurrence (a register read before it is rewritten in the iteration --

@@ -637,7 +637,18 @@ void SoftRenderer::AsyncRenderFrame()
     for (int b = 0; b < S2D_NBANDS - 1; b++) helpers[b].join();
 }
 
-#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
+#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER) && defined(LITEV_TOPO_PIN)
+#include "LitevCores.h"
+// The async 2D thread: RenderCritical (the fast non-emu cores, shared). debug.litev.s2dcpu=N
+// pins it to core N instead when N is one of those cores (scheduler/queueing diagnostic).
+static void litevPinRenderThread()
+{
+    using namespace melonDS::LitevTopo;
+    const int selected = Prop("debug.litev.s2dcpu", -1);
+    PinSelf(CoreRole::RenderCritical, selected);
+    Platform::Log(Platform::Info, "LITEV_S2DCPU resolved=%d\n", Get().CoresFor(CoreRole::RenderCritical, selected).size() == 1 ? selected : -1);
+}
+#elif defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
 #include <sched.h>
 // Pin the software render threads to cores {1,2}, OFF the emu's core (3, pinned by the
 // app glue) and off the UI/Mali core (0). Without this the lib-created render threads

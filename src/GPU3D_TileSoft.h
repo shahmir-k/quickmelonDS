@@ -334,7 +334,15 @@ private:
     // the DraStic per-band-worker private-tile model. 3 workers => 96KB total across 3 cores' L1D.
     static constexpr int TileH = 16;
     static constexpr int NumBlocks = OutHeight / TileH;   // 12
+#ifdef LITEV_TOPO_PIN
+    // Band-worker count from the topology (the fastest non-emu cluster; RG DS 3, Thor 4),
+    // a divisor of NumBlocks, set once in the constructor. debug.litev.tileworkers overrides.
+    static constexpr int NBMax = 6;
+    int NB = 3;
+#else
     static constexpr int NB = 3;                          // band-worker threads (cores {0,1,2})
+    static constexpr int NBMax = NB;
+#endif
 
     // Decode-once texture cache (reused melonDS design), made PER-WORKER so the 3 raster threads
     // never contend on it (mirrors the reference's per-band TexCaches[]). One 4MB arena/worker,
@@ -356,7 +364,7 @@ private:
         u32 DepthId[TileH * OutWidth];
         TexCacheState Tex;               // this worker's private decode-once cache
     };
-    BandScratch Band[NB];
+    BandScratch Band[NBMax];
 
     // id-byte layout (bits 24..31 of DepthId):
     static constexpr u32 ID_POLY_MASK = 0x3F;    // bits 24-29 : poly-id (edge-detect compares this)
@@ -386,22 +394,26 @@ private:
     // SEAM boundaries (rows R-1 / R across a range edge) can't be done in-worker; each worker
     // publishes its range's first-2 / last-2 rows here and the last worker finishes those ~4 seam
     // rows after the barrier (the consumer reaches them late enough that they're already ready).
+#ifdef LITEV_TOPO_PIN
+    int BlocksPerWorker = NumBlocks / 3;                      // NumBlocks / NB (constructor)
+#else
     static constexpr int BlocksPerWorker = NumBlocks / NB;   // 12/3 = 4  (rows per worker = 64)
     static_assert(NumBlocks % NB == 0, "NumBlocks must divide evenly across workers");
+#endif
     // Each worker publishes its range-FIRST 2 raster rows ([0]=range-first, [1]=first+1); worker w-1
     // uses them (+ its own local carry) to finish the (w-1|w) seam. Worker w's own range-last rows
     // stay in its local carry (no need to publish them).
-    u32  SeamColor  [NB][2][OutWidth];
-    u32  SeamDepthId[NB][2][OutWidth];
+    u32  SeamColor  [NBMax][2][OutWidth];
+    u32  SeamDepthId[NBMax][2][OutWidth];
     // Set (release) by worker w once it has published its range-FIRST rows (right after rastering
     // its first block). Worker w-1 waits on it to finish the (w-1|w) seam EARLY -- as soon as both
     // sides are available, long before the full-frame barrier -- so the in-order consumer that has
     // pipelined worker w-1's range never stalls at that seam row.
-    std::atomic<u8> SeamFirstReady[NB] = {};
+    std::atomic<u8> SeamFirstReady[NBMax] = {};
 
     // ---- band-worker pool (DraStic gpu3d_render_worker model; reference EnsureBandPool pattern) --
-    Platform::Thread*    BandThreads[NB]   = {};
-    Platform::Semaphore* BandStartSema[NB] = {};
+    Platform::Thread*    BandThreads[NBMax]   = {};
+    Platform::Semaphore* BandStartSema[NBMax] = {};
     Platform::Semaphore* Sema_FrameDone    = nullptr;   // gate: posted once the frame is complete
     // Per-row publish semaphore (the reference's Sema_ScanlineCount pattern): workers post once per
     // published row (+ a 192-count flush at frame end so a late waiter can never sleep past the
