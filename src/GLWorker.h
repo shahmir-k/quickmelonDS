@@ -16,6 +16,9 @@
 #include <pthread.h>
 #endif
 #include "Platform.h"
+#if defined(__ANDROID__) && defined(LITEV_TOPO_PIN)
+#include "LitevCores.h"
+#endif
 
 namespace melonDS
 {
@@ -91,9 +94,13 @@ public:
                 cur = Surf != EGL_NO_SURFACE && eglMakeCurrent(Dpy, Surf, Surf, Ctx);
             }
             // off the emu thread's core 3 (it is pinned there by the app)
+#ifdef LITEV_TOPO_PIN
+            LitevTopo::PinSelf(LitevTopo::CoreRole::RenderCritical);
+#else
             cpu_set_t set; CPU_ZERO(&set);
             CPU_SET(0, &set); CPU_SET(1, &set); CPU_SET(2, &set);
             sched_setaffinity(0, sizeof(set), &set);
+#endif
             // the emu thread waits for this job when it falls a frame behind: let it win
             // cores 0-2 against the 2D thread and the app's background threads
             setpriority(PRIO_PROCESS, 0, -10);

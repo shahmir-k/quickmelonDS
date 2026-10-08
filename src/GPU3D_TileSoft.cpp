@@ -37,7 +37,15 @@
 #include "LiteProfile.h"   // async attribution counters (compiles to nothing unless LITEV_PROFILE=1)
 #include "LitevSoftProf.h" // tile-coordinator ownership-barrier attribution
 
-#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
+#ifdef LITEV_TOPO_PIN
+#include "LitevCores.h"
+#endif
+#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER) && defined(LITEV_TOPO_PIN)
+// Each band worker on its own core of the fastest non-emu cluster (RG DS: 0, 1, 2); the
+// coordinator with the other light render threads.
+static void litevPinTileWorker(int idx) { melonDS::LitevTopo::PinSelf(melonDS::LitevTopo::CoreRole::RenderParallel, idx); }
+static void litevPinTileCoord() { melonDS::LitevTopo::PinSelf(melonDS::LitevTopo::CoreRole::RenderCritical); }
+#elif defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
 #include <sched.h>
 #include "LitevCores.h"
 // Pin each tile band-worker to its OWN core, off the emu's (the fastest remaining cores first;
@@ -55,6 +63,9 @@ static void litevPinTileWorker(int idx)
 }
 #else
 static void litevPinTileWorker(int) {}
+#endif
+#if !(defined(__ANDROID__) && defined(LITEV_PIN_RENDER) && defined(LITEV_TOPO_PIN))
+static void litevPinTileCoord() {}
 #endif
 
 #if defined(__ANDROID__)
@@ -88,12 +99,16 @@ namespace melonDS
 TileRenderer3D::TileRenderer3D(melonDS::GPU3D& gpu3D, SoftRenderer& parent) noexcept
     : Renderer3D(gpu3D), Parent(parent)
 {
+#ifdef LITEV_TOPO_PIN
+    NB = LitevTopo::TileWorkers(NumBlocks, NBMax);   // fixed for this renderer's lifetime
+    BlocksPerWorker = NumBlocks / NB;
+#endif
 }
 
 TileRenderer3D::~TileRenderer3D()
 {
     ShutdownBandPool();                 // join workers before freeing anything they touch
-    for (int b = 0; b < NB; b++)
+    for (int b = 0; b < NBMax; b++)
         delete[] Band[b].Tex.Arena;
     for (int g = 0; g < NGEOM; g++) delete[] VtxArena[g];
 }
@@ -1403,6 +1418,7 @@ void TileRenderer3D::CoordDispatch(int geomIdx, int colIdx)
 
 void TileRenderer3D::CoordFunc()
 {
+    litevPinTileCoord();
     for (;;)
     {
         Platform::Semaphore_Wait(Sema_CoordWork);

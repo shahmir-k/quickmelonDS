@@ -25,7 +25,10 @@
 #include "GPU.h"
 #include "LitevSoftProf.h"
 
-#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
+#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER) && defined(LITEV_TOPO_PIN)
+#include "LitevCores.h"
+static void litevPinRenderThread() { melonDS::LitevTopo::PinSelf(melonDS::LitevTopo::CoreRole::RenderCritical); }
+#elif defined(__ANDROID__) && defined(LITEV_PIN_RENDER)
 #include <sched.h>
 // Pin the software 3D render thread to cores {0,1,2}, off the emu's core
 // (3), so it stops preempting the critical emu thread.
