@@ -638,6 +638,18 @@ public:
     // during the previous one); render 3D every frame for that if a game desyncs on it.
     bool Headless = false;
     bool CaptureSeen = false;
+#ifdef LITEV_NETPLAY_CAPTURE
+    // LITEV_NETPLAY_CAPTURE: captured pixels only matter to emulation if the CPU reads them back
+    // (games use capture for display effects: motion blur, a frozen 3D frame shown as a BG). So
+    // CaptureSeen is set when an ARM9/DMA access reads a VRAM block a capture wrote (or such a
+    // bank is handed to the ARM7), not when capture is merely used. CaptureTaint = 32 KB blocks
+    // of banks A-D a capture has written (bit = bank*4 + block), never cleared.
+    // ponytail: sticky taint over-reports after the game overwrites a captured block (fallback =
+    // the slow everything-software path, still correct); clear per block on full overwrite if a
+    // game trips it. A read that does fire may already differ between devices (the local console's
+    // GPU capture is not bit-exact with software), so it is logged as a desync risk.
+    u16 CaptureTaint = 0;
+#endif
     int DiagNoDraw = 0;         // TEMP diagnostic: bit0 skip 2D drawing, bit1 skip 3D rendering   // the game has used display capture (Netplay then renders identically everywhere)
 
     void SetFrameskipTarget(int target) noexcept

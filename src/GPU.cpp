@@ -661,6 +661,14 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+#ifdef LITEV_NETPLAY_CAPTURE
+    // a captured bank given to the ARM7 (MST 2): its reads bypass SyncVRAMCaptureBlock
+    if ((cnt & 0x87) == 0x82 && ((CaptureTaint >> (bank << 2)) & 0xF) && !CaptureSeen)
+    {
+        CaptureSeen = true;
+        Log(LogLevel::Warn, "Netplay: captured VRAM bank %c mapped to the ARM7: rendering everywhere from now on; possible desync\n", 'A' + bank);
+    }
+#endif
 
     VRAMSTAT &= ~(1 << (bank-2));
 
@@ -1158,7 +1166,11 @@ void GPU::StartFrame() noexcept
     {
         SkipThisFrame = false;
     }
+#ifdef LITEV_NETPLAY_CAPTURE
+    if (CaptureSeen) GPU3D.Headless = false;
+#else
     if (CaptureCnt & (1u << 31)) { CaptureSeen = true; GPU3D.Headless = false; }
+#endif
     if (LITEV_HEADLESS(Headless))
         SkipThisFrame = !CaptureSeen;
 #endif
@@ -1308,6 +1320,13 @@ void GPU::StartScanline(u32 line) noexcept
         {
             CaptureEnable = true;
             CaptureCount++;
+#ifdef LITEV_NETPLAY_CAPTURE
+            {
+                u32 bank = (CaptureCnt >> 16) & 0x3, blk = (CaptureCnt >> 18) & 0x3, size = (CaptureCnt >> 20) & 0x3;
+                for (u32 i = 0; i < (size ? size : 1); i++)
+                    CaptureTaint |= 1u << ((bank << 2) | ((blk + i) & 0x3));
+            }
+#endif
             CheckCaptureStart();
         }
     }
@@ -1728,6 +1747,13 @@ void GPU::CheckCaptureEnd()
 
 void GPU::SyncVRAMCaptureBlock(u32 block, bool write)
 {
+#ifdef LITEV_NETPLAY_CAPTURE
+    if (!write && (CaptureTaint & (1u << block)) && !CaptureSeen)
+    {
+        CaptureSeen = true;
+        Log(LogLevel::Warn, "Netplay: the game read captured VRAM (block %u, frame %u): rendering everywhere from now on; possible desync\n", block, NDS.NumFrames);
+    }
+#endif
     u16 flags = VRAMCaptureBlockFlags[block];
     if (!(flags & CBFlag_IsCapture)) return;
 
