@@ -246,13 +246,22 @@ int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
 #endif
     u64 visible = now - kHostDelay;
     Log(inst, "RecvHostWait", HostID, visible);
+    // Ties at exactly `visible` go by console id: a peer at `visible` with a higher id counts as
+    // past it, and what it sends at `visible` shows only from our next poll. Two clients at the
+    // same clock waiting for a host (none yet, kHostDelay 0: the 3-player app froze when the in-game
+    // host started syncing) then never wait on each other; the lower id goes first.
+    auto past = [&](int i) { u64 t = Now(i); return t > visible || (t == visible && i > inst); };
+    auto shows = [&](const Packet& p) { return p.Time < visible || (p.Time == visible && p.Sender < inst); };
     WaitFor(lk, [&] {
+        if (!FromHost[inst].empty() && shows(FromHost[inst].front())) return true;
         // (a console that was the last host itself waits on the others, never on its own clock)
-        return (!FromHost[inst].empty() && FromHost[inst].front().Time <= visible)
-            || (HostID >= 0 && HostID != inst ? Now(HostID) > visible : PeersReached(inst, visible));
+        if (HostID >= 0 && HostID != inst) return past(HostID);
+        for (int i = 0; i < kMaxInst; i++)
+            if (i != inst && (Members & (1 << i)) && !past(i)) return false;
+        return true;
     });
     while (!FromHost[inst].empty() && FromHost[inst].front().Time < BeginTime[inst]) FromHost[inst].pop_front();
-    if (FromHost[inst].empty() || FromHost[inst].front().Time > visible) { Log(inst, "RecvHost", 0, 0); return 0; }
+    if (FromHost[inst].empty() || !shows(FromHost[inst].front())) { Log(inst, "RecvHost", 0, 0); return 0; }
 
     Packet p = std::move(FromHost[inst].front());
     FromHost[inst].pop_front();

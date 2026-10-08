@@ -56,7 +56,9 @@ namespace melonDS
 // kDelay (4 ms; measured fastest on the RG DS, 2 ms makes the consoles wait on each other more) is longer than any MP reply window (~0.5 ms). Deadlock freedom: every wait is
 // either "peer clock > my clock - kDelay" (regular frames) or "peer clock >= my clock + kDelay"
 // (host frames, reply deadline): one strict, one inclusive, so two consoles can never both be
-// waiting on each other (that would need each to be at least kDelay ahead of the other).
+// waiting on each other (that would need each to be at least kDelay ahead of the other). With
+// kHostDelay 0 the host-frame wait of a client with no host yet is "peer clock > my clock", so equal
+// clocks break the tie by console id (RecvHostPacket).
 // ponytail: waits poll the peers' clocks every 100 us; a per-peer wake threshold if that costs fps.
 class LockstepMP : public MPInterface
 {
