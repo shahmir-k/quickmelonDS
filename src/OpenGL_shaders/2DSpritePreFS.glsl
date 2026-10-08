@@ -55,17 +55,17 @@ int VRAMRead16(int addr)
     return lo | (hi << 8);
 }
 
-vec4 GetSpritePixel(int sprite, ivec2 coord)
+vec4 GetSpritePixel(sOAM spr, ivec2 coord)
 {
     vec4 ret;
 
-    if (uOAM[sprite].Type == 0)
+    if (spr.Type == 0)
     {
         // 16-color
 
-        int tileoffset = uOAM[sprite].TileOffset +
+        int tileoffset = spr.TileOffset +
             ((coord.x >> 3) * 32) +
-            ((coord.y >> 3) * uOAM[sprite].TileStride) +
+            ((coord.y >> 3) * spr.TileStride) +
             ((coord.x & 0x7) >> 1) +
             ((coord.y & 0x7) << 2);
 
@@ -74,33 +74,33 @@ vec4 GetSpritePixel(int sprite, ivec2 coord)
             col >>= 4;
         else
             col &= 0xF;
-        col += uOAM[sprite].PalOffset;
+        col += spr.PalOffset;
 
         ret = GetOBJPalEntry(0, col);
         ret.a = ((col & 0xF) == 0) ? 0.0 : 1.0;
     }
-    else if (uOAM[sprite].Type == 1)
+    else if (spr.Type == 1)
     {
         // 256-color
 
-        int tileoffset = uOAM[sprite].TileOffset +
+        int tileoffset = spr.TileOffset +
             ((coord.x >> 3) * 64) +
-            ((coord.y >> 3) * uOAM[sprite].TileStride) +
+            ((coord.y >> 3) * spr.TileStride) +
              (coord.x & 0x7) +
             ((coord.y & 0x7) << 3);
 
         int col = VRAMRead8(tileoffset);
 
-        ret = GetOBJPalEntry(uOAM[sprite].PalOffset, col);
+        ret = GetOBJPalEntry(spr.PalOffset, col);
         ret.a = (col == 0) ? 0.0 : 1.0;
     }
-    else //if (uOAM[sprite].Type == 2)
+    else //if (spr.Type == 2)
     {
         // direct color bitmap
 
-        int tileoffset = uOAM[sprite].TileOffset +
+        int tileoffset = spr.TileOffset +
             (coord.x * 2) +
-            (coord.y * uOAM[sprite].TileStride);
+            (coord.y * spr.TileStride);
 
         int col = VRAMRead16(tileoffset);
 
@@ -115,5 +115,8 @@ vec4 GetSpritePixel(int sprite, ivec2 coord)
 
 void main()
 {
-    oColor = GetSpritePixel(fSpriteIndex, ivec2(fTexcoord));
+    // Pass the sprite's config by value. Indexing uOAM[] with GetSpritePixel's int
+    // parameter miscompiles on Adreno (AYN Thor): direct-colour bitmap sprites came out
+    // as garbage, while the same fields read here in main() are correct.
+    oColor = GetSpritePixel(uOAM[fSpriteIndex], ivec2(fTexcoord));
 }
