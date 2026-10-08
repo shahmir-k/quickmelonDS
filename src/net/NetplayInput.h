@@ -26,8 +26,11 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "types.h"
+#include "LockstepMP.h"
 
 namespace melonDS
 {
@@ -45,16 +48,23 @@ struct NetplayFrameInput
 // local device sends it at once, so the network has Delay frames to deliver it and nobody waits.
 // When an input is late, Get() blocks until it arrives (a stutter, never a desync).
 //
-// UDP, one socket per device. Each packet carries every input the peer has not acknowledged yet
-// (up to kMaxPerPacket, oldest first) and acknowledges the peer's inputs received so far; the
-// receive thread also re-sends every kResendMs, so nothing is lost even if the peer starts late
-// or this side is blocked. Two players for now (peer = the other device).
+// UDP, one socket per device, full mesh: the local input goes to every peer. Each packet to a peer
+// carries every input that peer has not acknowledged yet (up to kMaxPerPacket, oldest first) and
+// acknowledges that peer's inputs received so far; the receive thread also re-sends every
+// kResendMs, so nothing is lost even if a peer starts late or this side is blocked.
+// Up to kMaxPlayers players (the DS wireless maximum; N itself comes from the lobby); player indices need not be contiguous.
 class NetplayInput
 {
 public:
-    // localPlayer: this device's player index (0 or 1); bindPort: local UDP port; peer: "ip:port".
-    // latencyMs: artificial one-way delay added to received packets (testing only).
-    NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::string& peer, int latencyMs = 0);
+    static constexpr int kMaxPlayers = LockstepMP::kMaxInst; // the DS wireless maximum
+
+    // localPlayer: this device's player index; bindPort: local UDP port; peers: every other
+    // player, (player, "ip:port"). latencyMs: artificial one-way delay added to received packets
+    // (testing only).
+    NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::vector<std::pair<int, std::string>>& peers, int latencyMs = 0);
+    // Two players: the peer is the other one.
+    NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::string& peer, int latencyMs = 0)
+        : NetplayInput(localPlayer, delayFrames, bindPort, {{1 - localPlayer, peer}}, latencyMs) {}
     ~NetplayInput();
 
     bool Ok() const { return Socket >= 0; }
@@ -69,15 +79,15 @@ public:
     // Session ending: Get() stops waiting and returns no input from now on.
     void Abort();
 
-    // Desync check: each device sends the hash of its own console's state every so often; the
-    // other device compares it with its copy of that console (PeerHash). Unreliable: a lost
-    // report only skips one check.
+    // Desync check: each device sends the hash of its own console's state every so often to every
+    // peer; the others compare it with their copy of that console (PeerHash(owner, ...)).
+    // Unreliable: a lost report only skips one check.
     void SendHash(int frame, u64 hash);
-    bool PeerHash(int frame, u64& hash);
+    bool PeerHash(int player, int frame, u64& hash);
 
-    // Total time spent blocked in Get() waiting for the remote player (ms).
+    // Total time spent blocked in Get() waiting for remote players (ms).
     double StallMs() const { return StallUs.load() / 1000.0; }
-    // Time since the last packet from the peer (ms); huge before the first one.
+    // Time since the last packet from the quietest peer (ms); huge before the first one.
     double MsSincePeer() const;
 
 private:
@@ -86,23 +96,49 @@ private:
 
     int Local, DelayFrames, LatencyMs;
     int Socket = -1;
-    u8 PeerAddr[16] {};     // sockaddr_in
+    std::vector<int> Peers;                 // the other players
+    u8 PeerAddr[kMaxPlayers][16] {};        // sockaddr_in, by player
+    bool PeerSet[kMaxPlayers] {};
     std::atomic<bool> Running {true};
     std::thread Receiver;
 
     std::mutex Lock;
     std::condition_variable Changed;
-    std::map<int, NetplayFrameInput> Inputs[2];    // by applied frame
-    std::map<int, u64> PeerHashes;  // the peer's own console, by frame
+    std::map<int, NetplayFrameInput> Inputs[kMaxPlayers];   // by applied frame
+    std::map<int, u64> PeerHashes[kMaxPlayers];   // each peer's own console, by frame
     std::deque<std::pair<int, NetplayFrameInput>> Unacked; // (applied frame, input), oldest first
-    int PeerAck;            // the peer has all our inputs up to this applied frame
-    int RemoteUpTo;         // we have all the peer's inputs up to this applied frame
+    int PeerAck[kMaxPlayers];       // that peer has all our inputs up to this applied frame
+    int RemoteUpTo[kMaxPlayers];    // we have all of that player's inputs up to this applied frame
     std::atomic<u64> StallUs {0};
-    std::atomic<u64> LastPeerUs {0};
+    std::atomic<u64> LastPeerUs[kMaxPlayers] {};
 
+    bool IsPeer(int player) const { return player >= 0 && player < kMaxPlayers && PeerSet[player]; }
     void ReceiveLoop();
     void Send();
 };
+
+// Netplay session start (TCP, host-centric): the host (player 0) listens on Port + 1 and waits for
+// NumPlayers - 1 guests; each guest connects to it and sends its player index, UDP port, ROM id
+// and save. The host times round trips to every guest, picks the input delay, and sends every
+// guest the full player list (addresses as the host sees them), every other player's save and the
+// delay. Everyone thus agrees on the players, the delay and every console's starting save.
+struct NetplaySetup
+{
+    // in
+    int Player = 0;             // this device's player; 0 = host
+    int NumPlayers = 2;         // host: how many players (itself included) to wait for
+    int Port = 7100;            // this device's UDP input port
+    std::string Host;           // guests: the host's "ip:port" (its UDP port; TCP = port + 1)
+    u64 RomId = 0;              // must match on every device
+    std::vector<u8> Save;       // this player's save
+    int Delay = 0;              // host: fixed input delay, 0 = from the measured round trips
+    int TimeoutS = 60;          // how long to wait for the others
+    // out
+    std::vector<std::pair<int, std::string>> Peers;     // every other player: (player, "ip:port")
+    std::map<int, std::vector<u8>> Saves;               // every other player's save
+    std::string Log;            // what happened (errors included), one line per event
+};
+bool NetplayHandshake(NetplaySetup& s);
 
 }
 

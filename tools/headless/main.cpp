@@ -9,6 +9,7 @@
     See docs/liteDS-v2-plan.md B.2 "Unit 0" for the spec.
 */
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -72,8 +73,7 @@ struct Options
     // Unit 1 trace/verify modes.
     RunMode mode = RunMode::Benchmark;
     std::string tracePath;
-    std::string mpScript0;              // --mp-test host (instance 0) input script
-    std::string mpScript1;              // --mp-test client (instance 1) input script
+    std::vector<std::string> mpScripts; // --mp-test: --mp-scriptK = instance K's input script (0 = host)
     long long fixedRtc = liteds::kDefaultRtcEpoch;
 
     AudioInterpolation interp = AudioInterpolation::None;
@@ -232,8 +232,13 @@ bool ParseArgs(int argc, char** argv, Options& o)
         else if (a == "--verify-trace") { o.mode = RunMode::VerifyTrace; o.tracePath = next("--verify-trace"); }
         else if (a == "--verify-interp-converge") o.mode = RunMode::VerifyInterpConverge;
         else if (a == "--mp-test") o.mode = RunMode::MPTest;
-        else if (a == "--mp-script0") o.mpScript0 = next("--mp-script0");
-        else if (a == "--mp-script1") o.mpScript1 = next("--mp-script1");
+        else if (a.rfind("--mp-script", 0) == 0 && a.size() > 11 && isdigit((unsigned char)a[11]))
+        {
+            size_t k = std::stoul(a.substr(11));
+            if (k >= 16) { fprintf(stderr, "error: %s: at most 16 instances\n", a.c_str()); return false; }
+            if (o.mpScripts.size() <= k) o.mpScripts.resize(k + 1);
+            o.mpScripts[k] = next(a.c_str());
+        }
         else if (a == "--help" || a == "-h") Usage(argv[0], 0);
         else { fprintf(stderr, "error: unknown argument '%s'\n", a.c_str()); return false; }
     }
@@ -369,7 +374,7 @@ int main(int argc, char** argv)
         case RunMode::VerifyInterpConverge:
             return liteds::VerifyInterpConverge(cfg, opt.frames);
         case RunMode::MPTest:
-            return liteds::MPTest(cfg, opt.frames, opt.mpScript0, opt.mpScript1);
+            return liteds::MPTest(cfg, opt.frames, opt.mpScripts);
         default:
             break;
         }

@@ -61,6 +61,9 @@ namespace melonDS
 class LockstepMP : public MPInterface
 {
 public:
+    // consoles on one link: the DS wireless maximum (also LAN's player bound and Netplay's)
+    static constexpr int kMaxInst = 16;
+
     LockstepMP() noexcept = default;
 
     void Process() override {}
@@ -86,7 +89,6 @@ public:
     u16 RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask) override;
 
 private:
-    static constexpr int kMaxInst = 16;
     static constexpr u64 kDelay = 33514 * 4; // 4 ms in system clock cycles (33.514 MHz)
     // host frames (CMD/ACK) reach the clients this much later; < kDelay, or a reply sent on time
     // would land past the host's deadline

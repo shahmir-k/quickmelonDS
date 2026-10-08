@@ -13,6 +13,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include "types.h"
 
 namespace liteds
@@ -55,7 +56,7 @@ int VerifyInterpConverge(const TraceRunConfig& cfg, int frames);
 // two-instance execution is safe under the LITEV stack. Later phases wire the
 // shared LocalMP + health metrics. Returns 0 iff both instances complete all
 // frames without a crash.
-int MPTest(const TraceRunConfig& cfg, int frames,
-           const std::string& script0, const std::string& script1);
+// LITEV_MP_PLAYERS=N (default 2) runs N instances; scripts[k] = instance k's input script.
+int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts);
 
 } // namespace liteds

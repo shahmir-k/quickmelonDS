@@ -641,90 +641,22 @@ static melonDS::NDS* gEvTraceNDS;
 static std::atomic<bool> gEvTraceOn {false};
 #endif
 
-int MPTest(const TraceRunConfig& cfg, int frames,
-           const std::string& script0, const std::string& script1)
+int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts)
 {
-    TraceRunConfig c0 = cfg; c0.instanceTag = "mp0";
-    TraceRunConfig c1 = cfg; c1.instanceTag = "mp1";
-    // Per-instance scripts (host vs client differ). Fall back to cfg.inputScript.
-    c0.inputScript = script0.empty() ? cfg.inputScript : script0;
-    c1.inputScript = script1.empty() ? cfg.inputScript : script1;
-
-    BuiltNDS b0, b1;
-    std::string err;
-    if (!BuildAndBoot(c0, true, b0, err)) { fprintf(stderr, "error (mp0): %s\n", err.c_str()); return 1; }
-    if (!BuildAndBoot(c1, true, b1, err)) { fprintf(stderr, "error (mp1): %s\n", err.c_str()); return 1; }
-    // LITEV_MP_NORENDER1: instance 1 draws nothing; LITEV_MP_NORENDER0: instance 0 too
-    if (getenv("LITEV_MP_NORENDER0"))
+    // LITEV_NETPLAY="player=P,delay=D,port=N,peer=IP:PORT[,latency=MS]": two-player Netplay (fixed
+    // peer, no session setup). This process is player P's device: it emulates every console, but
+    // only player P's input comes from its script; the others' arrive over UDP from their
+    // processes, applied D frames late.
+    // LITEV_NETPLAY="player=P,players=N,port=X[,host=IP:PORT][,delay=D][,latency=MS]": N-player
+    // Netplay with the app's session setup (NetplayHandshake): player 0 hosts (waits for N - 1
+    // guests on port X + 1), the others join host=IP:PORT (the host's port). delay omitted = picked
+    // by the host from the measured round trips.
+    int player = 0, delay = -1, port = 7100, latency = 0, players = 0;
+    std::string peer, host = "127.0.0.1:7100";
+    const char* np = getenv("LITEV_NETPLAY");
+    if (np)
     {
-        b0.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b0.nds->GPU));
-        printf("instance 0: renderer off\n");
-    }
-#ifdef LITEV_EVENT_TRACE
-    if (const char* ev = getenv("LITEV_MP_EVTRACE"))
-    {
-        gEvTrace = fopen(ev, "w");
-        gEvTraceNDS = b1.nds.get();
-        melonDS::LitevEventTrace = [](NDS* n, int id, u64 et, u64 st) {
-            if (n == gEvTraceNDS && gEvTraceOn.load(std::memory_order_relaxed))
-                fprintf(gEvTrace, "%llu %d %llu pc9=%08x pc7=%08x\n", (unsigned long long)et, id, (unsigned long long)st, n->ARM9.R[15], n->ARM7.R[15]);
-        };
-    }
-#endif
-    if (getenv("LITEV_MP_ACC3D1")) // instance 1 on the reference SoftRenderer3D instead of the tile renderer
-    {
-        RendererSettings rs{};
-        rs.ScaleFactor = 1;
-        rs.Accurate3D = true;
-        b1.nds->GPU.GetRenderer().SetRenderSettings(rs);
-        printf("instance 1: accurate 3D renderer\n");
-    }
-    if (getenv("LITEV_MP_NO3D1"))
-    {
-        b1.nds->GPU.SetRenderer(std::make_unique<SoftNo3DRenderer>(*b1.nds));
-        printf("instance 1: 3D renderer off\n");
-    }
-    if (getenv("LITEV_MP_NORENDER1"))
-    {
-        b1.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b1.nds->GPU));
-        printf("instance 1: renderer off\n");
-    }
-#ifdef LITEV_SKIP_REPEAT_FRAMES
-    if (getenv("LITEV_MP_SKIPREPEAT0"))
-    {
-        b0.nds->GPU.SkipRepeatEnabled = true;   // display-only: must not change any hash
-        printf("instance 0: skip repeated-3D frames\n");
-    }
-#endif
-    if (getenv("LITEV_MP_SILENT1"))
-    {
-        b1.nds->SPU.Silent = true;  // what Netplay does to the other player's console
-        printf("instance 1: silent (no audio mix)\n");
-    }
-#ifdef LITEV_AGGRESSIVE_SKIP
-    if (getenv("LITEV_MP_HEADLESS1"))
-    {
-        b1.nds->GPU.Headless = true; // what Netplay does to the other player's console
-        b1.nds->GPU.GPU3D.Headless = true;
-        printf("instance 1: headless (draws only once the game uses display capture)\n");
-    }
-#endif
-
-    // Install one shared in-process link and give each instance a distinct id.
-    // LITEV_MP_LOCKSTEP=1: the deterministic LockstepMP (Netplay) instead of LocalMP.
-    bool lockstep = getenv("LITEV_MP_LOCKSTEP") != nullptr;
-    MPInterface::Set(lockstep ? MPInterface_Netplay : MPInterface_Local);
-    LockstepMP* lockstepMP = lockstep ? dynamic_cast<LockstepMP*>(&MPInterface::Get()) : nullptr;
-    printf("link: %s\n", lockstep ? "LockstepMP (deterministic)" : "LocalMP");
-
-    // LITEV_NETPLAY="player=P,delay=D,port=N,peer=IP:PORT[,latency=MS]": Netplay. This process is
-    // player P's device: it emulates both consoles, but only player P's input comes from its
-    // script; the other player's arrives over UDP from the peer process, applied D frames late.
-    std::unique_ptr<NetplayInput> net;
-    if (const char* np = getenv("LITEV_NETPLAY"))
-    {
-        int player = 0, delay = 3, port = 7100, latency = 0;
-        std::string peer = "127.0.0.1:7101", spec = np;
+        std::string spec = np;
         for (size_t pos = 0; pos < spec.size();)
         {
             size_t end = spec.find(',', pos);
@@ -735,38 +667,162 @@ int MPTest(const TraceRunConfig& cfg, int frames,
             else if (k == "delay") delay = atoi(v.c_str());
             else if (k == "port") port = atoi(v.c_str());
             else if (k == "peer") peer = v;
+            else if (k == "host") host = v;
+            else if (k == "players") players = atoi(v.c_str());
             else if (k == "latency") latency = atoi(v.c_str());
             if (end == std::string::npos) break;
             pos = end + 1;
         }
+        if (players == 0 && peer.empty()) peer = "127.0.0.1:7101";
+    }
+
+    // LITEV_MP_PLAYERS=N: N consoles (default 2; Netplay: its player count)
+    int n = players ? players : getenv("LITEV_MP_PLAYERS") ? atoi(getenv("LITEV_MP_PLAYERS")) : 2;
+    if (n < 2 || n > LockstepMP::kMaxInst) { fprintf(stderr, "error: %d instances (2..%d)\n", n, LockstepMP::kMaxInst); return 1; }
+    const u16 allMask = (u16)((1u << n) - 1);
+
+    std::vector<BuiltNDS> b(n);
+    std::vector<std::string> instScripts(n);
+    for (int k = 0; k < n; k++)
+    {
+        TraceRunConfig c = cfg;
+        c.instanceTag = "mp" + std::to_string(k);
+        // Per-instance scripts (host vs client differ). Fall back to cfg.inputScript.
+        c.inputScript = (k < (int)scripts.size() && !scripts[k].empty()) ? scripts[k] : cfg.inputScript;
+        instScripts[k] = c.inputScript;
+        std::string err;
+        if (!BuildAndBoot(c, true, b[k], err)) { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
+    }
+    // Instance 0 knobs act on instance 0; the "1" knobs on every other instance (with two
+    // instances: instance 1, as before).
+    // LITEV_MP_NORENDER1: instance 1 draws nothing; LITEV_MP_NORENDER0: instance 0 too
+    if (getenv("LITEV_MP_NORENDER0"))
+    {
+        b[0].nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b[0].nds->GPU));
+        printf("instance 0: renderer off\n");
+    }
+#ifdef LITEV_EVENT_TRACE
+    if (const char* ev = getenv("LITEV_MP_EVTRACE"))
+    {
+        gEvTrace = fopen(ev, "w");
+        gEvTraceNDS = b[1].nds.get();
+        melonDS::LitevEventTrace = [](NDS* nd, int id, u64 et, u64 st) {
+            if (nd == gEvTraceNDS && gEvTraceOn.load(std::memory_order_relaxed))
+                fprintf(gEvTrace, "%llu %d %llu pc9=%08x pc7=%08x\n", (unsigned long long)et, id, (unsigned long long)st, nd->ARM9.R[15], nd->ARM7.R[15]);
+        };
+    }
+#endif
+    for (int k = 1; k < n; k++)
+    {
+        NDS& nds = *b[k].nds;
+        if (getenv("LITEV_MP_ACC3D1")) // the reference SoftRenderer3D instead of the tile renderer
+        {
+            RendererSettings rs{};
+            rs.ScaleFactor = 1;
+            rs.Accurate3D = true;
+            nds.GPU.GetRenderer().SetRenderSettings(rs);
+            printf("instance %d: accurate 3D renderer\n", k);
+        }
+        if (getenv("LITEV_MP_NO3D1"))
+        {
+            nds.GPU.SetRenderer(std::make_unique<SoftNo3DRenderer>(nds));
+            printf("instance %d: 3D renderer off\n", k);
+        }
+        if (getenv("LITEV_MP_NORENDER1"))
+        {
+            nds.GPU.SetRenderer(std::make_unique<NullRenderer>(nds.GPU));
+            printf("instance %d: renderer off\n", k);
+        }
+        if (getenv("LITEV_MP_SILENT1"))
+        {
+            nds.SPU.Silent = true;  // what Netplay does to the other players' consoles
+            printf("instance %d: silent (no audio mix)\n", k);
+        }
+#ifdef LITEV_AGGRESSIVE_SKIP
+        if (getenv("LITEV_MP_HEADLESS1"))
+        {
+            nds.GPU.Headless = true; // what Netplay does to the other players' consoles
+            nds.GPU.GPU3D.Headless = true;
+            printf("instance %d: headless (draws only once the game uses display capture)\n", k);
+        }
+#endif
+    }
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+    if (getenv("LITEV_MP_SKIPREPEAT0"))
+    {
+        b[0].nds->GPU.SkipRepeatEnabled = true;   // display-only: must not change any hash
+        printf("instance 0: skip repeated-3D frames\n");
+    }
+#endif
+
+    // Install one shared in-process link and give each instance a distinct id.
+    // LITEV_MP_LOCKSTEP=1: the deterministic LockstepMP (Netplay) instead of LocalMP.
+    bool lockstep = getenv("LITEV_MP_LOCKSTEP") != nullptr;
+    MPInterface::Set(lockstep ? MPInterface_Netplay : MPInterface_Local);
+    LockstepMP* lockstepMP = lockstep ? dynamic_cast<LockstepMP*>(&MPInterface::Get()) : nullptr;
+    printf("link: %s\n", lockstep ? "LockstepMP (deterministic)" : "LocalMP");
+
+    std::unique_ptr<NetplayInput> net;
+    if (np && players == 0)
+    {
+        if (delay < 0) delay = 3;
         net = std::make_unique<NetplayInput>(player, delay, port, peer, latency);
         if (!net->Ok()) { fprintf(stderr, "netplay: socket setup failed\n"); return 1; }
         printf("netplay: player %d, delay %d frames, port %d, peer %s, artificial latency %d ms\n", player, delay, port, peer.c_str(), latency);
     }
-    if (lockstepMP)
+    else if (np)
     {
-        NDS* n0 = b0.nds.get(); NDS* n1 = b1.nds.get();
-        lockstepMP->SetClock(0, [n0] { return n0->GetSysTimestamp(); });
-        lockstepMP->SetClock(1, [n1] { return n1->GetSysTimestamp(); });
+        NetplaySetup setup;
+        setup.Player = player;
+        setup.NumPlayers = players;
+        setup.Port = port;
+        setup.Host = host;
+        setup.RomId = b[0].romHash;
+        setup.Save.assign(1000 + player, (u8)(0xA0 + player)); // a recognisable stand-in save
+        setup.Delay = delay > 0 ? delay : 0;
+        bool ok = NetplayHandshake(setup);
+        printf("%s", setup.Log.c_str());
+        if (!ok) { fprintf(stderr, "netplay: session setup failed\n"); return 1; }
+        for (auto& [p, save] : setup.Saves)
+        {
+            bool expected = save.size() == 1000u + p && std::all_of(save.begin(), save.end(), [p = p](u8 v) { return v == 0xA0 + p; });
+            printf("netplay: player %d's save: %zu bytes, %s\n", p, save.size(), expected ? "as sent" : "WRONG");
+        }
+        if ((int)setup.Peers.size() != n - 1) { fprintf(stderr, "netplay: %zu peers for %d players\n", setup.Peers.size(), n); return 1; }
+        for (auto& [p, addr] : setup.Peers)
+            if (p >= n) { fprintf(stderr, "netplay: player %d outside 0..%d\n", p, n - 1); return 1; }
+        net = std::make_unique<NetplayInput>(player, setup.Delay, port, setup.Peers, latency);
+        if (!net->Ok()) { fprintf(stderr, "netplay: socket setup failed\n"); return 1; }
+        printf("netplay: player %d of %d, delay %d frames, port %d, peers", player, n, setup.Delay, port);
+        for (auto& [p, addr] : setup.Peers) printf(" %d@%s", p, addr.c_str());
+        printf(", artificial latency %d ms\n", latency);
     }
-    b0.udata->instanceID = 0;
-    b1.udata->instanceID = 1;
-
-    // Distinct MAC per instance so they associate as different wireless players.
+    for (int k = 0; k < n; k++)
     {
-        Firmware& fw = b1.nds->GetFirmware();
-        fw.GetHeader().MacAddr[5] ^= 0x01;
-        fw.UpdateChecksums();
+        if (lockstepMP)
+        {
+            NDS* nd = b[k].nds.get();
+            lockstepMP->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
+        }
+        b[k].udata->instanceID = k;
+        // Distinct MAC per instance so they associate as different wireless players.
+        if (k)
+        {
+            Firmware& fw = b[k].nds->GetFirmware();
+            fw.GetHeader().MacAddr[5] ^= (u8)k;
+            fw.UpdateChecksums();
+        }
     }
 
-    printf("=== liteDS-headless mp-test (Phase 2: Shrek 2-player association) ===\n");
+    printf("=== liteDS-headless mp-test (%d instances) ===\n", n);
     printf("rom:      %s\n", cfg.rom.c_str());
     printf("frames:   %d\n", frames);
-    printf("script0:  %s\n", c0.inputScript.c_str());
-    printf("script1:  %s\n", c1.inputScript.c_str());
+    for (int k = 0; k < n; k++) printf("script%d:  %s\n", k, instScripts[k].c_str());
     fflush(stdout);
 
-    std::atomic<int>  done0{0}, done1{0};
+    std::unique_ptr<std::atomic<int>[]> done(new std::atomic<int>[n]);
+    for (int k = 0; k < n; k++) done[k] = 0;
+    auto minDone = [&] { int m = INT32_MAX; for (int k = 0; k < n; k++) m = std::min(m, done[k].load()); return m; };
     std::atomic<bool> crashed{false};
     std::atomic<u32>  peakConnected{0};  // highest ConnectedBitmask seen
 
@@ -776,62 +832,61 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     // frame rate, which the emulator frame count does not show.
     const char* dumpDir = getenv("LITEV_MP_DUMP_DIR");
     int dumpEvery = getenv("LITEV_MP_DUMP_EVERY") ? atoi(getenv("LITEV_MP_DUMP_EVERY")) : 0;
-    auto runInstance = [&](BuiltNDS& b, std::atomic<int>& doneCounter)
+    auto runInstance = [&](int inst)
     {
-        int inst = (&b == &b0) ? 0 : 1;
-        std::atomic<int>& otherDone = (inst == 0) ? done1 : done0;
+        BuiltNDS& bi = b[inst];
         u32 lastSwaps = 0;
         auto lastT = std::chrono::steady_clock::now();
         try
         {
-            // Keep emulating past `frames` until the other instance is done too: it may still need
-            // this one's MP frames, and without a partner it stalls a full receive timeout per tick.
-            for (int f = 0; f < frames || otherDone.load() < frames; f++)
+            // Keep emulating past `frames` until the other instances are done too: they may still
+            // need this one's MP frames, and without a partner they stall a full receive timeout per tick.
+            for (int f = 0; f < frames || minDone() < frames; f++)
             {
                 if (!net)
-                    b.ApplyInput(f);
+                    bi.ApplyInput(f);
                 else if (f < frames)
                 {
                     if (inst == net->LocalPlayer())
                     {
                         NetplayFrameInput local;
-                        local.Keys = b.inputScript.Loaded() ? b.inputScript.KeyMaskForFrame(f) : 0xFFF;
+                        local.Keys = bi.inputScript.Loaded() ? bi.inputScript.KeyMaskForFrame(f) : 0xFFF;
                         int tx, ty;
-                        if (b.inputScript.HasTouch() && b.inputScript.TouchForFrame(f, tx, ty)) { local.TouchX = tx; local.TouchY = ty; }
+                        if (bi.inputScript.HasTouch() && bi.inputScript.TouchForFrame(f, tx, ty)) { local.TouchX = tx; local.TouchY = ty; }
                         net->SubmitLocal(f, local);
                     }
                     NetplayFrameInput in = net->Get(inst, f);
-                    b.nds->SetKeyMask(in.Keys);
-                    if (in.TouchX >= 0) b.nds->TouchScreen(in.TouchX, in.TouchY);
-                    else                b.nds->ReleaseScreen();
+                    bi.nds->SetKeyMask(in.Keys);
+                    if (in.TouchX >= 0) bi.nds->TouchScreen(in.TouchX, in.TouchY);
+                    else                bi.nds->ReleaseScreen();
                 }
 #ifdef LITEV_EVENT_TRACE
                 if (inst == 1 && getenv("LITEV_MP_EVTRACE_FROM")) gEvTraceOn = f + 1 >= atoi(getenv("LITEV_MP_EVTRACE_FROM"));
 #endif
-                b.nds->RunFrame();
+                bi.nds->RunFrame();
                 if (f >= frames) continue;
-                doneCounter.store(f + 1, std::memory_order_relaxed);
+                done[inst].store(f + 1, std::memory_order_relaxed);
                 static const int every = getenv("LITEV_MP_EVERY") ? atoi(getenv("LITEV_MP_EVERY")) : 60;
                 if (((f + 1) % every) == 0)
                 {
-                    u32 sw = b.nds->GPU.GPU3D.SwapCount;
+                    u32 sw = bi.nds->GPU.GPU3D.SwapCount;
                     auto now = std::chrono::steady_clock::now();
                     printf("inst%d frame %d: sys=%llu pc9=%08x pc7=%08x game 3D frames=%u/60 captures=%u ms=%.0f ram=%016llx\n", inst, f + 1,
-                           (unsigned long long)b.nds->GetSysTimestamp(), b.nds->ARM9.R[15], b.nds->ARM7.R[15],
-                           sw - lastSwaps, b.nds->GPU.CaptureCount,
+                           (unsigned long long)bi.nds->GetSysTimestamp(), bi.nds->ARM9.R[15], bi.nds->ARM7.R[15],
+                           sw - lastSwaps, bi.nds->GPU.CaptureCount,
                            std::chrono::duration<double, std::milli>(now - lastT).count(),
-                           (unsigned long long)XXH3_64bits(b.nds->MainRAM, b.nds->MainRAMMask + 1));
+                           (unsigned long long)XXH3_64bits(bi.nds->MainRAM, bi.nds->MainRAMMask + 1));
                     if (getenv("LITEV_MP_STATE"))
                     {
                         // diagnostics: more of the console's state, to find what diverges first
-                        GPU& g = b.nds->GPU;
+                        GPU& g = bi.nds->GPU;
                         u64 vram = 0;
                         for (int k = 0; k < 9; k++)
                             vram ^= XXH3_64bits(g.VRAM[k], g.VRAMMask[k] + 1) * (k + 1);
                         printf("inst%d state %d: vram=%016llx gxstat=%08x fifo=%u polys=%u verts=%u arm9r=%016llx arm7r=%016llx\n", inst, f + 1,
                                (unsigned long long)vram, g.GPU3D.GXStat, g.GPU3D.FifoLevel(), g.GPU3D.NumPolygons, g.GPU3D.NumVertices,
-                               (unsigned long long)XXH3_64bits(b.nds->ARM9.R, sizeof(b.nds->ARM9.R)),
-                               (unsigned long long)XXH3_64bits(b.nds->ARM7.R, sizeof(b.nds->ARM7.R)));
+                               (unsigned long long)XXH3_64bits(bi.nds->ARM9.R, sizeof(bi.nds->ARM9.R)),
+                               (unsigned long long)XXH3_64bits(bi.nds->ARM7.R, sizeof(bi.nds->ARM7.R)));
                     }
                     lastT = now;
                     fflush(stdout);
@@ -839,12 +894,12 @@ int MPTest(const TraceRunConfig& cfg, int frames,
                 }
                 if (getenv("LITEV_MP_DUMP7") && inst == 1 && f + 1 == atoi(getenv("LITEV_MP_DUMP7")))
                 {   // diagnostics: ARM7 WRAM (0x037F8000, 64 KB) to disassemble the hot ARM7 code
-                    if (FILE* fp = fopen("arm7wram.bin", "wb")) { fwrite(b.nds->ARM7WRAM, 1, 0x10000, fp); fclose(fp); }
+                    if (FILE* fp = fopen("arm7wram.bin", "wb")) { fwrite(bi.nds->ARM7WRAM, 1, 0x10000, fp); fclose(fp); }
                 }
                 if (dumpDir && dumpEvery > 0 && ((f + 1) % dumpEvery) == 0)
                 {
                     void* top = nullptr; void* bot = nullptr;
-                    if (b.nds->GPU.GetFramebuffers(&top, &bot) && top && bot)
+                    if (bi.nds->GPU.GetFramebuffers(&top, &bot) && top && bot)
                     {
                         char path[512];
                         snprintf(path, sizeof(path), "%s/inst%d_f%05d.ppm", dumpDir, inst, f + 1);
@@ -869,21 +924,21 @@ int MPTest(const TraceRunConfig& cfg, int frames,
         if (lockstepMP) { lockstepMP->End(inst); lockstepMP->Stop(); }
     };
 
-    std::thread t0(runInstance, std::ref(b0), std::ref(done0));
-    std::thread t1(runInstance, std::ref(b1), std::ref(done1));
+    std::vector<std::thread> threads;
+    for (int k = 0; k < n; k++) threads.emplace_back(runInstance, k);
 
     // Poll MP health from the main thread while the instances run, and log the
-    // first frame the two associate (ConnectedBitmask == 0x3).
+    // first frame all of them associate (ConnectedBitmask == every instance).
     int firstAssocFrame = -1;
-    while (done0.load() < frames || done1.load() < frames)
+    while (minDone() < frames)
     {
         u16 mask = MPInterface::Get().ObserveConnectedBitmask();
         if (mask > peakConnected.load()) peakConnected.store(mask);
-        if (mask == 0x3 && firstAssocFrame < 0)
+        if (mask == allMask && firstAssocFrame < 0)
         {
-            firstAssocFrame = std::min(done0.load(), done1.load());
-            printf("  [assoc] ConnectedBitmask=0x3 at ~frame %d (cmd=%llu reply=%llu pkt=%llu)\n",
-                   firstAssocFrame,
+            firstAssocFrame = minDone();
+            printf("  [assoc] ConnectedBitmask=0x%x at ~frame %d (cmd=%llu reply=%llu pkt=%llu)\n",
+                   mask, firstAssocFrame,
                    (unsigned long long)MPInterface::Get().ObserveCmdCount(),
                    (unsigned long long)MPInterface::Get().ObserveReplyCount(),
                    (unsigned long long)MPInterface::Get().ObservePacketCount());
@@ -891,24 +946,22 @@ int MPTest(const TraceRunConfig& cfg, int frames,
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    t0.join();
-    t1.join();
+    for (std::thread& t : threads) t.join();
 
     u64 cmd = MPInterface::Get().ObserveCmdCount();
     u64 reply = MPInterface::Get().ObserveReplyCount();
     u64 pkt = MPInterface::Get().ObservePacketCount();
-    if (net) printf("netplay stall: %.1f ms waiting for the remote player's input\n", net->StallMs());
-    bool ranClean = !crashed.load() && done0.load() == frames && done1.load() == frames;
-    bool associated = (peakConnected.load() == 0x3);
+    if (net) printf("netplay stall: %.1f ms waiting for the remote players' input\n", net->StallMs());
+    bool ranClean = !crashed.load() && minDone() == frames;
+    bool associated = (peakConnected.load() == allMask);
     bool exchanged = (cmd > 0 || reply > 0 || pkt > 0);
 
-    printf("mp0_frames:      %d\n", done0.load());
-    printf("mp1_frames:      %d\n", done1.load());
+    for (int k = 0; k < n; k++) printf("mp%d_frames:      %d\n", k, done[k].load());
     printf("peak_connected:  0x%x\n", peakConnected.load());
     printf("first_assoc_frame: %d\n", firstAssocFrame);
     printf("cmd_frames:      %llu\n", (unsigned long long)cmd);
 #if LITEV_PROFILE
-    {   // JIT transition counters over the whole run, both consoles (LITEV_PROFILE builds)
+    {   // JIT transition counters over the whole run, all consoles (LITEV_PROFILE builds)
         using namespace melonDS::LiteProfile;
         auto v = [](std::atomic<uint64_t>& a) { return (unsigned long long)a.load(); };
         printf("jit: cpp_reentries=%llu dispatcher_hits=%llu icache_hits=%llu commit_stub=%llu"
@@ -928,7 +981,7 @@ int MPTest(const TraceRunConfig& cfg, int frames,
     printf("associated:      %s\n", associated ? "yes" : "no");
     printf("exchanged:       %s\n", exchanged ? "yes" : "no");
     fflush(stdout);
-    // Success (for now, the Phase-2 milestone) = ran clean AND the two associated.
+    // Success (for now, the Phase-2 milestone) = ran clean AND every instance associated.
     return (ranClean && associated) ? 0 : 1;
 }
 
