@@ -580,6 +580,18 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
 {
     LastLineHas3D = true;
     const u32 blendCnt = GPU2D.BlendCnt;
+#if defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
+    // The two ColorComposite calls most pixels need, a whole line at a time with the bit-exact
+    // NEON compositor (Under3D[0] and [1] are contiguous like BGOBJLine's two halves).
+    alignas(16) u32 ccTop[256], ccUnder[256];
+    GPU2DNeon::ColorCompositeLine(ccTop, BGOBJLine, WindowMask, blendCnt, GPU2D.EVA, GPU2D.EVB, GPU2D.EVY);
+    GPU2DNeon::ColorCompositeLine(ccUnder, Under3D[0], WindowMask, blendCnt, GPU2D.EVA, GPU2D.EVB, GPU2D.EVY);
+#define CC_TOP(i) ccTop[i]
+#define CC_UNDER(i) ccUnder[i]
+#else
+#define CC_TOP(i) ColorComposite(i, BGOBJLine[i], BGOBJLine[256+i])
+#define CC_UNDER(i) ColorComposite(i, Under3D[0][i], Under3D[1][i])
+#endif
     for (int i = 0; i < 256; i++)
     {
         u32 val1 = BGOBJLine[i];
@@ -590,7 +602,7 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
         if ((flag1 & 0xC0) == 0x40)
         {
             // 3D on top. Under it: Under3D[0] (blend partner), then Under3D[1].
-            u32 u1 = Under3D[0][i], u2 = Under3D[1][i];
+            u32 u1 = Under3D[0][i];
             u32 f2 = u1 >> 24;
             u32 target2;
             if      (f2 & 0x80) target2 = 0x1000;
@@ -610,7 +622,7 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
                 }
             }
             dst[i]     = (u1 & 0xFFFFFF) | (mode << 29) | (((u32)GPU2D.EVY & 0x1F) << 24);
-            dst[256+i] = ColorComposite(i, u1, u2) & 0xFFFFFF;
+            dst[256+i] = CC_UNDER(i) & 0xFFFFFF;
         }
         else if ((flag2 & 0xC0) == 0x40)
         {
@@ -638,14 +650,16 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
             }
             // no blend: the 3D only matters through the fallback, so blend 16:0 with
             // val1 already carrying any brightness effect
-            dst[i]     = ((blend ? val1 : ColorComposite(i, val1, val2)) & 0xFFFFFF) | (1u << 29) | ((eva & 0x1F) << 24);
+            dst[i]     = ((blend ? val1 : CC_TOP(i)) & 0xFFFFFF) | (1u << 29) | ((eva & 0x1F) << 24);
             dst[256+i] = (ColorComposite(i, val1, under) & 0xFFFFFF) | ((evb & 0x1F) << 24);
         }
         else
         {
-            dst[i]     = (ColorComposite(i, val1, val2) & 0xFFFFFF) | (7u << 29);
+            dst[i]     = (CC_TOP(i) & 0xFFFFFF) | (7u << 29);
         }
     }
+#undef CC_TOP
+#undef CC_UNDER
 }
 
 // CPU version of the hybrid merge (HybridMergeFS.glsl) for one native pixel: c3d is the
