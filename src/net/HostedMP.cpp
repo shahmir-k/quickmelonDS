@@ -510,7 +510,7 @@ void HostedServer::SendChunk(int console, Chunk& c, u64 now)
 {
     Stream& s = Streams[console];
     size_t n = SendBytes(console, std::max(c.Offset, s.Acked), c.Offset + c.Len); // a chunk can be partly acknowledged
-    if (c.SentUs) { s.ResentBytes += n; c.Resends += c.Resends < 6; }
+    if (c.SentUs) { s.ResentBytes += n; c.Resends += c.Resends < 3; }
     c.SentUs = now;
 }
 
@@ -699,7 +699,11 @@ void HostedClient::ReceiveLoop()
             got = true;
             if (h.Offset > Expected)
             {
-                if (Ahead.size() < 1024) Ahead[h.Offset].assign(p.begin() + sizeof(h), p.end());
+                // keep the longer copy (a re-sent chunk can arrive after the packet that carried it
+                // with the next one): the server may already know this client holds all of it
+                auto it = Ahead.find(h.Offset);
+                if (it != Ahead.end() ? it->second.size() < h.Len : Ahead.size() < 1024)
+                    Ahead[h.Offset].assign(p.begin() + sizeof(h), p.end());
                 continue;
             }
             Ahead[h.Offset].assign(p.begin() + sizeof(h), p.end());
