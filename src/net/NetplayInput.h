@@ -24,6 +24,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <utility>
@@ -34,6 +35,21 @@
 
 namespace melonDS
 {
+
+// Testing only: what a bad network does to received packets (fixed delay, random extra delay,
+// which also reorders them, and loss). Default: nothing.
+struct NetFaults
+{
+    int LatencyMs = 0, JitterMs = 0, LossPct = 0;
+    std::mt19937 Rng {12345};
+    // a packet received at nowUs is handed on at dueUs; false = lost
+    bool Deliver(u64 nowUs, u64& dueUs)
+    {
+        if (LossPct && (int)(Rng() % 100) < LossPct) return false;
+        dueUs = nowUs + (u64)LatencyMs * 1000 + (JitterMs ? Rng() % ((u64)JitterMs * 1000 + 1) : 0);
+        return true;
+    }
+};
 
 // One player's input for one emulated frame.
 struct NetplayFrameInput
@@ -60,8 +76,8 @@ public:
 
     // localPlayer: this device's player index; bindPort: local UDP port; peers: every other
     // player, (player, "ip:port"). latencyMs: artificial one-way delay added to received packets
-    // (testing only).
-    NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::vector<std::pair<int, std::string>>& peers, int latencyMs = 0);
+    // (testing only); faults: more of that (jitter, loss).
+    NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::vector<std::pair<int, std::string>>& peers, int latencyMs = 0, const NetFaults& faults = {});
     // Two players: the peer is the other one.
     NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::string& peer, int latencyMs = 0)
         : NetplayInput(localPlayer, delayFrames, bindPort, {{1 - localPlayer, peer}}, latencyMs) {}
@@ -94,7 +110,8 @@ private:
     static constexpr int kMaxPerPacket = 64;
     static constexpr int kResendMs = 10;
 
-    int Local, DelayFrames, LatencyMs;
+    int Local, DelayFrames;
+    NetFaults Faults;
     int Socket = -1;
     std::vector<int> Peers;                 // the other players
     u8 PeerAddr[kMaxPlayers][16] {};        // sockaddr_in, by player
@@ -132,6 +149,11 @@ struct NetplaySetup
     u64 RomId = 0;              // must match on every device
     std::vector<u8> Save;       // this player's save
     int Delay = 0;              // host: fixed input delay, 0 = from the measured round trips
+    bool Hosted = false;        // host: Hosted Netplay server (the guests' inputs only travel to the
+                                // host and back: delay from twice the slowest one-way time)
+    bool HostPlays = true;      // host: it is player 0 (else a dedicated server: NumPlayers guests,
+                                // player 0 among them)
+    bool Join = false;          // a guest even as player 0 (a Hosted Netplay replica of console 0)
     int TimeoutS = 60;          // how long to wait for the others
     // out
     std::vector<std::pair<int, std::string>> Peers;     // every other player: (player, "ip:port")

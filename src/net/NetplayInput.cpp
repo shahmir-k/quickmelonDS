@@ -83,9 +83,10 @@ static sockaddr_in ParseAddr(const std::string& ipPort)
     return a;
 }
 
-NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::vector<std::pair<int, std::string>>& peers, int latencyMs)
-    : Local(localPlayer), DelayFrames(delayFrames), LatencyMs(latencyMs)
+NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::vector<std::pair<int, std::string>>& peers, int latencyMs, const NetFaults& faults)
+    : Local(localPlayer), DelayFrames(delayFrames), Faults(faults)
 {
+    Faults.LatencyMs = latencyMs;
     for (int p = 0; p < kMaxPlayers; p++)
         PeerAck[p] = RemoteUpTo[p] = delayFrames - 1; // frames before Delay are never sent
 
@@ -214,7 +215,7 @@ NetplayFrameInput NetplayInput::Get(int player, int frame)
 
 void NetplayInput::ReceiveLoop()
 {
-    std::deque<std::pair<u64, std::vector<u8>>> pending; // artificial latency: (due time, packet)
+    std::multimap<u64, std::vector<u8>> pending; // artificial latency: (due time, packet)
     u8 buf[2048];
     u64 lastSend = 0;
     while (Running)
@@ -229,12 +230,13 @@ void NetplayInput::ReceiveLoop()
         ssize_t len = recv(Socket, buf, sizeof(buf), 0);
         u64 now = NowUs();
         if (len > 4 && IsPeer(buf[4])) LastPeerUs[buf[4]] = now; // both packet kinds: magic, player
-        if (len >= (ssize_t)sizeof(WireHeader))
-            pending.emplace_back(now + (u64)LatencyMs * 1000, std::vector<u8>(buf, buf + len));
+        u64 due;
+        if (len >= (ssize_t)sizeof(WireHeader) && Faults.Deliver(now, due))
+            pending.emplace(due, std::vector<u8>(buf, buf + len));
 
-        while (!pending.empty() && pending.front().first <= now)
+        while (!pending.empty() && pending.begin()->first <= now)
         {
-            std::vector<u8>& packet = pending.front().second;
+            std::vector<u8>& packet = pending.begin()->second;
             WireHash wh;
             if (packet.size() == sizeof(WireHash) && (memcpy(&wh, packet.data(), sizeof(wh)), wh.Magic == kHashMagic))
             {
@@ -245,7 +247,7 @@ void NetplayInput::ReceiveLoop()
                     hashes[wh.Frame] = wh.Hash;
                     while (hashes.size() > 64) hashes.erase(hashes.begin());
                 }
-                pending.pop_front();
+                pending.erase(pending.begin());
                 continue;
             }
             WireHeader header;
@@ -271,7 +273,7 @@ void NetplayInput::ReceiveLoop()
                 while (!Unacked.empty() && Unacked.front().first <= allAcked) Unacked.pop_front();
                 Changed.notify_all();
             }
-            pending.pop_front();
+            pending.erase(pending.begin());
         }
     }
     std::lock_guard<std::mutex> lk(Lock);
@@ -381,7 +383,8 @@ bool HostHandshake(NetplaySetup& s)
         return false;
     }
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(s.TimeoutS);
-    while ((int)guests.size() < s.NumPlayers - 1)
+    const int numGuests = s.NumPlayers - (s.HostPlays ? 1 : 0);
+    while ((int)guests.size() < numGuests)
     {
         int ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
         pollfd pf {ls, POLLIN, 0};
@@ -400,7 +403,7 @@ bool HostHandshake(NetplaySetup& s)
         g.Player = player;
         bool dup = false;
         for (Guest& o : guests) dup |= o.Player == g.Player;
-        if (!ok || g.Player == 0 || g.Player >= NetplayInput::kMaxPlayers || dup)
+        if (!ok || (g.Player == 0 && s.HostPlays) || g.Player >= NetplayInput::kMaxPlayers || dup)
         {
             AddLog(s.Log, "Netplay: rejected a connection from %s (player %d)", IpString(g.Ip).c_str(), g.Player);
             close(g.Fd);
@@ -410,9 +413,9 @@ bool HostHandshake(NetplaySetup& s)
         guests.push_back(std::move(g));
     }
     close(ls);
-    if ((int)guests.size() < s.NumPlayers - 1)
+    if ((int)guests.size() < numGuests)
     {
-        AddLog(s.Log, "Netplay: only %zu of %d other players connected", guests.size(), s.NumPlayers - 1);
+        AddLog(s.Log, "Netplay: only %zu of %d other players connected", guests.size(), numGuests);
         closeAll();
         return false;
     }
@@ -443,7 +446,7 @@ bool HostHandshake(NetplaySetup& s)
         std::vector<double> oneWay;
         for (Guest& g : guests) oneWay.push_back(g.OneWayMs);
         std::sort(oneWay.rbegin(), oneWay.rend());
-        double worst = oneWay[0] + (oneWay.size() > 1 ? oneWay[1] : 0);
+        double worst = s.Hosted ? 2 * oneWay[0] : oneWay[0] + (oneWay.size() > 1 ? oneWay[1] : 0);
         s.Delay = std::clamp((int)std::ceil(worst / (1000.0 / 60)) + 1, 1, 8);
         AddLog(s.Log, "Netplay: worst one way %.1f ms -> input delay %d frames", worst, s.Delay);
     }
@@ -459,8 +462,9 @@ bool HostHandshake(NetplaySetup& s)
     for (Guest& g : guests)
     {
         ok = ok && SendVal(g.Fd, kSetupMagic) && SendVal(g.Fd, status) && SendVal(g.Fd, (u8)s.Delay)
-                && SendVal(g.Fd, (u8)(guests.size() + 1))
-                && SendVal(g.Fd, (u8)0) && SendVal(g.Fd, (u32)0) && SendVal(g.Fd, (u16)s.Port) && SendBlob(g.Fd, s.Save);
+                && SendVal(g.Fd, (u8)(guests.size() + (s.HostPlays ? 1 : 0)));
+        if (s.HostPlays)
+            ok = ok && SendVal(g.Fd, (u8)0) && SendVal(g.Fd, (u32)0) && SendVal(g.Fd, (u16)s.Port) && SendBlob(g.Fd, s.Save);
         for (Guest& o : guests)
             ok = ok && SendVal(g.Fd, (u8)o.Player) && SendVal(g.Fd, o.Ip) && SendVal(g.Fd, o.Port)
                     && SendBlob(g.Fd, &o == &g ? std::vector<u8>() : o.Save);
@@ -547,7 +551,7 @@ bool NetplayHandshake(NetplaySetup& s)
 {
     s.Peers.clear();
     s.Saves.clear();
-    return s.Player == 0 ? HostHandshake(s) : GuestHandshake(s);
+    return s.Player == 0 && !s.Join ? HostHandshake(s) : GuestHandshake(s);
 }
 
 }

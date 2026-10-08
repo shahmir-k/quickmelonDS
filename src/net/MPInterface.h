@@ -51,6 +51,10 @@ public:
     static MPInterface& Get() { return *Current; }
     static MPInterfaceType GetType() { return CurrentType; }
     static void Set(MPInterfaceType type);
+#ifdef LITEV_HOSTED_NETPLAY
+    // installs a ready-made link (Hosted Netplay: RecordMP, ReplayMP)
+    static void Set(std::unique_ptr<MPInterface> mp, MPInterfaceType type) { Current = std::move(mp); CurrentType = type; }
+#endif
 
     [[nodiscard]] int GetRecvTimeout() const noexcept { return RecvTimeout; }
     void SetRecvTimeout(int timeout) noexcept { RecvTimeout = timeout; }

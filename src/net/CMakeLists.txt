@@ -13,6 +13,10 @@ add_library(net-utils STATIC
     MPInterface.cpp
 )
 
+if (LITEV_HOSTED_NETPLAY)
+    target_sources(net-utils PRIVATE HostedMP.cpp)
+endif()
+
 target_include_directories(net-utils PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_CURRENT_SOURCE_DIR}/..")
