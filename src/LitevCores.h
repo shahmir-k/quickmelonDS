@@ -423,6 +423,7 @@ inline void PinSelf(CoreRole r, int idx = -1)
 // other thread of the process -> Background. Re-reads the allowed set; drops exited tids.
 inline void Reassert(pid_t emuTid)
 {
+    static const bool distinct = Prop("debug.litev.tilepin", 0) != 0;
     const cpu_set_t allowed = Allowed();
     cpu_set_t set = MaskFor(CoreRole::Emu, -1, allowed);
     sched_setaffinity(emuTid, sizeof set, &set);
@@ -436,6 +437,9 @@ inline void Reassert(pid_t emuTid)
         if (tid <= 0 || tid == emuTid) continue;
         Entry en{tid, CoreRole::Background, -1};
         for (const Entry& x : reg) if (x.tid == tid) { en = x; live.push_back(x); break; }
+        // Tile workers start on distinct cores (PinSelf); the sweep re-masks them to the shared
+        // render mask unless debug.litev.tilepin=1 (= the old blanket sweep's steady state).
+        if (en.role == CoreRole::RenderParallel && !distinct) en.idx = -1;
         set = MaskFor(en.role, en.idx, allowed);
         sched_setaffinity(tid, sizeof set, &set);
     }
