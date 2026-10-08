@@ -221,27 +221,27 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
     args.JIT = std::nullopt;
 #endif
 
-    // LITEV_APP_MAC=AA:BB:CC:DD:EE:FF: console mpK built as the Android app builds Netplay player K's
-    // console (EmulatorArgsBuilder customizeFirmware with the default firmware settings, that device's
-    // internal MAC + the per-instance offsets; RTC pinned to 2026-01-01), so a Mac server matches an
-    // app guest. Without it the harness's own firmware/MAC/RTC (Mac-only sessions).
-    const char* appMac = getenv("LITEV_APP_MAC");
+    // LITEV_APP_FW=1: console mpK built as the Android app builds Netplay player K's console
+    // (netplayFixConfiguration + EmulatorArgsBuilder customizeFirmware: nickname "SereneDS", English,
+    // 1 Jan, colour 0, the generated firmware's MAC + the per-instance offsets; battery okay, RTC
+    // 2026-01-01, Reset before the cart is inserted), so a Mac server matches an app guest.
+    // Without it the harness's own firmware/MAC/RTC (Mac-only sessions).
+    const bool appMac = getenv("LITEV_APP_FW") != nullptr;
     if (appMac)
     {
         int k = cfg.instanceTag.rfind("mp", 0) == 0 ? atoi(cfg.instanceTag.c_str() + 2) : 0;
         auto& u = args.Firmware.GetEffectiveUserData();
-        const std::u16string name = u"Player", msg = u"Hello!";
+        const std::u16string name = u"SereneDS";
         u.NameLength = (u16)name.size(); memcpy(u.Nickname, name.data(), name.size() * 2);
-        u.MessageLength = (u16)msg.size(); memcpy(u.Message, msg.data(), msg.size() * 2);
         u.Settings &= ~Firmware::Language::Reserved; u.Settings |= Firmware::Language::English;
         u.FavoriteColor = 0; u.BirthdayMonth = 1; u.BirthdayDay = 1;
-        unsigned m[6];
-        if (sscanf(appMac, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) { err = "bad LITEV_APP_MAC"; return false; }
         auto& h = args.Firmware.GetHeader();
-        for (int i = 0; i < 6; i++) h.MacAddr[i] = (u8)m[i];
-        h.MacAddr[3] += k; h.MacAddr[4] += k * 0x44; h.MacAddr[5] += k * 0x10;
-        h.MacAddr[0] &= 0xFC;
-        h.UpdateChecksum();
+        if (k > 0)
+        {
+            h.MacAddr[3] += k; h.MacAddr[4] += k * 0x44; h.MacAddr[5] += k * 0x10;
+            h.MacAddr[0] &= 0xFC;
+            h.UpdateChecksum();
+        }
         args.Firmware.UpdateChecksums();
     }
 
@@ -991,7 +991,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         }
         b[k].udata->instanceID = k;
         // Distinct MAC per instance so they associate as different wireless players.
-        if (k && !getenv("LITEV_APP_MAC"))
+        if (k && !getenv("LITEV_APP_FW"))
         {
             Firmware& fw = b[k].nds->GetFirmware();
             fw.GetHeader().MacAddr[5] ^= (u8)k;
@@ -1223,7 +1223,7 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
     std::string err;
     if (!BuildAndBoot(c, true, b, err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
     b.udata->instanceID = k;
-    if (k && !getenv("LITEV_APP_MAC"))
+    if (k && !getenv("LITEV_APP_FW"))
     {
         Firmware& fw = b.nds->GetFirmware();
         fw.GetHeader().MacAddr[5] ^= (u8)k;
