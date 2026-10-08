@@ -105,6 +105,10 @@ HybridRenderer::~HybridRenderer()
     glDeleteFramebuffers(2, OutFB);
     if (PresentFB) glDeleteFramebuffers(1, &PresentFB);
     glDeleteFramebuffers(1, &ReadFB);
+#ifdef LITEV_HYB_CAPTURE_ASYNC
+    glDeleteBuffers(2, CapPBO);
+    for (GLsync& f : CapFence) if (f) { glDeleteSync(f); f = nullptr; }
+#endif
     glDeleteFramebuffers(1, &DownFB);
     glDeleteTextures(1, &DownTex);
 }
@@ -267,8 +271,64 @@ int HybridRenderer::HybridCurrentTag()
 // Emu thread, VBlank of a capture frame: the frame's 3D (latest ring entry) at 1x in the
 // software 3D line format (6-bit RGB, 5-bit alpha in bits 24-28). Synchronous; the 3D was
 // submitted at the previous VCount 215, so the wait is short.
+#ifdef LITEV_HYB_CAPTURE_ASYNC
+void HybridRenderer::CapKick(int pbo)
+{
+    Sync3D(GL3D()->GetCurColor());   // GPU-side wait only, once the 3D thread submitted it
+    GLuint tex = GL3D()->GetColorTex(GL3D()->GetCurColor());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, ReadFB);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glDisable(GL_SCISSOR_TEST);
+    if (Scale > 1)
+    {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, DownFB);
+        glBlitFramebuffer(0, 0, 256 * Scale, 192 * Scale, 0, 0, 256, 192, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, DownFB);
+    }
+    if (!CapPBO[pbo])
+    {
+        glGenBuffers(1, &CapPBO[pbo]);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, CapPBO[pbo]);
+        glBufferData(GL_PIXEL_PACK_BUFFER, 256 * 192 * 4, nullptr, GL_STREAM_READ);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, CapPBO[pbo]);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (CapFence[pbo]) glDeleteSync(CapFence[pbo]);
+    CapFence[pbo] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+}
+#endif
+
 void HybridRenderer::HybridReadback3D(u32* dst)
 {
+#ifdef LITEV_HYB_CAPTURE_ASYNC
+    {
+        double t0 = HybNowMs();
+        const u32 frame = GPU.NDS.NumFrames;
+        // the read started on the previous frame (else a capture run just began: start and
+        // wait for this frame's own, once)
+        int use = CapNext ^ 1;
+        const bool prev = CapPendFrame + 1 == frame && CapFence[use];
+        CapKick(CapNext);
+        if (!prev) use = CapNext;
+        glClientWaitSync(CapFence[use], GL_SYNC_FLUSH_COMMANDS_BIT, 100000000);   // done by now on a run
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, CapPBO[use]);
+        if (const u8* p = (const u8*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 256 * 192 * 4, GL_MAP_READ_BIT))
+        {
+            CapConvert(p, dst);
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        CapPendFrame = frame;
+        CapNext ^= 1;
+        ProfReadback += HybNowMs() - t0;
+        return;
+    }
+#endif
+
     double t0 = HybNowMs();
     Sync3D(GL3D()->GetCurColor());
     GLuint tex = GL3D()->GetColorTex(GL3D()->GetCurColor());
@@ -286,9 +346,21 @@ void HybridRenderer::HybridReadback3D(u32* dst)
     glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, ReadBuf);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
+#ifdef LITEV_HYB_CAPTURE_ASYNC
+    CapConvert(ReadBuf, dst);
+    ProfReadback += HybNowMs() - t0;
+}
+
+void HybridRenderer::CapConvert(const u8* src, u32* dst)
+{
+#endif
     for (int i = 0; i < 256 * 192; i++)
     {
+#ifdef LITEV_HYB_CAPTURE_ASYNC
+        const u8* p = &src[i * 4];
+#else
         const u8* p = &ReadBuf[i * 4];
+#endif
 #ifdef __ANDROID__
         u32 r = p[2], g = p[1], b = p[0];   // the GLES 3D pass emits BGRA (3DRenderFS)
 #else
@@ -298,7 +370,9 @@ void HybridRenderer::HybridReadback3D(u32* dst)
         dst[i] = ((r * 63 + 127) / 255) | (((g * 63 + 127) / 255) << 8) |
                  (((b * 63 + 127) / 255) << 16) | (((a * 31 + 127) / 255) << 24);
     }
+#ifndef LITEV_HYB_CAPTURE_ASYNC
     ProfReadback += HybNowMs() - t0;
+#endif
 }
 
 // Emu thread, after RunFrame: upload the last completed 2D frame's descriptors and

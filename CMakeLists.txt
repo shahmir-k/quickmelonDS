@@ -804,6 +804,10 @@ endif()
 # (547/frame) by ~N x. Sample generation is bit-identical per iteration; only
 # scheduler granularity + SPU-IRQ/capture latency coarsen (FPS-first). N is the
 # batch factor (default 8 -> 547/frame -> ~68/frame). Default OFF.
+option(LITEV_HYB_CAPTURE_ASYNC "Hybrid renderer: display capture reads its 3D back asynchronously (PBO), one frame late, instead of stalling the emu thread on the GPU" OFF)
+if (LITEV_HYB_CAPTURE_ASYNC)
+    add_compile_definitions(LITEV_HYB_CAPTURE_ASYNC=1)
+endif()
 option(LITEV_SKIP_REPEAT_FRAMES "Display-only: skip 2D drawing + present of frames whose 3D repeats the previous frame while a game draws 3D at 30 Hz (runtime: GPU.SkipRepeatEnabled)" OFF)
 if (LITEV_SKIP_REPEAT_FRAMES)
     add_compile_definitions(LITEV_SKIP_REPEAT_FRAMES=1)

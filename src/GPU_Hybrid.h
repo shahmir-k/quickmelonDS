@@ -102,6 +102,16 @@ private:
     int OutIdx = 0;
     GLuint ReadFB = 0, DownFB = 0, DownTex = 0;   // capture readback at 1x
     u8 ReadBuf[256 * 192 * 4];
+#ifdef LITEV_HYB_CAPTURE_ASYNC
+    // capture readback without a GPU stall: each capture frame starts its 3D's read into a
+    // PBO and uses the one started on the previous frame (capture 3D one frame late)
+    GLuint CapPBO[2] {};
+    GLsync CapFence[2] {};
+    int CapNext = 0;
+    u32 CapPendFrame = ~0u;          // NumFrames of the read pending in CapPBO[CapNext ^ 1]
+    void CapKick(int pbo);
+    void CapConvert(const u8* src, u32* dst);
+#endif
     // emu-thread CPU time per 60 frames (logged as LITEV_HYB)
     double ProfGL3D = 0, ProfWait = 0, ProfMerge = 0, ProfUpload = 0, ProfSync = 0, ProfDraw = 0, ProfReadback = 0;
     int ProfFrames = 0;
