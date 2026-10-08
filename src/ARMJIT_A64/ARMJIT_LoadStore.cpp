@@ -343,10 +343,16 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
             }
             else
             {
+#ifdef LITEV_JIT_ARM7_CPUARG
                 MOV(X1, RCPU);
+#endif
                 if (flags & memop_Store)
                 {
+#ifdef LITEV_JIT_ARM7_CPUARG
                     MOV(W2, rdMapped);
+#else
+                    MOV(W1, rdMapped);
+#endif
                     switch (size | NDS.ConsoleType)
                     {
                     case 32: QuickCallFunction(X3, SlowWrite7<u32, 0>); break;

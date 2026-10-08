@@ -342,11 +342,22 @@ void Compiler::Comp_MemAccess(int rd, int rn, const Op2& op2, int size, int flag
             }
             else
             {
+#ifdef LITEV_JIT_ARM7_CPUARG
+                // (addr, cpu, val) like the ARM9 path above
+                if (flags & memop_Store)
+                    MOV(32, R(ABI_PARAM3), rdMapped);
+                MOV(64, R(ABI_PARAM2), R(RCPU));
+                if (ABI_PARAM1 != RSCRATCH3)
+                    MOV(32, R(ABI_PARAM1), R(RSCRATCH3));
+                if (flags & memop_Store)
+                {
+#else
                 if (ABI_PARAM1 != RSCRATCH3)
                     MOV(32, R(ABI_PARAM1), R(RSCRATCH3));
                 if (flags & memop_Store)
                 {
                     MOV(32, R(ABI_PARAM2), rdMapped);
+#endif
 
                     switch (size | NDS.ConsoleType)
                     {

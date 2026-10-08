@@ -910,7 +910,7 @@ void SPU::Mix(u32 spucycles)
 
         // A console nobody hears (Netplay's other players): the mix only feeds the speakers,
         // unless sound capture records it into memory, so skip it.
-        if (Silent && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7)) && NDS.ConsoleType == 0)
+        if (LITEV_HEADLESS(Silent) && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7)) && NDS.ConsoleType == 0)
         {
             NDS.Mic.Advance(spucycles << 1);
             goto mixed;

@@ -1434,7 +1434,7 @@ void GPU3D::SubmitPolygon() noexcept
 
         // hi-res positions
         // to consider: only do this when using the GL renderer? apply the aforementioned quirk to this?
-        if (w != 0 && !Headless)   // (two 64-bit divides per vertex, only for the hi-res renderer)
+        if (w != 0 && !LITEV_HEADLESS(Headless))   // (two 64-bit divides per vertex, only for the hi-res renderer)
         {
             posX = ((((s64)(vtx->Position[0] + w) * Viewport[4]) << 4) / (((s64)w) << 1)) + (Viewport[0] << 4);
             posY = ((((s64)(-vtx->Position[1] + w) * Viewport[5]) << 4) / (((s64)w) << 1)) + (Viewport[3] << 4);
@@ -1550,7 +1550,7 @@ void GPU3D::SubmitPolygon() noexcept
         NumVertices++;
         poly->NumVertices++;
 
-        if (Headless) continue;  // colours below only feed rendering
+        if (LITEV_HEADLESS(Headless)) continue;  // colours below only feed rendering
         vtx->FinalColor[0] = vtx->Color[0] >> 12;
         if (vtx->FinalColor[0]) vtx->FinalColor[0] = ((vtx->FinalColor[0] << 4) + 0xF);
         vtx->FinalColor[1] = vtx->Color[1] >> 12;
@@ -1561,7 +1561,7 @@ void GPU3D::SubmitPolygon() noexcept
 
     // A console nobody watches stops here: bounds, sort key and per-vertex depth (a 64-bit
     // divide each) only feed rendering. Counts, clipping and strip linking above are emulated.
-    if (Headless)
+    if (LITEV_HEADLESS(Headless))
     {
         LastStripPolygon = (PolygonMode >= 2) ? poly : NULL;
         return;
@@ -1770,7 +1770,7 @@ void GPU3D::CalculateLighting() noexcept
 {
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LightingCalls);
 
-    if (Headless)
+    if (LITEV_HEADLESS(Headless))
     {
         s32 c = __builtin_popcount(CurPolygonAttr & 0xF);
         NormalPipeline = 7;
@@ -3453,7 +3453,7 @@ void GPU3D::VBlank() noexcept
     {
         // a console nobody watches skips preparing the frame for the renderer (polygon sort,
         // Render* copies): only the renderer reads that state
-        if (RenderingEnabled && !Headless)
+        if (RenderingEnabled && !LITEV_HEADLESS(Headless))
         {
 #ifdef LITEV_SOFT3D_ASYNC
         // LITEV_SOFT3D_ASYNC: if this VBlank changes nothing the renderer reads, skip

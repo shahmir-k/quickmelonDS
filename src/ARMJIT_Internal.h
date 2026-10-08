@@ -97,8 +97,17 @@ inline bool PageContainsCode(const AddressRange* range, u32 pageSize)
 
 template <typename T, int ConsoleType> T SlowRead9(u32 addr, ARMv5* cpu);
 template <typename T, int ConsoleType> void SlowWrite9(u32 addr, ARMv5* cpu, u32 val);
-template <typename T, int ConsoleType> T SlowRead7(u32 addr, ARM* cpu);
-template <typename T, int ConsoleType> void SlowWrite7(u32 addr, ARM* cpu, u32 val);
+// LITEV_JIT_ARM7_CPUARG: the ARM7 slow helpers take the CPU like the ARM9 ones (W0=addr, X1=cpu,
+// W2=val) instead of reading thread_local NDS::Current. Off: (addr) / (addr, val).
+#ifdef LITEV_JIT_ARM7_CPUARG
+#define ARM7_SLOW_CPU_PARAM , ARM* cpu
+#define ARM7_SLOW_NDS (cpu->NDS)
+#else
+#define ARM7_SLOW_CPU_PARAM
+#define ARM7_SLOW_NDS (*NDS::Current)
+#endif
+template <typename T, int ConsoleType> T SlowRead7(u32 addr ARM7_SLOW_CPU_PARAM);
+template <typename T, int ConsoleType> void SlowWrite7(u32 addr ARM7_SLOW_CPU_PARAM, u32 val);
 
 template <bool Write, int ConsoleType> void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu);
 template <bool Write, int ConsoleType> void SlowBlockTransfer7(u32 addr, u64* data, u32 num);

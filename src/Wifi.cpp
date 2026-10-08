@@ -1140,6 +1140,9 @@ bool Wifi::ProcessTX(TXSlot* slot, int num)
                 // console waits on it (with Netplay, a thread hand-off per CMD)
                 MPReplyTS = USTimestamp;
                 MPRepliesPending = MPClientMask != 0;
+#ifndef LITEV_MP_REPLY_DEFER
+                CollectMPReplies();   // off: collect when the CMD ends
+#endif
 #ifdef LITEV_LAN_STATS
                 if (MPT.tCmdSent) { MPT.cmdToReplySum += MPNowUs() - MPT.tCmdSent; MPT.nCmdToReply++; MPT.tCmdSent = 0; }
                 // measurement: the host's MP CMD parameters, as the game programs them

@@ -36,6 +36,14 @@ typedef int64_t     s64;
 template<class T, std::size_t A, std::size_t B>
 using array2d = std::array<std::array<T, B>, A>;
 
+// LITEV_NETPLAY_HEADLESS: GPU::Headless / GPU3D::Headless / SPU::Silent (a Netplay console nobody
+// watches or hears) skip render/audio-only work. Off: the members exist but are ignored.
+#ifdef LITEV_NETPLAY_HEADLESS
+#define LITEV_HEADLESS(x) (x)
+#else
+#define LITEV_HEADLESS(x) false
+#endif
+
 #ifdef _MSC_VER
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp

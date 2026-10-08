@@ -90,7 +90,11 @@ private:
     static constexpr u64 kDelay = 33514 * 4; // 4 ms in system clock cycles (33.514 MHz)
     // host frames (CMD/ACK) reach the clients this much later; < kDelay, or a reply sent on time
     // would land past the host's deadline
+#ifdef LITEV_MP_HOSTDELAY
     static constexpr u64 kHostDelay = 33514 * 2;
+#else
+    static constexpr u64 kHostDelay = 0;   // host frames delivered immediately
+#endif
 
     struct Packet
     {

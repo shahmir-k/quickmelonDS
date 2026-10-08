@@ -241,7 +241,9 @@ int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
     // (> kHostDelay), and anything it sent before that is visible to us by then.
     while (!FromHost[inst].empty() && FromHost[inst].front().Time < BeginTime[inst]) FromHost[inst].pop_front();
     u64 now = Now(inst);
+#ifdef LITEV_MP_HOSTDELAY
     if (now < kHostDelay) return 0;
+#endif
     u64 visible = now - kHostDelay;
     Log(inst, "RecvHostWait", HostID, visible);
     WaitFor(lk, [&] {
@@ -257,8 +259,12 @@ int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
     if (St.On > 0 && p.Type == 1 && St.T0 && !St.T1) St.T1 = NowNs();
     int len = (int)p.Data.size();
     if (len) memcpy(data, p.Data.data(), len);
+#ifdef LITEV_MP_HOSTDELAY
     // advanced by the delay, as for regular frames (the client syncs its Wi-Fi clock to it)
     if (timestamp) *timestamp = p.Timestamp + (now - p.Time) * 1000000 / 33513982;
+#else
+    if (timestamp) *timestamp = p.Timestamp;
+#endif
     Log(inst, "RecvHost", len, p.Time);
     return len;
 }

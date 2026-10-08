@@ -580,7 +580,7 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
 {
     LastLineHas3D = true;
     const u32 blendCnt = GPU2D.BlendCnt;
-#if defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
+#if defined(LITEV_HYB_COMPOSITE_NEON) && defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
     // The two ColorComposite calls most pixels need, a whole line at a time with the bit-exact
     // NEON compositor (Under3D[0] and [1] are contiguous like BGOBJLine's two halves).
     alignas(16) u32 ccTop[256], ccUnder[256];
