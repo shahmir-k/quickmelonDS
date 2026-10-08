@@ -1161,6 +1161,10 @@ void GPU::StartFrame() noexcept
     if (CaptureCnt & (1u << 31)) { CaptureSeen = true; GPU3D.Headless = false; }
     if (LITEV_HEADLESS(Headless))
         SkipThisFrame = !CaptureSeen;
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+    SkipRepeat = NextSkipRepeat;
+    NextSkipRepeat = false;
+#endif
 #endif
 
     TotalScanlines = 0;
@@ -1184,7 +1188,11 @@ void GPU::StartHBlank(u32 line) noexcept
         // note: this should start 48 cycles after the scanline start
         // (CheckDMAs below always runs; only the renderer draw calls are gated)
 #ifdef LITEV_AGGRESSIVE_SKIP
-        if (!SkipThisFrame && !(DiagNoDraw & 1))
+        if (!SkipThisFrame && !(DiagNoDraw & 1)
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+            && !SkipRepeat
+#endif
+            )
 #endif
         {
             if (line < 192)
@@ -1204,9 +1212,19 @@ void GPU::StartHBlank(u32 line) noexcept
     }
     else if (VCount == 262)
     {
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+        // RenderFrameIdentical (set at this frame's VBlank): next frame's 3D repeats this one's
+        const bool repeat = GPU3D.RenderFrameIdentical;
+        NextSkipRepeat = SkipRepeatEnabled && repeat && !LastRepeat3D && !CaptureSeen && !LITEV_HEADLESS(Headless);
+        LastRepeat3D = repeat;
+#endif
         // sprites are pre-rendered one scanline in advance
 #ifdef LITEV_AGGRESSIVE_SKIP
-        if (!SkipThisFrame)
+        if (!SkipThisFrame
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+            && !NextSkipRepeat
+#endif
+            )
 #endif
         {
             Rend->DrawSprites(0);

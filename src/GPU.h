@@ -640,6 +640,17 @@ public:
     bool CaptureSeen = false;
     int DiagNoDraw = 0;         // TEMP diagnostic: bit0 skip 2D drawing, bit1 skip 3D rendering   // the game has used display capture (Netplay then renders identically everywhere)
 
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+    // Display-only: while a game draws 3D at 30 Hz (new 3D every other frame), skip the 2D
+    // drawing and the present of each frame whose 3D repeats the previous frame's; the screen
+    // keeps the previous frame (only 2D changes on that frame show one frame late). Never on a
+    // headless console or once the game has used display capture (drawn pixels then reach VRAM).
+    bool SkipRepeatEnabled = false;
+    bool SkipRepeat = false;         // this frame (valid until the next frame starts)
+    bool NextSkipRepeat = false;     // decided at line 262, before the next frame's line-0 sprites
+    bool LastRepeat3D = false;
+#endif
+
     void SetFrameskipTarget(int target) noexcept
     {
         if (target < 0) target = 0;

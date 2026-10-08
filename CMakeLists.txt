@@ -804,6 +804,10 @@ endif()
 # (547/frame) by ~N x. Sample generation is bit-identical per iteration; only
 # scheduler granularity + SPU-IRQ/capture latency coarsen (FPS-first). N is the
 # batch factor (default 8 -> 547/frame -> ~68/frame). Default OFF.
+option(LITEV_SKIP_REPEAT_FRAMES "Display-only: skip 2D drawing + present of frames whose 3D repeats the previous frame while a game draws 3D at 30 Hz (runtime: GPU.SkipRepeatEnabled)" OFF)
+if (LITEV_SKIP_REPEAT_FRAMES)
+    add_compile_definitions(LITEV_SKIP_REPEAT_FRAMES=1)
+endif()
 option(LITEV_WIFI_BATCH "Up to LITEV_WIFI_BATCH_N 8us Wi-Fi ticks per Event_Wifi while the Wi-Fi hardware is idle (Category B, deterministic)" OFF)
 set(LITEV_WIFI_BATCH_N "4" CACHE STRING "Wi-Fi ticks per event while idle")
 if (LITEV_WIFI_BATCH)

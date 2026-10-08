@@ -681,6 +681,13 @@ int MPTest(const TraceRunConfig& cfg, int frames,
         b1.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b1.nds->GPU));
         printf("instance 1: renderer off\n");
     }
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+    if (getenv("LITEV_MP_SKIPREPEAT0"))
+    {
+        b0.nds->GPU.SkipRepeatEnabled = true;   // display-only: must not change any hash
+        printf("instance 0: skip repeated-3D frames\n");
+    }
+#endif
     if (getenv("LITEV_MP_SILENT1"))
     {
         b1.nds->SPU.Silent = true;  // what Netplay does to the other player's console
