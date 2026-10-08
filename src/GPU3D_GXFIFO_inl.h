@@ -44,6 +44,11 @@ __attribute__((always_inline)) inline void GPU3D::CmdFIFOWrite_Inline(const CmdF
         if (FifoN >= 256)
         {
             // store it to the stall queue. stall the system.
+            // The JIT honours a GX stall only at block end, so one block can keep
+            // writing past the 64-entry stall queue (Sims 3 in-game: ~90). FIFO::Write
+            // would drop the entry and desync the command stream (lost MTX_MULT params
+            // -> garbage projection -> no 3D). Run the geometry engine ahead instead.
+            while (CmdStallQueue.IsFull() && !PipeEmpty()) ExecuteCommand();
             CmdStallQueue.Write(entry);
             NDS.GXFIFOStall();
             return;
@@ -62,6 +67,11 @@ __attribute__((always_inline)) inline void GPU3D::CmdFIFOWrite_Inline(const CmdF
         if (CmdFIFO.IsFull())
         {
             // store it to the stall queue. stall the system.
+            // The JIT honours a GX stall only at block end, so one block can keep
+            // writing past the 64-entry stall queue (Sims 3 in-game: ~90). FIFO::Write
+            // would drop the entry and desync the command stream (lost MTX_MULT params
+            // -> garbage projection -> no 3D). Run the geometry engine ahead instead.
+            while (CmdStallQueue.IsFull() && !PipeEmpty()) ExecuteCommand();
             CmdStallQueue.Write(entry);
             NDS.GXFIFOStall();
             return;

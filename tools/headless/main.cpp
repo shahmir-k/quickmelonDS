@@ -456,6 +456,12 @@ int main(int argc, char** argv)
         nds->GPU.GetRenderer().SetRenderSettings(rs);
     }
     nds->SetNDSCart(std::move(cart));
+    if (const char* sav = getenv("LITEV_HEADLESS_SAV"))   // game save (.sav) to boot with
+    {
+        u32 savlen = 0;
+        if (auto s = ReadFile(sav, savlen)) nds->SetNDSSave(s.get(), savlen);
+        else fprintf(stderr, "warning: cannot read save '%s'\n", sav);
+    }
     nds->Reset();
 
     // Direct boot so no external firmware boot menu / BIOS files are needed.
