@@ -418,7 +418,7 @@ HostedServer::HostedServer(int bindPort, const NetFaults& faults) : Faults(fault
 HostedServer::~HostedServer()
 {
     if (Socket < 0) return;
-    for (u64 start = NowUs(); NowUs() - start < 10000000; )
+    for (u64 start = NowUs(); NowUs() - start < (u64)DrainMs * 1000; )
     {
         bool all = true;
         {

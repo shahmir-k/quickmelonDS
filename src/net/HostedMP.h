@@ -178,9 +178,10 @@ class HostedServer
 {
 public:
     HostedServer(int bindPort, const NetFaults& faults = {});
-    // waits (up to 10 s) until every client has its whole stream
+    // waits (up to DrainMs) until every client has its whole stream
     ~HostedServer();
     bool Ok() const { return Socket >= 0; }
+    int DrainMs = 10000;    // how long the destructor waits for the clients
     // append to console's stream and send it
     void Push(int console, const u8* data, size_t len);
 
