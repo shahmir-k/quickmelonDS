@@ -47,6 +47,13 @@
 #include <chrono>
 #include <time.h>
 #endif
+#ifdef LITEV_LAN_RX_SPIN
+#include <chrono>
+#include <stdlib.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+#endif
 
 
 namespace melonDS
@@ -834,6 +841,7 @@ void LAN::ProcessEvent(ENetEvent& event)
 // 0 = per-frame processing of events and eventual misc. frame
 // 1 = checking if a misc. frame has arrived
 // 2 = waiting for a MP frame
+// 3 = checking if a MP frame has arrived (2 without blocking; LITEV_LAN_RX_SPIN)
 void LAN::ProcessLAN(int type)
 {
     if (!Host) return;
@@ -858,7 +866,7 @@ void LAN::ProcessLAN(int type)
         else
         {
             // we got a packet, depending on what the caller wants we might be able to return now
-            if (type == 2) return;
+            if (type >= 2) return;
             if (type == 1)
             {
                 // if looking for a misc. frame, we shouldn't be receiving a MP frame
@@ -1115,6 +1123,26 @@ int LAN::SendAck(int inst, u8* packet, int len, u64 timestamp)
     return SendPacketGeneric(3, packet, len, timestamp);
 }
 
+#ifdef LITEV_LAN_RX_SPIN
+// LAN latency: a client blocked at its sync point sleeps in poll() (inside enet_host_service) until
+// the host's CMD arrives, and waking a sleeping core costs a scheduler/cpuidle round trip. Polling
+// the socket without blocking for a short while first keeps the thread awake while the frame is
+// expected; after that it falls back to the normal blocking wait, so a long wait does not burn CPU.
+// Only the client's host-frame wait spins (the host's reply wait does not). Spin length in us:
+// prop debug.litev.lanspin (Android) / env LITEV_LAN_RX_SPIN_US, read once; default 2000, 0 = off.
+static int LanSpinUs()
+{
+    const char* v = nullptr;
+#ifdef __ANDROID__
+    static char b[PROP_VALUE_MAX];
+    if (__system_property_get("debug.litev.lanspin", b) > 0) v = b;
+#else
+    v = getenv("LITEV_LAN_RX_SPIN_US");
+#endif
+    return v ? atoi(v) : 2000;
+}
+#endif
+
 int LAN::RecvHostPacket(int inst, u8* packet, u64* timestamp)
 {
     if (LastHostID != -1)
@@ -1124,6 +1152,22 @@ int LAN::RecvHostPacket(int inst, u8* packet, u64* timestamp)
         if (!(ConnectedBitmask & (1<<LastHostID)))
             return -1;
     }
+
+#ifdef LITEV_LAN_RX_SPIN
+    static const int spinUs = LanSpinUs();
+    if (spinUs > 0 && RXQueue.empty())
+    {
+        auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(spinUs);
+        do
+        {
+            // poll(0) on the socket; ENet itself only runs once a datagram is there
+            enet_uint32 cond = ENET_SOCKET_WAIT_RECEIVE;
+            if (enet_socket_wait(Host->socket, &cond, 0) == 0 && (cond & ENET_SOCKET_WAIT_RECEIVE))
+                ProcessLAN(3);
+        }
+        while (RXQueue.empty() && std::chrono::steady_clock::now() < end);
+    }
+#endif
 
 #ifdef LITEV_LAN_STATS
     u64 t0 = LanNowUs();
