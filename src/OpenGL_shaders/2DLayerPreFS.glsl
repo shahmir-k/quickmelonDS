@@ -224,6 +224,12 @@ vec4 GetBGLayerPixel(int layer, ivec2 coord)
         ret.g = float((col >> 4) & 0x3E) / 63.0;
         ret.b = float((col >> 9) & 0x3E) / 63.0;
         ret.a = float(col >> 15);
+#ifdef GL_ES
+        // GLES: palettes are uploaded as 5_5_5_1 (GLES_Compat), which puts DS red in .b; the
+        // rest of the GLES pipeline (and the app's .bgr present) relies on that order, so a
+        // colour decoded here from a raw 15-bit value must use it too
+        ret.rgb = ret.bgr;
+#endif
     }
 
     return ret;

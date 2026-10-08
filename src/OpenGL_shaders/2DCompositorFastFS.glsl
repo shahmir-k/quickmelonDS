@@ -81,6 +81,12 @@ ivec3 ConvertColor(int col)
     ret.r = (col & 0x1F) << 1;
     ret.g = ((col & 0x3E0) >> 4) | (col >> 15);
     ret.b = (col & 0x7C00) >> 9;
+#ifdef GL_ES
+    // GLES: palettes are uploaded as 5_5_5_1 (GLES_Compat), which puts DS red in .b; the
+    // rest of the GLES pipeline (and the app's .bgr present) relies on that order, so a
+    // colour decoded here from a raw 15-bit value must use it too
+    ret = ret.bgr;
+#endif
     return ret;
 }
 
