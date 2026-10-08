@@ -69,6 +69,7 @@ void MPInterface::Set(MPInterfaceType type)
     }
 
     CurrentType = type;
+    LinkDelaysRegularFrames = type == MPInterface_Netplay;
 }
 
 }

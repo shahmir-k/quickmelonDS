@@ -457,6 +457,7 @@ std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len)
     // path while a console still holds the old one would be missed. Hash the file if that matters.
     std::string key = path + '\0' + std::to_string(len);
     std::lock_guard<std::recursive_mutex> lock(SharedROMLock);
+#ifdef LITEV_ROM_SHARE
     for (auto it = SharedROMs.begin(); it != SharedROMs.end();)
         it = it->second.buf.expired() ? SharedROMs.erase(it) : std::next(it);
 
@@ -465,6 +466,7 @@ std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len)
     {
         if (auto buf = it->second.buf.lock()) { Platform::CloseFile(f); return buf; }
     }
+#endif
 
     u32 padded = 1;
     while (padded < len) padded <<= 1;
@@ -476,7 +478,9 @@ std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len)
     memset(data.get() + len, 0, padded - len);
 
     std::shared_ptr<const u8[]> buf(std::move(data));
+#ifdef LITEV_ROM_SHARE
     SharedROMs[key] = {buf.get(), buf};
+#endif
     return buf;
 }
 

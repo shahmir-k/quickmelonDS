@@ -22,6 +22,7 @@
 #include "NDS.h"
 #include "SPI.h"
 #include "Wifi.h"
+#include "MPLinkFlags.h"
 #include "WifiAP.h"
 #include "Platform.h"
 #ifdef LITEV_LAN_STATS
@@ -2176,7 +2177,7 @@ void Wifi::USTick()
             // they reach it late (Netplay delivers them kDelay after they were sent), and a beacon
             // taken between a CMD and its ACK delayed the ACK and the client dropped out of the
             // session, Mario Kart DS with 6+ consoles)
-            if ((!IsMPClient) || (USTimestamp > NextSync && !MPInExchange))
+            if ((!IsMPClient) || (USTimestamp > NextSync && !(LinkDelaysRegularFrames && MPInExchange)))
             {
                 if ((!(RXCounter & 0x1FF & kTimeCheckMask)) && (!ComStatus))
                 {

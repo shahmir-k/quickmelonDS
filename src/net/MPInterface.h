@@ -21,6 +21,7 @@
 
 #include <memory>
 #include "types.h"
+#include "../MPLinkFlags.h"
 
 namespace melonDS
 {
@@ -53,7 +54,7 @@ public:
     static void Set(MPInterfaceType type);
 #ifdef LITEV_HOSTED_NETPLAY
     // installs a ready-made link (Hosted Netplay: RecordMP, ReplayMP)
-    static void Set(std::unique_ptr<MPInterface> mp, MPInterfaceType type) { Current = std::move(mp); CurrentType = type; }
+    static void Set(std::unique_ptr<MPInterface> mp, MPInterfaceType type) { Current = std::move(mp); CurrentType = type; LinkDelaysRegularFrames = type == MPInterface_Netplay; }
 #endif
 
     [[nodiscard]] int GetRecvTimeout() const noexcept { return RecvTimeout; }
