@@ -44,3 +44,10 @@ else()
     fix_interface_includes(PkgConfig::ENet)
     target_link_libraries(net-utils PUBLIC PkgConfig::ENet)
 endif()
+
+# The Android app adds net-utils from its own directory scope and net-utils does not link core,
+# so it missed every LITEV_* directory definition (shipping LockstepMP ran kHostDelay 0, LAN.cpp
+# without LITEV_LAN_RX_SPIN). Take the same definitions core exports to its dependents.
+if (TARGET core)
+    target_compile_definitions(net-utils PRIVATE $<TARGET_PROPERTY:core,INTERFACE_COMPILE_DEFINITIONS>)
+endif()
