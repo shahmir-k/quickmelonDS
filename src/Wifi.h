@@ -280,6 +280,15 @@ private:
     void FireTX();
     void SendMPDefaultReply();
     void SendMPReply(u16 clienttime, u16 clientmask);
+#ifdef LITEV_LAN_EARLY_REPLY
+    // client: the MP reply sent on the network as soon as the CMD is picked up (see SendEarlyMPReply)
+    u8 EarlyReply[0x2000];
+    int EarlyReplyLen = -1;  // -1 = none pending
+    u16 EarlyReplyAID;
+    u64 EarlyReplyTS;
+    void SendEarlyMPReply(u16 clienttime, u16 clientmask, u64 timestamp);
+    int SendLateMPReply(u8* data, int len, u16 aid);
+#endif
     void SendMPAck(u16 cmdcount, u16 clientfail);
     bool ProcessTX(TXSlot* slot, int num);
 

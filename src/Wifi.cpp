@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "NDS.h"
 #include "SPI.h"
 #include "Wifi.h"
@@ -258,6 +259,9 @@ void Wifi::Reset()
     IsMPClient = false;
     NextSync = 0;
     RXTimestamp = 0;
+#ifdef LITEV_LAN_EARLY_REPLY
+    EarlyReplyLen = -1;
+#endif
 
     WifiAP->Reset();
 }
@@ -335,6 +339,9 @@ void Wifi::DoSavestate(Savestate* file)
     file->Bool32(&IsMPClient);
     file->Var64(&NextSync);
     file->Var64(&RXTimestamp);
+#ifdef LITEV_LAN_EARLY_REPLY
+    if (!file->Saving) EarlyReplyLen = -1;
+#endif
 }
 
 
@@ -710,7 +717,11 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
 
     case 5:
         IncrementTXCount(slot);
+#ifdef LITEV_LAN_EARLY_REPLY
+        SendLateMPReply(TXBuffer, 12+len, IOPORT(W_AIDLow));
+#else
         Platform::MP_SendReply(TXBuffer, 12+len, USTimestamp, IOPORT(W_AIDLow), NDS.UserData);
+#endif
         break;
 
     case 4:
@@ -871,7 +882,11 @@ void Wifi::SendMPDefaultReply()
     *(u16*)&reply[0xC + 0x16] = IOPORT(W_TXSeqNo) << 4;
     *(u32*)&reply[0xC + 0x18] = 0;
 
+#ifdef LITEV_LAN_EARLY_REPLY
+    int txlen = SendLateMPReply(reply, 12+28, IOPORT(W_AIDLow));
+#else
     int txlen = Platform::MP_SendReply(reply, 12+28, USTimestamp, IOPORT(W_AIDLow), NDS.UserData);
+#endif
     WIFI_LOG("wifi: sent %d/40 bytes of MP default reply\n", txlen);
 }
 
@@ -953,6 +968,120 @@ void Wifi::SendMPReply(u16 clienttime, u16 clientmask)
 
     IOPORT(W_TXBusy) |= 0x0080;
 }
+
+#ifdef LITEV_LAN_EARLY_REPLY
+// LAN latency: a client answers a CMD only once it has emulated the CMD's airtime (FinishRX ->
+// SendMPReply), while the host sits blocked waiting for that reply. The reply's bytes are already
+// known when the CMD is picked up (CheckRX), so they are computed and sent right then, and the
+// RX-end path runs unchanged (all guest-visible writes, IRQs, timing) except that it does not put
+// the reply on the network a second time. Nothing here writes guest state.
+// The prediction assumes the guest does not touch the reply slot/registers during the CMD's
+// airtime; SendLateMPReply compares the late bytes against it and counts any miss
+// (log: MP_EARLYREPLY; LITEV_LAN_EARLY_REPLY_CHECK=1 logs the counts even when all match).
+static struct { u32 n, mismatch, orphan, lateOnly; s64 tsDiff; } EarlyStats;
+
+void Wifi::SendEarlyMPReply(u16 clienttime, u16 clientmask, u64 timestamp)
+{
+    if (EarlyReplyLen >= 0) EarlyStats.orphan++; // previous early reply never got its RX end
+    EarlyReplyLen = -1;
+    if (CurChannel == 0) return; // the late path sends nothing either
+
+    // will FinishRX flag this frame as a CMD for our BSS (rxflags 0x800C)? (mirrors its filter)
+    u16 framectl = *(u16*)&RXBuffer[12];
+    u16 rxfilter = IOPORT(W_RXFilter);
+    if ((framectl & (1<<14)) && !(IOPORT(W_WEPCnt) & (1<<15))) return;
+    if (((framectl >> 2) & 0x3) != 2) return;
+    u16 fromto = (framectl >> 8) & 0x3;
+    if (IOPORT(W_RXFilter2) & (1<<fromto)) return;
+    static const int bssidoffset[4] = {16, 4, 10, 0};
+    if (!bssidoffset[fromto] || !MACEqual(&RXBuffer[12 + bssidoffset[fromto]], (u8*)&IOPORT(W_BSSID0))) return;
+    if ((framectl & (1<<11)) && !(rxfilter & (1<<0))) return;
+    if (MACEqual(&RXBuffer[12 + 16], MPReplyMAC)) return;
+    switch ((framectl >> 4) & 0xF)
+    {
+    case 0x0: case 0x2: case 0x4: break;
+    case 0x1: if (!(rxfilter & (1<<1))) return; break;
+    case 0x3: if (!(rxfilter & (1<<3))) return; break;
+    case 0x5: if (!(rxfilter & (1<<4))) return; break;
+    case 0x6: if (!(rxfilter & (1<<5))) return; break;
+    case 0x7: if (!(rxfilter & (1<<6))) return; break;
+    default: return;
+    }
+
+    // Only a data reply that is already armed goes early. Games often arm the reply slot during
+    // the CMD's airtime (Shrek: ~1.5% of CMDs), and a blank/default reply sent early would then
+    // replace the data the host should have got; those cases keep the normal late send.
+    u16 aid = IOPORT(W_AIDLow);
+    if (!(aid && (clientmask & (1 << aid)))) return;
+
+    // SendMPReply: W_TXSlotReply2 <- W_TXSlotReply1, validity/duration check
+    u16 reply = IOPORT(W_TXSlotReply1);
+    if (!(reply & 0x8000)) return;
+    u32 addr = (reply & 0x0FFF) << 1;
+    u32 length = *(u16*)&RAM[addr + 0xA] & 0x3FFF;
+    if ((u32)(PreambleLen(2) + length * 4) > clienttime) return;
+
+    // TXSendFrame(slot 5) into our own buffer: its RAM writes become patches of the copy
+    int len = length;
+    if ((addr + len) > 0x1FF4) len = 0x1FF4 - addr;
+    u8* buf = EarlyReply;
+    memcpy(buf, &RAM[addr], 12+len);
+    auto patch = [&](u32 a, u32 v, int n)
+    {
+        for (int i = 0; i < n; i++)
+            if (a+i >= addr && a+i < addr+12+len) buf[a+i-addr] = (u8)(v >> (8*i));
+    };
+    if (IOPORT(W_TXSlotReply2) & 0x8000) patch(TXSlots[5].Addr, 0x0001, 2); // previous reply marked done
+
+    u32 noseqno = buf[0x4] ? 2 : 0;
+    if (!noseqno && !(IOPORT(W_TXHeaderCnt) & (1<<2)))
+        patch(addr + 0xC + 22, IOPORT(W_TXSeqNo) << 4, 2);
+    if ((*(u16*)&buf[0xC] & (1<<14)) && (IOPORT(W_WEPCnt) & (1<<15)))
+        patch((addr + 0xC + length - 7) & ~0x1, 0x22334466, 4);
+    if (noseqno == 2) *(u16*)&buf[0xC] |= (1<<11);
+    buf[9] = CurChannel;
+    len += 12;
+
+    EarlyReplyLen = len;
+    EarlyReplyAID = aid;
+    EarlyReplyTS = timestamp;
+    Platform::MP_SendReply(EarlyReply, len, timestamp, aid, NDS.UserData);
+}
+
+int Wifi::SendLateMPReply(u8* data, int len, u16 aid)
+{
+    if (EarlyReplyLen < 0)
+    {
+        EarlyStats.lateOnly++;
+        return Platform::MP_SendReply(data, len, USTimestamp, aid, NDS.UserData);
+    }
+
+    EarlyStats.n++;
+    EarlyStats.tsDiff += (s64)(USTimestamp - EarlyReplyTS);
+    if (EarlyReplyLen != len || EarlyReplyAID != aid || (len && memcmp(EarlyReply, data, len)))
+    {
+        EarlyStats.mismatch++;
+        if (EarlyStats.mismatch <= 20)
+        {
+            int at = -1;
+            for (int i = 0; i < len && i < EarlyReplyLen; i++) if (EarlyReply[i] != data[i]) { at = i; break; }
+            Log(LogLevel::Warn, "MP_EARLYREPLY mismatch: len %d/%d aid %d/%d first diff byte %d\n",
+                EarlyReplyLen, len, EarlyReplyAID, aid, at);
+        }
+    }
+    EarlyReplyLen = -1;
+
+    static const bool check = getenv("LITEV_LAN_EARLY_REPLY_CHECK") != nullptr;
+    if (EarlyStats.n >= 600)
+    {
+        if (check || EarlyStats.mismatch || EarlyStats.orphan)
+            Log(LogLevel::Info, "MP_EARLYREPLY 600: mismatch=%u orphan=%u late-only=%u late-early timestamp=%lld us avg\n",
+                EarlyStats.mismatch, EarlyStats.orphan, EarlyStats.lateOnly, (long long)(EarlyStats.tsDiff / (s64)EarlyStats.n));
+        EarlyStats = {};
+    }
+    return len;
+}
+#endif
 
 void Wifi::SendMPAck(u16 cmdcount, u16 clientfail)
 {
@@ -1606,7 +1735,11 @@ void Wifi::FinishRX()
             // in the case this client wasn't ready to send a reply
             // TODO: also send this if we have RX disabled
 
+#ifdef LITEV_LAN_EARLY_REPLY
+            SendLateMPReply(nullptr, 0, 0);
+#else
             Platform::MP_SendReply(nullptr, 0, USTimestamp, 0, NDS.UserData);
+#endif
         }
     }
     else if ((rxflags & 0x800F) == 0x8001)
@@ -1854,6 +1987,10 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
             }
 #endif
 
+#ifdef LITEV_LAN_EARLY_REPLY
+            // NextSync here = RXTimestamp + the CMD's airtime ~= USTimestamp when the reply is due
+            SendEarlyMPReply(clienttime, clientmask, NextSync);
+#endif
             // include the MP reply time window
             NextSync += 112 + ((clienttime + 10) * NumClients(clientmask));
         }
