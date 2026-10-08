@@ -189,6 +189,13 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
 
     out.nds = std::make_unique<NDS>(std::move(args), out.udata.get());
     out.nds->SetRenderer(std::make_unique<SoftRenderer>(*out.nds));
+#ifdef LITEV_AGGRESSIVE_SKIP
+    if (getenv("LITEV_TRACE_HEADLESS")) // what Netplay does to another player's console
+    {
+        out.nds->GPU.Headless = true;
+        out.nds->GPU.GPU3D.Headless = true;
+    }
+#endif
     out.nds->SetNDSCart(std::move(cart));
     out.nds->Reset();
 
@@ -497,6 +504,7 @@ int VerifyTrace(const TraceRunConfig& cfg, const std::string& tracePath)
     printf("=== liteDS-headless verify-trace: OK ===\n");
     printf("trace:  %s\n", tracePath.c_str());
     printf("frames: %u (all identical)\n", hdr.frames);
+    printf("captures: %u  capture_seen: %d\n", b.nds->GPU.CaptureCount, (int)b.nds->GPU.CaptureSeen);
     printf("mode:   %s\n", rc.jit ? "jit" : "interp");
     fflush(stdout);
     return 0;

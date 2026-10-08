@@ -1,0 +1,10 @@
+--- a/app/build.gradle.kts	2026-10-07 22:10:13
++++ b/app/build.gradle.kts	2026-10-07 22:10:13
+@@ -142,6 +142,7 @@
+                     // Netplay: other players' consoles skip render/audio-only work (the app
+                     // sets GPU/GPU3D::Headless and SPU::Silent on them in MelonDS.cpp).
+                     "-DLITEV_NETPLAY_HEADLESS=ON",
++                    "-DLITEV_NETPLAY_CAPTURE=ON",
+                     // LockstepMP: host frames 2 ms late; MP host collects replies at the
+                     // first reply slot (fewer thread hand-offs per CMD).
+                     "-DLITEV_MP_HOSTDELAY=ON",
