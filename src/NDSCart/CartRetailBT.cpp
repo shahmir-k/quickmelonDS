@@ -36,7 +36,7 @@ CartRetailBT::CartRetailBT(const u8* rom, u32 len, u32 chipid, ROMListEntry romp
 {
 }
 
-CartRetailBT::CartRetailBT(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata) :
+CartRetailBT::CartRetailBT(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata) :
     CartRetail(std::move(rom), len, chipid, false, romparams, std::move(sram), sramlen, userdata, CartType::RetailBT)
 {
     Log(LogLevel::Info,"POKETYPE CART\n");

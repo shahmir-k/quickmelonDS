@@ -245,6 +245,19 @@ private:
 /// or \c nullptr if the ROM data couldn't be parsed.
 std::unique_ptr<CartCommon> ParseROM(const u8* romdata, u32 romlen, void* userdata = nullptr, std::optional<NDSCartArgs>&& args = std::nullopt);
 std::unique_ptr<CartCommon> ParseROM(std::unique_ptr<u8[]>&& romdata, u32 romlen, void* userdata = nullptr, std::optional<NDSCartArgs>&& args = std::nullopt);
+/// As above, but the cart keeps a reference to \c romdata instead of copying it.
+/// \c romdata must be at least \c romlen rounded up to a power of 2 bytes long (zero-padded).
+std::unique_ptr<CartCommon> ParseROM(std::shared_ptr<const u8[]> romdata, u32 romlen, void* userdata = nullptr, std::optional<NDSCartArgs>&& args = std::nullopt);
+
+/// Process-wide ROM sharing (netplay runs many consoles of the same game in one process):
+/// reads the ROM file at \c path (zero-padded to a power of 2) into a buffer that every
+/// caller asking for the same path and file size gets, while any of them still holds it.
+/// Pass the result to ParseROM. Carts that patch their ROM take a private copy first.
+/// @param len Receives the file length (the \c romlen to give ParseROM).
+/// @returns nullptr if the file can't be read.
+std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len);
+/// True if \c rom is a buffer handed out by AcquireSharedROM that is still alive.
+bool IsSharedROM(const u8* rom);
 }
 
 #endif

@@ -47,7 +47,7 @@ enum CartR4Language
 class CartR4 : public CartSD
 {
 public:
-    CartR4(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, ROMListEntry romparams, CartR4Type ctype, CartR4Language clanguage, void* userdata,
+    CartR4(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, ROMListEntry romparams, CartR4Type ctype, CartR4Language clanguage, void* userdata,
            std::optional<FATStorage>&& sdcard = std::nullopt);
     ~CartR4() override;
 

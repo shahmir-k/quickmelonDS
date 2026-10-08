@@ -35,7 +35,7 @@ CartSD::CartSD(const u8* rom, u32 len, u32 chipid, ROMListEntry romparams, void*
     CartSD(CopyToUnique(rom, len), len, chipid, romparams, userdata, std::move(sdcard))
 {}
 
-CartSD::CartSD(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard) :
+CartSD::CartSD(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard) :
     CartCommon(std::move(rom), len, chipid, false, romparams, CartType::Homebrew, userdata),
     SD(std::move(sdcard))
 {
@@ -163,7 +163,7 @@ void CartSD::ApplyDLDIPatch(const u8* patch, u32 patchlen, bool readonly)
     u32 offset = *(u32*)&ROM[0x20];
     u32 size = *(u32*)&ROM[0x2C];
 
-    u8* binary = &ROM[offset];
+    u8* binary = &GetWritableROM()[offset];
 
     for (u32 i = 0; i < size; )
     {

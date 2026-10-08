@@ -51,7 +51,7 @@ class CartCommon
 {
 public:
     CartCommon(const u8* rom, u32 len, u32 chipid, bool badDSiDump, ROMListEntry romparams, CartType type, void* userdata);
-    CartCommon(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, bool badDSiDump, ROMListEntry romparams, CartType type, void* userdata);
+    CartCommon(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, bool badDSiDump, ROMListEntry romparams, CartType type, void* userdata);
     virtual ~CartCommon();
 
     [[nodiscard]] u32 Type() const { return CartType; };
@@ -85,7 +85,10 @@ public:
     [[nodiscard]] const NDSBanner* Banner() const;
     [[nodiscard]] const ROMListEntry& GetROMParams() const { return ROMParams; };
     [[nodiscard]] u32 ID() const { return ChipID; }
-    [[nodiscard]] const u8* GetROM() const { return ROM.get(); }
+    [[nodiscard]] const u8* GetROM() const { return ROM; }
+    /// The ROM for writing: a cart whose ROM is shared with other consoles
+    /// (see AcquireSharedROM) first takes a private copy (copy-on-write).
+    u8* GetWritableROM();
     [[nodiscard]] u32 GetROMLength() const { return ROMLength; }
 
 protected:
@@ -95,7 +98,10 @@ protected:
 
     bool ResetState;
 
-    std::unique_ptr<u8[]> ROM = nullptr;
+    // ROMOwner keeps the (possibly shared, see AcquireSharedROM) buffer alive;
+    // ROM is its raw pointer so reads never touch the refcount.
+    std::shared_ptr<const u8[]> ROMOwner = nullptr;
+    u8* ROM = nullptr;
     u32 ROMLength = 0;
     u32 ROMMask = 0;
     u32 ChipID = 0;
