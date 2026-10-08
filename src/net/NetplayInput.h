@@ -90,8 +90,21 @@ public:
     // The local player's input sampled at `frame` (applied at frame + Delay everywhere).
     void SubmitLocal(int frame, const NetplayFrameInput& input);
 
-    // The input of `player` for emulated frame `frame`; blocks until known (or Abort()).
+    // The input of `player` for emulated frame `frame`; blocks until known (or Abort(), or the
+    // player is dropped).
     NetplayFrameInput Get(int player, int frame);
+    // Hosted Netplay server only: a player whose input Get() has waited this long for is dropped,
+    // and from then on Get() returns no input for it (nothing pressed) without waiting. The server
+    // is the only device that applies inputs to that console (its replicas follow its record
+    // stream), so this is deterministic. 0 = wait forever (Netplay: every device applies every
+    // input itself, so all of them must wait).
+    int DropAfterMs = 0;
+    bool Dropped(int player) const { return (DroppedMask.load() >> player) & 1; }
+    // `peer` has acknowledged all of our inputs up to this applied frame. Hosted Netplay: the server
+    // applies a player's input exactly when it acknowledged it (it ignores a dropped player's
+    // packets), so a replica may apply its own input at frame F <= this; past it, only the
+    // server's (from its record stream) is certain.
+    int AckedBy(int peer);
     // Session ending: Get() stops waiting and returns no input from now on.
     void Abort();
 
@@ -128,6 +141,7 @@ private:
     int RemoteUpTo[kMaxPlayers];    // we have all of that player's inputs up to this applied frame
     std::atomic<u64> StallUs {0};
     std::atomic<u64> LastPeerUs[kMaxPlayers] {};
+    std::atomic<u32> DroppedMask {0};
 
     bool IsPeer(int player) const { return player >= 0 && player < kMaxPlayers && PeerSet[player]; }
     void ReceiveLoop();

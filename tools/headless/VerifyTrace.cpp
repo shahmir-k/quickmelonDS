@@ -789,12 +789,13 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     }
 
 #ifdef LITEV_HOSTED_NETPLAY
-    // LITEV_HOSTED="players=N,port=X[,play][,delay=D][,latency=MS][,jitter=MS][,loss=PCT]": Hosted
+    // LITEV_HOSTED="players=N,port=X[,play][,delay=D][,dropms=MS][,latency=MS][,jitter=MS][,loss=PCT]": Hosted
     // Netplay server. Emulates every console (as Netplay does) and sends each console's records to
     // the replica client that runs it (--replay-console, LITEV_HOSTED=host=...), whose input comes
     // back here, applied D frames late. play: this device also plays console 0 (input from
     // --mp-script0, applied at once); else a dedicated server. Session setup on TCP X + 1, inputs
-    // on UDP X, records on UDP X + 2. latency/jitter/loss: simulated network faults on receive.
+    // on UDP X, records on UDP X + 2. A guest whose input is dropms (3000) late is dropped: its
+    // console plays on with nothing pressed. latency/jitter/loss: simulated network faults on receive.
     // LITEV_MP_RECORD=<dir>: write each console's records to <dir>/console<K>.rec.
     const char* hostedSpec = getenv("LITEV_HOSTED");
     const char* recordDir = getenv("LITEV_MP_RECORD");
@@ -939,6 +940,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             if (p < n && !save.empty()) { b[p].nds->SetNDSSave(save.data(), (u32)save.size()); printf("hosted: console %d: guest's save, %zu bytes\n", p, save.size()); }
         NetFaults faults = FaultsFrom(hosted);
         net = std::make_unique<NetplayInput>(kHostedServerId, setup.Delay, hport, setup.Peers, faults.LatencyMs, faults);
+        net->DropAfterMs = SpecInt(hosted, "dropms", 3000);
         hostedServer = std::make_unique<HostedServer>(hport + 2, faults);
         if (!net->Ok() || !hostedServer->Ok()) { fprintf(stderr, "hosted: socket setup failed\n"); return 1; }
         printf("hosted: server for %d consoles (%s), delay %d frames, ports %d (inputs) %d (records), faults latency %d jitter %d loss %d%%\n",
@@ -1067,7 +1069,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_HOSTED_NETPLAY
                 if (record && f < frames)
                 {
-                    record->EndFrame(inst, f, HostedState(*bi.nds, applied, f));
+                    record->EndFrame(inst, f, HostedState(*bi.nds, applied, f), applied);
                     std::vector<u8> out;
                     record->TakeRecords(inst, out);
                     if (recordFiles[inst]) fwrite(out.data(), 1, out.size(), recordFiles[inst]);
@@ -1276,6 +1278,8 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
         int hport = atoi(setup.Host.substr(setup.Host.rfind(':') + 1).c_str());
         client = std::make_unique<HostedClient>(k, host + ":" + std::to_string(hport + 2), [replay](const u8* d, size_t l) { replay->Feed(d, l); }, faults);
         if (!net->Ok() || !client->Ok()) { fprintf(stderr, "hosted: socket setup failed\n"); return 1; }
+        NetplayInput* n = net.get();
+        replay->SetServerSilence([n] { return n->MsSincePeer(); });
         printf("hosted: replica of console %d, server %s, delay %d frames, faults latency %d jitter %d loss %d%%\n",
                k, setup.Host.c_str(), setup.Delay, faults.LatencyMs, faults.JitterMs, faults.LossPct);
     }
@@ -1286,8 +1290,12 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
     int inject = getenv("LITEV_REPLAY_INJECT") ? atoi(getenv("LITEV_REPLAY_INJECT")) : -1;
     bool hidden = getenv("LITEV_REPLAY_INJECT_HIDDEN") != nullptr;
     int every = getenv("LITEV_MP_EVERY") ? atoi(getenv("LITEV_MP_EVERY")) : 60;
+    // LITEV_REPLAY_SERVER_INPUT=1 (--replay-log): the input the server applied (from its frame
+    // markers) instead of the script, as a second replica of a console must
+    bool follow = !net && getenv("LITEV_REPLAY_SERVER_INPUT");
 
-    int firstDesync = -1;
+    int firstDesync = -1, lostAt = -1;
+    bool dropped = false;
     auto wall0 = std::chrono::steady_clock::now();
     double cpu0 = CpuMs();
     double maxFrameMs = 0;
@@ -1304,9 +1312,21 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
         }
         else
             in = ScriptInput(b, f);
+        // live: the server has not acknowledged our input for this frame yet, so it may have
+        // dropped this player: apply what it applied (from its frame marker)
+        NetplayFrameInput srv;
+        if ((follow || (net && f >= net->Delay() && f > net->AckedBy(kHostedServerId))) && replay->ServerInput(f, srv, true))
+        {
+            if (net && !dropped && (srv.Keys != in.Keys || srv.TouchX != in.TouchX || srv.TouchY != in.TouchY))
+            {
+                printf("hosted: the server dropped this player (frame %d): its console plays on with the server's input\n", f);
+                dropped = true;
+            }
+            in = srv;
+        }
         NetplayFrameInput marker = in;
         if (f == inject) { in.Keys ^= 1; if (!hidden) marker = in; printf("replay: injected A toggle at frame %d%s\n", f, hidden ? " (hidden from the marker)" : ""); }
-        if (net) ApplyNetInput(*b.nds, in);
+        if (net || follow) ApplyNetInput(*b.nds, in);
         else
         {
             b.ApplyInput(f);
@@ -1328,6 +1348,12 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
                    (unsigned long long)XXH3_64bits(b.nds->MainRAM, b.nds->MainRAMMask + 1));
             fflush(stdout);
         }
+        if (!ok && replay->Lost())
+        {
+            lostAt = f;
+            printf("hosted: session ended at frame %d: %s\n", f, replay->Error().c_str());
+            break;
+        }
         if (!ok)
         {
             firstDesync = f;
@@ -1338,11 +1364,12 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
     double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
     printf("perf: wall %.2f ms/frame (max %.1f), process CPU %.2f ms/frame, waited for records %.0f ms, for input %.0f ms\n",
            wall / frames, maxFrameMs, (CpuMs() - cpu0) / frames, replay->StallMs(), net ? net->StallMs() : 0.0);
-    printf("replay: %s\n", firstDesync < 0 ? "MATCH (every frame)" : ("DESYNC first at frame " + std::to_string(firstDesync)).c_str());
+    printf("replay: %s\n", firstDesync >= 0 ? ("DESYNC first at frame " + std::to_string(firstDesync)).c_str()
+                          : lostAt >= 0 ? ("MATCH until the server was lost at frame " + std::to_string(lostAt)).c_str() : "MATCH (every frame)");
     fflush(stdout);
     replay->Stop();
     if (net) net->Abort();
-    return firstDesync < 0 ? 0 : 2;
+    return firstDesync >= 0 ? 2 : lostAt >= 0 ? 3 : 0;
 }
 #else
 int ReplayConsole(const TraceRunConfig&, int, const std::vector<std::string>&, int, const std::string&)

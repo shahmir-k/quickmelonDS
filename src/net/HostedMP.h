@@ -51,7 +51,9 @@ namespace melonDS
 // RAM). A replica call with no record before the next marker returned nothing on the server.
 //
 // Record: u8 kind, u32 call, s32 result, u64 timestamp, u32 length, bytes. A frame marker is kind
-// HostedFrame: call = calls so far, result = frame, timestamp = call hash, bytes = u64 state.
+// HostedFrame: call = calls so far, result = frame, timestamp = call hash, bytes = u64 state, then
+// the input the server applied that frame (u32 keys, s16 touch x, s16 touch y), so a replica can
+// follow the server's input (a dropped player, a second replica of the same console).
 enum : u8
 {
     HostedBegin, HostedEnd, HostedSendPacket, HostedRecvPacket, HostedSendCmd, HostedSendReply,
@@ -78,8 +80,9 @@ public:
 
     LockstepMP& Link() { return *Inner; }
     void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = clock; Inner->SetClock(inst, std::move(clock)); }
-    // console `inst` finished emulated frame `frame`; `state` = the frontend's state hash
-    void EndFrame(int inst, int frame, u64 state);
+    // console `inst` finished emulated frame `frame` with input `in` applied; `state` = the
+    // frontend's state hash
+    void EndFrame(int inst, int frame, u64 state, const NetplayFrameInput& in);
     // moves console `inst`'s records so far to the end of `out`
     void TakeRecords(int inst, std::vector<u8>& out) { out.insert(out.end(), Out[inst].begin(), Out[inst].end()); Out[inst].clear(); }
 
@@ -115,7 +118,7 @@ private:
 class ReplayMP : public MPInterface
 {
 public:
-    explicit ReplayMP(int inst) : Inst(inst) {}
+    explicit ReplayMP(int inst);
 
     void SetClock(std::function<u64()> clock) { Clock = std::move(clock); }
     // more of the record stream, in order, in any pieces (any thread)
@@ -123,8 +126,16 @@ public:
     // the console finished emulated frame `frame`: waits for the server's marker for it and
     // compares. false = desync (the replica no longer matches the server's console); Error() says how.
     bool EndFrame(int frame, u64 state);
+    // the input the server applied at `frame`, if its marker for it has arrived (wait: until it
+    // does). false = not yet (or stopped).
+    bool ServerInput(int frame, NetplayFrameInput& in, bool wait);
     // ends every wait (the session is shutting down)
     void Stop();
+    // how long since the server was last heard from (ms): a wait for the stream ends the session
+    // (Lost(), Error() says so) once this passes LostAfterMs
+    void SetServerSilence(std::function<double()> ms) { ServerSilentMs = std::move(ms); }
+    int LostAfterMs = 5000;
+    bool Lost() const { return LostServer.load(); }
     std::string Error();
     // time spent waiting for the stream
     double StallMs() const { return StallUs.load() / 1000.0; }
@@ -161,24 +172,35 @@ private:
     bool Stopped = false;
     std::string Err;
     std::atomic<u64> StallUs {0};
+    std::function<double()> ServerSilentMs;
+    std::atomic<bool> LostServer {false};
+    const u64 CreatedUs;
 
     u64 Now() const { return Clock ? Clock() : 0; }
     // the record for this call (the next call number) if it returned something, else none
     bool Take(u8 kind, Record& out);
     void WaitLocked(std::unique_lock<std::mutex>& lk);
+    // waits for more of the stream (or a stop), checking for a lost server
+    void WaitMore(std::unique_lock<std::mutex>& lk, const std::function<bool()>& done);
     void Fail(const std::string& what);
 };
 
 // Hosted Netplay transport (UDP, star). The server sends each client its console's record stream,
-// reliably and in order: chunks carry their byte offset, the client acknowledges what it has
-// received contiguously, and the server re-sends what is not acknowledged every kResendMs (like
-// NetplayInput), so a lost or late packet stalls the replica, never desyncs it. The server learns
-// each client's address from its acknowledgements. Inputs go the other way through NetplayInput.
+// reliably and in order: chunks carry their byte offset, and the client acknowledges what it has
+// received contiguously plus the first run it holds past a gap. The server re-sends:
+// - a gap's chunks at once, when the client holds a chunk sent well after them (fast re-send);
+// - any chunk not acknowledged within 1.5 measured round trips (at least kMinRtoMs, doubling with
+//   each re-send of it, at most kWindow chunks per kResendMs tick);
+// and a small push also carries the previous one while that is unacknowledged, so one lost packet
+// costs a frame, not a round trip. A lost or late packet thus stalls the replica, never desyncs it.
+// The server learns each client's address from its acknowledgements (the client sends one every
+// 10 ms); a client silent for kGoneMs is gone, and its stream is buffered but not sent until it
+// answers again. Inputs go the other way through NetplayInput.
 class HostedServer
 {
 public:
     HostedServer(int bindPort, const NetFaults& faults = {});
-    // waits (up to DrainMs) until every client has its whole stream
+    // waits (up to DrainMs) until every client still answering has its whole stream
     ~HostedServer();
     bool Ok() const { return Socket >= 0; }
     int DrainMs = 10000;    // how long the destructor waits for the clients
@@ -188,13 +210,24 @@ public:
     void Traffic(int console, u64& sent, u64& resent);
 
 private:
+    struct Chunk
+    {
+        u64 Offset;
+        u32 Len;
+        u64 SentUs;     // last sent, 0 = never
+        u8 Resends;     // the timeout doubles with each
+        bool Held;      // the client has it, past a gap
+    };
     struct Stream
     {
-        std::vector<u8> Bytes;  // not acknowledged yet, from offset Acked
+        std::vector<u8> Bytes;      // not acknowledged yet, from offset Acked
         u64 Acked = 0;
-        u8 Addr[16] {};         // sockaddr_in
+        std::deque<Chunk> Chunks;   // the same bytes, as sent, oldest first
+        u8 Addr[16] {};             // sockaddr_in
         bool Known = false;
-        u64 SentTo = 0;         // stream bytes sent at least once
+        bool Gone = false;          // logged as gone
+        u64 LastAckUs = 0;
+        u64 RttUs = 0;              // smoothed round trip, 0 = no sample yet
         u64 SentBytes = 0, ResentBytes = 0;
     };
     int Socket = -1;
@@ -204,7 +237,9 @@ private:
     std::atomic<bool> Running {true};
     std::thread Receiver;
 
-    void SendRange(int console, u64 from, u64 to);  // Lock held
+    bool Live(int console, u64 now);                    // Lock held
+    void SendChunk(int console, Chunk& c, u64 now);     // Lock held
+    size_t SendBytes(int console, u64 from, u64 to);    // Lock held; the packet's size
     void ReceiveLoop();
 };
 

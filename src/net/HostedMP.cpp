@@ -28,6 +28,7 @@
 #include <cstring>
 
 #include "HostedMP.h"
+#include "../Platform.h"
 #include "xxhash/xxhash.h"
 
 namespace melonDS
@@ -84,11 +85,16 @@ void RecordMP::Put(int inst, u8 kind, u32 call, s32 result, u64 timestamp, const
     out.insert(out.end(), data, data + len);
 }
 
-void RecordMP::EndFrame(int inst, int frame, u64 state)
+void RecordMP::EndFrame(int inst, int frame, u64 state, const NetplayFrameInput& in)
 {
     if (frame == 0) Calls[inst].OpenTrace("server", inst);
     if (Calls[inst].Trace) fprintf(Calls[inst].Trace, "frame %d\n", frame);
-    Put(inst, HostedFrame, Calls[inst].Count, frame, Calls[inst].Hash, (const u8*)&state, sizeof(state));
+    u8 data[16];
+    memcpy(data, &state, 8);
+    memcpy(data + 8, &in.Keys, 4);
+    memcpy(data + 12, &in.TouchX, 2);
+    memcpy(data + 14, &in.TouchY, 2);
+    Put(inst, HostedFrame, Calls[inst].Count, frame, Calls[inst].Hash, data, sizeof(data));
 }
 
 void RecordMP::Begin(int inst)
@@ -219,12 +225,51 @@ void ReplayMP::Fail(const std::string& what)
     if (Err.empty()) Err = what;
 }
 
+ReplayMP::ReplayMP(int inst) : Inst(inst), CreatedUs(NowUs()) {}
+
+void ReplayMP::WaitMore(std::unique_lock<std::mutex>& lk, const std::function<bool()>& done)
+{
+    u64 start = NowUs(), silentSeen = 0;
+    while (!done() && !Stopped)
+    {
+        Changed.wait_for(lk, std::chrono::milliseconds(100));
+        // silent since the session started at most (nothing may have arrived yet), and still
+        // silent 200 ms later (this device may just have woken up, with packets not read yet)
+        double silent = ServerSilentMs ? std::min(ServerSilentMs(), (NowUs() - CreatedUs) / 1000.0) : 0;
+        if (done() || silent <= LostAfterMs) silentSeen = 0;
+        else if (!silentSeen) silentSeen = NowUs();
+        else if (NowUs() - silentSeen >= 200000)
+        {
+            Fail("lost the server: nothing from it for " + std::to_string((int)silent) + " ms");
+            LostServer = true;
+            Stopped = true;
+        }
+    }
+    StallUs += NowUs() - start;
+}
+
 void ReplayMP::WaitLocked(std::unique_lock<std::mutex>& lk)
 {
     if (!Queue.empty() || Stopped) return;
-    u64 start = NowUs();
-    Changed.wait(lk, [&] { return !Queue.empty() || Stopped; });
-    StallUs += NowUs() - start;
+    WaitMore(lk, [&] { return !Queue.empty(); });
+}
+
+bool ReplayMP::ServerInput(int frame, NetplayFrameInput& in, bool wait)
+{
+    std::unique_lock<std::mutex> lk(Lock);
+    const Record* m = nullptr;
+    auto find = [&]
+    {
+        for (const Record& r : Queue)
+            if (r.Kind == HostedFrame && r.Result >= frame) { m = r.Result == frame ? &r : nullptr; return true; }
+        return false;
+    };
+    if (!find() && wait) WaitMore(lk, find);
+    if (!m || m->Data.size() < 16) return false;
+    memcpy(&in.Keys, &m->Data[8], 4);
+    memcpy(&in.TouchX, &m->Data[12], 2);
+    memcpy(&in.TouchY, &m->Data[14], 2);
+    return true;
 }
 
 bool ReplayMP::Take(u8 kind, Record& out)
@@ -269,7 +314,7 @@ bool ReplayMP::EndFrame(int frame, u64 state)
     Record m = std::move(Queue.front());
     Queue.pop_front();
     u64 serverState = 0;
-    if (m.Data.size() == sizeof(serverState)) memcpy(&serverState, m.Data.data(), sizeof(serverState));
+    if (m.Data.size() >= sizeof(serverState)) memcpy(&serverState, m.Data.data(), sizeof(serverState));
     if (m.Result != frame) Fail("frame " + std::to_string(frame) + ": the server's marker is for frame " + std::to_string(m.Result));
     else if (m.Call != Calls.Count || m.Timestamp != Calls.Hash)
         Fail("frame " + std::to_string(frame) + ": link calls differ (server " + std::to_string(m.Call) + " calls, here " + std::to_string(Calls.Count) + ")");
@@ -373,8 +418,11 @@ namespace
 constexpr u32 kChunkMagic = 0x484E5331;    // "HNS1"
 constexpr u32 kAckMagic = 0x484E4131;      // "HNA1"
 constexpr size_t kChunk = 1200;            // stream bytes per packet (fits any MTU)
-constexpr int kWindow = 16;                // packets re-sent per tick
-constexpr int kResendMs = 10;
+constexpr int kWindow = 16;                // packets re-sent per tick, at most
+constexpr int kResendMs = 10;              // re-send tick
+constexpr int kMinRtoMs = 10;              // re-send a chunk after 1.5 round trips, at least this
+constexpr int kFirstRtoMs = 200;           // before the first round trip is measured
+constexpr int kGoneMs = 3000;              // a client silent this long is gone
 
 #pragma pack(push, 1)
 struct ChunkHeader
@@ -389,6 +437,7 @@ struct AckPacket
     u32 Magic;
     u8 Console;
     u64 Offset;     // the client has the stream up to here
+    u64 Next, NextEnd;  // and [Next, NextEnd) past a gap (Next = Offset: no gap)
 };
 #pragma pack(pop)
 
@@ -423,7 +472,7 @@ HostedServer::~HostedServer()
         bool all = true;
         {
             std::lock_guard<std::mutex> lk(Lock);
-            for (Stream& s : Streams) all &= !s.Known || s.Bytes.empty();
+            for (int c = 0; c < LockstepMP::kMaxInst; c++) all &= Streams[c].Bytes.empty() || !Live(c, NowUs());
         }
         if (all) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -433,20 +482,36 @@ HostedServer::~HostedServer()
     close(Socket);
 }
 
-void HostedServer::SendRange(int console, u64 from, u64 to)
+bool HostedServer::Live(int console, u64 now)
 {
     Stream& s = Streams[console];
+    if (!s.Known) return false;
+    bool gone = now - s.LastAckUs > (u64)kGoneMs * 1000;
+    if (gone != s.Gone)
+        Platform::Log(gone ? Platform::LogLevel::Warn : Platform::LogLevel::Info, gone ? "hosted: console %d: its client stopped answering, stream paused\n"
+                                                                                       : "hosted: console %d: its client answers again, stream resumed\n", console);
+    s.Gone = gone;
+    return !gone;
+}
+
+size_t HostedServer::SendBytes(int console, u64 from, u64 to)
+{
+    Stream& s = Streams[console];
+    ChunkHeader h {kChunkMagic, (u8)console, from, (u16)(to - from)};
     u8 packet[sizeof(ChunkHeader) + kChunk];
-    for (u64 o = from; o < to; o += kChunk)
-    {
-        ChunkHeader h {kChunkMagic, (u8)console, o, (u16)std::min<u64>(kChunk, to - o)};
-        memcpy(packet, &h, sizeof(h));
-        memcpy(packet + sizeof(h), s.Bytes.data() + (o - s.Acked), h.Len);
-        sendto(Socket, packet, sizeof(h) + h.Len, 0, (sockaddr*)s.Addr, sizeof(sockaddr_in));
-        s.SentBytes += sizeof(h) + h.Len;
-        if (o < s.SentTo) s.ResentBytes += sizeof(h) + h.Len;
-        s.SentTo = std::max(s.SentTo, o + h.Len);
-    }
+    memcpy(packet, &h, sizeof(h));
+    memcpy(packet + sizeof(h), s.Bytes.data() + (from - s.Acked), h.Len);
+    sendto(Socket, packet, sizeof(h) + h.Len, 0, (sockaddr*)s.Addr, sizeof(sockaddr_in));
+    s.SentBytes += sizeof(h) + h.Len;
+    return sizeof(h) + h.Len;
+}
+
+void HostedServer::SendChunk(int console, Chunk& c, u64 now)
+{
+    Stream& s = Streams[console];
+    size_t n = SendBytes(console, std::max(c.Offset, s.Acked), c.Offset + c.Len); // a chunk can be partly acknowledged
+    if (c.SentUs) { s.ResentBytes += n; c.Resends += c.Resends < 6; }
+    c.SentUs = now;
 }
 
 void HostedServer::Traffic(int console, u64& sent, u64& resent)
@@ -461,9 +526,28 @@ void HostedServer::Push(int console, const u8* data, size_t len)
     if (console < 0 || console >= LockstepMP::kMaxInst || !len) return;
     std::lock_guard<std::mutex> lk(Lock);
     Stream& s = Streams[console];
-    u64 end = s.Acked + s.Bytes.size();
+    u64 end = s.Acked + s.Bytes.size(), now = NowUs();
     s.Bytes.insert(s.Bytes.end(), data, data + len);
-    if (s.Known) SendRange(console, end, end + len);
+    bool live = Live(console, now);
+    // a small push also carries the previous one if that is not acknowledged yet: a single lost
+    // packet is then made up by the next one, a frame later, instead of a round trip later
+    if (live && len <= kChunk && !s.Chunks.empty())
+    {
+        Chunk& prev = s.Chunks.back();
+        u64 from = std::max(prev.Offset, s.Acked);
+        if (!prev.Held && prev.SentUs && from < end && end + len - from <= kChunk)
+        {
+            s.Chunks.push_back({end, (u32)len, now, 0, false});
+            s.ResentBytes += end - from;
+            SendBytes(console, from, end + len);
+            return;
+        }
+    }
+    for (u64 o = end; o < end + len; o += kChunk)
+    {
+        s.Chunks.push_back({o, (u32)std::min<u64>(kChunk, end + len - o), 0, 0, false});
+        if (live) SendChunk(console, s.Chunks.back(), now);
+    }
 }
 
 void HostedServer::ReceiveLoop()
@@ -494,11 +578,46 @@ void HostedServer::ReceiveLoop()
             Stream& s = Streams[a.Console];
             memcpy(s.Addr, &from, sizeof(from));   // the client's address, as the server sees it
             s.Known = true;
+            s.LastAckUs = now;
+            Live(a.Console, now);
             u64 end = s.Acked + s.Bytes.size();
             if (a.Offset > s.Acked && a.Offset <= end)
             {
+                // round trip: the newest chunk this acknowledges, unless a re-send was involved
+                // (its ack may answer either copy, or have waited for an earlier chunk's)
+                bool resent = false;
+                u64 sentUs = 0;
+                while (!s.Chunks.empty() && s.Chunks.front().Offset + s.Chunks.front().Len <= a.Offset)
+                {
+                    resent |= s.Chunks.front().Resends > 0;
+                    sentUs = s.Chunks.front().SentUs;
+                    s.Chunks.pop_front();
+                }
+                if (!resent && sentUs && now > sentUs)
+                    s.RttUs = s.RttUs ? (7 * s.RttUs + (now - sentUs)) / 8 : now - sentUs;
                 s.Bytes.erase(s.Bytes.begin(), s.Bytes.begin() + (a.Offset - s.Acked));
                 s.Acked = a.Offset;
+            }
+            if (a.Next > s.Acked && a.Next < a.NextEnd && a.NextEnd <= end)
+            {
+                // the client holds [Next, NextEnd): no need to re-send that. The gap's chunks sent
+                // well before it (a quarter round trip: not just reordered) are lost: re-send each
+                // once now rather than after the timeout.
+                u64 nextUs = 0;
+                for (Chunk& ch : s.Chunks)
+                {
+                    if (ch.Offset >= a.NextEnd) break;
+                    if (ch.Offset >= a.Next && ch.Offset + ch.Len <= a.NextEnd)
+                    {
+                        if (!nextUs) nextUs = ch.SentUs;
+                        ch.Held = true;
+                    }
+                }
+                for (Chunk& ch : s.Chunks)
+                {
+                    if (ch.Offset >= a.Next) break;
+                    if (!ch.Resends && ch.SentUs && ch.SentUs + s.RttUs / 4 < nextUs) SendChunk(a.Console, ch, now);
+                }
             }
         }
         if (now - lastSend >= kResendMs * 1000)
@@ -508,8 +627,14 @@ void HostedServer::ReceiveLoop()
             for (int c = 0; c < LockstepMP::kMaxInst; c++)
             {
                 Stream& s = Streams[c];
-                if (s.Known && !s.Bytes.empty())
-                    SendRange(c, s.Acked, s.Acked + std::min<u64>(s.Bytes.size(), kWindow * kChunk));
+                if (s.Chunks.empty() || !Live(c, now)) continue;
+                u64 rto = s.RttUs ? std::max<u64>(kMinRtoMs * 1000, s.RttUs * 3 / 2) : kFirstRtoMs * 1000;
+                int n = 0;
+                for (Chunk& ch : s.Chunks)
+                {
+                    if (n == kWindow) break;
+                    if (!ch.Held && (!ch.SentUs || now - ch.SentUs >= rto << ch.Resends)) { SendChunk(c, ch, now); n++; }
+                }
             }
         }
     }
@@ -537,7 +662,18 @@ HostedClient::~HostedClient()
 
 void HostedClient::SendAck()
 {
-    AckPacket a {kAckMagic, (u8)Console, Expected};
+    // past a gap: the first contiguous run held
+    u64 next = Expected, nextEnd = Expected;
+    if (!Ahead.empty())
+    {
+        next = nextEnd = Ahead.begin()->first;
+        for (auto& [o, d] : Ahead)
+        {
+            if (o > nextEnd) break;
+            nextEnd = std::max<u64>(nextEnd, o + d.size());
+        }
+    }
+    AckPacket a {kAckMagic, (u8)Console, Expected, next, nextEnd};
     sendto(Socket, &a, sizeof(a), 0, (sockaddr*)ServerAddr, sizeof(sockaddr_in));
 }
 

@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "NetplayInput.h"
+#include "../Platform.h"
 
 namespace melonDS
 {
@@ -181,6 +182,13 @@ bool NetplayInput::PeerHash(int player, int frame, u64& hash)
     return true;
 }
 
+int NetplayInput::AckedBy(int peer)
+{
+    if (!IsPeer(peer)) return INT32_MAX;
+    std::lock_guard<std::mutex> lk(Lock);
+    return PeerAck[peer];
+}
+
 double NetplayInput::MsSincePeer() const
 {
     u64 oldest = UINT64_MAX;
@@ -202,12 +210,21 @@ NetplayFrameInput NetplayInput::Get(int player, int frame)
 
     std::unique_lock<std::mutex> lk(Lock);
     auto& inputs = Inputs[player];
+    if (Dropped(player)) return {};
     if (inputs.find(frame) == inputs.end())
     {
         u64 start = NowUs();
-        Changed.wait(lk, [&] { return inputs.find(frame) != inputs.end() || !Running; });
+        auto known = [&] { return inputs.find(frame) != inputs.end() || !Running; };
+        if (DropAfterMs <= 0 || player == Local) Changed.wait(lk, known);
+        else if (!Changed.wait_for(lk, std::chrono::milliseconds(DropAfterMs), known))
+        {
+            DroppedMask |= 1u << player;
+            Platform::Log(Platform::LogLevel::Warn, "Netplay: player %d dropped at frame %d: no input for %d ms; it plays on with nothing pressed\n",
+                          player, frame, DropAfterMs);
+        }
         if (player != Local) StallUs += NowUs() - start;
     }
+    if (Dropped(player)) return {};
     NetplayFrameInput in = inputs[frame];
     inputs.erase(inputs.begin(), inputs.lower_bound(frame - 64)); // keep a little history
     return in;
@@ -252,7 +269,7 @@ void NetplayInput::ReceiveLoop()
             }
             WireHeader header;
             memcpy(&header, packet.data(), sizeof(header));
-            if (header.Magic == kMagic && IsPeer(header.Player) &&
+            if (header.Magic == kMagic && IsPeer(header.Player) && !Dropped(header.Player) &&
                 packet.size() >= sizeof(header) + header.Count * sizeof(WireEntry))
             {
                 std::lock_guard<std::mutex> lk(Lock);
