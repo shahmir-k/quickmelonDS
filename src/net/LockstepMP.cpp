@@ -200,28 +200,34 @@ int LockstepMP::SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid)
 int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
 {
     std::unique_lock<std::mutex> lk(Lock);
-    // The next host frame if the host had sent it by our current time, else nothing: a frame never
-    // arrives before it was sent (a client that took a CMD sent 1.7 ms in its future synced its
-    // Wi-Fi clock forward to the CMD's timestamp and dropped the session). Host frames are queued in
-    // send order before the host's clock moves on, so once the host is strictly past our time the
-    // answer can no longer change. No deadlock: a host waiting on our reply waits for our clock to
-    // pass its own + kDelay, and anything it sent before that is already at or before our time.
+    // The next host frame if the host had sent it kHostDelay before our current time, else
+    // nothing. The client sees the host's frames, like its beacons, uniformly later than they were
+    // sent, so it can run up to kHostDelay ahead of the host without waiting on it (each wait is a
+    // thread hand-off; Netplay makes ~13 per frame). A frame never arrives before it was sent (a
+    // client that took a CMD sent 1.7 ms in its future synced its Wi-Fi clock forward to the CMD's
+    // timestamp and dropped the session). Host frames are queued in send order before the host's
+    // clock moves on, so once the host is strictly past `visible` the answer can no longer change.
+    // No deadlock: a host waiting on our reply waits for our clock to pass its own + kDelay
+    // (> kHostDelay), and anything it sent before that is visible to us by then.
     while (!FromHost[inst].empty() && FromHost[inst].front().Time < BeginTime[inst]) FromHost[inst].pop_front();
     u64 now = Now(inst);
-    Log(inst, "RecvHostWait", HostID, now);
+    if (now < kHostDelay) return 0;
+    u64 visible = now - kHostDelay;
+    Log(inst, "RecvHostWait", HostID, visible);
     WaitFor(lk, [&] {
         // (a console that was the last host itself waits on the others, never on its own clock)
-        return (!FromHost[inst].empty() && FromHost[inst].front().Time <= now)
-            || (HostID >= 0 && HostID != inst ? Now(HostID) > now : PeersReached(inst, now));
+        return (!FromHost[inst].empty() && FromHost[inst].front().Time <= visible)
+            || (HostID >= 0 && HostID != inst ? Now(HostID) > visible : PeersReached(inst, visible));
     });
     while (!FromHost[inst].empty() && FromHost[inst].front().Time < BeginTime[inst]) FromHost[inst].pop_front();
-    if (FromHost[inst].empty() || FromHost[inst].front().Time > now) { Log(inst, "RecvHost", 0, 0); return 0; }
+    if (FromHost[inst].empty() || FromHost[inst].front().Time > visible) { Log(inst, "RecvHost", 0, 0); return 0; }
 
     Packet p = std::move(FromHost[inst].front());
     FromHost[inst].pop_front();
     int len = (int)p.Data.size();
     if (len) memcpy(data, p.Data.data(), len);
-    if (timestamp) *timestamp = p.Timestamp;
+    // advanced by the delay, as for regular frames (the client syncs its Wi-Fi clock to it)
+    if (timestamp) *timestamp = p.Timestamp + (now - p.Time) * 1000000 / 33513982;
     Log(inst, "RecvHost", len, p.Time);
     return len;
 }

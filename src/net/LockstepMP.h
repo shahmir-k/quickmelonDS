@@ -41,10 +41,12 @@ namespace melonDS
 //   others from their time S + kDelay. A console polling at time R first waits until every peer's
 //   clock has reached R - kDelay, so it always sees exactly the same frames, in (time, sender)
 //   order.
-// - MP frames (CMD, ACK from the host; replies to it) are delivered immediately, as the protocol
-//   needs, and the waits for them end on a clock condition instead of a timeout: a client that
-//   has run kDelay past the CMD without replying never will; a client waiting for the host gets
-//   nothing once the host's clock has passed its own.
+// - Host frames (CMD, ACK) sent at S are visible to the clients from their time S + kHostDelay,
+//   so a client can run up to kHostDelay ahead of the host without a thread hand-off (halves
+//   two-console wall time vs immediate delivery). Replies reach the host immediately. The waits
+//   end on a clock condition instead of a timeout: a client that has run kDelay past the CMD
+//   without replying never will; a client waiting for the host gets nothing once the host's clock
+//   has passed its own - kHostDelay.
 //
 // Wi-Fi on/off (Begin/End) happens at a console's own time, which another thread may not have
 // reached yet, so no decision depends on who is connected right now: frames go to every console
@@ -86,6 +88,9 @@ public:
 private:
     static constexpr int kMaxInst = 16;
     static constexpr u64 kDelay = 33514 * 4; // 4 ms in system clock cycles (33.514 MHz)
+    // host frames (CMD/ACK) reach the clients this much later; < kDelay, or a reply sent on time
+    // would land past the host's deadline
+    static constexpr u64 kHostDelay = 33514 * 2;
 
     struct Packet
     {
