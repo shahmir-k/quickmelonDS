@@ -37,7 +37,7 @@ CartRetailIR::CartRetailIR(const u8* rom, u32 len, u32 chipid, u32 irversion, bo
 }
 
 CartRetailIR::CartRetailIR(
-    std::unique_ptr<u8[]>&& rom,
+    std::shared_ptr<const u8[]> rom,
     u32 len,
     u32 chipid,
     u32 irversion,

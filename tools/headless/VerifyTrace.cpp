@@ -199,10 +199,16 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
                   BuiltNDS& out, std::string& err)
 {
     u32 romlen = 0;
-    auto romdata = ReadFile(cfg.rom, romlen);
+    // one in-memory ROM for every console of this process that boots the same file
+    auto romdata = NDSCart::AcquireSharedROM(cfg.rom, romlen);
     if (!romdata) { err = "cannot read ROM '" + cfg.rom + "'"; return false; }
 
-    out.romHash = XXH3_64bits(romdata.get(), romlen);
+    // Hash the file as loaded: a console booted earlier may since have re-encrypted the secure
+    // area of the shared buffer in place. The first load of a path is always fresh from the file.
+    static std::map<std::string, u64> romHashes;
+    auto h = romHashes.find(cfg.rom);
+    if (h == romHashes.end()) h = romHashes.emplace(cfg.rom, XXH3_64bits(romdata.get(), romlen)).first;
+    out.romHash = h->second;
     out.romSize = romlen;
 
     auto cart = NDSCart::ParseROM(std::move(romdata), romlen, nullptr, std::nullopt);

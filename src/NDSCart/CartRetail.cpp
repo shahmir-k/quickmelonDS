@@ -37,7 +37,7 @@ CartRetail::CartRetail(const u8* rom, u32 len, u32 chipid, bool badDSiDump, ROML
 {
 }
 
-CartRetail::CartRetail(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, bool badDSiDump, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata, melonDS::NDSCart::CartType type) :
+CartRetail::CartRetail(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, bool badDSiDump, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata, melonDS::NDSCart::CartType type) :
     CartCommon(std::move(rom), len, chipid, badDSiDump, romparams, type, userdata)
 {
     LenientAddressing = false;

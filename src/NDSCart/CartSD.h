@@ -30,7 +30,7 @@ class CartSD : public CartCommon
 {
 public:
     CartSD(const u8* rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard = std::nullopt);
-    CartSD(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard = std::nullopt);
+    CartSD(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard = std::nullopt);
     ~CartSD() override;
 
     [[nodiscard]] const std::optional<FATStorage>& GetSDCard() const noexcept { return SD; }

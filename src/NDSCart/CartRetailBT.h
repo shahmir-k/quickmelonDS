@@ -29,7 +29,7 @@ class CartRetailBT : public CartRetail
 {
 public:
     CartRetailBT(const u8* rom, u32 len, u32 chipid, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata);
-    CartRetailBT(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata);
+    CartRetailBT(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata);
     ~CartRetailBT() override;
 
     u8 SPITransmitReceive(u8 val) override;

@@ -64,7 +64,7 @@ static void DecryptR4Sector(u8* dest, u8* src, u16 key1)
     }
 }
 
-CartR4::CartR4(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, ROMListEntry romparams, CartR4Type ctype, CartR4Language clanguage, void* userdata,
+CartR4::CartR4(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, ROMListEntry romparams, CartR4Type ctype, CartR4Language clanguage, void* userdata,
             std::optional<FATStorage>&& sdcard)
     : CartSD(std::move(rom), len, chipid, romparams, userdata, std::move(sdcard))
 {

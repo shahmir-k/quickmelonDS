@@ -36,7 +36,7 @@ CartHomebrew::CartHomebrew(const u8* rom, u32 len, u32 chipid, ROMListEntry romp
     CartSD(rom, len, chipid, romparams, userdata, std::move(sdcard))
 {}
 
-CartHomebrew::CartHomebrew(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard) :
+CartHomebrew::CartHomebrew(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard) :
     CartSD(std::move(rom), len, chipid, romparams, userdata, std::move(sdcard))
 {}
 
@@ -58,7 +58,7 @@ void CartHomebrew::SetupDirectBoot(const std::string& romname, NDS& nds)
     {
         // add the ROM to the SD volume
 
-        if (!SD->InjectFile(romname, ROM.get(), ROMLength))
+        if (!SD->InjectFile(romname, ROM, ROMLength))
             return;
 
         // setup argv command line

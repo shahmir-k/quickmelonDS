@@ -29,7 +29,7 @@ class CartHomebrew : public CartSD
 {
 public:
     CartHomebrew(const u8* rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard = std::nullopt);
-    CartHomebrew(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard = std::nullopt);
+    CartHomebrew(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, ROMListEntry romparams, void* userdata, std::optional<FATStorage>&& sdcard = std::nullopt);
     ~CartHomebrew() override;
 
     void Reset() override;

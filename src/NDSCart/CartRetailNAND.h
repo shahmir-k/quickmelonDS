@@ -29,7 +29,7 @@ class CartRetailNAND : public CartRetail
 {
 public:
     CartRetailNAND(const u8* rom, u32 len, u32 chipid, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata);
-    CartRetailNAND(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata);
+    CartRetailNAND(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, ROMListEntry romparams, std::unique_ptr<u8[]>&& sram, u32 sramlen, void* userdata);
     ~CartRetailNAND() override;
 
     void Reset() override;

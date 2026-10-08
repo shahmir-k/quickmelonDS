@@ -40,7 +40,7 @@ public:
             melonDS::NDSCart::CartType type = CartType::Retail
     );
     CartRetail(
-            std::unique_ptr<u8[]>&& rom,
+            std::shared_ptr<const u8[]> rom,
             u32 len, u32 chipid,
             bool badDSiDump,
             ROMListEntry romparams,

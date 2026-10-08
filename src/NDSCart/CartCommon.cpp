@@ -41,8 +41,9 @@ CartCommon::CartCommon(const u8* rom, u32 len, u32 chipid, bool badDSiDump, ROML
 {
 }
 
-CartCommon::CartCommon(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, bool badDSiDump, ROMListEntry romparams, melonDS::NDSCart::CartType type, void* userdata) :
-    ROM(std::move(rom)),
+CartCommon::CartCommon(std::shared_ptr<const u8[]> rom, u32 len, u32 chipid, bool badDSiDump, ROMListEntry romparams, melonDS::NDSCart::CartType type, void* userdata) :
+    ROMOwner(std::move(rom)),
+    ROM(const_cast<u8*>(ROMOwner.get())),
     ROMLength(len),
     ChipID(chipid),
     ROMParams(romparams),
@@ -51,17 +52,27 @@ CartCommon::CartCommon(std::unique_ptr<u8[]>&& rom, u32 len, u32 chipid, bool ba
 {
     ROMMask = ROMLength - 1;
 
-    memcpy(&Header, ROM.get(), sizeof(Header));
+    memcpy(&Header, ROM, sizeof(Header));
     IsDSi = Header.IsDSi() && !badDSiDump;
     DSiBase = Header.DSiRegionStart << 19;
 }
 
 CartCommon::~CartCommon() = default;
 
+u8* CartCommon::GetWritableROM()
+{
+    if (IsSharedROM(ROM))
+    {
+        ROMOwner = CopyToUnique(ROM, ROMLength);
+        ROM = const_cast<u8*>(ROMOwner.get());
+    }
+    return ROM;
+}
+
 u32 CartCommon::Checksum() const
 {
     const NDSHeader& header = GetHeader();
-    u32 crc = CRC32(ROM.get(), 0x40);
+    u32 crc = CRC32(ROM, 0x40);
 
     crc = CRC32(&ROM[header.ARM9ROMOffset], header.ARM9Size, crc);
     crc = CRC32(&ROM[header.ARM7ROMOffset], header.ARM7Size, crc);
@@ -309,7 +320,7 @@ const NDSBanner* CartCommon::Banner() const
     size_t bannersize = header.IsDSi() ? 0x23C0 : 0xA40;
     if (header.BannerOffset >= 0x200 && header.BannerOffset < (ROMLength - bannersize))
     {
-        return reinterpret_cast<const NDSBanner*>(ROM.get() + header.BannerOffset);
+        return reinterpret_cast<const NDSBanner*>(ROM + header.BannerOffset);
     }
 
     return nullptr;

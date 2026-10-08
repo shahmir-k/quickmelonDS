@@ -35,6 +35,9 @@
 #include "NDSCart/CartRetailBT.h"
 #include "NDSCart/CartHomebrew.h"
 #include "NDSCart/CartR4.h"
+#include <map>
+#include <mutex>
+#include <vector>
 
 namespace melonDS
 {
@@ -385,7 +388,107 @@ std::unique_ptr<CartCommon> ParseROM(const u8* romdata, u32 romlen, void* userda
 
 std::unique_ptr<CartCommon> ParseROM(std::unique_ptr<u8[]>&& romdata, u32 romlen, void* userdata, std::optional<NDSCartArgs>&& args)
 {
-    if (romdata == nullptr)
+    if (romlen > 512*1024*1024) // rejected below; don't pad it first
+        return ParseROM(std::shared_ptr<const u8[]>(std::move(romdata)), romlen, userdata, std::move(args));
+
+    auto [cartrom, cartromsize] = PadToPowerOf2(std::move(romdata), romlen);
+    return ParseROM(std::shared_ptr<const u8[]>(std::move(cartrom)), romlen, userdata, std::move(args));
+}
+
+namespace
+{
+struct SharedROM
+{
+    const u8* ptr;
+    std::weak_ptr<const u8[]> buf;
+    std::vector<u8> plainSecureArea; // set once a console re-encrypted the secure area in place
+};
+std::recursive_mutex SharedROMLock;
+std::map<std::string, SharedROM> SharedROMs; // key: path + '\0' + file size
+
+SharedROM* FindSharedROM(const u8* rom)
+{
+    for (auto& [key, e] : SharedROMs)
+        if (e.ptr == rom && !e.buf.expired()) return &e;
+    return nullptr;
+}
+
+// The secure area as it was before a console re-encrypted the shared ROM in place.
+bool SharedROMPlainSecureArea(const u8* rom, u8* out)
+{
+    std::lock_guard<std::recursive_mutex> lock(SharedROMLock);
+    SharedROM* e = FindSharedROM(rom);
+    if (!e || e->plainSecureArea.empty()) return false;
+    memcpy(out, e->plainSecureArea.data(), e->plainSecureArea.size());
+    return true;
+}
+
+// Re-encryption is a pure function of the ROM and the console's BIOS key, so the first console
+// writes it into a shared ROM in place (it is still plain: no console has run from it yet) and
+// later ones with the same key find it already there. A console with another key (other BIOS)
+// takes a private copy.
+void WriteSecureArea(CartCommon& cart, u32 off, const u8* area)
+{
+    std::lock_guard<std::recursive_mutex> lock(SharedROMLock);
+    const u8* rom = cart.GetROM();
+    if (!memcmp(rom + off, area, 0x800)) return;
+    SharedROM* e = FindSharedROM(rom);
+    u8* dst;
+    if (e && e->plainSecureArea.empty())
+    {
+        e->plainSecureArea.assign(rom + off, rom + off + 0x800);
+        dst = const_cast<u8*>(rom);
+    }
+    else
+        dst = cart.GetWritableROM();
+    memcpy(dst + off, area, 0x800);
+}
+}
+
+std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len)
+{
+    Platform::FileHandle* f = Platform::OpenFile(path, Platform::FileMode::Read);
+    if (!f) return nullptr;
+    u64 flen = Platform::FileLength(f);
+    if (flen == 0 || flen > 512*1024*1024) { Platform::CloseFile(f); return nullptr; }
+    len = (u32)flen;
+
+    // ponytail: keyed on path+size, not content; a same-size file swapped in at the same
+    // path while a console still holds the old one would be missed. Hash the file if that matters.
+    std::string key = path + '\0' + std::to_string(len);
+    std::lock_guard<std::recursive_mutex> lock(SharedROMLock);
+    for (auto it = SharedROMs.begin(); it != SharedROMs.end();)
+        it = it->second.buf.expired() ? SharedROMs.erase(it) : std::next(it);
+
+    auto it = SharedROMs.find(key);
+    if (it != SharedROMs.end())
+    {
+        if (auto buf = it->second.buf.lock()) { Platform::CloseFile(f); return buf; }
+    }
+
+    u32 padded = 1;
+    while (padded < len) padded <<= 1;
+    std::unique_ptr<u8[]> data(new u8[padded]);
+    Platform::FileRewind(f);
+    bool ok = Platform::FileRead(data.get(), len, 1, f) == 1;
+    Platform::CloseFile(f);
+    if (!ok) return nullptr;
+    memset(data.get() + len, 0, padded - len);
+
+    std::shared_ptr<const u8[]> buf(std::move(data));
+    SharedROMs[key] = {buf.get(), buf};
+    return buf;
+}
+
+bool IsSharedROM(const u8* rom)
+{
+    std::lock_guard<std::recursive_mutex> lock(SharedROMLock);
+    return FindSharedROM(rom) != nullptr;
+}
+
+std::unique_ptr<CartCommon> ParseROM(std::shared_ptr<const u8[]> cartrom, u32 romlen, void* userdata, std::optional<NDSCartArgs>&& args)
+{
+    if (cartrom == nullptr)
     {
         Log(LogLevel::Error, "NDSCart: romdata is null\n");
         return nullptr;
@@ -403,7 +506,8 @@ std::unique_ptr<CartCommon> ParseROM(std::unique_ptr<u8[]>&& romdata, u32 romlen
         return nullptr;
     }
 
-    auto [cartrom, cartromsize] = PadToPowerOf2(std::move(romdata), romlen);
+    u32 cartromsize = 1;
+    while (cartromsize < romlen) cartromsize <<= 1;
 
     NDSHeader header {};
     memcpy(&header, cartrom.get(), sizeof(header));
@@ -527,22 +631,29 @@ void NDSCartSlot::SetCart(std::unique_ptr<CartCommon>&& cart) noexcept
     const NDSHeader& header = Cart->GetHeader();
     const ROMListEntry romparams = Cart->GetROMParams();
     const u8* cartrom = Cart->GetROM();
-    if (header.ARM9ROMOffset >= 0x4000 && header.ARM9ROMOffset < 0x8000)
+    const u32 sec = header.ARM9ROMOffset;
+    if (sec >= 0x4000 && sec < 0x8000)
     {
-        // reencrypt secure area if needed
-        if (*(u32*)&cartrom[header.ARM9ROMOffset] == 0xE7FFDEFF && *(u32*)&cartrom[header.ARM9ROMOffset + 0x10] != 0xE7FFDEFF)
+        // reencrypt secure area if needed. Done on a copy: a ROM shared with other consoles
+        // may already hold another console's re-encryption (see WriteSecureArea).
+        alignas(8) u8 area[0x800];
+        bool plain = *(u32*)&cartrom[sec] == 0xE7FFDEFF && *(u32*)&cartrom[sec + 0x10] != 0xE7FFDEFF;
+        if (plain)
+            memcpy(area, &cartrom[sec], sizeof(area));
+        if (plain || SharedROMPlainSecureArea(cartrom, area))
         {
             Log(LogLevel::Debug, "Re-encrypting cart secure area\n");
 
-            strncpy((char*)&cartrom[header.ARM9ROMOffset], "encryObj", 8);
+            strncpy((char*)area, "encryObj", 8);
 
             Key1_InitKeycode(false, romparams.GameCode, 3, 2);
             for (u32 i = 0; i < 0x800; i += 8)
-                Key1_Encrypt((u32*)&cartrom[header.ARM9ROMOffset + i]);
+                Key1_Encrypt((u32*)&area[i]);
 
             Key1_InitKeycode(false, romparams.GameCode, 2, 2);
-            Key1_Encrypt((u32*)&cartrom[header.ARM9ROMOffset]);
+            Key1_Encrypt((u32*)&area[0]);
 
+            WriteSecureArea(*Cart, sec, area);
             Log(LogLevel::Debug, "Re-encrypted cart secure area\n");
         }
         else
