@@ -19,6 +19,7 @@
 #ifndef LOCKSTEPMP_H
 #define LOCKSTEPMP_H
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -27,6 +28,7 @@
 #include <cstdio>
 
 #include "MPInterface.h"
+
 
 namespace melonDS
 {
@@ -84,6 +86,7 @@ public:
     int SendAck(int inst, u8* data, int len, u64 timestamp) override;
     int RecvHostPacket(int inst, u8* data, u64* timestamp) override;
     u16 RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask) override;
+    void Tick(int inst) override;
 
 private:
     static constexpr int kMaxInst = 16;
@@ -91,6 +94,14 @@ private:
     // host frames (CMD/ACK) reach the clients this much later; < kDelay, or a reply sent on time
     // would land past the host's deadline
     static constexpr u64 kHostDelay = 33514 * 2;
+    // a console waiting for another's clock is woken by that console's Tick once the clock is this
+    // far past what it needs (less often than every Wi-Fi tick, each wake is a thread hand-off);
+    // waits also re-check every BackstopUs. Tuning: debug.litev.mpwake (cycles) / mpback (us),
+    // re-read every second
+    std::atomic<u64> WakeAhead {0};
+    int BackstopUs = 100;
+    long long TuneReadNs = 0;
+    void Tune();
 
     struct Packet
     {
@@ -133,6 +144,9 @@ private:
     // waits (lock held) until pred(); peers' clocks advance without notifying, so also re-check
     // every 100 us
     template <typename Pred> void WaitFor(std::unique_lock<std::mutex>& lk, Pred pred);
+    // Tick(i) notifies the waiters once instance i's clock is past WakeAt[i] (0: nobody waits)
+    std::atomic<u64> WakeAt[kMaxInst] {};
+    void Watch(int i, u64 time);
 };
 
 }

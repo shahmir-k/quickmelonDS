@@ -1920,6 +1920,7 @@ void Wifi::USTimer(u32 param)
 #else
     while (false);
 #endif
+    Platform::MP_Tick(NDS.UserData);
     ScheduleTimer(false, ticks);
 }
 

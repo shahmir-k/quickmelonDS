@@ -92,6 +92,22 @@ bool LockstepMP::StatsOn()
     return St.On > 0;
 }
 
+void LockstepMP::Watch(int i, u64 time)
+{
+    time += WakeAhead.load(std::memory_order_relaxed);
+    u64 cur = WakeAt[i].load(std::memory_order_relaxed);
+    while ((cur == 0 || time < cur) && !WakeAt[i].compare_exchange_weak(cur, time, std::memory_order_relaxed)) {}
+}
+
+void LockstepMP::Tick(int inst)
+{
+    u64 w = WakeAt[inst].load(std::memory_order_relaxed);
+    if (!w || Now(inst) <= w) return;
+    std::lock_guard<std::mutex> lk(Lock);   // the waiter set WakeAt under the lock, so it is waiting by now
+    WakeAt[inst].store(0, std::memory_order_relaxed);
+    Changed.notify_all();
+}
+
 bool LockstepMP::PeersReached(int inst, u64 time) const
 {
     for (int i = 0; i < kMaxInst; i++)
@@ -103,13 +119,33 @@ bool LockstepMP::PeersReached(int inst, u64 time) const
     return true;
 }
 
+void LockstepMP::Tune()
+{
+    long long t = NowNs();
+    if (t - TuneReadNs < 1000000000LL) return;
+    TuneReadNs = t;
+#ifdef __ANDROID__
+    char v[92] = {0};
+    // "off": never woken by Tick (A/B against the backstop timer alone)
+    WakeAhead.store(__system_property_get("debug.litev.mpwake", v) > 0 ? (v[0] == 'o' ? (1ull << 62) : strtoull(v, nullptr, 10)) : 0, std::memory_order_relaxed);
+    v[0] = 0;
+    BackstopUs = __system_property_get("debug.litev.mpback", v) > 0 && atoi(v) > 0 ? atoi(v) : 100;
+#else
+    const char* e = getenv("LITEV_MP_WAKE");
+    WakeAhead.store(e ? strtoull(e, nullptr, 10) : 0, std::memory_order_relaxed);
+    e = getenv("LITEV_MP_BACK");
+    BackstopUs = e && atoi(e) > 0 ? atoi(e) : 100;
+#endif
+}
+
 template <typename Pred> void LockstepMP::WaitFor(std::unique_lock<std::mutex>& lk, Pred pred)
 {
+    Tune();
     auto start = std::chrono::steady_clock::now();
     bool reported = false;
     while (!pred() && !Stopped)
     {
-        Changed.wait_for(lk, std::chrono::microseconds(100));
+        Changed.wait_for(lk, std::chrono::microseconds(BackstopUs));
         if (!reported && std::chrono::steady_clock::now() - start > std::chrono::seconds(1))
         {
             reported = true; // diagnostics: a wait this long is a deadlock
@@ -156,6 +192,9 @@ int LockstepMP::RecvPacket(int inst, u8* data, u64* timestamp)
     Log(inst, "RecvPacketWait", 0, visible);
 
     // everything a peer sent up to `visible` must exist before we look
+    if (!PeersReached(inst, visible))
+        for (int i = 0; i < kMaxInst; i++)
+            if (i != inst && (Members & (1 << i))) Watch(i, visible);
     WaitFor(lk, [&] { return PeersReached(inst, visible); });
 
     // earliest visible frame by (send time, sender), first-sent among equals
@@ -244,6 +283,9 @@ int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
     if (now < kHostDelay) return 0;
     u64 visible = now - kHostDelay;
     Log(inst, "RecvHostWait", HostID, visible);
+    for (int i = 0; i < kMaxInst; i++)
+        if (i != inst && (Members & (1 << i)) && (HostID < 0 || HostID == inst || i == HostID) && Now(i) <= visible)
+            Watch(i, visible);
     WaitFor(lk, [&] {
         // (a console that was the last host itself waits on the others, never on its own clock)
         return (!FromHost[inst].empty() && FromHost[inst].front().Time <= visible)
