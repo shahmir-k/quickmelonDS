@@ -27,6 +27,8 @@ constexpr long long kDefaultRtcEpoch = 946684800LL;
 struct TraceRunConfig
 {
     std::string rom;                          // path to the DS ROM (required)
+    std::vector<std::string> roms;            // --mp-test/--replay-console: --romK = console K's ROM ("" = rom)
+    const std::string& RomFor(int k) const { return k < (int)roms.size() && !roms[k].empty() ? roms[k] : rom; }
     std::string dataDir = "./headless-data";  // firmware/save scratch dir
     bool jit = true;                          // JIT vs interpreter
     long long fixedRtcEpoch = kDefaultRtcEpoch;

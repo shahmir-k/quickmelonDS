@@ -73,6 +73,7 @@ struct Options
     // Unit 1 trace/verify modes.
     RunMode mode = RunMode::Benchmark;
     std::string tracePath;
+    std::vector<std::string> roms;      // --mp-test: --romK = console K's ROM (default --rom)
     std::vector<std::string> mpScripts; // --mp-test: --mp-scriptK = instance K's input script (0 = host)
     int replayConsole = -1;             // --replay-console K (Hosted Netplay replica)
     std::string replayLog;              // --replay-log <dir>: the records LITEV_MP_RECORD wrote
@@ -109,6 +110,9 @@ struct Options
         "liteDS-headless - headless melonDS benchmark runner (liteDS-v2 Unit 0)\n"
         "Usage: %s --rom <path> [options]\n"
         "  --rom <path>              DS ROM to run (required)\n"
+        "  --romK <path>             --mp-test / --replay-console: console K's ROM (default --rom).\n"
+        "                            Netplay/Hosted: the ROMs this process has; each console boots\n"
+        "                            its player's ROM, found among them by hash\n"
         "  --savestate <path>        load a savestate after boot (optional)\n"
         "  --dump-savestate <f>:<p>  write a core savestate to <p> after running frame f\n"
         "  --frames N                number of frames to run (default 300)\n"
@@ -240,6 +244,13 @@ bool ParseArgs(int argc, char** argv, Options& o)
         else if (a == "--mp-test") o.mode = RunMode::MPTest;
         else if (a == "--replay-console") { o.mode = RunMode::Replay; o.replayConsole = std::atoi(next("--replay-console").c_str()); }
         else if (a == "--replay-log") o.replayLog = next("--replay-log");
+        else if (a.rfind("--rom", 0) == 0 && a.size() > 5 && isdigit((unsigned char)a[5]))
+        {
+            size_t k = std::stoul(a.substr(5));
+            if (k >= 16) { fprintf(stderr, "error: %s: at most 16 instances\n", a.c_str()); return false; }
+            if (o.roms.size() <= k) o.roms.resize(k + 1);
+            o.roms[k] = next(a.c_str());
+        }
         else if (a.rfind("--mp-script", 0) == 0 && a.size() > 11 && isdigit((unsigned char)a[11]))
         {
             size_t k = std::stoul(a.substr(11));
@@ -367,6 +378,7 @@ int main(int argc, char** argv)
     {
         liteds::TraceRunConfig cfg;
         cfg.rom = opt.rom;
+        cfg.roms = opt.roms;
         cfg.dataDir = opt.dataDir;
         cfg.jit = opt.jit;
         cfg.fixedRtcEpoch = opt.fixedRtc;

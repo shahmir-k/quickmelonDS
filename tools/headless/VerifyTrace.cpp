@@ -145,7 +145,6 @@ struct BuiltNDS
     std::unique_ptr<NDS> nds;
     std::unique_ptr<HeadlessHost::InstanceUserData> udata;
     u64 romHash = 0;
-    u64 romId = 0;             // Netplay session ROM id: XXH3 of the first 4 KB, as the app computes it
     u32 romSize = 0;
     InputScript inputScript;   // optional scripted input (empty => none)
 
@@ -204,7 +203,6 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
     if (!romdata) { err = "cannot read ROM '" + cfg.rom + "'"; return false; }
 
     out.romHash = XXH3_64bits(romdata.get(), romlen);
-    out.romId = XXH3_64bits(romdata.get(), std::min<u32>(romlen, 0x1000));
     out.romSize = romlen;
 
     auto cart = NDSCart::ParseROM(std::move(romdata), romlen, nullptr, std::nullopt);
@@ -806,6 +804,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     if (hostedSpec && players > kHostedServerId) { fprintf(stderr, "error: Hosted Netplay: at most %d consoles\n", kHostedServerId); return 1; }
 #else
     const char* hostedSpec = nullptr;
+    auto hosted = ParseSpec(nullptr);
     const char* recordDir = nullptr;
     const bool hostedPlay = false;
 #endif
@@ -815,17 +814,57 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     if (n < 2 || n > LockstepMP::kMaxInst) { fprintf(stderr, "error: %d instances (2..%d)\n", n, LockstepMP::kMaxInst); return 1; }
     const u16 allMask = (u16)((1u << n) - 1);
 
+    // Each console's ROM: --romK (default --rom). With session setup (Netplay with players=, the
+    // Hosted server) this process's own console keeps its ROM, and every other console boots the
+    // ROM its player sent, found by hash among the ROMs this process was given (--rom, --romK);
+    // when one is missing, the setup fails on every process.
+    std::vector<std::string> romPaths(n);
+    for (int k = 0; k < n; k++) romPaths[k] = cfg.RomFor(k);
+    NetplaySetup setup;
+    if (hostedSpec || (np && players))
+    {
+        std::vector<std::string> library {cfg.rom};
+        for (const std::string& r : cfg.roms) if (!r.empty()) library.push_back(r);
+        setup.Rom = NetplayDescribeRom(romPaths[hostedSpec ? 0 : player]);
+        setup.FindRom = [library](const NetplayRom& r) { return NetplayFindRom(r, library); };
+        if (hostedSpec)
+        {
+            setup.Player = 0;
+            setup.NumPlayers = n;
+            setup.Port = SpecInt(hosted, "port", 7100);
+            setup.Delay = SpecInt(hosted, "delay", 0);
+            setup.Hosted = true;
+            setup.HostPlays = hostedPlay;
+        }
+        else
+        {
+            setup.Player = player;
+            setup.NumPlayers = players;
+            setup.Port = port;
+            setup.Host = host;
+            setup.Save.assign(1000 + player, (u8)(0xA0 + player)); // a recognisable stand-in save
+            setup.Delay = delay > 0 ? delay : 0;
+        }
+        bool ok = NetplayHandshake(setup);
+        printf("%s", setup.Log.c_str());
+        if (!ok) { fprintf(stderr, "%s: session setup failed\n", hostedSpec ? "hosted" : "netplay"); return 1; }
+        for (auto& [p, path] : setup.RomPaths)
+            if (p < n) romPaths[p] = path;
+    }
+
     std::vector<BuiltNDS> b(n);
     std::vector<std::string> instScripts(n);
     for (int k = 0; k < n; k++)
     {
         TraceRunConfig c = cfg;
+        c.rom = romPaths[k];
         c.instanceTag = "mp" + std::to_string(k);
         // Per-instance scripts (host vs client differ). Fall back to cfg.inputScript.
         c.inputScript = (k < (int)scripts.size() && !scripts[k].empty()) ? scripts[k] : cfg.inputScript;
         instScripts[k] = c.inputScript;
         std::string err;
         if (!BuildAndBoot(c, true, b[k], err)) { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
+        printf("console %d rom: %s (xxh3 %016llx)\n", k, c.rom.c_str(), (unsigned long long)b[k].romHash);
     }
     // Instance 0 knobs act on instance 0; the "1" knobs on every other instance (with two
     // instances: instance 1, as before).
@@ -922,18 +961,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_HOSTED_NETPLAY
     if (hostedSpec)
     {
-        int hport = SpecInt(hosted, "port", 7100);
-        NetplaySetup setup;
-        setup.Player = 0;
-        setup.NumPlayers = n;
-        setup.Port = hport;
-        setup.RomId = b[0].romId;
-        setup.Delay = SpecInt(hosted, "delay", 0);
-        setup.Hosted = true;
-        setup.HostPlays = hostedPlay;
-        bool ok = NetplayHandshake(setup);
-        printf("%s", setup.Log.c_str());
-        if (!ok) { fprintf(stderr, "hosted: session setup failed\n"); return 1; }
+        int hport = setup.Port;
         for (auto& [p, addr] : setup.Peers)
             if (p >= n) { fprintf(stderr, "hosted: player %d outside 0..%d\n", p, n - 1); return 1; }
         for (auto& [p, save] : setup.Saves)   // each guest's save in its console, as the app host does
@@ -957,17 +985,6 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     }
     else if (np)
     {
-        NetplaySetup setup;
-        setup.Player = player;
-        setup.NumPlayers = players;
-        setup.Port = port;
-        setup.Host = host;
-        setup.RomId = b[0].romId;
-        setup.Save.assign(1000 + player, (u8)(0xA0 + player)); // a recognisable stand-in save
-        setup.Delay = delay > 0 ? delay : 0;
-        bool ok = NetplayHandshake(setup);
-        printf("%s", setup.Log.c_str());
-        if (!ok) { fprintf(stderr, "netplay: session setup failed\n"); return 1; }
         for (auto& [p, save] : setup.Saves)
         {
             bool expected = save.size() == 1000u + p && std::all_of(save.begin(), save.end(), [p = p](u8 v) { return v == 0xA0 + p; });
@@ -1230,6 +1247,7 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
 
     // console K exactly as --mp-test builds it
     TraceRunConfig c = cfg;
+    c.rom = cfg.RomFor(k);
     c.instanceTag = "mp" + std::to_string(k);
     c.inputScript = (k < (int)scripts.size() && !scripts[k].empty()) ? scripts[k] : cfg.inputScript;
     BuiltNDS b;
@@ -1268,7 +1286,7 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
         setup.Port = SpecInt(spec, "port", 7110 + k);
         setup.Host = spec["host"];
         setup.Join = true;
-        setup.RomId = b.romId;
+        setup.Rom = NetplayDescribeRom(c.rom);   // a replica needs only its own ROM
         bool ok = NetplayHandshake(setup);
         printf("%s", setup.Log.c_str());
         if (!ok) { fprintf(stderr, "hosted: session setup failed\n"); return 1; }

@@ -30,10 +30,12 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include "NetplayInput.h"
 #include "../Platform.h"
+#include "xxhash/xxhash.h"
 
 namespace melonDS
 {
@@ -297,11 +299,99 @@ void NetplayInput::ReceiveLoop()
     Changed.notify_all();
 }
 
+// ---- ROM identity ----
+
+std::string NetplayRom::Name() const
+{
+    auto text = [](const char* p, size_t n) {
+        std::string t(p, strnlen(p, n));
+        while (!t.empty() && t.back() == ' ') t.pop_back();
+        return t;
+    };
+    char line[160];
+    snprintf(line, sizeof(line), "%s \"%s\" (xxh3-128 %016llx%016llx, %llu bytes)", text(GameCode, 4).c_str(),
+             text(Title, 12).c_str(), (unsigned long long)Hash[1], (unsigned long long)Hash[0], (unsigned long long)Size);
+    return line;
+}
+
+namespace
+{
+// a file's size and first 16 header bytes (title + game code); false = unreadable or too short
+bool RomHead(Platform::FileHandle* f, u64& size, u8 head[16])
+{
+    size = Platform::FileLength(f);
+    Platform::FileRewind(f);
+    return size >= 16 && Platform::FileRead(head, 16, 1, f) == 1;
+}
+}
+
+NetplayRom NetplayDescribeRom(const std::string& path)
+{
+    // ponytail: keyed by path + size, so a file replaced in place by one of the same size keeps
+    // its old hash until the app restarts; add the mtime if that ever happens
+    static std::mutex lock;
+    static std::map<std::pair<std::string, u64>, NetplayRom> known;
+    NetplayRom rom;
+    Platform::FileHandle* f = Platform::OpenFile(path, Platform::FileMode::Read);
+    if (!f) return rom;
+    u8 head[16];
+    u64 size;
+    if (RomHead(f, size, head))
+    {
+        std::lock_guard<std::mutex> lk(lock);
+        auto it = known.find({path, size});
+        if (it != known.end()) rom = it->second;
+        else
+        {
+            XXH3_state_t* st = XXH3_createState();
+            XXH3_128bits_reset(st);
+            std::vector<u8> buf(1 << 20);
+            Platform::FileRewind(f);
+            u64 left = size;
+            while (left)
+            {
+                u64 n = std::min<u64>(left, buf.size());
+                if (Platform::FileRead(buf.data(), n, 1, f) != 1) break;
+                XXH3_128bits_update(st, buf.data(), n);
+                left -= n;
+            }
+            XXH128_hash_t h = XXH3_128bits_digest(st);
+            XXH3_freeState(st);
+            if (!left)
+            {
+                rom.Hash[0] = h.low64;
+                rom.Hash[1] = h.high64;
+                rom.Size = size;
+                memcpy(rom.Title, head, 12);
+                memcpy(rom.GameCode, head + 12, 4);
+                known[{path, size}] = rom;
+            }
+        }
+    }
+    Platform::CloseFile(f);
+    return rom;
+}
+
+std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths)
+{
+    for (const std::string& path : paths)
+    {
+        Platform::FileHandle* f = Platform::OpenFile(path, Platform::FileMode::Read);
+        if (!f) continue;
+        u8 head[16];
+        u64 size;
+        bool maybe = RomHead(f, size, head) && size == rom.Size && !memcmp(head + 12, rom.GameCode, 4);
+        Platform::CloseFile(f);
+        if (maybe && NetplayDescribeRom(path) == rom) return path;
+    }
+    return "";
+}
+
 // ---- session start ----
 
 namespace
 {
-constexpr u32 kSetupMagic = 0x4E505331; // "NPS1"
+constexpr u32 kSetupMagic = 0x4E505332; // "NPS2" (NPS1 had one ROM id for everyone)
 constexpr int kPings = 12;
 constexpr u32 kMaxSave = 32u << 20;
 
@@ -382,7 +472,7 @@ void AddLog(std::string& log, const char* fmt, ...)
 
 bool HostHandshake(NetplaySetup& s)
 {
-    struct Guest { int Fd = -1; int Player = 0; u32 Ip = 0; u16 Port = 0; u64 Rom = 0; std::vector<u8> Save; double OneWayMs = 0; };
+    struct Guest { int Fd = -1; int Player = 0; u32 Ip = 0; u16 Port = 0; NetplayRom Rom; std::vector<u8> Save; double OneWayMs = 0; };
     std::vector<Guest> guests;
     auto closeAll = [&] { for (Guest& g : guests) if (g.Fd >= 0) close(g.Fd); };
 
@@ -468,29 +558,53 @@ bool HostHandshake(NetplaySetup& s)
         AddLog(s.Log, "Netplay: worst one way %.1f ms -> input delay %d frames", worst, s.Delay);
     }
 
-    u8 status = 0;
-    for (Guest& g : guests)
-        if (g.Rom != s.RomId)
-        {
-            AddLog(s.Log, "Netplay: player %d runs a different game", g.Player);
-            status = 1;
-        }
-    // every guest: status, delay, then every player (address 0 = the host itself) with its save
+    if (s.HostPlays) AddLog(s.Log, "Netplay: player 0 runs %s", s.Rom.Name().c_str());
+    for (Guest& g : guests) AddLog(s.Log, "Netplay: player %d runs %s", g.Player, g.Rom.Name().c_str());
+    // every guest: delay, then every player (address 0 = the host itself) with its ROM and save
     for (Guest& g : guests)
     {
-        ok = ok && SendVal(g.Fd, kSetupMagic) && SendVal(g.Fd, status) && SendVal(g.Fd, (u8)s.Delay)
+        ok = ok && SendVal(g.Fd, kSetupMagic) && SendVal(g.Fd, (u8)s.Delay)
                 && SendVal(g.Fd, (u8)(guests.size() + (s.HostPlays ? 1 : 0)));
         if (s.HostPlays)
-            ok = ok && SendVal(g.Fd, (u8)0) && SendVal(g.Fd, (u32)0) && SendVal(g.Fd, (u16)s.Port) && SendBlob(g.Fd, s.Save);
+            ok = ok && SendVal(g.Fd, (u8)0) && SendVal(g.Fd, (u32)0) && SendVal(g.Fd, (u16)s.Port) && SendVal(g.Fd, s.Rom)
+                    && SendBlob(g.Fd, s.Save);
         for (Guest& o : guests)
-            ok = ok && SendVal(g.Fd, (u8)o.Player) && SendVal(g.Fd, o.Ip) && SendVal(g.Fd, o.Port)
+            ok = ok && SendVal(g.Fd, (u8)o.Player) && SendVal(g.Fd, o.Ip) && SendVal(g.Fd, o.Port) && SendVal(g.Fd, o.Rom)
                     && SendBlob(g.Fd, &o == &g ? std::vector<u8>() : o.Save);
     }
+    // the host runs every console: find each guest's ROM here; each guest reports which of the
+    // others' it lacks; then everyone gets the verdict ("" = go, else why not)
+    std::string missing;
+    for (Guest& g : guests)
+    {
+        std::string path = s.FindRom ? s.FindRom(g.Rom) : "";
+        if (path.empty()) AddLog(missing, "Netplay: the host does not have player %d's game %s", g.Player, g.Rom.Name().c_str());
+        else s.RomPaths[g.Player] = path;
+    }
+    for (Guest& g : guests)
+    {
+        u16 lacks = 0;
+        ok = ok && RecvVal(g.Fd, lacks);
+        for (int p = 0; ok && p < NetplayInput::kMaxPlayers; p++)
+            if ((lacks >> p) & 1)
+            {
+                const NetplayRom* r = p == 0 && s.HostPlays ? &s.Rom : nullptr;
+                for (Guest& o : guests) if (o.Player == p) r = &o.Rom;
+                AddLog(missing, "Netplay: player %d does not have player %d's game %s", g.Player, p, r ? r->Name().c_str() : "?");
+            }
+    }
+    std::vector<u8> verdict(missing.begin(), missing.end());
+    for (Guest& g : guests) ok = ok && SendBlob(g.Fd, verdict);
     // wait for every guest to have it all (it closes first), so nobody's data is cut short
     for (Guest& g : guests) { u8 b; recv(g.Fd, &b, 1, 0); }
     closeAll();
     if (!ok) { AddLog(s.Log, "Netplay: session setup failed"); return false; }
-    if (status) return false;
+    if (!missing.empty())
+    {
+        s.Log += missing;
+        AddLog(s.Log, "Netplay: cancelled: a device lacks another player's game (sending ROMs is not supported yet)");
+        return false;
+    }
     for (Guest& g : guests)
     {
         s.Peers.emplace_back(g.Player, IpString(g.Ip) + ":" + std::to_string(g.Port));
@@ -522,40 +636,54 @@ bool GuestHandshake(NetplaySetup& s)
     }
     SetupSocket(fd, s.TimeoutS + 30);
     bool ok = SendVal(fd, kSetupMagic) && SendVal(fd, (u8)s.Player) && SendVal(fd, (u16)s.Port)
-           && SendVal(fd, s.RomId) && SendBlob(fd, s.Save);
+           && SendVal(fd, s.Rom) && SendBlob(fd, s.Save);
     for (int i = 0; ok && i < kPings; i++)
     {
         u8 b;
         ok = RecvVal(fd, b) && SendVal(fd, b);
     }
     u32 magic = 0;
-    u8 status = 1, delay = 0, count = 0;
-    ok = ok && RecvVal(fd, magic) && magic == kSetupMagic && RecvVal(fd, status) && RecvVal(fd, delay)
+    u8 delay = 0, count = 0;
+    ok = ok && RecvVal(fd, magic) && magic == kSetupMagic && RecvVal(fd, delay)
             && RecvVal(fd, count) && delay >= 1 && delay <= 8;
     std::string hostIp = s.Host.substr(0, s.Host.rfind(':'));
     bool self = false;
+    u16 lacks = 0;
     for (int i = 0; ok && i < count; i++)
     {
         u8 player;
         u32 ip;
         u16 port;
+        NetplayRom rom;
         std::vector<u8> save;
-        ok = RecvVal(fd, player) && RecvVal(fd, ip) && RecvVal(fd, port) && RecvBlob(fd, save)
+        ok = RecvVal(fd, player) && RecvVal(fd, ip) && RecvVal(fd, port) && RecvVal(fd, rom) && RecvBlob(fd, save)
           && player < NetplayInput::kMaxPlayers;
         if (!ok) break;
+        AddLog(s.Log, "Netplay: player %d runs %s", player, rom.Name().c_str());
         if (player == s.Player) { self = true; continue; }
         s.Peers.emplace_back(player, (ip ? IpString(ip) : hostIp) + ":" + std::to_string(port));
         s.Saves[player] = std::move(save);
+        if (s.Join) continue;   // a Hosted replica runs only its own console
+        std::string path = s.FindRom ? s.FindRom(rom) : "";
+        if (path.empty())
+        {
+            AddLog(s.Log, "Netplay: this device does not have player %d's game %s", player, rom.Name().c_str());
+            lacks |= 1 << player;
+        }
+        else s.RomPaths[player] = path;
     }
+    std::vector<u8> verdict;
+    ok = ok && SendVal(fd, lacks) && RecvBlob(fd, verdict);
     close(fd);
     if (!ok || !self)
     {
         AddLog(s.Log, "Netplay: session setup with the host failed");
         return false;
     }
-    if (status)
+    if (!verdict.empty())
     {
-        AddLog(s.Log, "Netplay: a player runs a different game");
+        s.Log.append(verdict.begin(), verdict.end());
+        AddLog(s.Log, "Netplay: cancelled: a device lacks another player's game (sending ROMs is not supported yet)");
         return false;
     }
     s.Delay = delay;
@@ -568,6 +696,7 @@ bool NetplayHandshake(NetplaySetup& s)
 {
     s.Peers.clear();
     s.Saves.clear();
+    s.RomPaths.clear();
     return s.Player == 0 && !s.Join ? HostHandshake(s) : GuestHandshake(s);
 }
 
