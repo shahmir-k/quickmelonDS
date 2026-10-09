@@ -444,6 +444,8 @@ void LAN::EndSession()
         RemotePeers[i] = nullptr;
     }
 
+    // send the disconnects now, so the others see this player leave instead of timing out
+    enet_host_flush(Host);
     enet_host_destroy(Host);
     Host = nullptr;
     IsHost = false;
