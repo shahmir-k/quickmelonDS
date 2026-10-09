@@ -95,7 +95,7 @@ public:
     // The input of `player` for emulated frame `frame`; blocks until known (or Abort(), or the
     // player is dropped).
     NetplayFrameInput Get(int player, int frame);
-    // Hosted Netplay server only: a player whose input Get() has waited this long for is dropped,
+    // Hosted Netplay server only: a player whose device sent nothing (not even the 10 ms heartbeat) this long while Get() waits for it is dropped,
     // and from then on Get() returns no input for it (nothing pressed) without waiting. The server
     // is the only device that applies inputs to that console (its replicas follow its record
     // stream), so this is deterministic. 0 = wait forever (Netplay: every device applies every

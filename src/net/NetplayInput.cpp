@@ -227,12 +227,17 @@ NetplayFrameInput NetplayInput::Get(int player, int frame)
         u64 start = NowUs();
         auto known = [&] { return inputs.find(frame) != inputs.end() || !Running; };
         if (DropAfterMs <= 0 || player == Local) Changed.wait(lk, known);
-        else if (!Changed.wait_for(lk, std::chrono::milliseconds(DropAfterMs), known))
-        {
-            DroppedMask |= 1u << player;
-            Platform::Log(Platform::LogLevel::Warn, "Netplay: player %d dropped at frame %d: no input for %d ms; it plays on with nothing pressed\n",
-                          player, frame, DropAfterMs);
-        }
+        else
+            // late input only stalls (a paused guest still sends its 10 ms heartbeat); only a
+            // device silent for DropAfterMs is dropped
+            while (!Changed.wait_for(lk, std::chrono::milliseconds(100), known))
+                if (NowUs() - std::max(start, LastPeerUs[player].load()) > (u64)DropAfterMs * 1000)
+                {
+                    DroppedMask |= 1u << player;
+                    Platform::Log(Platform::LogLevel::Warn, "Netplay: player %d dropped at frame %d: silent for %d ms; it plays on with nothing pressed\n",
+                                  player, frame, DropAfterMs);
+                    break;
+                }
         if (player != Local) StallUs += NowUs() - start;
     }
     if (Dropped(player)) return {};
