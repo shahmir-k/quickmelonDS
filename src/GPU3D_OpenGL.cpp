@@ -1246,6 +1246,33 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
                     else
                         glDepthFunc(GL_LESS);
 
+#ifdef LITEV_GL_BATCH_NEEDOPAQUE
+                    // same as pass 3 below: a run of same-state alpha-31 alpha-textured polygons
+                    // in two draws, not two per polygon (~500 draws a frame in a PW menu scene)
+                    static const int needOpMode2 = OpenGL::Prop("glneedop", 2);
+                    if (needopaque && !rp->PolyData->IsShadow && needOpMode2)
+                    {
+                        glDisable(GL_BLEND);
+                        glUniform1i(RenderModeULoc, RenderMode_Opaque);
+                        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                        glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, GL_FALSE);
+                        glStencilFunc(GL_ALWAYS, polyid, 0xFF);
+                        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+                        glStencilMask(0xFF);
+                        glDepthMask(GL_TRUE);
+                        RenderPolygonBatch(i);
+
+                        glUniform1i(RenderModeULoc, RenderMode_Translucent);
+                        glColorMaski(1, GL_FALSE, GL_FALSE, (polyattr & (1<<15)) ? GL_FALSE : fogenable, GL_FALSE);
+                        glStencilFunc(GL_EQUAL, 0xFF, 0xFE);
+                        glStencilOp(GL_KEEP, GL_KEEP, GL_INVERT);
+                        glStencilMask(~(0x40|polyid));
+                        glDepthMask((polyattr & (1<<11)) ? GL_TRUE : GL_FALSE);
+                        i += RenderPolygonBatch(i);
+                        continue;
+                    }
+#endif
+
                     if (needopaque)
                     {
                         glUniform1i(RenderModeULoc, RenderMode_Opaque);
