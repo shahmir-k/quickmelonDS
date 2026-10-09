@@ -620,7 +620,11 @@ int VerifyTrace(const TraceRunConfig& cfg, const std::string& tracePath)
     printf("=== liteDS-headless verify-trace: OK ===\n");
     printf("trace:  %s\n", tracePath.c_str());
     printf("frames: %u (all identical)\n", hdr.frames);
+#ifdef LITEV_AGGRESSIVE_SKIP
     printf("captures: %u  capture_seen: %d\n", b.nds->GPU.CaptureCount, (int)b.nds->GPU.CaptureSeen);
+#else
+    printf("captures: %u\n", b.nds->GPU.CaptureCount);
+#endif
     printf("mode:   %s\n", rc.jit ? "jit" : "interp");
     fflush(stdout);
     return 0;
