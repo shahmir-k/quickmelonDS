@@ -200,7 +200,8 @@ class HostedServer
 {
 public:
     HostedServer(int bindPort, const NetFaults& faults = {});
-    // waits (up to DrainMs) until every client still answering has its whole stream
+    // waits (up to DrainMs) until every client still answering has its whole stream; one that has
+    // gone quiet (left: a deliberate stop) is not waited for
     ~HostedServer();
     bool Ok() const { return Socket >= 0; }
     int DrainMs = 10000;    // how long the destructor waits for the clients

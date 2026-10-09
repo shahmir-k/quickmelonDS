@@ -116,7 +116,7 @@ enum
     Cmd_PlayerList,         // 03 -- host->client -- broadcast updated player list
     Cmd_PlayerConnect,      // 04 -- both -- signal connected state (ready to receive MP frames)
     Cmd_PlayerDisconnect,   // 05 -- both -- signal disconnected state (not receiving MP frames)
-    Cmd_StartSession,       // 06 -- host->client -- group command: mode, player count[, server id]
+    Cmd_StartSession,       // 06 -- both -- group command: mode, player count[, server id]; client->host from the leader
 };
 
 const int kDiscoveryPort = 7063;
@@ -294,6 +294,7 @@ bool LAN::StartHost(const char* playername, int numplayers)
     NumPlayers = 1;
     MaxPlayers = numplayers;
     StartRequest = -1;
+    Leader = 0;
     memcpy(&MyPlayer, player, sizeof(Player));
 
     Platform::Mutex_Unlock(PlayersMutex);
@@ -338,6 +339,7 @@ bool LAN::StartClient(const char* playername, const char* host)
     strncpy(player->Name, playername, 31);
     player->Status = Player_Connecting;
     StartRequest = -1;
+    Leader = 0;
 
     Platform::Mutex_Unlock(PlayersMutex);
 
@@ -699,6 +701,19 @@ void LAN::ProcessHostEvent(ENetEvent& event)
                     ConnectedBitmask &= ~(1 << player->ID);
                 }
                 break;
+
+            case Cmd_StartSession: // the group's leader (a client) sends a group command: run it, relay it
+                {
+                    Player* player = (Player*)event.peer->data;
+                    if (event.packet->dataLength != 4 || !player || player->ID != Leader) break;
+                    Leader = data[3];
+                    StartRequest = (data[3] << 16) | (data[1] << 8) | data[2];
+                    for (int i = 1; i < 16; i++)
+                        if (RemotePeers[i] && RemotePeers[i] != event.peer)
+                            enet_peer_send(RemotePeers[i], Chan_Cmd, enet_packet_create(data, 4, ENET_PACKET_FLAG_RELIABLE));
+                    enet_host_flush(Host);
+                }
+                break;
             }
 
             enet_packet_destroy(event.packet);
@@ -830,6 +845,7 @@ void LAN::ProcessClientEvent(ENetEvent& event)
                 {
                     if (event.packet->dataLength != 3 && event.packet->dataLength != 4) break;
                     int server = event.packet->dataLength == 4 ? data[3] : 0;
+                    Leader = server;
                     StartRequest = (server << 16) | (data[1] << 8) | data[2];
                 }
                 break;
@@ -845,11 +861,14 @@ void LAN::ProcessClientEvent(ENetEvent& event)
 
 void LAN::HostStartSession(u8 mode, u8 players, u8 server)
 {
-    if (!Active || !IsHost) return;
+    if (!Active) return;
     u8 cmd[4] = {Cmd_StartSession, mode, players, server};
     ENetPacket* pkt = enet_packet_create(cmd, 4, ENET_PACKET_FLAG_RELIABLE);
-    enet_host_broadcast(Host, Chan_Cmd, pkt);
+    if (IsHost) enet_host_broadcast(Host, Chan_Cmd, pkt);
+    else if (RemotePeers[0]) enet_peer_send(RemotePeers[0], Chan_Cmd, pkt);  // the host relays it
+    else { enet_packet_destroy(pkt); return; }
     enet_host_flush(Host);
+    Leader = server;
 }
 
 void LAN::ProcessEvent(ENetEvent& event)

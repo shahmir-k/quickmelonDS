@@ -423,6 +423,7 @@ constexpr int kResendMs = 10;              // re-send tick
 constexpr int kMinRtoMs = 10;              // re-send a chunk after 1.5 round trips, at least this
 constexpr int kFirstRtoMs = 200;           // before the first round trip is measured
 constexpr int kGoneMs = 3000;              // a client silent this long is gone
+constexpr int kLeftMs = 100;               // stopping: a client silent this long has left
 
 #pragma pack(push, 1)
 struct ChunkHeader
@@ -472,7 +473,10 @@ HostedServer::~HostedServer()
         bool all = true;
         {
             std::lock_guard<std::mutex> lk(Lock);
-            for (int c = 0; c < LockstepMP::kMaxInst; c++) all &= Streams[c].Bytes.empty() || !Live(c, NowUs());
+            // a client silent for kLeftMs (it acknowledges every 10 ms) has left: no waiting for it
+            u64 now = NowUs();
+            for (int c = 0; c < LockstepMP::kMaxInst; c++)
+                all &= Streams[c].Bytes.empty() || !Streams[c].Known || now - Streams[c].LastAckUs > (u64)kLeftMs * 1000;
         }
         if (all) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
