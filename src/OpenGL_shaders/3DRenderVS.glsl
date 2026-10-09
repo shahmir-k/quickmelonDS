@@ -21,7 +21,9 @@ smooth out vec4 fColor;
 smooth out vec2 fTexcoord;
 flat out ivec3 fPolygonAttr;
 
-#ifdef WBuffer
+#ifdef WEarlyZ
+uniform float uWZ0;
+#elif defined(WBuffer)
 smooth out float fZ;
 #endif
 
@@ -32,7 +34,13 @@ void main()
 
     vec4 fpos;
     fpos.xy = (((vec2(vPosition.xy) ) * 2.0) / uScreenSize) - 1.0;
-#ifdef WBuffer
+#ifdef WEarlyZ
+    // window depth 1 - z0/w: affine in 1/w, so the rasterizer interpolates it exactly and the
+    // GPU can test depth before shading. Depth-equal polygons: 0xFF nearer (see below).
+    float zz = float(vPosition.z << zshift);
+    if ((attr & 0x4000) != 0) zz -= 255.0;
+    fpos.z = 1.0 - 2.0 * uWZ0 / max(zz, uWZ0);
+#elif defined(WBuffer)
     fZ = float(vPosition.z << zshift) / 16777216.0;
     fpos.z = 0.0;
 #else

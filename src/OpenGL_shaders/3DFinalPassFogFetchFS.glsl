@@ -21,9 +21,13 @@ layout(std140) uniform uConfig
 layout(location = 0) out vec4 oColor;
 layout(location = 1) inout vec4 oAttr;
 
+uniform float uWZ0;
+
 vec4 CalculateFog(float depth)
 {
-    int idepth = int(depth * 16777216.0);
+    // W-buffer early-Z frames store 1 - z0/w (GPU3D_OpenGL WZ0): back to w
+    int idepth = uWZ0 > 0.0 ? int(min(uWZ0 / max(1.0 - depth, 1.0 / 16777216.0), 16777215.0))
+                            : int(depth * 16777216.0);
     int densityid, densityfrac;
 
     if (idepth < uFogOffset)

@@ -46,6 +46,9 @@ namespace melonDS
 bool GLRenderer3D::BuildRenderShader(bool wbuffer)
 {
     std::string wbufdef = "#define WBuffer\n";
+#ifdef LITEV_GL_WBUF_EARLYZ
+    if (WEarlyZ()) wbufdef += "#define WEarlyZ\n";
+#endif
 
     char shadername[32];
     snprintf(shadername, sizeof(shadername), "RenderShader%c", wbuffer?'W':'Z');
@@ -101,6 +104,17 @@ void GLRenderer3D::UseRenderShader(bool wbuffer)
 
     RenderModeULoc = glGetUniformLocation(RenderShader[flags], "uRenderMode");
 }
+
+#ifdef LITEV_GL_WBUF_EARLYZ
+// W-buffer frames: depth from the rasterizer (1 - z0/w is affine in 1/w, so exact per polygon)
+// instead of gl_FragDepth, which turns off the Mali's early depth test for every pixel.
+// debug.litev.glwearlyz=0 turns it off.
+bool GLRenderer3D::WEarlyZ()
+{
+    static const bool on = OpenGL::Prop("glwearlyz", 1) != 0;
+    return on;
+}
+#endif
 
 void SetupDefaultTexParams(GLuint tex)
 {
@@ -1079,6 +1093,7 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
     SC_Reset();
     bool flags = S.RenderPolygonRAM[0]->WBuffer;
     UseRenderShader(flags);
+    if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[1], "uWZ0"), WZ0);
 
     //if (h != 192) glScissor(0, y<<ScaleFactor, 256<<ScaleFactor, h<<ScaleFactor);
 
@@ -1503,6 +1518,7 @@ polygons_done:
             // fog
 
             glUseProgram(fogFetch ? FinalPassFogFetchShader : FinalPassFogShader);
+            glUniform1f(glGetUniformLocation(fogFetch ? FinalPassFogFetchShader : FinalPassFogShader, "uWZ0"), WZ0);
 
             if (S.RenderDispCnt & (1<<6))
                 glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_CONSTANT_COLOR, GL_ONE_MINUS_SRC_ALPHA);
@@ -1744,6 +1760,21 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
     glBindBuffer(GL_UNIFORM_BUFFER, ShaderConfigUBO);
     glBufferData(GL_UNIFORM_BUFFER, sizeof(ShaderConfig), &ShaderConfig, GL_DYNAMIC_DRAW);
 
+    WZ0 = 0;
+#ifdef LITEV_GL_WBUF_EARLYZ
+    if (WEarlyZ() && S.RenderNumPolygons && S.RenderPolygonRAM[0]->WBuffer)
+    {
+        // nearest W in the frame (and the clear plane) maps to window depth 0
+        u32 zmin = ((S.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
+        for (u32 i = 0; i < S.RenderNumPolygons; i++)
+        {
+            const Polygon* p = S.RenderPolygonRAM[i];
+            for (u32 j = 0; j < p->NumVertices; j++) zmin = std::min(zmin, (u32)p->FinalZ[j]);
+        }
+        WZ0 = (float)std::max(zmin, 1u);
+    }
+#endif
+
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_STENCIL_TEST);
@@ -1777,6 +1808,7 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
         bitmapoffset[1] = (float)yoff / 256.0;
 
         glUniform2f(ClearBitmapULoc[0], bitmapoffset[0], bitmapoffset[1]);
+        glUniform1f(glGetUniformLocation(ClearShaderBitmap, "uWZ0"), WZ0);
         glUniform1ui(ClearBitmapULoc[1], polyid);
 
         glActiveTexture(GL_TEXTURE0);
@@ -1796,6 +1828,7 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
         u32 a = (S.RenderClearAttr1 >> 16) & 0x1F;
         u32 polyid = (S.RenderClearAttr1 >> 24) & 0x3F;
         u32 z = ((S.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
+        if (WZ0 > 0) z = (u32)std::lround((1.0 - WZ0 / std::max((double)z, (double)WZ0)) * 16777216.0);
 
         /*if (r) r = r*2 + 1;
         if (g) g = g*2 + 1;

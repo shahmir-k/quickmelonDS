@@ -827,6 +827,14 @@ option(LITEV_HYB_MERGE_1X_2D "Hybrid: merge 2D-only screens at 1x, then blit up"
 if (LITEV_HYB_MERGE_1X_2D)
     add_compile_definitions(LITEV_HYB_MERGE_1X_2D=1)
 endif()
+
+# GL 3D, W-buffer frames: depth 1 - z0/w from the rasterizer instead of gl_FragDepth, so the GPU's
+# early depth test works (display only; same depth order, fog converts back to w).
+# Runtime: debug.litev.glwearlyz=0 off.
+option(LITEV_GL_WBUF_EARLYZ "GL 3D: W-buffer depth without gl_FragDepth (early-Z)" OFF)
+if (LITEV_GL_WBUF_EARLYZ)
+    add_compile_definitions(LITEV_GL_WBUF_EARLYZ=1)
+endif()
 # Display-only: a game that changes MASTER_BRIGHT once in the middle of a frame (a fade step
 # landing late because the game missed VBlank, e.g. Pokemon White's area loads) tears that frame
 # (top dark, bottom bright). A single mid-frame change now applies from the next frame; two or

@@ -126,6 +126,10 @@ private:
     GLuint RenderShader[2] {};
     GLint RenderModeULoc = 0;
     GLuint CurShaderID = -1;
+    // LITEV_GL_WBUF_EARLYZ: this frame's W-buffer depth mapping, window depth = 1 - WZ0/w
+    // (0: the plain z/2^24 mapping)
+    float WZ0 = 0;
+    static bool WEarlyZ();
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};

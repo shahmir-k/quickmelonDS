@@ -28,7 +28,7 @@ smooth in vec4 fColor;
 smooth in highp vec2 fTexcoord;
 flat in ivec3 fPolygonAttr;
 
-#ifdef WBuffer
+#if defined(WBuffer) && !defined(WEarlyZ)
 smooth in highp float fZ;
 #endif
 
@@ -136,7 +136,7 @@ void main()
         oColor = col;
     }
 
-#ifdef WBuffer
+#if defined(WBuffer) && !defined(WEarlyZ)
     // depth-equal polygons: the DS's +-0xFF W-buffer margin (see 3DRenderVS)
     gl_FragDepth = ((fPolygonAttr.x & 0x4000) != 0) ? fZ - 255.0 / 16777216.0 : fZ;
 #endif
