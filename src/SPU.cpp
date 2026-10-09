@@ -544,6 +544,29 @@ void SPUChannel::NextSample_PCM16()
     CurSample = val;
 }
 
+#ifdef LITEV_SPU_ADPCM_TABLE
+static const struct ADPCMTables
+{
+    u16 Diff[89][8];
+    u8 Next[89][8];
+    ADPCMTables()
+    {
+        for (int i = 0; i < 89; i++)
+            for (int n = 0; n < 8; n++)
+            {
+                const u16 val = SPUChannel::ADPCMTable[i];
+                u16 diff = val >> 3;
+                if (n & 0x1) diff += (val >> 2);
+                if (n & 0x2) diff += (val >> 1);
+                if (n & 0x4) diff += val;
+                Diff[i][n] = diff;
+                const int next = i + SPUChannel::ADPCMIndexTable[n];
+                Next[i][n] = next < 0 ? 0 : next > 88 ? 88 : next;
+            }
+    }
+} ADPCMTabs;
+#endif
+
 void SPUChannel::NextSample_ADPCM()
 {
     Pos++;
@@ -588,6 +611,26 @@ void SPUChannel::NextSample_ADPCM()
         else
             ADPCMCurByte >>= 4;
 
+#ifdef LITEV_SPU_ADPCM_TABLE
+        // the step x nibble difference and the next step index from tables (the same values the
+        // code below computes): its per-bit branches were unpredictable on the in-order A55
+        // (ADPCM decode: ~5% of the emu thread with PW's ADPCM music)
+        {
+            const u32 nib = ADPCMCurByte & 0x7;
+            const s32 diff = ADPCMTabs.Diff[ADPCMIndex][nib];
+            if (ADPCMCurByte & 0x8)
+            {
+                ADPCMVal -= diff;
+                if (ADPCMVal < -0x7FFF) ADPCMVal = -0x7FFF;
+            }
+            else
+            {
+                ADPCMVal += diff;
+                if (ADPCMVal > 0x7FFF) ADPCMVal = 0x7FFF;
+            }
+            ADPCMIndex = ADPCMTabs.Next[ADPCMIndex][nib];
+        }
+#else
         u16 val = ADPCMTable[ADPCMIndex];
         u16 diff = val >> 3;
         if (ADPCMCurByte & 0x1) diff += (val >> 2);
@@ -608,6 +651,7 @@ void SPUChannel::NextSample_ADPCM()
         ADPCMIndex += ADPCMIndexTable[ADPCMCurByte & 0x7];
         if      (ADPCMIndex < 0)  ADPCMIndex = 0;
         else if (ADPCMIndex > 88) ADPCMIndex = 88;
+#endif
 
         if (Pos == (LoopPos<<1))
         {

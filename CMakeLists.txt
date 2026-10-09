@@ -704,6 +704,12 @@ if (LITEV_JIT_BLOCKXFER_MAINRAM)
     add_compile_definitions(LITEV_JIT_BLOCKXFER_MAINRAM=1)
 endif()
 
+# SPU: ADPCM decode from precomputed difference / next-index tables (bit-exact).
+option(LITEV_SPU_ADPCM_TABLE "SPU: table-driven ADPCM decode (bit-exact)" OFF)
+if (LITEV_SPU_ADPCM_TABLE)
+    add_compile_definitions(LITEV_SPU_ADPCM_TABLE=1)
+endif()
+
 # DraStic JIT emit-quality (teardown 01, FUN_001912f0): merge the host NZCV flags into
 # guest CPSR with one MRS + masked AND/ORR (3 host instrs) instead of a per-flag CSET+BFI
 # pair (8 instrs) for full-flag arithmetic S-ops (CMP/SUBS/ADDS...). Guest CPSR N/Z/C/V
