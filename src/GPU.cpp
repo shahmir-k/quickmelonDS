@@ -1199,6 +1199,9 @@ void GPU::StartHBlank(u32 line) noexcept
     GPU2D_A.UpdateRegistersPreDraw(resetregs);
     GPU2D_B.UpdateRegistersPreDraw(resetregs);
 
+#ifdef LITEV_MASTERBRIGHT_LATCH
+    if (VCount < 192) UpdateDrawBrightness();
+#endif
     if (VCount < 192)
     {
         // draw

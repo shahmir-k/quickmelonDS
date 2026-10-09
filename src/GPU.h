@@ -686,6 +686,29 @@ public:
 
     u16 MasterBrightnessA;
     u16 MasterBrightnessB;
+#ifdef LITEV_MASTERBRIGHT_LATCH
+    // Display only (not guest state): the brightness the renderers draw a line with. A game that
+    // changes MASTER_BRIGHT once mid-frame (a fade step landing late, after the game missed
+    // VBlank) would tear that frame, so a single change takes effect from the next frame; a
+    // second change in the same frame is a deliberate raster effect and is followed line by line.
+    u16 DrawBrightness[2] {}, BrightLatch[2] {}, BrightLast[2] {};
+    u8 BrightChanges[2] {};
+    void UpdateDrawBrightness() noexcept
+    {
+        const u16 cur[2] = { MasterBrightnessA, MasterBrightnessB };
+        for (int s = 0; s < 2; s++)
+        {
+            if (VCount == 0) { BrightLatch[s] = BrightLast[s] = cur[s]; BrightChanges[s] = 0; }
+            else if (cur[s] != BrightLast[s]) { BrightLast[s] = cur[s]; BrightChanges[s]++; }
+            DrawBrightness[s] = BrightChanges[s] <= 1 ? BrightLatch[s] : cur[s];
+        }
+    }
+    u16 DrawBrightnessA() const noexcept { return DrawBrightness[0]; }
+    u16 DrawBrightnessB() const noexcept { return DrawBrightness[1]; }
+#else
+    u16 DrawBrightnessA() const noexcept { return MasterBrightnessA; }
+    u16 DrawBrightnessB() const noexcept { return MasterBrightnessB; }
+#endif
 
     u16 DispFIFO[16];
     u8 DispFIFOReadPtr;

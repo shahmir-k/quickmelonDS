@@ -309,8 +309,8 @@ void SoftRenderer::DrawScanline(u32 line)
         Rend2D_B->DrawScanline(line);
 
         // draw the final screen output
-        DrawScanlineA(line, dstA, Output2D[0], GPU.GPU2D_A.DispCnt, GPU.MasterBrightnessA);
-        DrawScanlineB(line, dstB, Output2D[1], GPU.GPU2D_B.DispCnt, GPU.MasterBrightnessB);
+        DrawScanlineA(line, dstA, Output2D[0], GPU.GPU2D_A.DispCnt, GPU.DrawBrightnessA());
+        DrawScanlineB(line, dstB, Output2D[1], GPU.GPU2D_B.DispCnt, GPU.DrawBrightnessB());
 
         // perform display capture if enabled
         if (GPU.CaptureEnable)
@@ -369,8 +369,8 @@ void SoftRenderer::SnapshotCompositeLine(u32 line)
     FrameLineSnap& f = FrameSnap[line];
     f.DispCntA = GPU.GPU2D_A.DispCnt;
     f.DispCntB = GPU.GPU2D_B.DispCnt;
-    f.MasterBrightnessA = GPU.MasterBrightnessA;
-    f.MasterBrightnessB = GPU.MasterBrightnessB;
+    f.MasterBrightnessA = GPU.DrawBrightnessA();
+    f.MasterBrightnessB = GPU.DrawBrightnessB();
     f.ScreenSwap = GPU.ScreenSwap;
     f.ScreensEnabled = GPU.ScreensEnabled;
     f.CaptureEnable = GPU.CaptureEnable;

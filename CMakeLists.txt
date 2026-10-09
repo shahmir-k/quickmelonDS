@@ -820,6 +820,15 @@ option(LITEV_HYB_CAPTURE_ASYNC "Hybrid renderer: display capture reads its 3D ba
 if (LITEV_HYB_CAPTURE_ASYNC)
     add_compile_definitions(LITEV_HYB_CAPTURE_ASYNC=1)
 endif()
+# Display-only: a game that changes MASTER_BRIGHT once in the middle of a frame (a fade step
+# landing late because the game missed VBlank, e.g. Pokemon White's area loads) tears that frame
+# (top dark, bottom bright). A single mid-frame change now applies from the next frame; two or
+# more in one frame (a raster effect) are followed line by line. GPU.DrawBrightnessA/B.
+option(LITEV_MASTERBRIGHT_LATCH "Display-only: one mid-frame MASTER_BRIGHT change applies from the next frame (no torn fade frame)" OFF)
+if (LITEV_MASTERBRIGHT_LATCH)
+    add_compile_definitions(LITEV_MASTERBRIGHT_LATCH=1)
+endif()
+
 option(LITEV_SKIP_REPEAT_FRAMES "Display-only: skip 2D drawing + present of frames whose 3D repeats the previous frame while a game draws 3D at 30 Hz (runtime: GPU.SkipRepeatEnabled)" OFF)
 if (LITEV_SKIP_REPEAT_FRAMES)
     add_compile_definitions(LITEV_SKIP_REPEAT_FRAMES=1)

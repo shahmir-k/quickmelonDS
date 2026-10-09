@@ -539,8 +539,8 @@ void GLRenderer::DrawScanline(u32 line)
         need_render = true;
     else if (dispcnt_b_diff & 0x10000)
         need_render = true;
-    else if (MasterBrightnessA != GPU.MasterBrightnessA ||
-             MasterBrightnessB != GPU.MasterBrightnessB)
+    else if (MasterBrightnessA != GPU.DrawBrightnessA() ||
+             MasterBrightnessB != GPU.DrawBrightnessB())
         need_render = true;
 
     if (GPU.CaptureEnable && (capturecnt_diff & 0x7FFFFFFF))
@@ -567,8 +567,8 @@ void GLRenderer::DrawScanline(u32 line)
 
     DispCntA = GPU.GPU2D_A.DispCnt;
     DispCntB = GPU.GPU2D_B.DispCnt;
-    MasterBrightnessA = GPU.MasterBrightnessA;
-    MasterBrightnessB = GPU.MasterBrightnessB;
+    MasterBrightnessA = GPU.DrawBrightnessA();
+    MasterBrightnessB = GPU.DrawBrightnessB();
     CaptureCnt = GPU.CaptureCnt;
 
     FinalPassConfig.uScreenSwap[line] = GPU.ScreenSwap;

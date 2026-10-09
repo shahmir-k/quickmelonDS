@@ -546,7 +546,7 @@ bool GLRenderer2D::IsScreenOn()
     if (!GPU2D.Enabled) return false;
     if (GPU2D.ForcedBlank) return false;
 
-    u16 masterbright = GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
+    u16 masterbright = GPU2D.Num ? GPU.DrawBrightnessB() : GPU.DrawBrightnessA();
     u16 brightmode = masterbright >> 14;
     u16 brightness = masterbright & 0x1F;
     if ((brightmode == 1 || brightmode == 2) && brightness >= 16)
