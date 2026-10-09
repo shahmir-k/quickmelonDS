@@ -143,6 +143,8 @@ bool HybridRenderer::Init()
     ScaleULoc = glGetUniformLocation(MergeShader, "uScale");
     SingleULoc = glGetUniformLocation(MergeShader, "uSingle");
     OriginULoc = glGetUniformLocation(MergeShader, "uOrigin");
+    FastULoc = glGetUniformLocation(MergeShader, "uFast");
+    FastEvyULoc = glGetUniformLocation(MergeShader, "uFastEvy");
 
     glGenVertexArrays(1, &EmptyVAO);
 
@@ -558,6 +560,47 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
                 glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
                 glBlitFramebuffer(0, 0, 256, 192, 0, y, 256 * Scale, y + 192 * Scale, GL_COLOR_BUFFER_BIT, GL_NEAREST);
                 glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                continue;
+            }
+#endif
+#ifdef LITEV_HYB_MERGE_FASTLINES
+            // lines that show the 3D straight through (most of a 3D scene) merge with a copy
+            // shader; the others (2D on top, blends, brightness) with the full one. Each run of
+            // lines is the full-screen triangle scissored to it (thin quads cost more on Mali).
+            // PW town intro at 3x. Same pixels. debug.litev.hybfastlines=0 turns it off.
+            static const bool fastLines = OpenGL::Prop("hybfastlines", 1) != 0;
+            if (fastLines && Scale > 1 && HybHas3D[fb][sc] && !(OpenGL::GLSkip() & 64))
+            {
+                int fast[192];   // 0: full merge; else 1 + bright mode, with evy in bits 8+
+                const u32* scr = HybFB[fb] + sc * 192 * HybStride;
+                for (int l = 0; l < 192; l++)
+                {
+                    const u32* ln = scr + l * HybStride;
+                    const u32 c = ln[512];
+                    u32 bright = (c >> 14) & 3;
+                    const u32 evy = std::min<u32>(c & 0x1F, 16);
+                    if (bright == 3 || evy == 0) bright = 0;
+                    bool f = ((c >> 16) & 3) == 1 && (c & (1 << 18)) && !(c >> 23);
+                    for (int x = 0; f && x < 256; x++)
+                    {
+                        const u32 mode = ln[x] >> 29;
+                        f = mode == 0 || mode == 5 || mode == 6;
+                    }
+                    fast[l] = f ? int(1 + bright + (bright ? evy << 8 : 0)) : 0;
+                }
+                glEnable(GL_SCISSOR_TEST);
+                for (int l0 = 0; l0 < 192; )
+                {
+                    int l1 = l0 + 1;
+                    while (l1 < 192 && fast[l1] == fast[l0]) l1++;
+                    glScissor(0, y + l0 * Scale, 256 * Scale, (l1 - l0) * Scale);
+                    glUniform1i(FastULoc, fast[l0] & 0xFF);
+                    glUniform1i(FastEvyULoc, fast[l0] >> 8);
+                    glDrawArrays(GL_TRIANGLES, 0, 3);
+                    l0 = l1;
+                }
+                glDisable(GL_SCISSOR_TEST);
+                glUniform1i(FastULoc, 0);
                 continue;
             }
 #endif

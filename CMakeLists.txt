@@ -828,6 +828,13 @@ if (LITEV_HYB_MERGE_1X_2D)
     add_compile_definitions(LITEV_HYB_MERGE_1X_2D=1)
 endif()
 
+# Hybrid renderer: lines showing the 3D straight through merge with a copy shader, the rest with
+# the full merge (scissored runs of lines; same pixels). Runtime: debug.litev.hybfastlines=0 off.
+option(LITEV_HYB_MERGE_FASTLINES "Hybrid: fast merge for plain-3D lines" OFF)
+if (LITEV_HYB_MERGE_FASTLINES)
+    add_compile_definitions(LITEV_HYB_MERGE_FASTLINES=1)
+endif()
+
 # GL 3D, W-buffer frames: depth 1 - z0/w from the rasterizer instead of gl_FragDepth, so the GPU's
 # early depth test works (display only; same depth order, fog converts back to w).
 # Runtime: debug.litev.glwearlyz=0 off.
