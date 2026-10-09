@@ -49,7 +49,8 @@ bool CompileComputeProgram(GLuint& result, const std::string& source, const std:
 // debug.litev.glskip (Android, read once): diagnostic GPU pass-skip bitmask, for a per-pass
 // GPU cost breakdown (wrong pixels by design). 1 3D polygons, 2 3D edge/fog, 4 2D compositor,
 // 8 2D sprites, 16 hi-res final pass, 32 hi-res present copy, 64 hybrid merge draw,
-// 128 compositor does not bind the 3D texture, 256 compositor uses a trivial shader.
+// 128 compositor does not bind the 3D texture, 256 compositor uses a trivial shader,
+// 512 no opaque 3D pass, 1024 no translucent 3D passes.
 int GLSkip();
 
 // debug.litev.<name> as an int (Android; def when unset or elsewhere)

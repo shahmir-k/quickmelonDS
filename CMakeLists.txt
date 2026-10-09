@@ -836,6 +836,15 @@ if (LITEV_GL_SORT_OPAQUE)
     add_compile_definitions(LITEV_GL_SORT_OPAQUE=1)
 endif()
 
+# GL 3D: draw runs of same-state alpha-31 polygons that use alpha textures (needopaque) in one
+# blended draw instead of two draws per polygon (opaque + translucent texels). Render-only
+# approximation (edge texels write depth like opaque ones). Runtime: debug.litev.glneedop=0 off,
+# 1 batched two-pass, 2 one pass (default).
+option(LITEV_GL_BATCH_NEEDOPAQUE "GL 3D: batch alpha-31 alpha-textured translucent polygons" OFF)
+if (LITEV_GL_BATCH_NEEDOPAQUE)
+    add_compile_definitions(LITEV_GL_BATCH_NEEDOPAQUE=1)
+endif()
+
 option(LITEV_SKIP_REPEAT_FRAMES "Display-only: skip 2D drawing + present of frames whose 3D repeats the previous frame while a game draws 3D at 30 Hz (runtime: GPU.SkipRepeatEnabled)" OFF)
 if (LITEV_SKIP_REPEAT_FRAMES)
     add_compile_definitions(LITEV_SKIP_REPEAT_FRAMES=1)

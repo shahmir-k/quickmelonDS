@@ -113,10 +113,10 @@ void main()
     else
     {
         vec4 col = FinalColor();
-        if (uRenderMode == 0)
+        if (uRenderMode == 0 || uRenderMode == 3)
         {
-            // opaque pixels
-            if (col.a < 30.5/31.0) discard;
+            // opaque pixels (3: translucent texels too, blended by the caller)
+            if (col.a < (uRenderMode == 0 ? 30.5/31.0 : 0.5/31.0)) discard;
 
             oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
             oAttr.g = 0.0;

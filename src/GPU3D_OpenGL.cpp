@@ -1125,7 +1125,7 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
 
     glActiveTexture(GL_TEXTURE0);
 
-    for (int i = 0; i < NumFinalPolys; )
+    for (int i = 0; i < NumFinalPolys && !(OpenGL::GLSkip() & 512); )   // 512: diagnostic, no opaque pass
     {
         RendererPolygon* rp = &PolygonList[i];
 
@@ -1186,7 +1186,7 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
 
     glLineWidth(1.0);
 
-    if (NumOpaqueFinalPolys > -1)
+    if (NumOpaqueFinalPolys > -1 && !(OpenGL::GLSkip() & 1024))   // 1024: diagnostic, no translucent passes
     {
         // pass 2: if needed, render translucent pixels that are against background pixels
         // when background alpha is zero, those need to be rendered with blending disabled
@@ -1343,6 +1343,39 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
                     glDepthFunc(GL_LEQUAL);
                 else
                     glDepthFunc(GL_LESS);
+
+#ifdef LITEV_GL_BATCH_NEEDOPAQUE
+                // alpha-31 polygons with alpha textures (trees, fences, ground: ~140 per frame in a PW
+                // town) were drawn one at a time, twice each (opaque texels, then translucent ones):
+                // at 3x the GPU fill of that second pass alone kept the town intro under 60 fps.
+                // Draw a run of same-state ones once, blended, as opaque: partial-alpha texels then
+                // also write depth/stencil/attr like opaque ones (edge texels of foliage may hide a
+                // later translucent polygon behind them; display only).
+                // debug.litev.glneedop: 0 off, 1 batched two passes, 2 one pass (default).
+                static const int needOpMode = OpenGL::Prop("glneedop", 2);
+                if (needopaque && !rp->PolyData->IsShadow && needOpMode)
+                {
+                    glUniform1i(RenderModeULoc, needOpMode == 2 ? RenderMode_OpaqueBlended : RenderMode_Opaque);
+                    if (needOpMode == 2) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+                    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                    glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, GL_FALSE);
+                    glStencilFunc(GL_ALWAYS, polyid, 0xFF);
+                    glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+                    glStencilMask(0xFF);
+                    glDepthMask(GL_TRUE);
+                    if (needOpMode == 2) { i += RenderPolygonBatch(i); continue; }
+                    RenderPolygonBatch(i);
+
+                    glUniform1i(RenderModeULoc, RenderMode_Translucent);
+                    glEnable(GL_BLEND);
+                    glColorMaski(1, GL_FALSE, GL_FALSE, (polyattr & (1<<15)) ? GL_FALSE : fogenable, GL_FALSE);
+                    glStencilFunc(GL_NOTEQUAL, 0x40|polyid, 0x7F);
+                    glStencilMask(0x7F);
+                    glDepthMask((polyattr & (1<<11)) ? GL_TRUE : GL_FALSE);
+                    i += RenderPolygonBatch(i);
+                    continue;
+                }
+#endif
 
                 if (needopaque)
                 {

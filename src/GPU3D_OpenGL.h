@@ -116,6 +116,7 @@ private:
         RenderMode_Opaque = 0,
         RenderMode_Translucent,
         RenderMode_ShadowMask,
+        RenderMode_OpaqueBlended,   // LITEV_GL_BATCH_NEEDOPAQUE: opaque and translucent texels in one draw
     };
 
 
