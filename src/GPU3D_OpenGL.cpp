@@ -864,6 +864,20 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
         rp->EdgeIndicesOffset = eidx;
         rp->NumEdgeIndices = 0;
 
+        if (poly->Type == 1)
+        {
+            // a line writes only its two distinct ends (plus their offset copies as a quad), not
+            // NumVertices vertices: edges over NumVertices reached into the next polygon's
+            // vertices and drew a long stray edge (Pokemon White's town intro)
+            if (vidx - vidx_first >= 2)
+            {
+                IndexBuffer[eidx++] = vidx_first;
+                IndexBuffer[eidx++] = vidx_first + 1;
+                rp->NumEdgeIndices = 2;
+            }
+            continue;
+        }
+
         u32 vidx_cur = vidx_first;
         for (u32 j = 1; j < poly->NumVertices; j++)
         {
