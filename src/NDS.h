@@ -22,6 +22,7 @@
 #include <memory>
 #include <string>
 #include <optional>
+#include <atomic>
 #include <functional>
 
 #include "Platform.h"
@@ -451,6 +452,12 @@ public: // TODO: Encapsulate the rest of these members
     // liteDS-v2: read-only accessor for the global scheduler timestamp, used by
     // the headless trace/verify oracle (tools/headless/VerifyTrace.cpp).
     [[nodiscard]] u64 GetSysTimestamp() const noexcept { return SysTimestamp; }
+#ifdef LITEV_MP_CLOCKWAKE
+    // LockstepMP (SetWake): once SysTimestamp reaches *MPWakeAt, MPWake() wakes the consoles
+    // waiting on this one's clock
+    std::atomic<u64>* MPWakeAt = nullptr;
+    std::function<void()> MPWake;
+#endif
     void NocashPrint(u32 cpu, u32 addr, bool appendNewline = true);
 
     void MonitorARM9Jump(u32 addr);

@@ -19,17 +19,20 @@
 #ifndef LOCKSTEPMP_H
 #define LOCKSTEPMP_H
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
 #include <mutex>
 #include <vector>
+#include <chrono>
 #include <cstdio>
 
 #include "MPInterface.h"
 
 namespace melonDS
 {
+class NDS;
 
 // Deterministic in-process wireless link between several emulated consoles, each running on its
 // own thread (Netplay runs every player's console on every device, so every device must compute
@@ -66,7 +69,12 @@ public:
     // consoles on one link: the DS wireless maximum (also LAN's player bound and Netplay's)
     static constexpr int kMaxInst = 16;
 
-    LockstepMP() noexcept = default;
+    LockstepMP() noexcept
+    {
+#ifdef LITEV_MP_CLOCKWAKE
+        for (auto& w : WakeAt) w.store(UINT64_MAX, std::memory_order_relaxed);
+#endif
+    }
 
     void Process() override {}
     void Begin(int inst) override;
@@ -74,6 +82,9 @@ public:
 
     // How to read instance `inst`'s emulated clock (NDS::GetSysTimestamp), from any thread.
     void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = std::move(clock); Members |= (1 << inst); }
+    // LITEV_MP_CLOCKWAKE: inst's console (`nds`) wakes the consoles waiting on its clock as soon as
+    // it reaches what they wait for; nothing without the flag. After SetClock.
+    void SetWake(int inst, NDS& nds);
     // Ends every wait (the session is shutting down).
     void Stop();
 
@@ -90,7 +101,16 @@ public:
     int RecvHostPacket(int inst, u8* data, u64* timestamp) override;
     u16 RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask) override;
 
+    // LITEV_MP_STATS: per console, link calls and how many of them blocked (0 RecvPacket,
+    // 1 RecvHostPacket, 2 RecvReplies), wait wakeups and blocked time, since the last take
+    struct WaitStats { u32 Calls[3] {}, Blocked[3] {}, Wakeups = 0, Contended = 0, Missed = 0; long long Ns[3] {}, LockNs = 0; };
+    WaitStats TakeWaitStats(int inst) { std::lock_guard<std::mutex> lk(Lock); WaitStats s = WS[inst]; WS[inst] = {}; return s; }
+
 private:
+    WaitStats WS[kMaxInst];
+    // LITEV_MP_TL=<dir>: timeline, one line per blocking event: wall ns, event, own clock, host clock
+    FILE* TL[kMaxInst] {};
+    void TLog(int inst, const char* ev);
     static constexpr u64 kDelay = 33514 * 4; // 4 ms in system clock cycles (33.514 MHz)
     // host frames (CMD/ACK) reach the clients this much later; < kDelay, or a reply sent on time
     // would land past the host's deadline
@@ -133,6 +153,17 @@ private:
     std::deque<Packet> FromHost[kMaxInst];  // CMD/ACK, per receiver
     std::deque<Packet> Replies[kMaxInst];   // replies, per host
     int HostID = -1;
+#ifdef LITEV_MP_FASTPOLL
+    // copies for RecvHostPacket's lock-free poll, written under Lock: HostID, FromHost[i].size()
+    std::atomic<int> HostIDSeen {-1};
+    std::atomic<u32> FromHostN[kMaxInst] {};
+#endif
+    void FromHostChanged(int inst)
+    {
+#ifdef LITEV_MP_FASTPOLL
+        FromHostN[inst].store((u32)FromHost[inst].size(), std::memory_order_relaxed);
+#endif
+    }
 
     u64 CmdCount = 0, ReplyCount = 0, PacketCount = 0;
 
@@ -141,7 +172,82 @@ private:
     bool PeersReached(int inst, u64 time) const;
     // waits (lock held) until pred(); peers' clocks advance without notifying, so also re-check
     // every 100 us
-    template <typename Pred> void WaitFor(std::unique_lock<std::mutex>& lk, Pred pred);
+    // need(): registers (NeedClock) the clocks the wait is for, before each sleep
+    template <typename Pred, typename Need> void WaitFor(std::unique_lock<std::mutex>& lk, Pred pred, Need need, int inst, int kind);
+#ifdef LITEV_MP_CLOCKWAKE
+    std::atomic<u64> WakeAt[kMaxInst];      // per console: wake the waiters once its clock reaches this
+    u16 WaitersOn[kMaxInst] {};             // (Lock) who waits on each console's clock
+    std::condition_variable CV[kMaxInst];   // each console sleeps on its own: wakes go to who needs them
+    u16 Notified = 0;                       // (Lock) diagnostics: woken since it went to sleep
+    void Wake(int inst);
+    // fallback poll: a wake can still be missed (the clock store and the WakeAt load in
+    // NDS::RunSystem are unfenced), then the waiter notices at most this late
+    static constexpr auto kPoll = std::chrono::microseconds(1000);
+#else
+    static constexpr auto kPoll = std::chrono::microseconds(100);
+#endif
+    // (Lock held) console `waiter` needs console `peer`'s clock to reach `t`
+    void NeedClock(int waiter, int peer, u64 t)
+    {
+#ifdef LITEV_MP_CLOCKWAKE
+        WaitersOn[peer] |= (u16)(1 << waiter);
+        u64 cur = WakeAt[peer].load(std::memory_order_relaxed);
+        while (t < cur && !WakeAt[peer].compare_exchange_weak(cur, t, std::memory_order_relaxed)) {}
+#endif
+    }
+    // (Lock held, before sleeping) wake those waiting on our own clock if it is already there
+    void WakeOwn(int inst)
+    {
+#ifdef LITEV_MP_CLOCKWAKE
+        if (Now(inst) >= WakeAt[inst].load(std::memory_order_relaxed)) WakeLocked(inst);
+#endif
+    }
+#ifdef LITEV_MP_CLOCKWAKE
+    void WakeLocked(int inst)
+    {
+        WakeAt[inst].store(UINT64_MAX, std::memory_order_relaxed);
+        for (int i = 0; i < kMaxInst; i++) if (WaitersOn[inst] & (1 << i)) CV[i].notify_one();
+        Notified |= WaitersOn[inst];
+        WaitersOn[inst] = 0;
+    }
+#endif
+    // (Lock held) wake: everyone / console `inst` / every console but `inst`
+    void NotifyAll()
+    {
+#ifdef LITEV_MP_CLOCKWAKE
+        for (auto& cv : CV) cv.notify_one();
+        Notified = 0xFFFF;
+#endif
+        Changed.notify_all();
+    }
+    void NotifyOne(int inst)
+    {
+#ifdef LITEV_MP_CLOCKWAKE
+        CV[inst].notify_one();
+        Notified |= (u16)(1 << inst);
+#else
+        Changed.notify_all();
+#endif
+    }
+    void NotifyOthers(int inst)
+    {
+#ifdef LITEV_MP_CLOCKWAKE
+        for (int i = 0; i < kMaxInst; i++) if (i != inst && (Members & (1 << i))) CV[i].notify_one();
+        Notified |= (u16)(Members & ~(1 << inst));
+#else
+        Changed.notify_all();
+#endif
+    }
+    // (Lock held) console `inst` sleeps until woken or kPoll; true = timed out
+    bool Sleep(std::unique_lock<std::mutex>& lk, int inst)
+    {
+#ifdef LITEV_MP_CLOCKWAKE
+        Notified &= (u16)~(1 << inst);
+        return CV[inst].wait_for(lk, kPoll) == std::cv_status::timeout && !(Notified & (1 << inst));
+#else
+        return Changed.wait_for(lk, kPoll) == std::cv_status::timeout;
+#endif
+    }
 };
 
 }

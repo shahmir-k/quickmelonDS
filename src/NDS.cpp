@@ -985,6 +985,9 @@ void (*LitevEventTrace)(NDS* nds, int id, u64 eventTime, u64 sysTime) = nullptr;
 void NDS::RunSystem(u64 timestamp)
 {
     SysTimestamp = timestamp;
+#ifdef LITEV_MP_CLOCKWAKE
+    if (MPWakeAt && timestamp >= MPWakeAt->load(std::memory_order_relaxed)) MPWake();
+#endif
 
     u32 mask = SchedListMask;
     for (int i = 0; i < Event_MAX; i++)

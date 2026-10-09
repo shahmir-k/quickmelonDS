@@ -22,6 +22,7 @@
 
 #include "LockstepMP.h"
 #include "../Platform.h"
+#include "../NDS.h"
 #include <chrono>
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
@@ -35,21 +36,37 @@ void LockstepMP::Begin(int inst)
     std::lock_guard<std::mutex> lk(Lock);
     Connected |= (1 << inst);
     BeginTime[inst] = Now(inst);
-    Changed.notify_all();
+    NotifyAll();
 }
+
+void LockstepMP::SetWake(int inst, NDS& nds)
+{
+#ifdef LITEV_MP_CLOCKWAKE
+    nds.MPWakeAt = &WakeAt[inst];
+    nds.MPWake = [this, inst] { Wake(inst); };
+#endif
+}
+
+#ifdef LITEV_MP_CLOCKWAKE
+void LockstepMP::Wake(int inst)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    WakeLocked(inst);
+}
+#endif
 
 void LockstepMP::Stop()
 {
     std::lock_guard<std::mutex> lk(Lock);
     Stopped = true;
-    Changed.notify_all();
+    NotifyAll();
 }
 
 void LockstepMP::End(int inst)
 {
     std::lock_guard<std::mutex> lk(Lock);
     Connected &= ~(1 << inst);
-    Changed.notify_all();
+    NotifyAll();
 }
 
 void LockstepMP::Log(int inst, const char* call, int result, u64 extra)
@@ -92,6 +109,20 @@ bool LockstepMP::StatsOn()
     return St.On > 0;
 }
 
+void LockstepMP::TLog(int inst, const char* ev)
+{
+    static const char* dir = getenv("LITEV_MP_TL");
+    if (!dir) return;
+    if (!TL[inst])
+    {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/tl%d.txt", dir, inst);
+        TL[inst] = fopen(path, "w");
+        if (!TL[inst]) return;
+    }
+    fprintf(TL[inst], "%lld %s %llu %llu\n", NowNs(), ev, (unsigned long long)Now(inst), (unsigned long long)(HostID >= 0 ? Now(HostID) : 0));
+}
+
 bool LockstepMP::PeersReached(int inst, u64 time) const
 {
     for (int i = 0; i < kMaxInst; i++)
@@ -103,13 +134,26 @@ bool LockstepMP::PeersReached(int inst, u64 time) const
     return true;
 }
 
-template <typename Pred> void LockstepMP::WaitFor(std::unique_lock<std::mutex>& lk, Pred pred)
+template <typename Pred, typename Need> void LockstepMP::WaitFor(std::unique_lock<std::mutex>& lk, Pred pred, Need need, int inst, int kind)
 {
     auto start = std::chrono::steady_clock::now();
     bool reported = false;
+    const bool stats = St.On > 0;
+    if (stats) WS[inst].Calls[kind]++;
+    if (pred() || Stopped) return;
+    if (stats) WS[inst].Blocked[kind]++;
+    TLog(inst, kind == 0 ? "B_pkt" : "B_host");
     while (!pred() && !Stopped)
     {
-        Changed.wait_for(lk, std::chrono::microseconds(100));
+#ifdef LITEV_MP_CLOCKWAKE
+        need();
+        WakeOwn(inst);
+        // the registration before a last look at the clocks (a peer stores its clock, then loads WakeAt)
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (pred()) break;
+#endif
+        bool timedOut = Sleep(lk, inst);
+        if (stats) { WS[inst].Wakeups++; if (timedOut && pred()) WS[inst].Missed++; }
         if (!reported && std::chrono::steady_clock::now() - start > std::chrono::seconds(1))
         {
             reported = true; // diagnostics: a wait this long is a deadlock
@@ -121,6 +165,8 @@ template <typename Pred> void LockstepMP::WaitFor(std::unique_lock<std::mutex>& 
             fprintf(stderr, "\n");
         }
     }
+    TLog(inst, "U");
+    if (stats) WS[inst].Ns[kind] += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
 }
 
 void LockstepMP::Broadcast(int inst, u32 type, u8* data, int len, u64 timestamp, std::deque<Packet>* queues)
@@ -134,6 +180,7 @@ void LockstepMP::Broadcast(int inst, u32 type, u8* data, int len, u64 timestamp,
         if (!(Connected & (1 << i)))
             while (!queues[i].empty() && queues[i].front().Time < Now(i)) queues[i].pop_front();
         queues[i].push_back({inst, type, timestamp, now, std::vector<u8>(data, data + len)});
+        if (queues == FromHost) FromHostChanged(i);
     }
 }
 
@@ -143,7 +190,9 @@ int LockstepMP::SendPacket(int inst, u8* data, int len, u64 timestamp)
     Log(inst, "SendPacket", len, timestamp);
     PacketCount++;
     Broadcast(inst, 0, data, len, timestamp, Regular);
-    Changed.notify_all();
+#ifndef LITEV_MP_CLOCKWAKE
+    Changed.notify_all();   // (with LITEV_MP_CLOCKWAKE: regular frames are waited for by clock only)
+#endif
     return len;
 }
 
@@ -156,7 +205,10 @@ int LockstepMP::RecvPacket(int inst, u8* data, u64* timestamp)
     Log(inst, "RecvPacketWait", 0, visible);
 
     // everything a peer sent up to `visible` must exist before we look
-    WaitFor(lk, [&] { return PeersReached(inst, visible); });
+    WaitFor(lk, [&] { return PeersReached(inst, visible); }, [&] {
+        for (int i = 0; i < kMaxInst; i++)
+            if (i != inst && (Members & (1 << i)) && Now(i) <= visible) NeedClock(inst, i, visible + 1);
+    }, inst, 0);
 
     // earliest visible frame by (send time, sender), first-sent among equals
     std::deque<Packet>& q = Regular[inst];
@@ -184,13 +236,17 @@ int LockstepMP::RecvPacket(int inst, u8* data, u64* timestamp)
 
 int LockstepMP::SendCmd(int inst, u8* data, int len, u64 timestamp)
 {
-    std::lock_guard<std::mutex> lk(Lock);
+    std::unique_lock<std::mutex> lk(Lock);
     Log(inst, "SendCmd", len, timestamp);
     PacketCount++; CmdCount++;
     HostID = inst;
+#ifdef LITEV_MP_FASTPOLL
+    HostIDSeen.store(inst, std::memory_order_relaxed);
+#endif
     // (no clearing the reply queue here: what is in it now depends on thread timing; RecvReplies
     // drops replies sent before this CMD instead)
     CmdTime[inst] = Now(inst);
+    TLog(inst, "CMD");
     if (StatsOn())
     {
         St.T0 = NowNs(); St.T1 = St.T2 = 0;
@@ -203,13 +259,19 @@ int LockstepMP::SendCmd(int inst, u8* data, int len, u64 timestamp)
             }
     }
     Broadcast(inst, 1, data, len, timestamp, FromHost);
-    Changed.notify_all();
+    NotifyOthers(inst);
+#ifdef LITEV_MP_FASTPOLL
+    lk.unlock();
+    // the queued frame (and FromHostN) before any later store of this console's clock: a client
+    // that sees the clock past the frame's time then also sees the frame queued
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
     return len;
 }
 
 int LockstepMP::SendAck(int inst, u8* data, int len, u64 timestamp)
 {
-    std::lock_guard<std::mutex> lk(Lock);
+    std::unique_lock<std::mutex> lk(Lock);
     Log(inst, "SendAck", len, timestamp);
     PacketCount++;
     // The ACK's first word (melonDS frame header) tells clients how long they may run without
@@ -220,7 +282,13 @@ int LockstepMP::SendAck(int inst, u8* data, int len, u64 timestamp)
     // host's clock anyway, so it polls every tick instead: no runahead.
     if (len >= 4) memset(data, 0, 4);
     Broadcast(inst, 3, data, len, timestamp, FromHost);
-    Changed.notify_all();
+    NotifyOthers(inst);
+#ifdef LITEV_MP_FASTPOLL
+    lk.unlock();
+    // the queued frame (and FromHostN) before any later store of this console's clock: a client
+    // that sees the clock past the frame's time then also sees the frame queued
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
     return len;
 }
 
@@ -229,16 +297,47 @@ int LockstepMP::SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid)
     std::lock_guard<std::mutex> lk(Lock);
     Log(inst, "SendReply", len, timestamp);
     if (St.On > 0 && St.T1 && !St.T2) St.T2 = NowNs();
+    TLog(inst, "REPLY");
     PacketCount++; ReplyCount++;
     if (HostID >= 0 && HostID != inst && (Members & (1 << HostID)))
         Replies[HostID].push_back({inst, 2u | ((u32)aid << 16), timestamp, Now(inst), std::vector<u8>(data, data + len)});
-    Changed.notify_all();
+    NotifyOne(HostID >= 0 ? HostID : inst);
     return len;
 }
 
 int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
 {
-    std::unique_lock<std::mutex> lk(Lock);
+#ifdef LITEV_MP_FASTPOLL
+    // An MP client polls on every Wi-Fi tick (~900 times per frame in Mario Kart DS) and almost
+    // always gets nothing; with 8 consoles those polls queued on Lock for 2-3 ms per frame each.
+    // Without the lock: nothing queued for us and the host strictly past our time is exactly the
+    // case where the locked path below returns 0 at once (host frames are queued before the host's
+    // clock moves on; the fence after SendCmd/SendAck orders the queue count before that clock).
+    {
+        int host = HostIDSeen.load(std::memory_order_relaxed);
+        u64 now = Now(inst);
+        if (host >= 0 && host != inst && now >= kHostDelay)
+        {
+            u64 visible = now - kHostDelay;
+            u64 t = Now(host);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if ((t > visible || (t == visible && host > inst)) && FromHostN[inst].load(std::memory_order_relaxed) == 0)
+            {
+                if (St.On > 0) WS[inst].Calls[1]++;
+                Log(inst, "RecvHostWait", host, visible);
+                Log(inst, "RecvHost", 0, 0);
+                return 0;
+            }
+        }
+    }
+#endif
+    std::unique_lock<std::mutex> lk(Lock, std::try_to_lock);
+    if (!lk.owns_lock())
+    {
+        long long t = St.On > 0 ? NowNs() : 0;
+        lk.lock();
+        if (St.On > 0) { WS[inst].Contended++; WS[inst].LockNs += NowNs() - t; }
+    }
     // The next host frame if the host had sent it kHostDelay before our current time, else
     // nothing. The client sees the host's frames, like its beacons, uniformly later than they were
     // sent, so it can run up to kHostDelay ahead of the host without waiting on it (each wait is a
@@ -268,12 +367,20 @@ int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
         for (int i = 0; i < kMaxInst; i++)
             if (i != inst && (Members & (1 << i)) && !past(i)) return false;
         return true;
-    });
+    }, [&] {
+        // past(i): clock > visible, or == visible for a higher id
+        auto needPast = [&](int i) { NeedClock(inst, i, i > inst ? visible : visible + 1); };
+        if (HostID >= 0 && HostID != inst) { needPast(HostID); return; }
+        for (int i = 0; i < kMaxInst; i++)
+            if (i != inst && (Members & (1 << i))) needPast(i);
+    }, inst, 1);
     while (!FromHost[inst].empty() && FromHost[inst].front().Time < BeginTime[inst]) FromHost[inst].pop_front();
+    FromHostChanged(inst);
     if (FromHost[inst].empty() || !shows(FromHost[inst].front())) { Log(inst, "RecvHost", 0, 0); return 0; }
 
     Packet p = std::move(FromHost[inst].front());
     FromHost[inst].pop_front();
+    FromHostChanged(inst);
     if (St.On > 0 && p.Type == 1 && St.T0 && !St.T1) St.T1 = NowNs();
     int len = (int)p.Data.size();
     if (len) memcpy(data, p.Data.data(), len);
@@ -293,7 +400,8 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
     u16 ret = 0;
     u16 replied = (1 << inst);
     u64 deadline = Now(inst) + kDelay;
-    if (St.On > 0) St.Enter = NowNs();
+    if (St.On > 0) { St.Enter = NowNs(); WS[inst].Calls[2]++; }
+    bool blocked = false;
     auto stats = [&] {
         if (St.On <= 0 || !St.T0) return;
         long long t3 = NowNs();
@@ -373,10 +481,30 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
                 u64 other = 0; for (int i = 0; i < kMaxInst; i++) if (i != inst && (Members & (1 << i))) other = Now(i);
                 Log(inst, "RecvRepliesGiveUp", (int)q.size(), other - deadline);
             }
+            if (blocked && St.On > 0) WS[inst].Ns[2] += NowNs() - St.Enter;
+            if (blocked) TLog(inst, "U");
             Log(inst, "RecvReplies", ret, replied); stats(); return ret;
         }
 
-        Changed.wait_for(lk, std::chrono::microseconds(100));
+#ifdef LITEV_MP_CLOCKWAKE
+        // the clients that have not replied yet: until they pass the deadline
+        for (int i = 0; i < kMaxInst; i++)
+            if ((Members & (1 << i)) && !(seen & (1 << i)) && !(passed & (1 << i))) NeedClock(inst, i, deadline);
+        WakeOwn(inst);
+        // (a reply arriving now notifies under Lock, which we hold until the wait)
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        {
+            bool now = false;
+            for (int i = 0; i < kMaxInst; i++)
+                if ((Members & (1 << i)) && !(seen & (1 << i)) && !(passed & (1 << i)) && Now(i) >= deadline) now = true;
+            if (now) continue;
+        }
+#endif
+        if (!blocked && St.On > 0) WS[inst].Blocked[2]++;
+        if (!blocked) TLog(inst, "B_rep");
+        blocked = true;
+        Sleep(lk, inst);
+        if (St.On > 0) WS[inst].Wakeups++;
     }
 }
 

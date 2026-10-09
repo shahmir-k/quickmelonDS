@@ -1033,6 +1033,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             else
 #endif
             lockstepMP->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
+            lockstepMP->SetWake(k, *nd);
         }
         b[k].udata->instanceID = k;
         // Distinct MAC per instance so they associate as different wireless players.
@@ -1065,6 +1066,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     auto runInstance = [&](int inst)
     {
         BuiltNDS& bi = b[inst];
+        // LITEV_MP_NICE0 / LITEV_MP_NICE1: nice of console 0's thread / every other console's (the
+        // app: EmulatorThread -10, NetplayRemote -16)
+        if (const char* nv = getenv(inst ? "LITEV_MP_NICE1" : "LITEV_MP_NICE0"))
+            if (setpriority(PRIO_PROCESS, 0, atoi(nv)) != 0) fprintf(stderr, "inst%d: setpriority %s failed\n", inst, nv);
         u32 lastSwaps = 0;
         auto lastT = std::chrono::steady_clock::now();
         try
@@ -1084,8 +1089,19 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                 }
                 else if (!net)
                 {
-                    bi.ApplyInput(f);
-                    applied = ScriptInput(bi, f);
+                    // LITEV_MP_GUEST_DELAY=D: consoles 1.. take their script D frames late, as a
+                    // Hosted server with input delay D does (the same route as thor.sh)
+                    static const int guestDelay = getenv("LITEV_MP_GUEST_DELAY") ? atoi(getenv("LITEV_MP_GUEST_DELAY")) : 0;
+                    if (guestDelay > 0 && inst > 0)
+                    {
+                        applied = f >= guestDelay ? ScriptInput(bi, f - guestDelay) : NetplayFrameInput {};
+                        ApplyNetInput(*bi.nds, applied);
+                    }
+                    else
+                    {
+                        bi.ApplyInput(f);
+                        applied = ScriptInput(bi, f);
+                    }
                 }
                 else if (f < frames)
                 {
@@ -1140,6 +1156,18 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                                (unsigned long long)vram, g.GPU3D.GXStat, g.GPU3D.FifoLevel(), g.GPU3D.NumPolygons, g.GPU3D.NumVertices,
                                (unsigned long long)XXH3_64bits(bi.nds->ARM9.R, sizeof(bi.nds->ARM9.R)),
                                (unsigned long long)XXH3_64bits(bi.nds->ARM7.R, sizeof(bi.nds->ARM7.R)));
+                    }
+                    if (lockstepMP && getenv("LITEV_MP_STATS"))
+                    {   // per console: CPU, link calls / blocked waits / blocked ms per frame (Packet, Host, Replies)
+                        timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+                        double cpu = ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+                        static thread_local double lastCpu = 0;
+                        LockstepMP::WaitStats w = lockstepMP->TakeWaitStats(inst);
+                        double fr = every;
+                        printf("inst%d wait %d: cpu %.2f ms/f | pkt %.0f calls %.1f blocked %.2f ms | host %.0f calls %.1f blocked %.2f ms | replies %.1f calls %.1f blocked %.2f ms | wakeups %.1f /f | host lock contended %.1f /f %.3f ms/f | missed wakes %.2f /f\n",
+                               inst, f + 1, (cpu - lastCpu) / fr, w.Calls[0] / fr, w.Blocked[0] / fr, w.Ns[0] / 1e6 / fr,
+                               w.Calls[1] / fr, w.Blocked[1] / fr, w.Ns[1] / 1e6 / fr, w.Calls[2] / fr, w.Blocked[2] / fr, w.Ns[2] / 1e6 / fr, w.Wakeups / fr, w.Contended / fr, w.LockNs / 1e6 / fr, w.Missed / fr);
+                        lastCpu = cpu;
                     }
                     lastT = now;
                     fflush(stdout);
