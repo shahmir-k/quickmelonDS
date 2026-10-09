@@ -829,6 +829,13 @@ if (LITEV_MASTERBRIGHT_LATCH)
     add_compile_definitions(LITEV_MASTERBRIGHT_LATCH=1)
 endif()
 
+# GL 3D: group opaque polygons by state + texture before batching (display only; exact-depth ties
+# and the stencil polygon ID may differ). Runtime: debug.litev.glsortopaque=0 off.
+option(LITEV_GL_SORT_OPAQUE "GL 3D: sort opaque polygons by state/texture so draw calls merge" OFF)
+if (LITEV_GL_SORT_OPAQUE)
+    add_compile_definitions(LITEV_GL_SORT_OPAQUE=1)
+endif()
+
 option(LITEV_SKIP_REPEAT_FRAMES "Display-only: skip 2D drawing + present of frames whose 3D repeats the previous frame while a game draws 3D at 30 Hz (runtime: GPU.SkipRepeatEnabled)" OFF)
 if (LITEV_SKIP_REPEAT_FRAMES)
     add_compile_definitions(LITEV_SKIP_REPEAT_FRAMES=1)

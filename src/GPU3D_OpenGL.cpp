@@ -1813,6 +1813,26 @@ cleared:
         NumFinalPolys = npolys;
         NumOpaqueFinalPolys = firsttrans;
         StatPolys += npolys;
+#ifdef LITEV_GL_SORT_OPAQUE
+        // Draw calls only merge polygons that are adjacent with the same state and texture; in
+        // submission order a scene with many textures (Pokemon White's town: ~500 draws for ~700
+        // polygons, ~16 ms of Mali driver CPU) merges almost nothing. Opaque polygons with the
+        // LESS depth test draw the same picture in any order (except exact-depth ties and which
+        // polygon ID the stencil keeps: display only), so group them by state and texture.
+        // Depth-equal ones (decals) go after the rest, onto finished ground; translucent polygons
+        // keep their order (blending depends on it). debug.litev.glsortopaque=0 turns it off.
+        static const bool sortOpaque = OpenGL::Prop("glsortopaque", 1) != 0;
+        if (sortOpaque)
+        {
+            const int nopaque = firsttrans < 0 ? npolys : firsttrans;
+            auto key = [](const RendererPolygon& rp) {
+                const Polygon* p = rp.PolyData;
+                return std::make_tuple((p->Attr >> 14) & 1, p->Type == 1, rp.RenderKey, p->TexParam, p->TexPalette);
+            };
+            std::stable_sort(&PolygonList[0], &PolygonList[nopaque],
+                             [&](const RendererPolygon& a, const RendererPolygon& b) { return key(a) < key(b); });
+        }
+#endif
 
         BuildPolygons(&PolygonList[0], npolys, captureinfo);
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
