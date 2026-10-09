@@ -116,6 +116,7 @@ enum
     Cmd_PlayerList,         // 03 -- host->client -- broadcast updated player list
     Cmd_PlayerConnect,      // 04 -- both -- signal connected state (ready to receive MP frames)
     Cmd_PlayerDisconnect,   // 05 -- both -- signal disconnected state (not receiving MP frames)
+    Cmd_StartSession,       // 06 -- host->client -- start a Netplay session: mode, player count
 };
 
 const int kDiscoveryPort = 7063;
@@ -292,6 +293,7 @@ bool LAN::StartHost(const char* playername, int numplayers)
     player->Address = kLocalhost;
     NumPlayers = 1;
     MaxPlayers = numplayers;
+    StartRequest = -1;
     memcpy(&MyPlayer, player, sizeof(Player));
 
     Platform::Mutex_Unlock(PlayersMutex);
@@ -335,6 +337,7 @@ bool LAN::StartClient(const char* playername, const char* host)
     player->ID = 0;
     strncpy(player->Name, playername, 31);
     player->Status = Player_Connecting;
+    StartRequest = -1;
 
     Platform::Mutex_Unlock(PlayersMutex);
 
@@ -820,6 +823,13 @@ void LAN::ProcessClientEvent(ENetEvent& event)
                     ConnectedBitmask &= ~(1 << player->ID);
                 }
                 break;
+
+            case Cmd_StartSession: // host starting a Netplay session
+                {
+                    if (event.packet->dataLength != 3) break;
+                    StartRequest = (data[1] << 8) | data[2];
+                }
+                break;
             }
 
             enet_packet_destroy(event.packet);
@@ -828,6 +838,15 @@ void LAN::ProcessClientEvent(ENetEvent& event)
     case ENET_EVENT_TYPE_NONE:
         break;
     }
+}
+
+void LAN::HostStartSession(u8 mode, u8 players)
+{
+    if (!Active || !IsHost) return;
+    u8 cmd[3] = {Cmd_StartSession, mode, players};
+    ENetPacket* pkt = enet_packet_create(cmd, 3, ENET_PACKET_FLAG_RELIABLE);
+    enet_host_broadcast(Host, Chan_Cmd, pkt);
+    enet_host_flush(Host);
 }
 
 void LAN::ProcessEvent(ENetEvent& event)

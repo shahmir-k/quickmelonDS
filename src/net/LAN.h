@@ -94,6 +94,11 @@ public:
     int GetNumPlayers() { return NumPlayers; }
     int GetMaxPlayers() { return MaxPlayers; }
 
+    // Netplay start, sent by the host to every client over the lobby: client side, -1 until it
+    // arrives, then (mode << 8) | players
+    void HostStartSession(u8 mode, u8 players);
+    int GetStartRequest() { return StartRequest; }
+
     void Process() override;
 
     void Begin(int inst) override;
@@ -135,6 +140,7 @@ private:
     std::queue<ENetPacket*> RXQueue;
 
     u32 FrameCount;
+    int StartRequest = -1;
 
     void ProcessDiscovery();
 
