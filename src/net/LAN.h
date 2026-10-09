@@ -105,6 +105,13 @@ public:
     int GetStartRequest() { return StartRequest; }
     int TakeStartRequest() { int r = StartRequest; StartRequest = -1; return r; }
 
+    // Players whose lobby link closed (left, or timed out) since the last call, with their lobby
+    // id, so the group's leader can restart a Netplay session without them.
+    std::vector<Player> TakeLeft() { std::vector<Player> r; r.swap(Left); return r; }
+    // A group's links time out after `ms` of silence (ENet's default is 5-30 s), so a dropped
+    // device is noticed while everyone else waits for its input.
+    void SetPeerTimeout(u32 ms);
+
     void Process() override;
 
     void Begin(int inst) override;
@@ -148,6 +155,7 @@ private:
     u32 FrameCount;
     int StartRequest = -1;
     int Leader = 0;     // lobby id that leads the group (the last command's server)
+    std::vector<Player> Left;
 
     void ProcessDiscovery();
 

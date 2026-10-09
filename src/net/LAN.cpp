@@ -295,6 +295,7 @@ bool LAN::StartHost(const char* playername, int numplayers)
     MaxPlayers = numplayers;
     StartRequest = -1;
     Leader = 0;
+    Left.clear();
     memcpy(&MyPlayer, player, sizeof(Player));
 
     Platform::Mutex_Unlock(PlayersMutex);
@@ -340,6 +341,7 @@ bool LAN::StartClient(const char* playername, const char* host)
     player->Status = Player_Connecting;
     StartRequest = -1;
     Leader = 0;
+    Left.clear();
 
     Platform::Mutex_Unlock(PlayersMutex);
 
@@ -629,6 +631,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
 
             int id = player->ID;
             RemotePeers[id] = nullptr;
+            Left.push_back(*player);
 
             player->ID = 0;
             player->Status = Player_None;
@@ -762,13 +765,16 @@ void LAN::ProcessClientEvent(ENetEvent& event)
             Player* player = (Player*)event.peer->data;
             if (!player) break;
 
-            ConnectedBitmask &= ~(1 << player->ID);
-
-            int id = player->ID;
+            // the entry's index, not its ID: a newer player list from the host may already have
+            // cleared this player (ID 0, Player_None), which would read as the host leaving
+            int id = (int)(player - Players);
+            ConnectedBitmask &= ~(1 << id);
             RemotePeers[id] = nullptr;
+            Left.push_back(*player);
+            Left.back().ID = id;
 
             Platform::Mutex_Lock(PlayersMutex);
-            player->Status = Player_Disconnected;
+            if (player->Status != Player_None) player->Status = Player_Disconnected;
             Platform::Mutex_Unlock(PlayersMutex);
 
             ClientUpdatePlayerList();
@@ -869,6 +875,12 @@ void LAN::HostStartSession(u8 mode, u8 players, u8 server)
     else { enet_packet_destroy(pkt); return; }
     enet_host_flush(Host);
     Leader = server;
+}
+
+void LAN::SetPeerTimeout(u32 ms)
+{
+    for (int i = 0; i < 16; i++)
+        if (RemotePeers[i]) enet_peer_timeout(RemotePeers[i], 0, ms, ms);
 }
 
 void LAN::ProcessEvent(ENetEvent& event)
