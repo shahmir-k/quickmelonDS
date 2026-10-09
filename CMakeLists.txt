@@ -820,6 +820,13 @@ option(LITEV_HYB_CAPTURE_ASYNC "Hybrid renderer: display capture reads its 3D ba
 if (LITEV_HYB_CAPTURE_ASYNC)
     add_compile_definitions(LITEV_HYB_CAPTURE_ASYNC=1)
 endif()
+
+# Hybrid renderer: a screen with no 3D is merged at 1x and blitted up to Nx (same pixels; at 3x
+# the 2D-only screen's per-pixel merge was ~2 ms of GPU a frame). Runtime: debug.litev.hybmerge1x=0 off.
+option(LITEV_HYB_MERGE_1X_2D "Hybrid: merge 2D-only screens at 1x, then blit up" OFF)
+if (LITEV_HYB_MERGE_1X_2D)
+    add_compile_definitions(LITEV_HYB_MERGE_1X_2D=1)
+endif()
 # Display-only: a game that changes MASTER_BRIGHT once in the middle of a frame (a fade step
 # landing late because the game missed VBlank, e.g. Pokemon White's area loads) tears that frame
 # (top dark, bottom bright). A single mid-frame change now applies from the next frame; two or

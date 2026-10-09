@@ -111,6 +111,10 @@ HybridRenderer::~HybridRenderer()
 #endif
     glDeleteFramebuffers(1, &DownFB);
     glDeleteTextures(1, &DownTex);
+#ifdef LITEV_HYB_MERGE_1X_2D
+    glDeleteFramebuffers(1, &Merge1xFB);
+    glDeleteTextures(1, &Merge1xTex);
+#endif
 }
 
 bool HybridRenderer::Init()
@@ -525,6 +529,38 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
             glUniform1i(SingleULoc, sc);
             glUniform2i(OriginULoc, 0, y);
             glViewport(0, y, 256 * Scale, 192 * Scale);
+#ifdef LITEV_HYB_MERGE_1X_2D
+            // a screen without 3D has no Nx detail: merge its 256x192 pixels once, not Nx*Nx
+            // times (the 2D-only screen's merge alone was ~2 ms of GPU per frame at 3x), then
+            // copy them up. Same pixels. debug.litev.hybmerge1x=0 turns it off.
+            static const bool merge1x = OpenGL::Prop("hybmerge1x", 1) != 0;
+            if (merge1x && Scale > 1 && !HybHas3D[fb][sc])
+            {
+                // ponytail: made on the first merging context; one merge path (emu thread or
+                // hyb-present) is used per session
+                if (!Merge1xFB)
+                {
+                    glGenTextures(1, &Merge1xTex);
+                    glBindTexture(GL_TEXTURE_2D, Merge1xTex);
+                    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 256, 192);
+                    glBindTexture(GL_TEXTURE_2D, GL3D()->GetColorTex(tag));   // TEXTURE1 stays the 3D colour
+                    glGenFramebuffers(1, &Merge1xFB);
+                    glBindFramebuffer(GL_FRAMEBUFFER, Merge1xFB);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, Merge1xTex, 0);
+                }
+                glBindFramebuffer(GL_FRAMEBUFFER, Merge1xFB);
+                glUniform1i(ScaleULoc, 1);
+                glUniform2i(OriginULoc, 0, 0);
+                glViewport(0, 0, 256, 192);
+                if (!(OpenGL::GLSkip() & 64)) glDrawArrays(GL_TRIANGLES, 0, 3);
+                glUniform1i(ScaleULoc, Scale);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, Merge1xFB);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
+                glBlitFramebuffer(0, 0, 256, 192, 0, y, 256 * Scale, y + 192 * Scale, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                continue;
+            }
+#endif
             if (!(OpenGL::GLSkip() & 64)) glDrawArrays(GL_TRIANGLES, 0, 3);
         }
     }

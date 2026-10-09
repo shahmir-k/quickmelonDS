@@ -89,6 +89,10 @@ private:
     // sync: wait (GPU-side) for that 3D render first (not needed on the GL thread)
     void MergeSlot(GLuint fbo, int single, int bottomY, int fb, int tag, GLuint vao, bool sync);
     GLuint EmptyVAO = 0;
+#ifdef LITEV_HYB_MERGE_1X_2D
+    // a screen without 3D merges at 1x here, then is blitted up to Nx (made by the merging context)
+    GLuint Merge1xFB = 0, Merge1xTex = 0;
+#endif
     std::unique_ptr<GLWorker> Present;        // async present thread (shared EGL context)
     GLuint GLThreadFB = 0, GLThreadVAO = 0;   // its objects
     u64 MergeSeq = 0, SlotMergeSeq[3] {};
