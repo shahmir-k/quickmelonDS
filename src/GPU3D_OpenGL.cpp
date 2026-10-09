@@ -1627,25 +1627,30 @@ void GLRenderer3D::PrepareFrame(int slot, const std::function<void()>& beforeVRA
         std::vector<Polygon>& pc = PolyCopy[slot];
         std::vector<Vertex>& vc = VtxCopy[slot];
         const u32 np = n.RenderNumPolygons;
+        // one pass over the (scattered, uncached) polygon RAM, prefetched ahead: on the in-order
+        // A55 each first touch of a polygon stalled, and the old scan + copy touched each twice
         Vertex* vmin = nullptr; Vertex* vmax = nullptr;
+        pc.resize(np);
+        Polygon* const* src = GPU3D.RenderPolygonRAM.data();
         for (u32 i = 0; i < np; i++)
         {
-            const Polygon* p = GPU3D.RenderPolygonRAM[i];
-            for (u32 j = 0; j < p->NumVertices; j++)
+            if (i + 8 < np)
+                for (u32 l = 0; l < sizeof(Polygon); l += 64) __builtin_prefetch((const char*)src[i + 8] + l);
+            Polygon& c = pc[i];
+            c = *src[i];
+            for (u32 j = 0; j < c.NumVertices; j++)
             {
-                Vertex* v = p->Vertices[j];
+                Vertex* v = c.Vertices[j];
                 if (!vmin || v < vmin) vmin = v;
                 if (!vmax || v > vmax) vmax = v;
             }
         }
         if (vmin) vc.assign(vmin, vmax + 1); else vc.clear();
-        pc.resize(np);
         for (u32 i = 0; i < np; i++)
         {
-            const Polygon* p = GPU3D.RenderPolygonRAM[i];
-            pc[i] = *p;
-            for (u32 j = 0; j < p->NumVertices; j++) pc[i].Vertices[j] = &vc[p->Vertices[j] - vmin];
-            n.RenderPolygonRAM[i] = &pc[i];
+            Polygon& c = pc[i];
+            for (u32 j = 0; j < c.NumVertices; j++) c.Vertices[j] = &vc[c.Vertices[j] - vmin];
+            n.RenderPolygonRAM[i] = &c;
         }
     }
 
