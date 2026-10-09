@@ -1501,7 +1501,16 @@ polygons_done:
 
     if (S.RenderDispCnt & (1<<5)) OpenGL::GLStatAdd(OpenGL::GLStatEdge);
     if (S.RenderDispCnt & (1<<7)) OpenGL::GLStatAdd(OpenGL::GLStatFog);
-    if ((S.RenderDispCnt & 0x00A0) && !(OpenGL::GLSkip() & 2)) // fog/edge enabled
+    // edge marking (DISPCNT bit 5) only marks pixels whose attribute G is set, and nothing writes
+    // it (the edge-flag pass above is commented out, every shader and clear writes G = 0): the
+    // pass drew nothing, yet split the 3D render pass to sample depth/attr. Skip it.
+    // debug.litev.gledgenoop=0 draws it anyway.
+    u32 finalDispCnt = S.RenderDispCnt;
+#ifdef LITEV_GL_SKIP_NOOP_EDGE
+    static const bool skipEdge = OpenGL::Prop("gledgenoop", 1) != 0;
+    if (skipEdge) finalDispCnt &= ~(1u << 5);
+#endif
+    if ((finalDispCnt & 0x00A0) && !(OpenGL::GLSkip() & 2)) // fog/edge enabled
     {
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -1516,7 +1525,7 @@ polygons_done:
         glStencilMask(0);
 
         // fog alone reads only this pixel: framebuffer fetch, no attachment sampling
-        const bool fogFetch = FinalPassFogFetchShader && !(S.RenderDispCnt & (1<<5));
+        const bool fogFetch = FinalPassFogFetchShader && !(finalDispCnt & (1<<5));
         if (!fogFetch)
         {
             glActiveTexture(GL_TEXTURE0);
@@ -1528,7 +1537,7 @@ polygons_done:
         glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
         glBindVertexArray(ClearVertexArrayID);
 
-        if (S.RenderDispCnt & (1<<5))
+        if (finalDispCnt & (1<<5))
         {
             // edge marking
             // TODO: depth/polyid values at screen edges

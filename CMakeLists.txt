@@ -835,6 +835,13 @@ option(LITEV_GL_WBUF_EARLYZ "GL 3D: W-buffer depth without gl_FragDepth (early-Z
 if (LITEV_GL_WBUF_EARLYZ)
     add_compile_definitions(LITEV_GL_WBUF_EARLYZ=1)
 endif()
+
+# GL 3D: skip the edge-marking final pass, which can't mark anything in this renderer (no shader
+# writes the edge flag it tests) but split the 3D render pass. Exact. Runtime: debug.litev.gledgenoop=0 off.
+option(LITEV_GL_SKIP_NOOP_EDGE "GL 3D: skip the no-op edge marking pass" OFF)
+if (LITEV_GL_SKIP_NOOP_EDGE)
+    add_compile_definitions(LITEV_GL_SKIP_NOOP_EDGE=1)
+endif()
 # Display-only: a game that changes MASTER_BRIGHT once in the middle of a frame (a fade step
 # landing late because the game missed VBlank, e.g. Pokemon White's area loads) tears that frame
 # (top dark, bottom bright). A single mid-frame change now applies from the next frame; two or
