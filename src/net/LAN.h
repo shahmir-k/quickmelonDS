@@ -94,10 +94,13 @@ public:
     int GetNumPlayers() { return NumPlayers; }
     int GetMaxPlayers() { return MaxPlayers; }
 
-    // Netplay start, sent by the host to every client over the lobby: client side, -1 until it
-    // arrives, then (mode << 8) | players
-    void HostStartSession(u8 mode, u8 players);
+    // Group command (a session start / switch / end), sent by the host to every client over the
+    // lobby, which stays connected as the group's control channel while a session runs. Client
+    // side: -1 until one arrives, then (server << 16) | (mode << 8) | players, where server = the
+    // lobby id of the session's player 0. TakeStartRequest also clears it (the next command).
+    void HostStartSession(u8 mode, u8 players, u8 server = 0);
     int GetStartRequest() { return StartRequest; }
+    int TakeStartRequest() { int r = StartRequest; StartRequest = -1; return r; }
 
     void Process() override;
 

@@ -52,10 +52,11 @@ public:
     static MPInterface& Get() { return *Current; }
     static MPInterfaceType GetType() { return CurrentType; }
     static void Set(MPInterfaceType type);
-#ifdef LITEV_HOSTED_NETPLAY
-    // installs a ready-made link (Hosted Netplay: RecordMP, ReplayMP)
+    // hands the current link to the caller and installs the dummy one (the lobby's LAN link
+    // outlives it as a group's control channel)
+    static std::unique_ptr<MPInterface> Take() { auto mp = std::move(Current); Set(MPInterface_Dummy); return mp; }
+    // installs a ready-made link (Hosted Netplay: RecordMP, ReplayMP; a group's LAN link)
     static void Set(std::unique_ptr<MPInterface> mp, MPInterfaceType type) { Current = std::move(mp); CurrentType = type; LinkDelaysRegularFrames = type == MPInterface_Netplay; }
-#endif
 
     [[nodiscard]] int GetRecvTimeout() const noexcept { return RecvTimeout; }
     void SetRecvTimeout(int timeout) noexcept { RecvTimeout = timeout; }

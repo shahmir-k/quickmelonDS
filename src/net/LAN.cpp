@@ -116,7 +116,7 @@ enum
     Cmd_PlayerList,         // 03 -- host->client -- broadcast updated player list
     Cmd_PlayerConnect,      // 04 -- both -- signal connected state (ready to receive MP frames)
     Cmd_PlayerDisconnect,   // 05 -- both -- signal disconnected state (not receiving MP frames)
-    Cmd_StartSession,       // 06 -- host->client -- start a Netplay session: mode, player count
+    Cmd_StartSession,       // 06 -- host->client -- group command: mode, player count[, server id]
 };
 
 const int kDiscoveryPort = 7063;
@@ -828,8 +828,9 @@ void LAN::ProcessClientEvent(ENetEvent& event)
 
             case Cmd_StartSession: // host starting a Netplay session
                 {
-                    if (event.packet->dataLength != 3) break;
-                    StartRequest = (data[1] << 8) | data[2];
+                    if (event.packet->dataLength != 3 && event.packet->dataLength != 4) break;
+                    int server = event.packet->dataLength == 4 ? data[3] : 0;
+                    StartRequest = (server << 16) | (data[1] << 8) | data[2];
                 }
                 break;
             }
@@ -842,11 +843,11 @@ void LAN::ProcessClientEvent(ENetEvent& event)
     }
 }
 
-void LAN::HostStartSession(u8 mode, u8 players)
+void LAN::HostStartSession(u8 mode, u8 players, u8 server)
 {
     if (!Active || !IsHost) return;
-    u8 cmd[3] = {Cmd_StartSession, mode, players};
-    ENetPacket* pkt = enet_packet_create(cmd, 3, ENET_PACKET_FLAG_RELIABLE);
+    u8 cmd[4] = {Cmd_StartSession, mode, players, server};
+    ENetPacket* pkt = enet_packet_create(cmd, 4, ENET_PACKET_FLAG_RELIABLE);
     enet_host_broadcast(Host, Chan_Cmd, pkt);
     enet_host_flush(Host);
 }
