@@ -1166,6 +1166,11 @@ void GPU::StartFrame() noexcept
     {
         SkipThisFrame = false;
     }
+    if (KeepCaptures)
+    {
+        KeepCapturesSeen |= (CaptureCnt & (1u << 31)) != 0;
+        if (KeepCapturesSeen) SkipThisFrame = false;
+    }
 #ifdef LITEV_NETPLAY_CAPTURE
     if (CaptureSeen) GPU3D.Headless = false;
 #else

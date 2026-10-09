@@ -638,6 +638,13 @@ public:
     // during the previous one); render 3D every frame for that if a game desyncs on it.
     bool Headless = false;
     bool CaptureSeen = false;
+    // Record mode: skipping a frame's drawing must not change guest state, but a display capture
+    // writes the drawn picture into VRAM. Once the game has captured, draw every frame (fast-forward
+    // and auto frameskip then only drop the sleep), so a recording replays exactly.
+    // ponytail: a first capture right after a skipped frame can still see stale 3D; the replay's
+    // hash check reports it.
+    bool KeepCaptures = false;
+    bool KeepCapturesSeen = false;
 #ifdef LITEV_NETPLAY_CAPTURE
     // LITEV_NETPLAY_CAPTURE: captured pixels only matter to emulation if the CPU reads them back
     // (games use capture for display effects: motion blur, a frozen 3D frame shown as a BG). So
