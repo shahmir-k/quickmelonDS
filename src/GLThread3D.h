@@ -92,7 +92,8 @@ public:
             DoneSeq.store(seq, std::memory_order_release);
         }, false);
     }
-    // the render state is snapshotted in PrepareFrame: VBlank never has to wait for the job
+    // The render state AND the polygons/vertices are snapshotted in PrepareFrame (copies the
+    // job owns), so VBlank never has to wait for the job.
     void FinishRendering() override {}
     // block until the job that renders colour buffer c has been issued (its fence exists)
     void WaitColor(int c)
@@ -119,7 +120,7 @@ public:
     int Slot = 0;
     std::atomic<u64> DoneSeq { 0 };
     // job timing (GL thread), read/reset by HybridRenderer's log while the job is idle
-    double JobQueued = 0, JobWall = 0, JobCpu = 0, PrepWait = 0, PrepMs = 0, JobTail = 0, KickGap = 0, LastKick = 0, JobEndFromKick = 0; int JobN = 0;
+    double JobQueued = 0, JobWall = 0, JobCpu = 0, PrepWait = 0, PrepMs = 0, JobTail = 0, KickGap = 0, LastKick = 0, JobEndFromKick = 0, FinishWait = 0; int JobN = 0;
     static double NowMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
     static double CpuMs() { timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6; }
 };

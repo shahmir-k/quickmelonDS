@@ -137,6 +137,7 @@ void main()
     }
 
 #ifdef WBuffer
-    gl_FragDepth = fZ;
+    // depth-equal polygons: the DS's +-0xFF W-buffer margin (see 3DRenderVS)
+    gl_FragDepth = ((fPolygonAttr.x & 0x4000) != 0) ? fZ - 255.0 / 16777216.0 : fZ;
 #endif
 }

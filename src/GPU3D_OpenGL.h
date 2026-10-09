@@ -24,6 +24,7 @@
 #include "GPU3D_TexcacheOpenGL.h"
 #include "NonStupidBitfield.h"
 #include <functional>
+#include <vector>
 
 namespace melonDS
 {
@@ -200,6 +201,10 @@ private:
         int CaptureInfo[16];   // GLRenderer's captures that textures read (-1: plain VRAM)
         Polygon* RenderPolygonRAM[2048];
     } S {}, Next[2] {};
+    // the polygons and vertices of Next[slot] (RenderPolygonRAM points here): GPU3D reuses its
+    // polygon/vertex bank at the VBlank after next, possibly while this job still draws
+    std::vector<Polygon> PolyCopy[2];
+    std::vector<Vertex> VtxCopy[2];
     GLuint DepthBufferTex {}, AttrBufferTex {};
     void AllocColorBuffers() noexcept;
 

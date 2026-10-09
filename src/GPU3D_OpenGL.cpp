@@ -1544,7 +1544,34 @@ void GLRenderer3D::PrepareFrame(int slot, const std::function<void()>& beforeVRA
         GPU.GetCaptureInfo_Texture(n.CaptureInfo);
     else
         for (int i = 0; i < 16; i++) n.CaptureInfo[i] = -1;
-    memcpy(n.RenderPolygonRAM, GPU3D.RenderPolygonRAM.data(), n.RenderNumPolygons * sizeof(Polygon*));
+    // the polygons and their vertices themselves (the job reads them through all its passes,
+    // and GPU3D rewrites this bank once its VBlank after next swaps it back: a job running that
+    // late, as in Pokemon White's town intro, drew half-rewritten polygons as wedges)
+    {
+        std::vector<Polygon>& pc = PolyCopy[slot];
+        std::vector<Vertex>& vc = VtxCopy[slot];
+        const u32 np = n.RenderNumPolygons;
+        Vertex* vmin = nullptr; Vertex* vmax = nullptr;
+        for (u32 i = 0; i < np; i++)
+        {
+            const Polygon* p = GPU3D.RenderPolygonRAM[i];
+            for (u32 j = 0; j < p->NumVertices; j++)
+            {
+                Vertex* v = p->Vertices[j];
+                if (!vmin || v < vmin) vmin = v;
+                if (!vmax || v > vmax) vmax = v;
+            }
+        }
+        if (vmin) vc.assign(vmin, vmax + 1); else vc.clear();
+        pc.resize(np);
+        for (u32 i = 0; i < np; i++)
+        {
+            const Polygon* p = GPU3D.RenderPolygonRAM[i];
+            pc[i] = *p;
+            for (u32 j = 0; j < p->NumVertices; j++) pc[i].Vertices[j] = &vc[p->Vertices[j] - vmin];
+            n.RenderPolygonRAM[i] = &pc[i];
+        }
+    }
 
     // decided here (not on the render thread) so the caller knows at once which colour
     // buffer this frame's 3D lands in

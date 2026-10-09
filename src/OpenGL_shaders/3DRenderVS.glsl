@@ -37,6 +37,10 @@ void main()
     fpos.z = 0.0;
 #else
     fpos.z = (float(vPosition.z << zshift) / 8388608.0) - 1.0;
+    // depth-equal polygons (decals such as ground shadows): the DS accepts a depth within
+    // +-0x200 of the one drawn; GL_LEQUAL needs it exact, so the decal z-fought (flickered).
+    // Move it 0x200 toward the camera (NDC z = z / 2^23 - 1, linear in z here).
+    if ((attr & 0x4000) != 0) fpos.z -= 512.0 / 8388608.0;
 #endif
     fpos.w = float(vPosition.w) / 65536.0f;
     fpos.xyz *= fpos.w;
