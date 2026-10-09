@@ -106,7 +106,7 @@ HybridRenderer::~HybridRenderer()
     if (PresentFB) glDeleteFramebuffers(1, &PresentFB);
     glDeleteFramebuffers(1, &ReadFB);
 #ifdef LITEV_HYB_CAPTURE_ASYNC
-    glDeleteBuffers(2, CapPBO);
+    glDeleteBuffers(3, CapPBO);
     for (GLsync& f : CapFence) if (f) { glDeleteSync(f); f = nullptr; }
 #endif
     glDeleteFramebuffers(1, &DownFB);
@@ -308,28 +308,113 @@ void HybridRenderer::CapKick(int pbo)
 }
 #endif
 
+#ifdef LITEV_HYB_CAPTURE_OFFTHREAD
+// GL 3D thread: start reading 3D colour buffer `color` (at 1x) into CapPBO[k]
+void HybridRenderer::CapKickGL(int k, int color)
+{
+    if (!CapGLReadFB) { glGenFramebuffers(1, &CapGLReadFB); glGenFramebuffers(1, &CapGLDownFB); }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, CapGLReadFB);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, GL3D()->GetColorTex(color), 0);
+    glDisable(GL_SCISSOR_TEST);
+    if (Scale > 1)
+    {
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CapGLDownFB);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, DownTex, 0);
+        glBlitFramebuffer(0, 0, 256 * Scale, 192 * Scale, 0, 0, 256, 192, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CapGLDownFB);
+    }
+    if (!CapPBO[k])
+    {
+        glGenBuffers(1, &CapPBO[k]);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, CapPBO[k]);
+        glBufferData(GL_PIXEL_PACK_BUFFER, 256 * 192 * 4, nullptr, GL_STREAM_READ);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, CapPBO[k]);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (CapFence[k]) glDeleteSync(CapFence[k]);
+    CapFence[k] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    glFlush();
+}
+
+// GL 3D thread: finish the read in CapPBO[k] into CapOut[k]
+void HybridRenderer::CapFinishGL(int k)
+{
+    glClientWaitSync(CapFence[k], GL_SYNC_FLUSH_COMMANDS_BIT, 100000000);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, CapPBO[k]);
+    if (const u8* p = (const u8*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 256 * 192 * 4, GL_MAP_READ_BIT))
+    {
+        memcpy(ReadBuf, p, sizeof(ReadBuf));   // the mapping is uncached on Mali: one bulk copy
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        CapConvert(ReadBuf, CapOut[k]);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    CapBusy[k].store(false, std::memory_order_release);
+}
+#endif
+
 void HybridRenderer::HybridReadback3D(u32* dst)
 {
 #ifdef LITEV_HYB_CAPTURE_ASYNC
     {
         double t0 = HybNowMs();
         const u32 frame = GPU.NDS.NumFrames;
-        // the read started on the previous frame (else a capture run just began: start and
-        // wait for this frame's own, once)
-        int use = CapNext ^ 1;
-        const bool prev = CapPendFrame + 1 == frame && CapFence[use];
+        // the read started `lag` frames ago, or the newest one at most that old while a capture
+        // run is starting (else this frame's own, once). One frame back was not enough: with
+        // the GPU over a frame behind (PW title screen, 3x) the wait still cost ~11 ms a frame.
+        static const int lag = std::clamp(OpenGL::Prop("caplag", 2), 1, 2);
+        int use = -1;
+        for (int k = 0; k < 3; k++)
+            if (k != CapNext && CapFence[k] && frame - CapFrameOf[k] <= (u32)lag && frame != CapFrameOf[k]
+                && (use < 0 || CapFrameOf[k] < CapFrameOf[use]))
+                use = k;
+#ifdef LITEV_HYB_CAPTURE_OFFTHREAD
+        // the whole read on the GL 3D thread, queued behind this frame's 3D render (so no wait
+        // for it here): each job starts this frame's read and finishes the previous one (wait,
+        // map, copy out of the uncached mapping, convert: ~7 ms of the emu thread's frame on the
+        // PW title screen at 3x). The emu thread takes the result `lag` frames later.
+        // debug.litev.capoff=0 turns it off.
+        static const bool off = OpenGL::Prop("capoff", 1) != 0 && Thread3D()->Threaded;
+        if (off)
+        {
+            const int k = CapNext, color = GL3D()->GetCurColor(), prev = CapPrevSlot;
+            while (CapBusy[k].load(std::memory_order_acquire)) std::this_thread::yield();   // slot reuse
+            CapBusy[k].store(true, std::memory_order_relaxed);
+            CapFrameOf[k] = frame;
+            Thread3D()->Run([this, k, color, prev] { CapKickGL(k, color); if (prev >= 0) CapFinishGL(prev); }, false);
+            CapPrevSlot = k;
+            if (use < 0)   // a capture run starts: this frame's own read, now
+            {
+                Thread3D()->Run([this, k] { CapFinishGL(k); }, true);
+                CapPrevSlot = -1;
+                use = k;
+            }
+            while (CapBusy[use].load(std::memory_order_acquire)) std::this_thread::yield();   // done by now on a run
+            memcpy(dst, CapOut[use], sizeof(CapOut[use]));
+            CapNext = (k + 1) % 3;
+            ProfReadback += HybNowMs() - t0;
+            return;
+        }
+#endif
+
         CapKick(CapNext);
-        if (!prev) use = CapNext;
+        CapFrameOf[CapNext] = frame;
+        if (use < 0) use = CapNext;
+
         glClientWaitSync(CapFence[use], GL_SYNC_FLUSH_COMMANDS_BIT, 100000000);   // done by now on a run
         glBindBuffer(GL_PIXEL_PACK_BUFFER, CapPBO[use]);
         if (const u8* p = (const u8*)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, 256 * 192 * 4, GL_MAP_READ_BIT))
         {
-            CapConvert(p, dst);
+            // the mapping is uncached on Mali: one bulk copy, not 3 byte loads per pixel from it
+            // (PW title screen: ~10 ms a frame on the emu thread -> the copy)
+            memcpy(ReadBuf, p, sizeof(ReadBuf));
             glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            CapConvert(ReadBuf, dst);
         }
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-        CapPendFrame = frame;
-        CapNext ^= 1;
+        CapNext = (CapNext + 1) % 3;
         ProfReadback += HybNowMs() - t0;
         return;
     }

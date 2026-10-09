@@ -109,10 +109,19 @@ private:
 #ifdef LITEV_HYB_CAPTURE_ASYNC
     // capture readback without a GPU stall: each capture frame starts its 3D's read into a
     // PBO and uses the one started on the previous frame (capture 3D one frame late)
-    GLuint CapPBO[2] {};
-    GLsync CapFence[2] {};
+    // a ring of reads: a capture uses the one started debug.litev.caplag (default 2) frames ago
+    GLuint CapPBO[3] {};
+    GLsync CapFence[3] {};
+    u32 CapFrameOf[3] {};            // NumFrames each read was started on
+#ifdef LITEV_HYB_CAPTURE_OFFTHREAD
+    std::atomic<bool> CapBusy[3] {}; // its read is still being finished on the GL 3D thread
+    u32 CapOut[3][256 * 192];        // the finished reads, converted
+    int CapPrevSlot = -1;            // read started by the last capture job, not finished yet
+    GLuint CapGLReadFB = 0, CapGLDownFB = 0;   // the GL 3D thread's own (FBOs aren't shared)
+    void CapKickGL(int k, int color);
+    void CapFinishGL(int k);
+#endif
     int CapNext = 0;
-    u32 CapPendFrame = ~0u;          // NumFrames of the read pending in CapPBO[CapNext ^ 1]
     void CapKick(int pbo);
     void CapConvert(const u8* src, u32* dst);
 #endif
