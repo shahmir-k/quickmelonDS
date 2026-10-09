@@ -676,7 +676,7 @@ int main(int argc, char** argv)
                 u64 v[4] = { keys | ((u64)(u16)tx << 32) | ((u64)(u16)ty << 48), nds->GetSysTimestamp(),
                              XXH3_64bits(nds->MainRAM, nds->MainRAMMask + 1), (u64)frame };
                 u64 hash = XXH3_64bits(v, sizeof(v));
-                if (emitHashes) printf("%d,0,0,0,0,1,%016llx\n", frame, (unsigned long long) hash);
+                if (emitHashes) printf("%d,0,0,0,0,1,0,%016llx\n", frame, (unsigned long long) hash);
                 if (it != recordedHashes.end() && ++hashesChecked && hash != it->second && firstDiff < 0)
                     firstDiff = frame;
             }
