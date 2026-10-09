@@ -72,6 +72,7 @@ struct Options
     std::vector<std::pair<int, std::string>> fbDumps;
     std::string videoMp4;               // --video-mp4: every frame, through ffmpeg
     std::string checkRecording;         // --check-recording: an app recording's frames.csv
+    int reloadAt = -1;                  // --reload-at: load --savestate again after this many frames
 
     // Unit 1 trace/verify modes.
     RunMode mode = RunMode::Benchmark;
@@ -132,6 +133,8 @@ struct Options
         "  --data-dir <path>         local firmware/save directory (default ./headless-data)\n"
         "  --video-mp4 <path>        write every frame (top over bottom) to an MP4 (needs ffmpeg)\n"
         "  --check-recording <csv>   compare the state hashes with an app recording's frames.csv\n"
+        "  --reload-at <n>           after n frames, load --savestate again and restart the frame count\n"
+        "                            (finds emulator state a savestate does not hold)\n"
         "  --fixed-rtc <unix-ts>     fixed RTC epoch for determinism (default 946684800)\n"
         "  --lan-join <host>         join the LAN multiplayer session at <host> (e.g. a SereneDS\n"
         "                            device); runs paced at 60 fps (LITEV_HEADLESS_LAN build)\n"
@@ -194,6 +197,7 @@ bool ParseArgs(int argc, char** argv, Options& o)
         else if (a == "--fb-hash-every") o.fbHashEvery = std::atoi(next("--fb-hash-every").c_str());
         else if (a == "--video-mp4") o.videoMp4 = next("--video-mp4");
         else if (a == "--check-recording") o.checkRecording = next("--check-recording");
+        else if (a == "--reload-at") o.reloadAt = std::atoi(next("--reload-at").c_str());
         else if (a == "--fb-dump-ppm")
         {
             // Accept one or more <frame>:<path> pairs, comma-separated, in a single flag (the flag
@@ -649,6 +653,13 @@ int main(int argc, char** argv)
 
     for (int frame = 0; frame < opt.frames; frame++)
     {
+        if (frame == opt.reloadAt && !opt.savestate.empty())
+        {
+            if (!LoadSavestate(*nds, opt.savestate)) { fprintf(stderr, "error: reload failed\n"); return 1; }
+            fprintf(stderr, "reloaded %s after %d frames\n", opt.savestate.c_str(), frame);
+            opt.reloadAt = -1;
+            frame = 0;
+        }
         if (inputScript.Loaded())
         {
             nds->SetKeyMask(inputScript.KeyMaskForFrame(frame));
@@ -797,7 +808,7 @@ int main(int argc, char** argv)
                 fflush(stdout);
             }
 
-            if (video)
+            if (video && opt.reloadAt < 0)   // not the warm-up frames before a --reload-at
             {
                 std::vector<u8> rgb(256 * 384 * 3);
                 for (int i = 0; i < 256 * 384; i++)

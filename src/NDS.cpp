@@ -693,6 +693,19 @@ bool NDS::DoSavestate(Savestate* file)
 
     file->Var16(&DivCnt);
     file->Var16(&SqrtCnt);
+    // The divider and square-root operands and results (state 14.1). Older states lacked them, so a
+    // load kept whatever the console had computed before it: a game whose IRQ handler saves and
+    // restores these registers (Shrek) then ran differently after every load (record-mode replays
+    // diverged within a frame).
+    if (file->IsAtLeastVersion(14, 1))
+    {
+        file->VarArray(DivNumerator, sizeof(DivNumerator));
+        file->VarArray(DivDenominator, sizeof(DivDenominator));
+        file->VarArray(DivQuotient, sizeof(DivQuotient));
+        file->VarArray(DivRemainder, sizeof(DivRemainder));
+        file->VarArray(SqrtVal, sizeof(SqrtVal));
+        file->Var32(&SqrtRes);
+    }
 
     file->Var32(&CPUStop);
 

@@ -25,7 +25,7 @@
 #include "types.h"
 
 #define SAVESTATE_MAJOR 14
-#define SAVESTATE_MINOR 0
+#define SAVESTATE_MINOR 1   // 1: divider/sqrt operands and results
 
 // bitmask for the savestate config word
 enum
