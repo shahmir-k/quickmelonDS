@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <map>
 #include <utility>
 #include <memory>
 #include <optional>
@@ -69,6 +70,8 @@ struct Options
     // frame:path pairs to dump as PPM. Multiple frames in ONE run (comma-separated in a single
     // --fb-dump-ppm, or the flag repeated) so a visual A/B needs one replay, not one-per-frame.
     std::vector<std::pair<int, std::string>> fbDumps;
+    std::string videoMp4;               // --video-mp4: every frame, through ffmpeg
+    std::string checkRecording;         // --check-recording: an app recording's frames.csv
 
     // Unit 1 trace/verify modes.
     RunMode mode = RunMode::Benchmark;
@@ -127,6 +130,8 @@ struct Options
         "  --bench-window <s>:<e>    report avg FPS over frames [s,e] inclusive only (still runs all frames)\n"
         "  --profile-json <path>     write per-run totals as JSON\n"
         "  --data-dir <path>         local firmware/save directory (default ./headless-data)\n"
+        "  --video-mp4 <path>        write every frame (top over bottom) to an MP4 (needs ffmpeg)\n"
+        "  --check-recording <csv>   compare the state hashes with an app recording's frames.csv\n"
         "  --fixed-rtc <unix-ts>     fixed RTC epoch for determinism (default 946684800)\n"
         "  --lan-join <host>         join the LAN multiplayer session at <host> (e.g. a SereneDS\n"
         "                            device); runs paced at 60 fps (LITEV_HEADLESS_LAN build)\n"
@@ -187,6 +192,8 @@ bool ParseArgs(int argc, char** argv, Options& o)
             else { fprintf(stderr, "error: --fastmem must be on or off\n"); return false; }
         }
         else if (a == "--fb-hash-every") o.fbHashEvery = std::atoi(next("--fb-hash-every").c_str());
+        else if (a == "--video-mp4") o.videoMp4 = next("--video-mp4");
+        else if (a == "--check-recording") o.checkRecording = next("--check-recording");
         else if (a == "--fb-dump-ppm")
         {
             // Accept one or more <frame>:<path> pairs, comma-separated, in a single flag (the flag
@@ -617,6 +624,29 @@ int main(int argc, char** argv)
         fprintf(stderr, "warning: --lan-join ignored (build lacks LITEV_HEADLESS_LAN)\n");
 #endif
 
+    // App record mode (MelonDS.cpp recordFrame): every 60 frames the app logs a hash of the input
+    // applied, the clock and the RAM. Same formula here, so a replay proves it matches the device.
+    std::map<int, unsigned long long> recordedHashes;
+    if (!opt.checkRecording.empty())
+        if (FILE* f = fopen(opt.checkRecording.c_str(), "r"))
+        {
+            char line[256];
+            int fr;
+            unsigned long long h;
+            while (fgets(line, sizeof(line), f))
+                if (const char* c = strrchr(line, ','); sscanf(line, "%d", &fr) == 1 && c && sscanf(c + 1, "%llx", &h) == 1)
+                    recordedHashes[fr] = h;
+            fclose(f);
+        }
+    int firstDiff = -1, hashesChecked = 0;
+    FILE* video = nullptr;
+    if (!opt.videoMp4.empty())
+    {
+        std::string cmd = "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgb24 -s 256x384 -r 60 -i - "
+                          "-c:v libx264 -crf 20 -pix_fmt yuv420p '" + opt.videoMp4 + "'";
+        video = popen(cmd.c_str(), "w");
+    }
+
     for (int frame = 0; frame < opt.frames; frame++)
     {
         if (inputScript.Loaded())
@@ -632,6 +662,25 @@ int main(int argc, char** argv)
 
         LITE_PROFILE_RESET_FRAME();
         nds->RunFrame();
+
+        static const bool emitHashes = getenv("LITEV_RECORD_EMIT") != nullptr;   // print them (tests)
+        if ((!recordedHashes.empty() || emitHashes) && ((frame + 1) % 60) == 0)
+        {
+            auto it = recordedHashes.find(frame);
+            if (it != recordedHashes.end() || emitHashes)
+            {
+                // the app's NetplayFrameInput: active-low keys, touch -1 when released
+                u64 keys = inputScript.Loaded() ? (inputScript.KeyMaskForFrame(frame) & 0xFFF) : 0xFFF;
+                int tx = -1, ty = -1;
+                if (inputScript.Loaded() && !inputScript.TouchForFrame(frame, tx, ty)) tx = ty = -1;
+                u64 v[4] = { keys | ((u64)(u16)tx << 32) | ((u64)(u16)ty << 48), nds->GetSysTimestamp(),
+                             XXH3_64bits(nds->MainRAM, nds->MainRAMMask + 1), (u64)frame };
+                u64 hash = XXH3_64bits(v, sizeof(v));
+                if (emitHashes) printf("%d,0,0,0,0,1,%016llx\n", frame, (unsigned long long) hash);
+                if (it != recordedHashes.end() && ++hashesChecked && hash != it->second && firstDiff < 0)
+                    firstDiff = frame;
+            }
+        }
 
 #ifdef LITEV_HEADLESS_LAN
         if (lan)
@@ -748,6 +797,17 @@ int main(int argc, char** argv)
                 fflush(stdout);
             }
 
+            if (video)
+            {
+                std::vector<u8> rgb(256 * 384 * 3);
+                for (int i = 0; i < 256 * 384; i++)
+                {
+                    u32 px = i < 256 * 192 ? ((const u32*)top)[i] : ((const u32*)bot)[i - 256 * 192];
+                    rgb[i*3+0] = (px >> 16) & 0xFF; rgb[i*3+1] = (px >> 8) & 0xFF; rgb[i*3+2] = px & 0xFF;
+                }
+                fwrite(rgb.data(), 1, rgb.size(), video);
+            }
+
             for (const auto& d : opt.fbDumps)
             {
                 if (d.first == frame && !d.second.empty())
@@ -760,6 +820,11 @@ int main(int argc, char** argv)
             }
         }
     }
+
+    if (video) pclose(video);
+    if (!recordedHashes.empty())
+        printf("%s (%d of %zu recorded hashes checked)\n", firstDiff >= 0 ? ("REPLAY DIFFERS at frame " + std::to_string(firstDiff)).c_str() : "REPLAY OK",
+               hashesChecked, recordedHashes.size());
 
     auto wallEnd = std::chrono::steady_clock::now();
     double wallSec = std::chrono::duration<double>(wallEnd - wallStart).count();
