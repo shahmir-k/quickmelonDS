@@ -697,6 +697,13 @@ if (LITEV_JIT_BLOCKXFER_FAST)
     add_compile_definitions(LITEV_JIT_BLOCKXFER_FAST=1)
 endif()
 
+# With LITEV_JIT_BLOCKXFER_FAST: also hoist the dispatch for LDM/STM blocks wholly in DS main RAM
+# (bit-exact; the JIT invalidation check stays per word).
+option(LITEV_JIT_BLOCKXFER_MAINRAM "SlowBlockTransfer9 fast path for whole-in-MainRAM blocks (bit-exact)" OFF)
+if (LITEV_JIT_BLOCKXFER_MAINRAM)
+    add_compile_definitions(LITEV_JIT_BLOCKXFER_MAINRAM=1)
+endif()
+
 # DraStic JIT emit-quality (teardown 01, FUN_001912f0): merge the host NZCV flags into
 # guest CPSR with one MRS + masked AND/ORR (3 host instrs) instead of a per-flag CSET+BFI
 # pair (8 instrs) for full-flag arithmetic S-ops (CMP/SUBS/ADDS...). Guest CPSR N/Z/C/V

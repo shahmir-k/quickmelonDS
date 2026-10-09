@@ -269,6 +269,31 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
             }
             return;
         }
+#ifdef LITEV_JIT_BLOCKXFER_MAINRAM
+        // whole block in DS main RAM, clear of both TCMs (a <= 64 B block whose ends are both
+        // outside the >= 16 KB DTCM has no word inside it): per word exactly what
+        // NDS::ARM9Write32/ARM9Read32 do there (JIT invalidation check, plain access), without
+        // the per-word ITCM/DTCM/region dispatch. LDM/STM to main RAM through this slow path
+        // were ~4% of the emu thread on the PW title screen. Bit-exact.
+        if (ConsoleType == 0 && (addr & 0xFF000000) == 0x02000000 && (last & 0xFF000000) == 0x02000000
+            && addr >= cpu->ITCMSize
+            && (addr & cpu->DTCMMask) != cpu->DTCMBase && (last & cpu->DTCMMask) != cpu->DTCMBase)
+        {
+            NDS& nds = cpu->NDS;
+            for (u32 i = 0; i < num; i++)
+            {
+                const u32 a = addr + (i << 2);
+                if (Write)
+                {
+                    nds.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(a);
+                    *(u32*)&nds.MainRAM[a & nds.MainRAMMask] = (u32)data[i];
+                }
+                else
+                    data[i] = *(u32*)&nds.MainRAM[a & nds.MainRAMMask];
+            }
+            return;
+        }
+#endif
     }
 #endif
 
