@@ -1098,7 +1098,11 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             if (record) record->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
             else
 #endif
+#ifdef LITEV_MP_FASTPOLL
+            lockstepMP->SetClockSource(k, nd->SysTimestampPtr());
+#else
             lockstepMP->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
+#endif
             lockstepMP->SetWake(k, *nd);
         }
         b[k].udata->instanceID = k;

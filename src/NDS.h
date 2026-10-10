@@ -461,6 +461,7 @@ public: // TODO: Encapsulate the rest of these members
     // liteDS-v2: read-only accessor for the global scheduler timestamp, used by
     // the headless trace/verify oracle (tools/headless/VerifyTrace.cpp).
     [[nodiscard]] u64 GetSysTimestamp() const noexcept { return SysTimestamp; }
+    [[nodiscard]] const u64* SysTimestampPtr() const noexcept { return &SysTimestamp; }
 #ifdef LITEV_MP_CLOCKWAKE
     // LockstepMP (SetWake): once SysTimestamp reaches *MPWakeAt, MPWake() wakes the consoles
     // waiting on this one's clock

@@ -86,6 +86,10 @@ public:
 
     // How to read instance `inst`'s emulated clock (NDS::GetSysTimestamp), from any thread.
     void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = std::move(clock); Members |= (1 << inst); }
+#ifdef LITEV_MP_FASTPOLL
+    // the clock as a plain read of the console's timestamp (Now() runs several times per poll)
+    void SetClockSource(int inst, const u64* src) { ClockSrc[inst] = src; Clock[inst] = [src] { return *src; }; Members |= (1 << inst); }
+#endif
     // LITEV_MP_CLOCKWAKE: inst's console (`nds`) wakes the consoles waiting on its clock as soon as
     // it reaches what they wait for; nothing without the flag. After SetClock.
     void SetWake(int inst, NDS& nds);
@@ -197,7 +201,12 @@ private:
     u64 CmdCount = 0, ReplyCount = 0, PacketCount = 0;
 
     void Broadcast(int inst, u32 type, u8* data, int len, u64 timestamp, std::deque<Packet>* queues);
+#ifdef LITEV_MP_FASTPOLL
+    const u64* ClockSrc[kMaxInst] {};
+    u64 Now(int inst) const { return ClockSrc[inst] ? __atomic_load_n(ClockSrc[inst], __ATOMIC_RELAXED) : Clock[inst] ? Clock[inst]() : 0; }
+#else
     u64 Now(int inst) const { return Clock[inst] ? Clock[inst]() : 0; }
+#endif
     bool PeersReached(int inst, u64 time) const;
     // waits (lock held) until pred(); peers' clocks advance without notifying, so also re-check
     // every 100 us
