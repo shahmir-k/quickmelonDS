@@ -55,6 +55,13 @@ constexpr u32 kGxChunk = 0x1D8;             // bytes per DMA (118 words)
 // OS_IRQTable[1] (HBlank) = the Thumb stub code[12].a | 1, OS_IrqHandler after the table call = code[0].a + 0x58)
 constexpr int kNumWake = 12;    // code ranges of 1. and 2. (signature sig); the rest: 3. (irqSig)
 
+// 8. for the TWL SDK build (W2): NNS G3D in Thumb. SBC MAT (entry), MAT_InternalDefault, NNS_G3dGeBufferOP_N,
+// MI_CpuSend32 (ARM), the material function table, the material cache, NNS_G3dGlb, the mask table, the GE buffer object
+struct MatT { u32 sbc, def, opn, snd, tab, cache, glb, mask, ge; Range code[4]; u64 sig; };
+constexpr MatT kW2Mat = {0x020668A4, 0x02066584, 0x02067D48, 0x020786B0, 0x0209B370, 0x02143CB4, 0x02143ACC, 0x02094440, 0x021469B4,
+                         {{0x020668A4, 0x02066918}, {0x02066584, 0x020668A4}, {0x02067D48, 0x02067DD0}, {0x020786B0, 0x020786C8}},
+                         0x4fbe252de9fcc4e2ull};
+
 // OSThread: +0 context {cpsr, r0-r14, pc, sp_svc, CP context (+0x48, 0x1C bytes)}, +0x64 state,
 // +0x68 list link, +0x70 priority, +0x78 queue, +0x7C/+0x80 queue link prev/next
 struct Variant
@@ -92,6 +99,7 @@ struct Variant
     u32 shp;
     Range shpCode[3];
     u64 shpSig;
+    const MatT* matT;           // 8. in Thumb (W2)
 };
 constexpr Variant kPW = {
     "PW", 0x01FF8160, 0x0208478C, 0x02084830, 0x02082864,
@@ -199,6 +207,7 @@ constexpr Variant kW2 = {
     0x0214C1B8, 0x0214C26C, 0x0214C250, 0x0214C0EC, 0x0209DA98,
     0x0207ABE4, 0x0207A49F, 0x0207A8BB, 0x02079C38, 0x0207A4C7,
     0x0207C81C, 0x0207AADF, 1, 0x14, 417, 25, 13,     // check mode: set 417, get 302 at bit 21 (~13/bit, Thumb loop)
+    0, {}, 0, {}, 0, 0, {}, 0, &kW2Mat,
 };
 constexpr const Variant* kVariants[] = {&kPW, &kPB, &kW2};
 constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
@@ -208,7 +217,7 @@ inline int Kind(const Variant& v, u32 addr, u32 instr, bool thumb = false)
     if (!thumb && v.async && addr == v.async && instr == kGxInstr) return 10;
     if (!thumb && v.shp && addr == v.shp && instr == 0xE92D4010) return 13;
     if (thumb) return !v.twl ? -1 : addr == v.set && instr == kSetInstrT ? 1 : addr == v.get && instr == kGetInstrT ? 2
-                    : v.gx && addr == v.gx && instr == kGxInstrT ? 5 : -1;
+                    : v.gx && addr == v.gx && instr == kGxInstrT ? 5 : v.matT && addr == v.matT->sbc && instr == 0xB570 ? 8 : -1;
     return addr == v.wake && instr == kWakeInstr ? 0 : !v.twl && addr == v.set && instr == kSetInstr ? 1
          : !v.twl && addr == v.get && instr == kGetInstr ? 2 : v.gx && addr == v.gx && instr == kGxInstr ? 5 : -1;
 }
@@ -233,6 +242,8 @@ struct State
     bool irqOk = false;             // IRQ path code matches the variant (3.)
     bool dmaOk = false;             // DMA-end IRQ path matches (11.)
     bool shpOk = false;             // G3D shape path matches (13.)
+    bool matTOk = false;            // 8. in Thumb (W2) matches
+    std::vector<u8> matTCode;
     bool hbLive = false, dmaLive = false;   // 3. / 11. verified when the wake hook block (A9HLEGuard) was compiled
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
     u64 calls[kKinds] = {}, native[kKinds] = {}, fallback[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, irqDuring[kKinds] = {};
@@ -385,6 +396,18 @@ bool ShpIntact(melonDS::ARMv5* c, const State& s)
     return true;
 }
 
+bool MatTIntact(melonDS::ARMv5* c, const State& s)
+{
+    size_t o = 0;
+    for (const Range& r : s.v->matT->code)
+    {
+        const u8* p = CodePtr(c, r.a);
+        if (!p || memcmp(p, s.matTCode.data() + o, r.b - r.a) != 0) return false;
+        o += r.b - r.a;
+    }
+    return true;
+}
+
 bool AsyncIntact(melonDS::ARMv5* c, const State& s)
 {
     size_t o = 0;
@@ -445,6 +468,12 @@ __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 in
         for (u32 a = v.gxCode.a; a < v.gxCode.b; a++) { const u8* p = CodePtr(c, a); s.gxCode.push_back(p ? *p : 0); }
         s.gxOk = Fnv(s.gxCode) == v.gxSig;
         if (g_Stats) fprintf(stderr, "A9HLE: GX send signature %016llx -> %s\n", (unsigned long long)Fnv(s.gxCode), s.gxOk ? "on" : "off");
+        if (v.matT)
+        {
+            CodeBytes(c, s.matTCode, v.matT->code, 0, 4);
+            s.matTOk = Fnv(s.matTCode) == v.matT->sig;
+            if (g_Stats) fprintf(stderr, "A9HLE: G3D material (Thumb) signature %016llx -> %s\n", (unsigned long long)Fnv(s.matTCode), s.matTOk ? "on" : "off");
+        }
         if (v.async)
         {
             CodeBytes(c, s.asyncCode, v.asyncCode, 0, 7);
@@ -1742,6 +1771,144 @@ __attribute__((noinline)) bool RunMat(melonDS::ARMv5* c, State& s, bool jit)
 }
 #endif
 
+#ifdef LITEV_GX_BULK
+// ---- 8. in Thumb (W2, TWL SDK build) ---------------------------------------------------------------
+// SBC MAT -> MAT_InternalDefault -> NNS_G3dGeBufferOP_N -> MI_CpuSend32: the same material logic as 8. (NNS_G3dGlb
+// defaults at +0x14/+0x18/+0x1C in this build), natively at SBC MAT's (Thumb) entry: 154 calls a frame in the W2 town,
+// ~250 guest instructions each (MAT_InternalDefault alone 21% of the town's ARM9 guest instructions). Fallback as 8.
+// (render callbacks, material cache, a cached result, texture matrix, a material animation callback, GE buffering).
+// ponytail: fixed estimates (check-mode guest averages, W2 town)
+constexpr s32 kMatTCyc = 483, kMatTCycNoSend = 307;   // (no invisible material in the W2 states: 8.'s ratio)
+
+bool MatTNative(melonDS::ARMv5* c, Mem& m, Expect& e, const MatT& t, u32* gw, bool& send)
+{
+    bool bad = false;
+    auto rd = [&](u32 a, u32 n) -> u32 {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    };
+    const u32 rs = c->R[0], opt = c->R[1], S = c->R[13];
+    Obj RS = m.O(rs, 0x100);
+    if (!RS) return false;
+    // SBC MAT: skip conditions, the material, its function from the table
+    const u32 flag = RS.r(8);
+    if (flag & 0x200) return false;
+    const u32 sbc = RS.r(0), idx = rd(sbc + 1, 1);
+    if (bad || (!(flag & 1) && (flag & 8) && idx == RS.p[0xAD])) return false;
+    const u32 res = RS.r(0xD8);
+    if (!res) return false;
+    const u32 nEnt = rd(res + 5, 1), ofs = rd(res + 0xA, 2);
+    if (bad || idx >= nEnt) return false;
+    const u32 dict = res + 4, ent = dict + ofs + 4 + rd(dict + ofs, 2) * idx;
+    const u32 md = res + rd(ent, 4), hmd = rd(md, 2), fn = rd(t.tab + hmd * 4, 4);
+    if (bad || !ent || fn != (t.def | 1)) return false;
+    // MAT_InternalDefault(rs, opt, md, idx)
+    const u32 cb = RS.r(0x1C), cbT = cb ? RS.p[0x90] : 0;
+    if (cbT >= 1 && cbT <= 3) return false;
+    const u32 ro = RS.r(4);
+    if (rd(ro + 0x38, 4) || bad) return false;
+    const u32 bo = 0xBC + (idx >> 5) * 4, bit = 1u << (idx & 31), bits = RS.r(bo);
+    if ((opt == 0x20 || opt == 0x40) && (bits & bit)) return false;
+    const u32 r8 = opt == 0x40 ? t.cache + idx * 0x38 : rs + 0xF4;
+    Obj R8 = m.O(r8, 0x38);
+    const u32 h = rd(md + 0x1E, 2);
+    if (!R8 || bad || (h & 1)) return false;
+    const u32 anm = rd(ro + 8, 4);
+    if (anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit)) return false;     // material animation callback
+    const u32 t1 = rd(t.mask + ((h >> 6) & 7) * 4, 4), t2 = rd(t.mask + ((h >> 9) & 7) * 4, 4);
+    const u32 v0 = h & 0x20;
+    const u32 v4 = (rd(t.glb + 0x14, 4) & ~t1) | (rd(md + 4, 4) & t1);
+    const u32 v8 = (rd(t.glb + 0x18, 4) & ~t2) | (rd(md + 8, 4) & t2);
+    const u32 m10 = rd(md + 0x10, 4);
+    u32 vc = (rd(t.glb + 0x1C, 4) & ~m10) | (rd(md + 0xC, 4) & m10);
+    const u32 v10 = rd(md + 0x14, 4), v14 = rd(md + 0x1C, 2);
+    send = vc & 0x1F0000;
+    const u32 fl8 = flag | 8, fl = send ? fl8 & ~2u : fl8 | 2;
+    if (bad || (send && (fl & 0x100))) return false;
+    if (send)
+    {
+        // OP_N: nothing being sent, no GE buffer or an empty one: straight to GXFIFO (the other paths leave the same
+        // registers once MI_CpuSend32 has run)
+        const u32 gb = rd(t.ge, 4);
+        if (rd(t.ge + 4, 4) || (gb && rd(gb, 4)) || bad) return false;
+    }
+    if (send && v0) vc &= ~0x1F0000u;
+    // stack (S = sp): SBC MAT push {r4-r6, lr} at S-16; MAT_InternalDefault push {r3-r7, lr} at S-40, locals at M = S-72
+    // ([M] the callback timing, [M+4] the command word, [M+8] the 6 parameters); OP_N push {r3-r7, lr} at M-24
+    Obj st = m.O(S - 96, 96);
+    if (!st) return false;
+    const u32 M = S - 72;
+    const u32 w0[4] = {c->R[4], c->R[5], c->R[6], c->R[14]}, w1[6] = {idx, rs, fn, hmd * 4, c->R[7], t.sbc + 0x67};
+    for (int i = 0; i < 4; i++) m.W(st, 80 + i * 4, w0[i]);
+    for (int i = 0; i < 6; i++) m.W(st, 56 + i * 4, w1[i]);
+    m.W(st, 24, cbT);
+    const u32 cmd0 = 0x00293130, cmd1 = 0x00002B2A;
+    if (send)
+    {
+        const u32 w2[7] = {cmd0, v4, v8, vc, cmd1, v10, v14}, w3[6] = {ro, r8, rs, md, idx, t.def + 0x2D3};
+        for (int i = 0; i < 7; i++) m.W(st, 28 + i * 4, w2[i]);
+        for (int i = 0; i < 6; i++) m.W(st, i * 4, w3[i]);
+    }
+    // render state, material result
+    m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFF00u) | idx << 8);
+    m.W(RS, 8, fl);
+    m.W(RS, 0xB0, r8);
+    if (opt == 0x40) m.W(RS, bo, bits | bit);
+    m.W(RS, 0, sbc + 2);
+    m.W(R8, 0, v0); m.W(R8, 4, v4); m.W(R8, 8, v8); m.W(R8, 0xC, vc); m.W(R8, 0x10, v10); m.W(R8, 0x14, v14);
+    gw[0] = cmd0; gw[1] = v4; gw[2] = v8; gw[3] = vc; gw[4] = cmd1; gw[5] = v10; gw[6] = v14;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = sbc + 2; e.R[3] = idx;
+    if (send) { e.R[1] = v0; e.R[2] = v14; e.R[12] = M + 32; e.R[14] = t.opn + 0x7D; }
+    else { e.R[1] = fl8; e.R[2] = anm; e.R[12] = dict + ofs + 4; e.R[14] = t.sbc + 0x67; }
+    e.retPc = c->R[14];
+    // SBC MAT's adds r0, r0, #2 sets the flags
+    const u32 r = sbc + 2, nzcv = (r & 0x80000000) | ((r == 0) << 30) | ((r < sbc) << 29) | (((~(sbc ^ 2u) & (sbc ^ r)) >> 31) << 28);
+    e.CPSR = (c->CPSR & 0x0FFFFFDF) | nzcv | ((e.retPc & 1) << 5);
+    return true;
+}
+
+__attribute__((noinline)) bool RunMatT(melonDS::ARMv5* c, State& s, bool jit)
+{
+    melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
+    Mem m(c, g_Check || g_Dry);
+    Expect e;
+    u32 gw[7];
+    bool send = false;
+    bool ok = !CheckPending && s.matTOk && (jit || MatTIntact(c, s)) && MatTNative(c, m, e, *s.v->matT, gw, send)
+              && (!send || (gx.GeometryEnabled && gx.BulkReady()));
+#ifdef LITEV_HLE_DIAG
+    if (ok && (g_Check || g_Dry))
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 8, m, e);
+            g_P.gx.assign(gw, gw + (send ? 7 : 0));
+            g_P.fit[0] = send;
+#ifdef LITEV_A9HLE_GXCHECK
+            if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
+#endif
+        }
+        s.checks[8]++;
+        ok = false;
+    }
+#endif
+    if (!ok)
+    {
+        s.fallback[8] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    m.Flush();
+    if (send) gx.BulkWords(gw, 7);
+    s.native[8]++;
+    Return(c, e, send ? kMatTCyc : kMatTCycNoSend);
+    return true;
+}
+#endif
+
 // ---- 9. _ll_sdiv: 64-bit signed divide of the compiler runtime -----------------------------------
 // r1:r0 / r3:r2 by shift-and-subtract (~750 guest instructions a call; PW: 2-3 calls a frame from one
 // caller in 3D scenes). Natively: the quotient, r3:r2 = |divisor| normalized (shifted left until bit
@@ -2019,6 +2186,7 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return kNumCode + 3;
     }
     if (addr == v.gx) { r = &v.gxCode; return 1; }
+    if (v.matT && addr == v.matT->sbc) { r = v.matT->code; return 4; }
     if (addr == v.async)
     {
         static thread_local Range as[9];
@@ -2041,6 +2209,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         const int k = Kind(*s.v, addr, instr & 0xFFFF, true);
         if (k < 0 || !(s.mask & Bit(k))) return 0;
         if (k == 5) return !s.gxOk ? 0 : GxIntact(&nds.ARM9, s) ? 1 : 2;
+#ifdef LITEV_GX_BULK
+        if (k == 8) return !s.matTOk ? 0 : MatTIntact(&nds.ARM9, s) ? 1 : 2;
+#else
+        if (k == 8) return 0;
+#endif
         return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
     }
     if (!MaybeHook(instr)) return 0;
@@ -2499,6 +2672,7 @@ __attribute__((noinline)) bool RunThumb(melonDS::ARMv5* c, bool jit)
     s.calls[k]++;
 #ifdef LITEV_GX_BULK
     if (k == 5) return RunGx(c, s, jit);
+    if (k == 8) return RunMatT(c, s, jit);
 #endif
     return RunOs(c, s, k, jit);
 }

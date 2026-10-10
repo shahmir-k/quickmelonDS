@@ -57,6 +57,7 @@
 // 8. NNS G3D material (NNSi_G3dFuncSbc_MAT + MAT_InternalDefault + NNS_G3dGeBufferOP_N + MI_CpuSend32):
 //    the material result, the stack/state writes and the 7 GXFIFO words natively, guest fallback on any
 //    callback / cache hit / buffered geometry (position independent, literal-pool globals read at the call).
+//    W2 (TWL SDK build, Thumb NNS): the same at SBC MAT's Thumb entry (variant code, exact bytes).
 // 9. _ll_sdiv (64-bit signed divide of the compiler runtime): native quotient with the guest's exact
 //    registers / flags / stack bytes (position independent).
 // 10. MI_SendGXCommandAsync's synchronous part (PW, PB): the same IO writes in the same order, every memory
@@ -91,8 +92,8 @@ namespace melonDS::A9HLE
 inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001 || instr == 0xE5942000
                                         || instr == 0xE92D4010 || instr == 0xE92D58F0; }
 // Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4} / MIi_FIFOCallback
-// push {r3-r7, lr}); instr: the halfword
-inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8; }
+// push {r3-r7, lr} / SBC MAT push {r4-r6, lr}); instr: the halfword
+inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8 || instr == 0xB570; }
 // JIT decode: is the instruction at addr (ARM, or Thumb with thumb set) a hooked entry?
 // 0 no, 1 yes (code signature verified: under the JIT this compile-time check is the code
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the
