@@ -787,7 +787,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     // Netplay with the app's session setup (NetplayHandshake): player 0 hosts (waits for N - 1
     // guests on port X + 1), the others join host=IP:PORT (the host's port). delay omitted = picked
     // by the host from the measured round trips.
-    int player = 0, delay = -1, port = 7100, latency = 0, players = 0;
+    // jitter=MS, loss=PCT: more simulated network faults on receive; pace=FPS: this player's own
+    // console runs at most FPS frames per second (the app: 60), the others as their inputs allow.
+    // adaptive=0|1: input delay follows the measured round trip (NetplayInput::Adaptive).
+    int player = 0, delay = -1, port = 7100, latency = 0, players = 0, jitter = 0, loss = 0, pace = 0, adaptive = -1;
     std::string peer, host = "127.0.0.1:7100";
     const char* np = getenv("LITEV_NETPLAY");
     if (np)
@@ -806,6 +809,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             else if (k == "host") host = v;
             else if (k == "players") players = atoi(v.c_str());
             else if (k == "latency") latency = atoi(v.c_str());
+            else if (k == "jitter") jitter = atoi(v.c_str());
+            else if (k == "loss") loss = atoi(v.c_str());
+            else if (k == "pace") pace = atoi(v.c_str());
+            else if (k == "adaptive") adaptive = atoi(v.c_str());
             if (end == std::string::npos) break;
             pos = end + 1;
         }
@@ -1007,9 +1014,12 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     if (np && players == 0)
     {
         if (delay < 0) delay = 3;
-        net = std::make_unique<NetplayInput>(player, delay, port, peer, latency);
+        NetFaults faults;
+        faults.JitterMs = jitter;
+        faults.LossPct = loss;
+        net = std::make_unique<NetplayInput>(player, delay, port, std::vector<std::pair<int, std::string>> {{1 - player, peer}}, latency, faults);
         if (!net->Ok()) { fprintf(stderr, "netplay: socket setup failed\n"); return 1; }
-        printf("netplay: player %d, delay %d frames, port %d, peer %s, artificial latency %d ms\n", player, delay, port, peer.c_str(), latency);
+        printf("netplay: player %d, delay %d frames, port %d, peer %s, faults latency %d jitter %d loss %d%%\n", player, delay, port, peer.c_str(), latency, jitter, loss);
     }
     else if (np)
     {
@@ -1021,12 +1031,18 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         if ((int)setup.Peers.size() != n - 1) { fprintf(stderr, "netplay: %zu peers for %d players\n", setup.Peers.size(), n); return 1; }
         for (auto& [p, addr] : setup.Peers)
             if (p >= n) { fprintf(stderr, "netplay: player %d outside 0..%d\n", p, n - 1); return 1; }
-        net = std::make_unique<NetplayInput>(player, setup.Delay, port, setup.Peers, latency);
+        NetFaults faults;
+        faults.JitterMs = jitter;
+        faults.LossPct = loss;
+        net = std::make_unique<NetplayInput>(player, setup.Delay, port, setup.Peers, latency, faults);
         if (!net->Ok()) { fprintf(stderr, "netplay: socket setup failed\n"); return 1; }
         printf("netplay: player %d of %d, delay %d frames, port %d, peers", player, n, setup.Delay, port);
         for (auto& [p, addr] : setup.Peers) printf(" %d@%s", p, addr.c_str());
         printf(", artificial latency %d ms\n", latency);
     }
+#ifdef LITEV_NP_ADAPTIVE_DELAY
+    if (net && np) net->Adaptive = adaptive != 0;   // plain Netplay, on unless adaptive=0
+#endif
     for (int k = 0; k < n; k++)
     {
         if (lockstepMP)
@@ -1127,6 +1143,12 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                 if (inst == 1 && getenv("LITEV_MP_EVTRACE_FROM")) gEvTraceOn = f + 1 >= atoi(getenv("LITEV_MP_EVTRACE_FROM"));
 #endif
                 bi.nds->RunFrame();
+                if (pace > 0 && net && inst == net->LocalPlayer())
+                {   // no catch-up after a stall (a burst would hide it in the average)
+                    static thread_local auto next = std::chrono::steady_clock::now();
+                    next = std::max(next + std::chrono::microseconds(1000000 / pace), std::chrono::steady_clock::now());
+                    std::this_thread::sleep_until(next);
+                }
 #ifdef LITEV_HOSTED_NETPLAY
                 if (record && f < frames)
                 {
@@ -1173,6 +1195,8 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                                w.Calls[1] / fr, w.Blocked[1] / fr, w.Ns[1] / 1e6 / fr, w.Calls[2] / fr, w.Blocked[2] / fr, w.Ns[2] / 1e6 / fr, w.Wakeups / fr, w.Contended / fr, w.LockNs / 1e6 / fr, w.Missed / fr);
                         lastCpu = cpu;
                     }
+                    if (net && np && inst == net->LocalPlayer())
+                        printf("inst%d net %d: delay %d frames, peer round trip %.1f ms, stalled %.1f s\n", inst, f + 1, net->CurrentDelay(), net->PeerRttMs(), net->StallMs() / 1000);
                     lastT = now;
                     fflush(stdout);
                     lastSwaps = sw;
