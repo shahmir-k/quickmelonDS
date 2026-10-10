@@ -371,6 +371,13 @@ bool LoadSavestate(NDS& nds, const std::string& path)
         fprintf(stderr, "error: failed to load savestate into emulator\n");
         return false;
     }
+    // the hardware divider/sqrt registers as loaded (state 14.1 carries them; for re-creating
+    // them in emulators whose savestates don't, e.g. stock melonDS)
+    if (getenv("LITEV_PRINT_DIV"))
+        printf("DIVREGS %04X %08X %08X %08X %08X %04X %08X %08X\n", nds.ARM9IORead16(0x04000280),
+               nds.ARM9IORead32(0x04000290), nds.ARM9IORead32(0x04000294),
+               nds.ARM9IORead32(0x04000298), nds.ARM9IORead32(0x0400029C),
+               nds.ARM9IORead16(0x040002B0), nds.ARM9IORead32(0x040002B8), nds.ARM9IORead32(0x040002BC));
     return true;
 }
 
@@ -673,6 +680,14 @@ int main(int argc, char** argv)
 
         LITE_PROFILE_RESET_FRAME();
         nds->RunFrame();
+        {   // LITEV_PRINT_REGS=<frame>: display registers after that frame (diagnosis)
+            static const int regsAt = getenv("LITEV_PRINT_REGS") ? atoi(getenv("LITEV_PRINT_REGS")) : -1;
+            if (frame == regsAt)
+                printf("REGS frame %d DISPCNT_A %08X DISPCNT_B %08X DISPCAPCNT %08X POWCNT %04X VRAMCNT %08X %08X BG0CNT %04X DISP3DCNT %04X MASTERBRIGHT %04X\n",
+                       frame, nds->ARM9IORead32(0x04000000), nds->ARM9IORead32(0x04001000), nds->ARM9IORead32(0x04000064),
+                       nds->ARM9IORead16(0x04000304), nds->ARM9IORead32(0x04000240), nds->ARM9IORead32(0x04000244),
+                       nds->ARM9IORead16(0x04000008), nds->ARM9IORead16(0x04000060), nds->ARM9IORead16(0x0400006C));
+        }
 
         static const bool emitHashes = getenv("LITEV_RECORD_EMIT") != nullptr;   // print them (tests)
         if ((!recordedHashes.empty() || emitHashes) && ((frame + 1) % 60) == 0)
