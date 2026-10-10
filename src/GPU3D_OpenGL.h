@@ -225,6 +225,7 @@ private:
     void AllocColorBuffers() noexcept;
 
     GLuint MainFramebuffer {};
+    GLuint FinalFramebuffer {};   // colour only: the edge/fog passes sample depth + attributes
     GLuint WrapSampler[9] {};   // [wrapS * 3 + wrapT], 0 clamp / 1 repeat / 2 mirror
 };
 }

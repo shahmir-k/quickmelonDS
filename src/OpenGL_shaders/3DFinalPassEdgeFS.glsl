@@ -17,64 +17,40 @@ layout(std140) uniform uConfig
 
 out vec4 oColor;
 
-// make up for crapo zbuffer precision
-bool isless(float a, float b)
+// DS edge marking: an opaque pixel (attr.g, set by 3DRenderFS) is marked when a neighbour one DS
+// pixel away (scale internal pixels) has another polygon ID and is farther (the clear plane
+// counts: it carries the clear polygon ID and depth). The DS also requires the pixel to lie on
+// its polygon's rasterized edge; skipping that only differs where polygons interpenetrate.
+// ponytail: neighbours past the screen border clamp to the pixel itself (no mark there); the DS
+// compares them against the clear values.
+bool farther(ivec2 c, int refPolyID, float refDepth)
 {
-    return a < b;
-
-    // a < b
-    float diff = a - b;
-    return diff < (256.0 / 16777216.0);
-}
-
-bool isgood(vec4 attr, float depth, int refPolyID, float refDepth)
-{
-    int polyid = int(attr.r * 63.0);
-
-    if (polyid != refPolyID && isless(refDepth, depth))
-    return true;
-
-    return false;
+    c = clamp(c, ivec2(0), ivec2(uScreenSize) - 1);
+    int polyid = int(texelFetch(AttrBuffer, c, 0).r * 63.0 + 0.5);
+    return polyid != refPolyID && refDepth < texelFetch(DepthBuffer, c, 0).r;
 }
 
 void main()
 {
     ivec2 coord = ivec2(gl_FragCoord.xy);
-    int scale = 1;//int(uScreenSize.x / 256);
-
-    vec4 ret = vec4(0,0,0,0);
-    vec4 depth = texelFetch(DepthBuffer, coord, 0);
     vec4 attr = texelFetch(AttrBuffer, coord, 0);
+    if (attr.g == 0.0) discard;
 
-    int polyid = int(attr.r * 63.0);
+    int scale = max(int(uScreenSize.x) / 256, 1);
+    int polyid = int(attr.r * 63.0 + 0.5);
+    float depth = texelFetch(DepthBuffer, coord, 0).r;
 
-    if (attr.g != 0.0)
-    {
-        vec4 depthU = texelFetch(DepthBuffer, coord + ivec2(0,-scale), 0);
-        vec4 attrU = texelFetch(AttrBuffer, coord + ivec2(0,-scale), 0);
-        vec4 depthD = texelFetch(DepthBuffer, coord + ivec2(0,scale), 0);
-        vec4 attrD = texelFetch(AttrBuffer, coord + ivec2(0,scale), 0);
-        vec4 depthL = texelFetch(DepthBuffer, coord + ivec2(-scale,0), 0);
-        vec4 attrL = texelFetch(AttrBuffer, coord + ivec2(-scale,0), 0);
-        vec4 depthR = texelFetch(DepthBuffer, coord + ivec2(scale,0), 0);
-        vec4 attrR = texelFetch(AttrBuffer, coord + ivec2(scale,0), 0);
+    if (!(farther(coord + ivec2(0,-scale), polyid, depth) ||
+          farther(coord + ivec2(0, scale), polyid, depth) ||
+          farther(coord + ivec2(-scale,0), polyid, depth) ||
+          farther(coord + ivec2( scale,0), polyid, depth)))
+        discard;
 
-        if (isgood(attrU, depthU.r, polyid, depth.r) ||
-        isgood(attrD, depthD.r, polyid, depth.r) ||
-        isgood(attrL, depthL.r, polyid, depth.r) ||
-        isgood(attrR, depthR.r, polyid, depth.r))
-        {
-            // mark this pixel!
-
-            ret.rgb = uEdgeColors[polyid >> 3].rgb;
-
-            // this isn't quite accurate, but it will have to do
-            if ((uDispCnt & (1<<4)) != 0)
-            ret.a = 0.5;
-            else
-            ret.a = 1.0;
-        }
-    }
-
-    oColor = ret;
+#ifdef GL_ES
+    oColor.rgb = uEdgeColors[polyid >> 3].bgr;   // the GLES 3D layer is BGRA (3DRenderFS)
+#else
+    oColor.rgb = uEdgeColors[polyid >> 3].rgb;
+#endif
+    // this isn't quite accurate (antialiasing), but it will have to do
+    oColor.a = ((uDispCnt & (1<<4)) != 0) ? 0.5 : 1.0;
 }

@@ -395,6 +395,7 @@ GLRenderer3D::~GLRenderer3D()
 
     if (FinalPassFogFetchShader) glDeleteProgram(FinalPassFogFetchShader);
     glDeleteFramebuffers(1, &MainFramebuffer);
+    if (FinalFramebuffer) glDeleteFramebuffers(1, &FinalFramebuffer);
     glDeleteSamplers(9, WrapSampler);
     glDeleteTextures(MaxColorRing, ColorBufferTex);
     glDeleteTextures(1, &DepthBufferTex);
@@ -1667,12 +1668,14 @@ polygons_done:
 
     if (S.RenderDispCnt & (1<<5)) OpenGL::GLStatAdd(OpenGL::GLStatEdge);
     if (S.RenderDispCnt & (1<<7)) OpenGL::GLStatAdd(OpenGL::GLStatFog);
-    // edge marking (DISPCNT bit 5) only marks pixels whose attribute G is set, and nothing writes
-    // it (the edge-flag pass above is commented out, every shader and clear writes G = 0): the
-    // pass drew nothing, yet split the 3D render pass to sample depth/attr. Skip it.
-    // debug.litev.gledgenoop=0 draws it anyway.
+    // edge marking (DISPCNT bit 5): only on frames whose game enables it; it splits the 3D render
+    // pass to sample depth/attr (3DFinalPassEdgeFS)
     u32 finalDispCnt = S.RenderDispCnt;
-#ifdef LITEV_GL_SKIP_NOOP_EDGE
+#if defined(LITEV_GL_EDGE_MARK)
+    static const bool edgeOn = OpenGL::Prop("gledge", 1) != 0;   // debug.litev.gledge=0: no outlines
+    if (!edgeOn) finalDispCnt &= ~(1u << 5);
+#elif defined(LITEV_GL_SKIP_NOOP_EDGE)
+    // drop edge marking entirely (it was a no-op before LITEV_GL_EDGE_MARK); gledgenoop=0 keeps it
     static const bool skipEdge = OpenGL::Prop("gledgenoop", 1) != 0;
     if (skipEdge) finalDispCnt &= ~(1u << 5);
 #endif
@@ -1694,6 +1697,12 @@ polygons_done:
         const bool fogFetch = FinalPassFogFetchShader && !(finalDispCnt & (1<<5));
         if (!fogFetch)
         {
+            // draw into a framebuffer without the depth/attribute attachments: sampling them while
+            // they are attached is a feedback loop (the Mali reads zeros: no edges at all)
+            if (!FinalFramebuffer) glGenFramebuffers(1, &FinalFramebuffer);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, FinalFramebuffer);
+            glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ColorBufferTex[ColorRing > 1 ? S.Color : CurColor], 0);
+
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
             glActiveTexture(GL_TEXTURE1);
@@ -1745,6 +1754,7 @@ polygons_done:
             glEnable(GL_BLEND);
 #endif
         }
+        if (!fogFetch) glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
     }
 }
 #undef glDepthFunc
