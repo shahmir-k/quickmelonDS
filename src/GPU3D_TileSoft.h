@@ -362,6 +362,9 @@ private:
     {
         u32 Color  [TileH * OutWidth];   // 32KB tile: fits ONE core's L1D
         u32 DepthId[TileH * OutWidth];
+        // polygon ID of the last translucent blend on each pixel (0xFF none): the DS doesn't blend a
+        // translucent pixel over one of the same translucent polygon ID
+        u8  TranslId[TileH * OutWidth];
         TexCacheState Tex;               // this worker's private decode-once cache
     };
     BandScratch Band[NBMax];

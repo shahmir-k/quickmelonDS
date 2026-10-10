@@ -686,6 +686,7 @@ void TileRenderer3D::ClearTile(BandScratch& bs)
         bs.Color[i]   = c;
         bs.DepthId[i] = di;
     }
+    memset(bs.TranslId, 0xFF, sizeof(bs.TranslId));
 }
 
 void TileRenderer3D::FlushTile(BandScratch& bs, u32* out, s32 ty0)
@@ -703,6 +704,12 @@ void TileRenderer3D::FlushTile(BandScratch& bs, u32* out, s32 ty0)
 // same-translucent-poly no-reblend rule is dropped (the user authorized approximation).
 void TileRenderer3D::PlotTranslucentTile(BandScratch& bs, u32 idx, u32 color, s32 z, u32 idword)
 {
+    // a translucent pixel isn't drawn over one from a translucent polygon with the same ID (the
+    // pieces of one translucent object blend once: Pokemon White's gift-box light beams got
+    // doubled-up white seams without this)
+    const u8 pid = (idword >> 24) & ID_POLY_MASK;
+    if (bs.TranslId[idx] == pid) return;
+    bs.TranslId[idx] = pid;
     bs.Color[idx] = AlphaBlend(color, bs.Color[idx], color >> 24);
     if (z != -1)
         bs.DepthId[idx] = ((u32)z & 0x00FFFFFF) | idword;   // idword carries ID_TRANSL
@@ -979,7 +986,9 @@ void TileRenderer3D::RasterPolyInTile(BandScratch& bs, const TilePoly& poly, s32
         ps.translDepthWrite = (attr & (1u<<11)) != 0;
         ps.texcache  = nullptr;
         ps.texW = 0; ps.texH = 0;
-        if (ps.texEnable)
+        // the cache keeps 1 bit of alpha: the graded-alpha formats (A3I5 = 1, A5I3 = 6) look texels
+        // up directly, else their soft alpha became opaque (Pokemon White's town mist: white blobs)
+        if (ps.texEnable && texfmt != 1 && texfmt != 6)
             ps.texcache = ResolveTexCache(bs.Tex, ps.texparam, ps.texpal, &ps.texW, &ps.texH);
     }
 
