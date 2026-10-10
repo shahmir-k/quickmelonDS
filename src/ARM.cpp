@@ -1177,6 +1177,11 @@ void ARM::TriggerIRQ()
 {
     if (CPSR & 0x80)
         return;
+#ifdef LITEV_A9HLE
+    // PW's HBlank IRQ taken natively (registers unchanged); deliver anything still pending
+    if (Num == 0 && A9HLE::Irq((ARMv5*)this, false) && !IRQ)
+        return;
+#endif
 
     // liteDS-v2 Unit 2 (shadow, inert): an IRQ being delivered forces the slice to
     // end so the dispatcher re-enters C++. Currently redundant with StopExecution.
@@ -1282,6 +1287,22 @@ void ARMv5::Execute()
         else if (NDS.HaltInterrupted(0))
         {
             Halted = 0;
+#ifdef LITEV_A9HLE
+            // PW's HBlank IRQ while halted in the OS idle loop: taken natively, and the guest
+            // would halt again right after it with the same registers
+            if (A9HLE::Irq(this, true))
+            {
+                NDS.ARM9Timestamp += Cycles;
+                Cycles = 0;
+                if (!NDS.HaltInterrupted(0))
+                {
+                    Halted = 1;
+                    if (NDS.ARM9Timestamp < NDS.ARM9Target)
+                        NDS.ARM9Timestamp = NDS.ARM9Target;
+                    return;
+                }
+            }
+#endif
             if (NDS.IME[0] & 0x1)
                 TriggerIRQ();
         }

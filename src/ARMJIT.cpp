@@ -749,6 +749,9 @@ ARMJIT::ARMJIT(melonDS::NDS& nds, std::optional<JITArgs> jit) noexcept :
 
 void ARMJIT::RetireJitBlock(JitBlock* block) noexcept
 {
+#ifdef LITEV_A9HLE
+    A9HLE::BlockGone(NDS, block);
+#endif
     auto it = RestoreCandidates.find(block->InstrHash);
     if (it != RestoreCandidates.end())
     {
@@ -1027,7 +1030,8 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
 
 #ifdef LITEV_A9HLE
     // + room for an A9HLE hook block's dependency ranges (see below)
-    const int maxRanges = MaxBlockSize + 32;
+    const int maxRanges = MaxBlockSize + 48;
+    u32 a9HookAt = 0;           // verified hook in this block (its address), see A9HLE::HookCompiled
 #else
     const int maxRanges = MaxBlockSize;
 #endif
@@ -1156,7 +1160,10 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                 std::swap(addressMasks[cur], addressMasks[numAddressRanges - 1]);
             }
             if (hook == 1)
+            {
                 instrs[i].Info = ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
+                a9HookAt = instrs[i].Addr;
+            }
         }
 #endif
 
@@ -1384,6 +1391,11 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
 
     u32 literalHash = (u32)XXH3_64bits(literalValues, numLiterals * 4);
     u32 instrHash = (u32)XXH3_64bits(instrValues, numInstrs * 4);
+#ifdef LITEV_A9HLE
+    // a block compiled with a native hook must never be restored for the same bytes compiled
+    // without it (hook site whose dependencies changed): different restore key
+    if (a9HookAt) instrHash ^= 0x5A9E1A9Eu;
+#endif
 
     auto prevBlockIt = RestoreCandidates.find(instrHash);
     JitBlock* prevBlock = NULL;
@@ -1475,7 +1487,12 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     }
 
     if (cpu->Num == 0)
+    {
         JitBlocks9[blockAddr] = block;
+#ifdef LITEV_A9HLE
+        if (a9HookAt) A9HLE::HookCompiled(NDS, a9HookAt, block);
+#endif
+    }
     else
         JitBlocks7[blockAddr] = block;
 
@@ -1603,6 +1620,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
         }
         else
         {
+#ifdef LITEV_A9HLE
+            A9HLE::BlockGone(NDS, block);
+#endif
             delete block;
         }
     }
@@ -1745,6 +1765,9 @@ void ARMJIT::ResetBlockCache() noexcept
     Memory.Reset();
 
     InvalidLiterals.Clear();
+#ifdef LITEV_A9HLE
+    NDS.ARM9.A9HLEGuard = nullptr;
+#endif
     for (int i = 0; i < ARMJIT_Memory::memregions_Count; i++)
     {
         if (FastBlockLookupRegions[i])

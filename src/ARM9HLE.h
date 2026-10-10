@@ -23,18 +23,28 @@
 // a fixed estimated number of ARM9 cycles instead of the real count (and an IRQ that would
 // have arrived inside the elided round trip is taken right after it). Deterministic.
 // Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS.
-// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get) for A/B of single hooks.
+// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ; 8 needs 1) for A/B of single hooks.
+//
+// 3. Whole HBlank IRQs (~265 a frame on PW, ~3.8k Mac host instructions each through the JIT
+//    even with 1. native; ~1.7k native): when the only pending enabled IRQ is HBlank and the game's HBlank callback
+//    list is empty, the IRQ is taken natively at delivery: BIOS frame, OS_IrqHandler, the IF
+//    acknowledge, the (empty) callback, then either the empty-queue return or the wake-skip of
+//    1., then the BIOS return. Nothing changes in the interrupted registers; guest memory and the
+//    banked IRQ/SVC registers get what the guest path leaves. When the ARM9 was halted in the
+//    OS idle loop it stays halted. Code verified at JIT compile of the wake hook block (which
+//    depends on all of it: ARMv5::A9HLEGuard), BIOS once; anything else runs the guest path.
 //
 // LITEV_A9HLE_CHECK=1 (env, interpreter mode): compute the native result, run the guest code
 // instead, and at the guest's return compare all of main RAM, ITCM, DTCM and the registers
 // with the native prediction. LITEV_A9HLE_STATS=1: counts, host ns per native call (and measured
 // guest cycles in check). LITEV_A9HLE_DRY=1: compute the native result but run the guest code
-// (cost measurement: dry - off = native path cost, dry - on = guest round trip cost).
+// (cost measurement: dry - off = native path cost, dry - on = guest round trip cost);
+// LITEV_A9HLE_DRYIRQ=1 the same for 3. only.
 #pragma once
 #ifdef LITEV_A9HLE
 #include "types.h"
 
-namespace melonDS { class ARM; class NDS; }
+namespace melonDS { class ARM; class ARMv5; class NDS; }
 
 namespace melonDS::A9HLE
 {
@@ -45,15 +55,23 @@ inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the
 // ranges so restoring the code re-enables the hook)
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr);
-// guest code the hook at addr depends on: ARMJIT adds these to the hook block's code ranges,
+// guest code the hook at addr depends on (the wake hook: also all of 3.): ARMJIT adds these to the hook block's code ranges,
 // so any write there invalidates the block (and the next compile re-verifies)
 struct Range { u32 a, b; };
-constexpr int kNumCode = 12;
+constexpr int kNumCode = 17;
 int Deps(u32 addr, const Range*& r);
 // Execute the hook at R15-8 (native, or the guest instruction on fallback). jit: reached from a
 // JIT-compiled hook (code already verified); else the code is compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).
 bool Run(melonDS::ARM* cpu, bool jit);
+// IRQ delivery to the ARM9 (TriggerIRQ, IRQs enabled). halted: the ARM9 is waking from a halt.
+// true: taken natively (registers unchanged, Cycles added); the caller then delivers any IRQ that
+// is still pending as usual (and a halted ARM9 in the OS idle loop stays halted if none is).
+bool Irq(melonDS::ARMv5* c, bool halted);
+// ARMJIT: a block compiled with the wake hook (code verified, IsHook == 1) at addr
+void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
+// ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted)
+void BlockGone(melonDS::NDS& nds, const void* block);
 // interpreter check mode: called before every ARM9 instruction while a check is pending
 extern bool CheckPending;
 void CheckAt(melonDS::ARM* cpu, u32 pc);
