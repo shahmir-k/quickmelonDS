@@ -24,6 +24,7 @@
 #include "ARM.h"
 #include "ARM7Prof.h"
 #include "ARM7HLE.h"
+#include "ARM9HLE.h"
 #include "ARMInterpreter.h"
 #include "AREngine.h"
 #include "ARMJIT.h"
@@ -1422,7 +1423,17 @@ void ARMv5::Execute()
 
                 // actually execute
                 u32 icode = (CurInstr >> 6) & 0x3FF;
+#ifdef LITEV_A9HLE
+                if (A9HLE::CheckPending) A9HLE::CheckAt(this, R[15] - 4);
+#endif
+#ifdef LITEV_A7PROF
+                A7Prof::g9.Pre(R[15] - 4, 2, CPSR, R[14]);
+                const u32 a9pc = R[15] - 4;
+#endif
                 ARMInterpreter::THUMBInstrTable[icode](this);
+#ifdef LITEV_A7PROF
+                A7Prof::g9.Post(a9pc, Cycles);
+#endif
             }
             else
             {
@@ -1436,6 +1447,15 @@ void ARMv5::Execute()
                 NextInstr[1] = CodeRead32(R[15], false);
 
                 // actually execute
+#ifdef LITEV_A7PROF
+                A7Prof::g9.Pre(R[15] - 8, 4, CPSR, R[14]);
+                const u32 a9pc = R[15] - 8;
+#endif
+#ifdef LITEV_A9HLE
+                if (A9HLE::CheckPending) A9HLE::CheckAt(this, R[15] - 8);
+                if (A9HLE::MaybeHook(CurInstr) && A9HLE::Run(this)) {}
+                else
+#endif
                 if (CheckCondition(CurInstr >> 28))
                 {
                     u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
@@ -1447,6 +1467,9 @@ void ARMv5::Execute()
                 }
                 else
                     AddCycles_C();
+#ifdef LITEV_A7PROF
+                A7Prof::g9.Post(a9pc, Cycles);
+#endif
             }
 
             // TODO optimize this shit!!!

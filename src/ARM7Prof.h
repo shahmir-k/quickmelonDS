@@ -1,4 +1,5 @@
-// LITEV_A7PROF (diagnostic, headless/interpreter only): per-guest-function ARM7 profile.
+// LITEV_A7PROF (diagnostic, headless/interpreter only): per-guest-function ARM7 profile
+// (and the ARM9 one with env LITEV_A9PROF=<out prefix>, same files).
 // Run with --mode interp and LITEV_A7PROF=<out prefix>. Hooks the ARMv4 interpreter loop:
 // every instruction is charged (instructions + cycles) to its PC and, via a shadow call stack
 // (call = LR points just past the previous instruction; return = PC hits a stacked return
@@ -24,7 +25,10 @@ struct Node { uint32_t parent, fn; uint64_t selfN = 0, selfC = 0, calls = 0; };
 
 struct Prof
 {
-    const char* out = getenv("LITEV_A7PROF");
+    // g: ARM7 (env LITEV_A7PROF, IRQ vector 0x18); g9: ARM9 (env LITEV_A9PROF, vector 0xFFFF0018)
+    Prof(const char* env, uint32_t vec) : out(getenv(env)), irqVec(vec) {}
+    const char* out;
+    uint32_t irqVec;
     uint64_t frames = 0, skipFrames = (uint64_t)atoi(getenv("LITEV_A7PROF_SKIP") ? getenv("LITEV_A7PROF_SKIP") : "5");
     std::unordered_map<uint32_t, PcStat> pcs;
     std::unordered_map<uint32_t, FnStat> fns;
@@ -43,7 +47,7 @@ struct Prof
         uint32_t mode = cpsr & 0x1F;
         if (pc != prevPc + prevSize)
         {
-            if (pc == 0x18 && mode == 0x12)
+            if (pc == irqVec && mode == 0x12)
             {
                 uint32_t r = (lr - 4) & ~1u;
                 Push(r, 0x18, true);
@@ -136,6 +140,7 @@ struct Prof
         fprintf(stderr, "A7PROF: %llu frames profiled -> %s.{pcs,fns}.tsv\n", (unsigned long long)f, out);
     }
 };
-inline Prof g;
+inline Prof g{"LITEV_A7PROF", 0x18};
+inline Prof g9{"LITEV_A9PROF", 0xFFFF0018};
 }
 #endif

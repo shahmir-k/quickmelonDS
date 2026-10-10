@@ -14,6 +14,7 @@ add_library(core STATIC
     ARMInterpreter_LoadStore.cpp
     CP15.cpp
     ARM7HLE.cpp
+    ARM9HLE.cpp
     CRC32.cpp
     DMA.cpp
     DMA_Timings.h

@@ -589,7 +589,17 @@ if (LITEV_A7HLE)
     add_compile_definitions(LITEV_A7HLE=1)
 endif()
 
-# A7PROF (diagnostic): per-guest-function ARM7 profile in the interpreter (--mode interp,
+# A9HLE: Pokemon Black/White's NitroSDK ARM9 OS: spurious OS_WaitIrq wake-ups (the IRQ handler
+# switching to the VBlank-waiting main thread and back on every HBlank, 25-50% of ARM9 guest
+# instructions) are skipped with the exact memory/register result, and OS_SetIrqFunction /
+# OS_GetIrqFunction run natively. Signature-detected, code re-checked per call, guest fallback;
+# cycles are a fixed estimate. Runtime: debug.litev.a9hle (default on). See src/ARM9HLE.h.
+option(LITEV_A9HLE "ARM9 HLE of NitroSDK OS IRQ wake-ups / IRQ table functions (PW/PB, approximate cycles)" OFF)
+if (LITEV_A9HLE)
+    add_compile_definitions(LITEV_A9HLE=1)
+endif()
+
+# A7PROF (diagnostic): per-guest-function ARM7 (and ARM9: env LITEV_A9PROF) profile in the interpreter (--mode interp,
 # env LITEV_A7PROF=<out prefix>). See src/ARM7Prof.h. Never in a shipping build.
 option(LITEV_A7PROF "Diagnostic: ARM7 per-function guest profile (interpreter)" OFF)
 if (LITEV_A7PROF)
