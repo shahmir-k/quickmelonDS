@@ -71,6 +71,8 @@ public:
     void SetColorRing(int n) noexcept;
     [[nodiscard]] int GetCurColor() const noexcept { return CurColor; }
     [[nodiscard]] GLuint GetColorTex(int i) const noexcept { return ColorBufferTex[i]; }
+    // that frame's 256x192 edge-marking overlay (rgb colour, a coverage), 0 if it has none
+    [[nodiscard]] GLuint GetEdgeTex(int i) const noexcept { return EdgeValid[i] ? EdgeTex[i] : 0; }
 
 private:
     GLRenderer* Parent;
@@ -225,6 +227,9 @@ private:
     void AllocColorBuffers() noexcept;
 
     GLuint MainFramebuffer {};
+    GLuint FinalFramebuffer {};   // colour only: the fog texture pass samples depth + attributes
+    GLuint EdgeTex[MaxColorRing] {}, EdgeFramebuffer {};   // 1x edge marking per ring entry
+    bool EdgeValid[MaxColorRing] {};
     GLuint WrapSampler[9] {};   // [wrapS * 3 + wrapT], 0 clamp / 1 repeat / 2 mirror
 };
 }

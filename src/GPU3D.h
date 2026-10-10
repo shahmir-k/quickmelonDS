@@ -321,6 +321,7 @@ public:
 
     u16 RenderToonTable[32] {};
     u16 RenderEdgeTable[8] {};
+    bool EdgeMarkEnabled = true;   // frontend "Edge outlines" setting (GL renderer, LITEV_GL_EDGE_MARK)
 
     u32 RenderFogColor = 0;
     u32 RenderFogOffset = 0;

@@ -395,6 +395,9 @@ GLRenderer3D::~GLRenderer3D()
 
     if (FinalPassFogFetchShader) glDeleteProgram(FinalPassFogFetchShader);
     glDeleteFramebuffers(1, &MainFramebuffer);
+    if (FinalFramebuffer) glDeleteFramebuffers(1, &FinalFramebuffer);
+    if (EdgeFramebuffer) glDeleteFramebuffers(1, &EdgeFramebuffer);
+    glDeleteTextures(MaxColorRing, EdgeTex);
     glDeleteSamplers(9, WrapSampler);
     glDeleteTextures(MaxColorRing, ColorBufferTex);
     glDeleteTextures(1, &DepthBufferTex);
@@ -1667,16 +1670,19 @@ polygons_done:
 
     if (S.RenderDispCnt & (1<<5)) OpenGL::GLStatAdd(OpenGL::GLStatEdge);
     if (S.RenderDispCnt & (1<<7)) OpenGL::GLStatAdd(OpenGL::GLStatFog);
-    // edge marking (DISPCNT bit 5) only marks pixels whose attribute G is set, and nothing writes
-    // it (the edge-flag pass above is commented out, every shader and clear writes G = 0): the
-    // pass drew nothing, yet split the 3D render pass to sample depth/attr. Skip it.
-    // debug.litev.gledgenoop=0 draws it anyway.
+    // edge marking (DISPCNT bit 5): only on frames whose game enables it; it splits the 3D render
+    // pass to sample depth/attr (3DFinalPassEdgeFS)
     u32 finalDispCnt = S.RenderDispCnt;
-#ifdef LITEV_GL_SKIP_NOOP_EDGE
+#if defined(LITEV_GL_EDGE_MARK)
+    // the Edge outlines setting; debug.litev.gledge=0 forces it off, 2 forces it on
+    static const int edgeProp = OpenGL::Prop("gledge", 1);
+    if (edgeProp == 0 || (edgeProp == 1 && !GPU3D.EdgeMarkEnabled)) finalDispCnt &= ~(1u << 5);
+#elif defined(LITEV_GL_SKIP_NOOP_EDGE)
+    // drop edge marking entirely (it was a no-op before LITEV_GL_EDGE_MARK); gledgenoop=0 keeps it
     static const bool skipEdge = OpenGL::Prop("gledgenoop", 1) != 0;
     if (skipEdge) finalDispCnt &= ~(1u << 5);
 #endif
-    if ((finalDispCnt & 0x00A0) && !(OpenGL::GLSkip() & 2)) // fog/edge enabled
+    if ((finalDispCnt & 0x0080) && !(OpenGL::GLSkip() & 2)) // fog enabled
     {
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
@@ -1691,9 +1697,15 @@ polygons_done:
         glStencilMask(0);
 
         // fog alone reads only this pixel: framebuffer fetch, no attachment sampling
-        const bool fogFetch = FinalPassFogFetchShader && !(finalDispCnt & (1<<5));
+        const bool fogFetch = FinalPassFogFetchShader != 0;
         if (!fogFetch)
         {
+            // draw into a framebuffer without the depth/attribute attachments: sampling them while
+            // they are attached is a feedback loop (the Mali reads zeros)
+            if (!FinalFramebuffer) glGenFramebuffers(1, &FinalFramebuffer);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, FinalFramebuffer);
+            glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ColorBufferTex[ColorRing > 1 ? S.Color : CurColor], 0);
+
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
             glActiveTexture(GL_TEXTURE1);
@@ -1702,18 +1714,6 @@ polygons_done:
 
         glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
         glBindVertexArray(ClearVertexArrayID);
-
-        if (finalDispCnt & (1<<5))
-        {
-            // edge marking
-            // TODO: depth/polyid values at screen edges
-
-            glUseProgram(FinalPassEdgeShader);
-
-            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
-
-            LSP_GLDRAW(0xF0000001u, glDrawArrays(GL_TRIANGLES, 0, 2*3));
-        }
 
         if (S.RenderDispCnt & (1<<7))
         {
@@ -1745,6 +1745,41 @@ polygons_done:
             glEnable(GL_BLEND);
 #endif
         }
+        if (!fogFetch) glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
+    }
+
+    // edge marking (LITEV_GL_EDGE_MARK): decided per DS pixel at 1x into this ring entry's
+    // 256x192 edge texture, which the hybrid merge lays over the 3D colour. The 3D colour never
+    // leaves the tile for it; only the attribute buffer is written out (one small extra pass).
+    const int ci = ColorRing > 1 ? S.Color : CurColor;
+    EdgeValid[ci] = (finalDispCnt & (1<<5)) && !(OpenGL::GLSkip() & 2);
+    if (EdgeValid[ci])
+    {
+        if (!EdgeTex[ci])
+        {
+            glGenTextures(1, &EdgeTex[ci]);
+            SetupDefaultTexParams(EdgeTex[ci]);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 256, 192);
+        }
+        if (!EdgeFramebuffer) glGenFramebuffers(1, &EdgeFramebuffer);
+        if (TileMode)
+        {
+            static const GLenum ds[1] = {GL_DEPTH_STENCIL_ATTACHMENT};
+            glInvalidateFramebuffer(GL_DRAW_FRAMEBUFFER, 1, ds);   // edges read only the attributes
+        }
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, EdgeFramebuffer);
+        glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, EdgeTex[ci], 0);
+        glViewport(0, 0, 256, 192);
+        glDisable(GL_BLEND);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, AttrBufferTex);
+        glUseProgram(FinalPassEdgeShader);
+        glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
+        glBindVertexArray(ClearVertexArrayID);
+        LSP_GLDRAW(0xF0000001u, glDrawArrays(GL_TRIANGLES, 0, 2*3));
+        glViewport(0, 0, ScreenW, ScreenH);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
     }
 }
 #undef glDepthFunc
