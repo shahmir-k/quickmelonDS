@@ -26,6 +26,17 @@
 #include "../ARMJIT_x64/ARMJIT_Offsets.h"
 #include "../LiteProfile.h"
 
+#ifdef LITEV_BLOCKPROF
+// Profiling only: per-compiled-block entry counter + dump at exit (LITEV_BLOCKPROF_OUT).
+#include <deque>
+#include <cstdio>
+namespace { struct BPEnt { uint32_t addr, last; uint8_t num, thumb, idle; uint16_t n; uint64_t count; uint32_t instr[64]; uint32_t iaddr[64]; };
+std::deque<BPEnt>& BP() { static std::deque<BPEnt> d; return d; }
+void BPDump() { const char* o = getenv("LITEV_BLOCKPROF_OUT"); FILE* f = fopen(o ? o : "/tmp/blockprof.txt", "w"); if (!f) return;
+  for (auto& e : BP()) if (e.count) { fprintf(f, "%d %d %08x %08x %d %d %llu", e.num, e.thumb, e.addr, e.last, e.n, e.idle, (unsigned long long)e.count);
+    for (int i = 0; i < e.n && i < 64; i++) fprintf(f, " %08x:%08x", e.iaddr[i], e.instr[i]); fprintf(f, "\n"); } fclose(f); } }
+#endif
+
 #include <stdlib.h>
 #if defined(LITEV_JIT_RAS) && defined(__ANDROID__)
 #include <sys/system_properties.h>
@@ -2034,6 +2045,35 @@ static void LiteV_DirectPatchDemote(Compiler* c, u32 num, u32 site)
 
 void Compiler::Comp_BranchSpecialBehaviour(bool taken)
 {
+#ifdef LITEV_JIT_IDLE2
+    if (taken && (CurInstr.BranchFlags & branch_Idle2Cand) && Num == 0)
+    {
+        // Candidate wait-loop back-edge: while the site's enable byte is set, exit to C++
+        // with IdleLoop = 2 (ARMv5::Idle2Handle proves/skips the loop), exactly like the
+        // classic idle branch below.
+        if (u8* en = ((ARMv5*)CurCPU)->Idle2EnableByte(CurInstr.Addr | (Thumb ? 1 : 0)))
+        {
+            MOVP2R(X16, en);
+            LDRB(INDEX_UNSIGNED, W17, X16, 0);
+            FixupBranch off = CBZ(W17);
+            MOVI2R(W17, CurInstr.Addr | (Thumb ? 1 : 0));
+            STR(INDEX_UNSIGNED, W17, RCPU, offsetof(ARM, Idle2Site));
+            MOVI2R(W0, 2);
+            STRB(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, IdleLoop));
+#ifdef LITEV_JIT_DISPATCH
+#ifdef LITEV_JIT_BUDGET_REG
+            SXTW(X17, RBudget);
+            LDR(INDEX_UNSIGNED, X16, RCPU, offsetof(ARM, JitTsBase));
+            SUB(X16, X16, X17);
+            STR(INDEX_UNSIGNED, X16, RCPU, offsetof(ARM, JitTsBase));
+            MOVI2R(RBudget, 0);
+#endif
+            STR(INDEX_UNSIGNED, WZR, RCPU, offsetof(ARM, CyclesBudget));
+#endif
+            SetJumpTarget(off);
+        }
+    }
+#endif
     if (taken && CurInstr.BranchFlags & branch_IdleBranch)
     {
         MOVI2R(W0, 1);
@@ -2114,6 +2154,19 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     }
 
     JitBlockEntry res = (JitBlockEntry)GetRXPtr();
+#ifdef LITEV_BLOCKPROF
+    {
+        static bool reg = (BP(), atexit(BPDump), true); (void)reg;
+        BP().push_back({});
+        BPEnt& e = BP().back();
+        e.addr = instrs[0].Addr; e.last = instrs[instrsCount-1].Addr; e.num = cpu->Num; e.thumb = thumb; e.n = instrsCount; e.count = 0; e.idle = 0;
+        for (int i = 0; i < instrsCount; i++) { if (i < 64) { e.instr[i] = instrs[i].Instr; e.iaddr[i] = instrs[i].Addr; } if (instrs[i].BranchFlags & branch_IdleBranch) e.idle = 1; }
+        MOVP2R(X16, &e.count);
+        LDR(INDEX_UNSIGNED, X17, X16, 0);
+        ADD(X17, X17, 1);
+        STR(INDEX_UNSIGNED, X17, X16, 0);
+    }
+#endif
 
     Thumb = thumb;
     Num = cpu->Num;

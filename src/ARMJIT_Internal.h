@@ -42,6 +42,7 @@ enum
     branch_FollowCondTaken = 1 << 1,
     branch_FollowCondNotTaken = 1 << 2,
     branch_StaticTarget = 1 << 3,
+    branch_Idle2Cand = 1 << 4, // LITEV_JIT_IDLE2: taken back-edge exits to ARMv5::Idle2Handle
 };
 
 struct FetchedInstr

@@ -588,6 +588,18 @@ if (LITEV_JIT_CP15_INLINE)
     add_compile_definitions(LITEV_JIT_CP15_INLINE=1)
 endif()
 
+# IDLE2: generalized ARM9 wait-loop skipping. (1) classic idle-loop detection also over
+# back-edges whose in-block path crosses followed branches; (2) back-edges of loops that
+# store or call (not provable statically) exit to C++, which traces two iterations in the
+# interpreter (taint: timer/DIV values and loop-carried stores may only feed data, never
+# control flow / addresses / accumulators) and then skips to the slice target like the
+# classic idle loop. Approximate (deterministic). Runtime: debug.litev.idle2 (prop on
+# Android, env elsewhere; default on).
+option(LITEV_JIT_IDLE2 "JIT: generalized idle/wait-loop skipping (ARM9)" OFF)
+if (LITEV_JIT_IDLE2)
+    add_compile_definitions(LITEV_JIT_IDLE2=1)
+endif()
+
 # Unit 5 (M2.1): event-true scheduler slices. When ON, each scheduler iteration
 # runs the CPUs to the TRUE next deadline (next scheduled event / frame end /
 # next timer overflow) instead of the fixed kMaxIterationCycles cap, so the CPUs
