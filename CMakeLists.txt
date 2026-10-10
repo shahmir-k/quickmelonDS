@@ -767,6 +767,13 @@ option(LITEV_GX_POLY_LEAN "Lean polygon setup: SubmitPolygon out of line, merged
 if (LITEV_GX_POLY_LEAN)
     add_compile_definitions(LITEV_GX_POLY_LEAN=1)
 endif()
+
+# GX_CLIP_REJECT: polygons entirely past one clip plane (PW town: ~835 of ~1720 a frame) get the
+# clipper's result (0 vertices) without its vertex copy passes. Exact.
+option(LITEV_GX_CLIP_REJECT "Trivial reject before the polygon clipper (exact)" OFF)
+if (LITEV_GX_CLIP_REJECT)
+    add_compile_definitions(LITEV_GX_CLIP_REJECT=1)
+endif()
 option(LITEV_JIT_CYCLE_BATCH "Batch the per-instruction cycle adds of unconditional non-branch instructions into one add before the next cycle read (AArch64, exact)" OFF)
 if (LITEV_JIT_CYCLE_BATCH)
     add_compile_definitions(LITEV_JIT_CYCLE_BATCH=1)

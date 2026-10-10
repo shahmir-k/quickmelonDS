@@ -1180,6 +1180,30 @@ bool ClipCoordsEqual(Vertex* a, Vertex* b)
            a->Position[3] == b->Position[3];
 }
 
+#ifdef LITEV_GX_CLIP_REJECT
+// ClipPolygon returns 0 for these without the copy passes (clipstart 0 only: kept strip vertices
+// make the clipper return at least 2). Planes in its order (Z, Y, X); the first one with a vertex
+// outside decides: every vertex past the same side -> 0 (the + pass, or the - pass after the +
+// pass copied them all), a vertex past the far plane without attr bit 12 -> 0; anything else clips.
+// Planes with no vertex outside leave the positions as they are.
+static bool ClipTrivialReject(const Vertex* v, int n, u32 attr)
+{
+    for (int comp = 2; comp >= 0; comp--)
+    {
+        bool anyOut = false, allPlus = true, allMinus = true;
+        for (int i = 0; i < n; i++)
+        {
+            const s32 p = v[i].Position[comp], w = v[i].Position[3];
+            const bool plus = p > w, minus = !plus && p < -w;
+            if (comp == 2 && plus && !(attr & (1<<12))) return true;
+            anyOut |= plus | minus; allPlus &= plus; allMinus &= minus;
+        }
+        if (anyOut) return allPlus || allMinus;
+    }
+    return false;
+}
+#endif
+
 void GPU3D::SubmitPolygon() noexcept
 {
 #ifdef LITEV_GX_VTX_PREFETCH
@@ -1385,6 +1409,10 @@ void GPU3D::SubmitPolygon() noexcept
         }
         // nverts unchanged; skip ClipPolygon.
     }
+    else
+#endif
+#ifdef LITEV_GX_CLIP_REJECT
+    if (clipstart == 0 && ClipTrivialReject(clippedvertices, nverts, CurPolygonAttr)) nverts = 0;
     else
 #endif
     nverts = ClipPolygon<true>(*this, clippedvertices, nverts, clipstart);
