@@ -83,6 +83,10 @@ struct Variant
     u32 async;
     Range asyncCode[7];
     u64 asyncSig;
+    // 11.: the display list's DMA-end IRQ: OSi_IrqCallback + its literals + the OSi_IrqDma0-3 stubs (+0x88, 16 bytes
+    // each), OS_DisableIrqMask, MIi_DMACallback (with the IRQ handler code[0] and OS_SetIrqFunction code[3])
+    Range dmaCode[3];
+    u64 dmaSig;
 };
 constexpr Variant kPW = {
     "PW", 0x01FF8160, 0x0208478C, 0x02084830, 0x02082864,
@@ -122,6 +126,8 @@ constexpr Variant kPW = {
         {0x020879A0, 0x020879CC},   // OS_DisableInterrupts, OS_RestoreInterrupts
     },
     0xb26c62ca8cd70cfeull,
+    {{0x0208462C, 0x020846F4}, {0x020849B0, 0x020849E0}, {0x02082918, 0x02082978}},
+    0x872c1f487669f8b6ull,
 };
 // Pokemon Black: the same code; main-binary OS code 0x18 bytes lower, its data 0x20 lower
 // (located by masked code match against PW + the literal pools; tools/hle/xmap.py)
@@ -147,6 +153,8 @@ constexpr Variant kPB = {
         {B(0x02084980), B(0x020849B0)}, {B(0x020849E0), B(0x02084A0C)}, {0x01FF8020, 0x01FF80F0}, {B(0x020879A0), B(0x020879CC)},
     },
     0x3f2c017ca1395eceull,
+    {{B(0x0208462C), B(0x020846F4)}, {B(0x020849B0), B(0x020849E0)}, {B(0x02082918), B(0x02082978)}},
+    0x16d7560ac9ef0156ull,
 };
 // Pokemon White 2 (USA/EU), TWL SDK build: OS_IrqHandler and the ARM context switch code are PW's
 // (ITCM +0xB98), OS_WaitIrq, CP and OS_Save/LoadContext ARM as in PW; OS_SleepThread,
@@ -200,18 +208,21 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 11;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start
+constexpr int kKinds = 12;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 2047;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = 1023;                // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start
-    std::vector<u8> code, irqCode, gxCode, asyncCode;
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ
+    std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
     bool irqOk = false;             // IRQ path code matches the variant (3.)
+    bool dmaOk = false;             // DMA-end IRQ path matches (11.)
+    bool hbLive = false, dmaLive = false;   // 3. / 11. verified when the wake hook block (A9HLEGuard) was compiled
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
     u64 calls[kKinds] = {}, native[kKinds] = {}, fallback[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, irqDuring[kKinds] = {};
     u64 guestCyc[kKinds] = {}, guestN[kKinds] = {}, getBits = 0, gxWords = 0, lzBytes = 0, lzEst = 0, cardWords = 0;
@@ -237,9 +248,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -339,6 +350,18 @@ bool CodeIntact(melonDS::ARMv5* c, const State& s, int k)
     return true;
 }
 
+bool DmaIntact(melonDS::ARMv5* c, const State& s)
+{
+    size_t o = 0;
+    for (const Range& r : s.v->dmaCode)
+    {
+        const u8* p = CodePtr(c, r.a);
+        if (!p || memcmp(p, s.dmaCode.data() + o, r.b - r.a) != 0) return false;
+        o += r.b - r.a;
+    }
+    return true;
+}
+
 bool AsyncIntact(melonDS::ARMv5* c, const State& s)
 {
     size_t o = 0;
@@ -404,6 +427,9 @@ __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 in
             CodeBytes(c, s.asyncCode, v.asyncCode, 0, 7);
             s.asyncOk = Fnv(s.asyncCode) == v.asyncSig;
             if (g_Stats) fprintf(stderr, "A9HLE: GX async start signature %016llx -> %s\n", (unsigned long long)Fnv(s.asyncCode), s.asyncOk ? "on" : "off");
+            CodeBytes(c, s.dmaCode, v.dmaCode, 0, 3);
+            s.dmaOk = Fnv(s.dmaCode) == v.dmaSig && s.biosRet;
+            if (g_Stats) fprintf(stderr, "A9HLE: GX DMA-end IRQ signature %016llx -> %s\n", (unsigned long long)Fnv(s.dmaCode), s.dmaOk ? "on" : "off");
         }
         break;
     }
@@ -892,6 +918,83 @@ bool IrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, int&
     IrqIn in{cpsr, sp - 28, c->R_SVC[0], c->R[13], c->R[14], head, true, s.biosRet, {f[0], f[1], f[2], f[3], f[4], f[5]}};
     if (!Wake(c, s, m, e, in, tpc, tcpsr)) return false;
     kind = 4;
+    return true;
+}
+
+// ---- 11. the display list's DMA-end IRQ ---------------------------------------------------------
+// MI_SendGXCommandAsync's last chunk is a DMA with an IRQ (10. starts it); its end IRQ runs BIOS ->
+// OS_IrqHandler (IF acknowledge) -> OSi_IrqDma<n> stub -> OSi_IrqCallback(n): clears the DMA IRQ table entry,
+// calls MIi_DMACallback (OS_DisableIrqMask(GXFIFO), GXSTAT IRQ mode restored, OS_SetIrqFunction(GXFIFO,
+// the saved handler), MIi_GXDmaParams.busy = 0, the list's callback: NNS G3D's "[arg] = 0"), sets the IRQ
+// check flag, OS_DisableIrqMask(the DMA bit) -> empty thread queue, no reschedule: return. ~120 guest
+// instructions, an IRQ entry and the OS_SetIrqFunction hook exit, 55 a frame in the PW town. Natively at
+// delivery (like 3.) when that DMA bit is the lowest pending enabled IRQ, the entry is MIi_DMACallback, the
+// list callback is the 3-word clear (or none) and the thread queue is empty: the same IO writes in the same
+// order (IF, IE, GXSTAT, IE; IME toggles left out: IRQs are off and IME ends unchanged), the IRQ stack bytes,
+// the tables, flags and banked IRQ registers the guest leaves. Category B: a fixed cycle estimate.
+// ponytail: fixed estimate (guest average in check mode, IRQ entry to the BIOS return)
+constexpr s32 kDmaIrqCycles = 870;
+constexpr u32 kClearCb[3] = {0xE3A01000, 0xE5801000, 0xE12FFF1E};    // mov r1, #0; str r1, [r0]; bx lr
+
+struct IoPlan { u32 n = 0, a[4], v[4]; void Add(u32 x, u32 y) { a[n] = x; v[n++] = y; } };
+bool DmaIrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, u32 bit, IoPlan& io)
+{
+    melonDS::NDS& nds = c->NDS;
+    const Variant& v = *s.v;
+    const u32 cpsr = c->CPSR, mode = cpsr & 0x1F, n = bit - 8;
+    if ((cpsr & 0x80) || (mode != 0x1F && mode != 0x10 && mode != 0x13)) return false;
+    const bool thumb = cpsr & 0x20;
+    if (halted && (thumb || c->R[15] - 4 != v.idlePc || c->R[0] != 0 || c->R[14] != v.idleLr)) return false;
+    if (!Fixed(c, s, m) || !s.fhp || !s.ftab || !s.ftab2) return false;
+    const u32 sp = c->R_IRQ[0];
+    Obj fs = m.O(sp - 92, 92);
+    if (!fs) return false;
+    __builtin_prefetch(fs.p); __builtin_prefetch(fs.p + 64);
+    const u32 cbFn = v.dmaCode[0].a, mdc = v.dmaCode[2].a;
+    // the handler chain: BIOS -> OS_IrqHandler -> OSi_IrqDma<n> -> MIi_DMACallback; an empty thread queue, no reschedule
+    if (R32(s.fhp) != v.code[0].a || R32(s.ftab + bit * 4) != cbFn + 0x88 + n * 16 || R32(s.fq)
+        || R16(s.fosi + (v.info - v.osi)) || !(nds.IME[0] & 1)) return false;
+    const Obj tab{s.ftab, kIrqTable, s.ftabD}, tab2{s.ftab2, v.irqTable2, s.ftab2D};
+    if (tab2.r(n * 12) != mdc) return false;
+    // the IRQ bit of entry n (OSi_IrqCallback's u16 table)
+    const u8* bt = m.P(R32(CodePtr(c, cbFn + 0x78)) + n * 2);
+    if (!bt || R16(bt) != bit) return false;
+    Obj P = m.O(v.gxParams, 0x20);
+    if (!P || P.dtcm) return false;
+    const u32 ucb = P.r(0x10), arg = P.r(0x14);
+    Obj A;
+    if (ucb)
+    {
+        const u8* q = CodePtr(c, ucb);
+        if ((ucb & 3) || !q || memcmp(q, kClearCb, 12)) return false;
+        A = m.O(arg, 4);
+        if (!A) return false;
+    }
+    const u32 lrIrq = c->R[15] + (thumb ? 2 : 0);
+    const u32 ie0 = nds.IE[0], ie1 = ie0 & ~0x200000u, en = tab2.r(n * 12 + 4), ie2 = en ? ie1 : ie1 & ~(1u << bit);
+    // IRQ stack (fs = sp - 92): OS_SetIrqFunction push {r4-r10, lr} | MIi_DMACallback push {r3-r5, lr} |
+    // OSi_IrqCallback push {r3-r5, lr} | OS_IrqHandler push {lr} | BIOS push {r0-r3, r12, lr}
+    const u32 w[23] = {v.gxParams, 0x200000, c->R[6], c->R[7], c->R[8], c->R[9], c->R[10], mdc + 0x38,
+                       bit, 1u << bit, n * 12, cbFn + 0x44,
+                       0x80000000, c->R[4], c->R[5], v.code[0].a + 0x58,
+                       s.biosRet, c->R[0], c->R[1], c->R[2], c->R[3], c->R[12], lrIrq};
+    for (int i = 0; i < 23; i++) m.W(fs, i * 4, w[i]);
+    m.W(tab2, n * 12, 0);
+    m.W(tab, 21 * 4, P.r(0x1C));
+    m.W(P, 0, 0);
+    if (ucb) m.W(A, 0, 0);
+    Obj chk{(u8*)s.fchk, kIrqCheck, true};
+    m.W(chk, 0, R32(s.fchk) | 1u << bit);
+    const u32 gxstat = nds.ARM9Read32(0x04000600), gxw = (gxstat & ~0xC0000000u) | (P.r(0x18) << 30);
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.CPSR = cpsr;
+    e.retPc = (lrIrq - 4) | (thumb ? 1 : 0);
+    e.IRQ[0] = sp; e.IRQ[1] = lrIrq; e.IRQ[2] = cpsr;
+    e.SVC[0] = c->R_SVC[0]; e.SVC[1] = c->R_SVC[1]; e.SVC[2] = c->R_SVC[2];
+    e.banks = true;
+    e.cur = 0;
+    io.Add(0x04000214, 1u << bit); io.Add(0x04000210, ie1); io.Add(0x04000600, gxw);
+    if (!en) io.Add(0x04000210, ie2);
     return true;
 }
 
@@ -1728,12 +1831,68 @@ void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block)
     State* s = Active(c);
     if (!s || addr != s->v->wake) return;
     // the wake hook block depends on all of the variant's code (Deps): while it lives, the IRQ path is intact
-    c->A9HLEGuard = s->irqOk && (s->mask & 8) && IrqCodeIntact(c, *s) ? block : nullptr;
+    s->hbLive = s->irqOk && (s->mask & 8) && IrqCodeIntact(c, *s);
+    s->dmaLive = s->dmaOk && (s->mask & 1024) && DmaIntact(c, *s) && CodeIntact(c, *s, 1);
+    c->A9HLEGuard = s->hbLive || s->dmaLive ? block : nullptr;
 }
 
 void BlockGone(melonDS::NDS& nds, const void* block)
 {
     if (nds.ARM9.A9HLEGuard == block) nds.ARM9.A9HLEGuard = nullptr;
+}
+
+namespace
+{
+// one IRQ natively (3. HBlank, 11. a display list's DMA end): 1 done, 0 guest path, -1 check / dry (guest path, stop)
+int IrqOne(melonDS::ARMv5* c, State& s, bool halted, bool jit, u32 low)
+{
+    melonDS::NDS& nds = c->NDS;
+    const u64 t0 = g_Time ? Now() : 0;
+    Mem m(c, g_Check || g_DryIrq);
+    Expect e;
+    int kind = 3;
+    u32 tpc = 0, tcpsr = 0;
+    IoPlan io;
+    if (low == 2)
+    {
+        if (jit ? !s.hbLive : (!s.irqOk || !(s.mask & 8) || !IrqCodeIntact(c, s))) return 0;
+        if (!IrqNative(c, s, m, e, halted, kind, tpc, tcpsr)) return 0;
+    }
+    else
+    {
+        if (jit ? !s.dmaLive : (!s.dmaOk || !(s.mask & 1024) || !DmaIntact(c, s) || !CodeIntact(c, s, 1))) return 0;
+        kind = 11;
+        if (!DmaIrqNative(c, s, m, e, halted, __builtin_ctz(low), io)) return 0;
+    }
+    s.calls[kind]++;
+    m.Flush();                                          // check / dry: logs only
+#ifdef LITEV_HLE_DIAG
+    if (__builtin_expect(g_Check, 0))
+    {
+        ArmCheck(c, kind, m, e);
+        g_P.vecSkip = true;
+        g_P.io.clear();
+        for (u32 i = 0; i < io.n; i++) g_P.io.push_back({io.a[i], io.a[i] == 0x04000600 ? io.v[i] & 0xC0008000u : io.v[i]});
+        s.checks[kind]++;
+        return -1;
+    }
+    if (__builtin_expect(g_DryIrq, 0)) { s.checks[kind]++; return -1; }
+#endif
+    s.native[kind]++;
+    if (kind == 11) for (u32 i = 0; i < io.n; i++) nds.ARM9Write32(io.a[i], io.v[i]);
+    else
+    {
+        nds.IF[0] &= ~2u;                               // OS_IrqHandler: str r1, [IF]
+        nds.GPU.GPU3D.CheckFIFOIRQ();
+        nds.UpdateIRQ(0);
+    }
+    if (kind == 4) { c->R_SVC[1] = e.SVC[1]; c->R_SVC[2] = e.SVC[2]; }
+    c->R_IRQ[1] = e.IRQ[1];
+    c->R_IRQ[2] = e.IRQ[2];
+    c->Cycles += kind == 4 ? kIrqWakeCycles : kind == 3 ? kIrqCycles : kDmaIrqCycles;
+    if (g_Time) s.ns += Now() - t0;
+    return 1;
+}
 }
 
 bool Irq(melonDS::ARMv5* c, bool halted)
@@ -1746,38 +1905,22 @@ bool Irq(melonDS::ARMv5* c, bool halted)
     const bool jit = c->A9HLEGuard != nullptr;
     if (!jit && c->NDS.IsJITEnabled()) return false;
     State* sp = Active(c);
-    if (!sp || ((c->NDS.IE[0] & c->NDS.IF[0]) & 3) != 2) return false;     // HBlank must be the lowest pending IRQ
-    State& s = *sp;
-    if (!jit && (!s.irqOk || !(s.mask & 8) || !IrqCodeIntact(c, s))) return false;
-    const u64 t0 = g_Time ? Now() : 0;
-    Mem m(c, g_Check || g_DryIrq);
-    Expect e;
-    int kind = 3;
-    u32 tpc = 0, tcpsr = 0;
-    if (!IrqNative(c, s, m, e, halted, kind, tpc, tcpsr)) return false;
-    s.calls[kind]++;
-    m.Flush();                                          // check / dry: logs only
-#ifdef LITEV_HLE_DIAG
-    if (__builtin_expect(g_Check, 0))
+    if (!sp) return false;
+    bool any = false;
+    // the lowest pending enabled IRQ is the one OS_IrqHandler takes; after a native one, the next (an HBlank and a
+    // DMA end can be pending together)
+    for (int i = 0; i < 4; i++)
     {
-        ArmCheck(c, kind, m, e);
-        g_P.vecSkip = true;
-        s.checks[kind]++;
-        return false;
-    }
-    if (__builtin_expect(g_DryIrq, 0)) { s.checks[kind]++; dryHalted = halted; return false; }
+        const u32 p = c->NDS.IE[0] & c->NDS.IF[0], low = p & (0u - p);
+        if (low != 2 && !(low & 0xE00)) break;
+        const int r = IrqOne(c, *sp, halted, jit, low);
+#ifdef LITEV_HLE_DIAG
+        if (r < 0) { dryHalted = g_DryIrq && halted; return false; }
 #endif
-    s.native[kind]++;
-    melonDS::NDS& nds = c->NDS;
-    nds.IF[0] &= ~2u;                                   // OS_IrqHandler: str r1, [IF]
-    nds.GPU.GPU3D.CheckFIFOIRQ();
-    nds.UpdateIRQ(0);
-    if (kind == 4) { c->R_SVC[1] = e.SVC[1]; c->R_SVC[2] = e.SVC[2]; }
-    c->R_IRQ[1] = e.IRQ[1];
-    c->R_IRQ[2] = e.IRQ[2];
-    c->Cycles += kind == 4 ? kIrqWakeCycles : kIrqCycles;
-    if (g_Time) s.ns += Now() - t0;
-    return true;
+        if (r <= 0) break;
+        any = true;
+    }
+    return any;
 }
 
 int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
@@ -1815,7 +1958,14 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return 1;
     }
     const Variant& v = *Active(&nds.ARM9)->v;     // after IsHook != 0
-    if (addr == v.wake) { r = v.code; return kNumCode; }
+    if (addr == v.wake)
+    {
+        static thread_local Range wk[kNumCode + 3];
+        for (int i = 0; i < kNumCode; i++) wk[i] = v.code[i];
+        for (int i = 0; i < 3; i++) wk[kNumCode + i] = v.dmaCode[i];
+        r = wk;
+        return kNumCode + 3;
+    }
     if (addr == v.gx) { r = &v.gxCode; return 1; }
     if (addr == v.async)
     {
@@ -2256,7 +2406,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             if (gs[i] != e.SVC[i]) { if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " svc[%d] guest %08x native %08x;", i, gs[i], e.SVC[i]); nd++; }
         }
     }
-    if (k == 10)
+    if (k == 10 || k == 11)
     {
         std::vector<std::pair<u32, u32>> io;
         for (auto& a : g_P.acc)
@@ -2297,6 +2447,9 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             nd++;
         }
     }
+    if (k == 11)
+        for (auto& a : g_P.acc)     // a lower IRQ (HBlank) raised after the delivery: the guest's handler took that one first
+            if (a.Write && a.Addr == 0x04000214) { if (a.Val != g_P.io[0].second) g_P.irq = true; break; }
     if (nd && g_P.irq && k != 6)
         nd = 0;   // an IRQ arrived inside the guest round trip: the native path takes it after; counted in irq_during
     if (nd)

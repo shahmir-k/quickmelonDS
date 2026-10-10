@@ -25,7 +25,8 @@
 // Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS:
 // 0 off, 1 all, other values = the mask below.
 // Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material,
-// 256 _ll_sdiv, 512 GX async start; 8 needs 1)
+// 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ;
+// 8 needs 1)
 // for A/B of single hooks.
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
@@ -60,6 +61,9 @@
 //    registers / flags / stack bytes (position independent).
 // 10. MI_SendGXCommandAsync's synchronous part (PW, PB): the same IO writes in the same order, every memory
 //    byte and register up to its return; the display list's DMA-end IRQ stays guest code.
+// 11. That DMA-end IRQ (PW, PB) natively at delivery like 3.: OS_IrqHandler -> OSi_IrqCallback -> MIi_DMACallback
+//    (OS_DisableIrqMask, GXSTAT, OS_SetIrqFunction, busy = 0, NNS G3D's "[arg] = 0" callback) with the same IO writes
+//    in order, the IRQ stack bytes and the banked IRQ registers.
 //
 // Diagnostics (build with LITEV_HLE_DIAG; compiled out of shipping builds):
 //
