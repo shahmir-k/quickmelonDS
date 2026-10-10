@@ -5,7 +5,11 @@
 #define FRAGLOC(loc)
 #endif
 
+#ifdef TexUnorm
+uniform sampler2DArray CurTexture;
+#else
 uniform usampler2DArray CurTexture;
+#endif
 uniform sampler2DArray Capture128Texture;
 uniform sampler2DArray Capture256Texture;
 
@@ -66,7 +70,11 @@ vec4 FinalColor()
         highp vec3 texcoord = vec3(fTexcoord, fPolygonAttr.y);
         vec4 tcol;
         if (fPolygonAttr.z == 0)
+#ifdef TexUnorm
+            tcol = texture(CurTexture, texcoord);
+#else
             tcol = vec4(texture(CurTexture, texcoord)) / vec4(63,63,63,31);
+#endif
         else if (fPolygonAttr.z == 1)
             tcol = texture(Capture128Texture, texcoord);
         else
@@ -106,6 +114,30 @@ vec4 FinalColor()
 
 void main()
 {
+#ifdef AlphaTestOnly
+    // LITEV_GL_ALPHATEST_2PASS pass A: FinalColor's alpha only (polygon alpha is 31 here)
+    {
+        float a = fColor.a;
+        if (fPolygonAttr.y != 0xFFFF && ((fPolygonAttr.x >> 4) & 0x3) != 1)
+        {
+            highp vec3 texcoord = vec3(fTexcoord, fPolygonAttr.y);
+            if (fPolygonAttr.z == 0)
+#ifdef TexUnorm
+                a *= texture(CurTexture, texcoord).a;
+#else
+                a *= float(texture(CurTexture, texcoord).a) / 31.0;
+#endif
+            else if (fPolygonAttr.z == 1)
+                a *= texture(Capture128Texture, texcoord).a;
+            else
+                a *= texture(Capture256Texture, texcoord).a;
+        }
+        if (a < 30.5/31.0) discard;
+        oColor = vec4(0.0);
+        oAttr = vec4(0.0);
+        return;
+    }
+#endif
 #ifdef NoDiscard
     // opaque pass, polygon that can't produce a transparent pixel: no alpha test, so the Mali
     // keeps its early depth test and hidden-surface removal (any discard in the shader loses both)

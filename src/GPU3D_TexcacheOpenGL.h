@@ -25,6 +25,10 @@ private:
 
 using TexcacheOpenGL = Texcache<TexcacheOpenGLLoader, GLuint>;
 
+#ifdef LITEV_GL_TEX_UNORM
+bool TexUnorm();   // the GL 3D textures are normalized RGBA8
+#endif
+
 }
 
 #endif
