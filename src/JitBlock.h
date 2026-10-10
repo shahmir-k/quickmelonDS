@@ -21,6 +21,9 @@
 
 #include "types.h"
 #include "TinyVector.h"
+#ifdef LITEV_JIT_POOL_ALLOC
+#include "JitPool.h"
+#endif
 
 namespace melonDS
 {
@@ -55,6 +58,11 @@ public:
         NumLiterals = numLiterals;
         Data.SetLength(numAddresses * 2 + numLiterals);
     }
+
+#ifdef LITEV_JIT_POOL_ALLOC
+    static void* operator new(size_t n) { return JitPool::Alloc(n); }
+    static void operator delete(void* p, size_t n) { JitPool::Free(p, n); }
+#endif
 
     u32 StartAddr;
     u32 StartAddrLocal;

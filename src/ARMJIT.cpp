@@ -800,12 +800,24 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
         }
         else
         {
+#ifdef LITEV_JIT_FLATMAPS
+            pending.insert(link.TargetAddr, LinkSite{block->StartAddr, link.PatchOffset});
+#else
             pending.insert({link.TargetAddr, LinkSite{block->StartAddr, link.PatchOffset}});
+#endif
         }
     }
 
     // (b) drain pending links waiting on THIS block's start address.
     u32 entryOff = JITCompiler.SubEntryOffset(block->EntryPoint);
+#ifdef LITEV_JIT_FLATMAPS
+    pending.drain(block->StartAddr, [&](const LinkSite& site)
+    {
+        JITCompiler.PatchLinkSite(site.PatchOffset, entryOff);
+        block->Incoming.Add(site);
+        LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
+    });
+#else
     auto range = pending.equal_range(block->StartAddr);
     for (auto it = range.first; it != range.second; ++it)
     {
@@ -815,6 +827,7 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
         LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
     }
     pending.erase(range.first, range.second);
+#endif
 
     JitEnableExecute();
 
@@ -835,7 +848,11 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
     {
         LinkSite site = block->Incoming[i];
         JITCompiler.PatchLinkSite(site.PatchOffset, JITCompiler.UnlinkedSiteTarget(block->Num, site.PatchOffset));
+#ifdef LITEV_JIT_FLATMAPS
+        pending.insert(block->StartAddr, site);
+#else
         pending.insert({block->StartAddr, site});
+#endif
         LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksUnlinked);
     }
     block->Incoming.Clear();
@@ -847,6 +864,10 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
     {
         const OutgoingLink& link = block->Outgoing[i];
 
+#ifdef LITEV_JIT_FLATMAPS
+        bool found = pending.remove_one(link.TargetAddr, [&](const LinkSite& s)
+            { return s.PatchOffset == link.PatchOffset && s.SourceBlockAddr == block->StartAddr; });
+#else
         bool found = false;
         auto range = pending.equal_range(link.TargetAddr);
         for (auto pit = range.first; pit != range.second; ++pit)
@@ -859,6 +880,7 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
                 break;
             }
         }
+#endif
         if (!found)
         {
             auto it = blocks.find(link.TargetAddr);
@@ -923,7 +945,7 @@ void ARMJIT::ValidateLinkSites() noexcept
         }
     };
 
-    auto walk = [&](std::unordered_map<u32, JitBlock*>& map)
+    auto walk = [&](auto& map)
     {
         for (auto& kv : map)
         {

@@ -2197,7 +2197,11 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     PendingCycles = 0;
     DeferCycles = false;
 #endif
+#ifdef LITEV_JIT_REGALLOC_USEMASK
+    RegCache.Reset(this, instrs, instrsCount, true);
+#else
     RegCache = RegisterCache<Compiler, ARM64Reg>(this, instrs, instrsCount, true);
+#endif
 #ifdef LITEV_JIT_GLOBALREG
     // GLOBALREG: install the fixed guest->host map. These regs are already resident
     // in their host regs (loaded by ARM_Dispatch at slice entry, preserved across

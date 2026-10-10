@@ -439,18 +439,33 @@ void ARM64XEmitter::FlushIcacheSection(u8* start, u8* end)
   icache_line_size = isize = icache_line_size < isize ? icache_line_size : isize;
   dcache_line_size = dsize = dcache_line_size < dsize ? dcache_line_size : dsize;
 
-  addr = (u64)start & ~(u64)(dsize - 1);
-  for (; addr < (u64)end; addr += dsize)
-    // use "civac" instead of "cvau", as this is the suggested workaround for
-    // Cortex-A53 errata 819472, 826319, 827319 and 824069.
-    __asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
+#ifdef LITEV_JIT_FLUSH_CTR
+  // CTR_EL0.IDC: the data cache needn't be cleaned for instruction fetches to see new code
+  // (the RG DS's A55 reports it); DIC: nor the instruction cache invalidated. The kernel shows a
+  // value that is safe on every core. Skipping a clean to the point of coherency per line was
+  // ~1 us per compiled block on the A55.
+  const bool needDC = !((ctr_el0 >> 28) & 1), needIC = !((ctr_el0 >> 29) & 1);
+#else
+  const bool needDC = true, needIC = true;
+#endif
+  if (needDC)
+  {
+    addr = (u64)start & ~(u64)(dsize - 1);
+    for (; addr < (u64)end; addr += dsize)
+      // use "civac" instead of "cvau", as this is the suggested workaround for
+      // Cortex-A53 errata 819472, 826319, 827319 and 824069.
+      __asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
+  }
   __asm__ volatile("dsb ish" : : : "memory");
 
-  addr = (u64)start & ~(u64)(isize - 1);
-  for (; addr < (u64)end; addr += isize)
-    __asm__ volatile("ic ivau, %0" : : "r"(addr) : "memory");
+  if (needIC)
+  {
+    addr = (u64)start & ~(u64)(isize - 1);
+    for (; addr < (u64)end; addr += isize)
+      __asm__ volatile("ic ivau, %0" : : "r"(addr) : "memory");
 
-  __asm__ volatile("dsb ish" : : : "memory");
+    __asm__ volatile("dsb ish" : : : "memory");
+  }
   __asm__ volatile("isb" : : : "memory");
 #endif
 }
