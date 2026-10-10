@@ -23,10 +23,96 @@
 #include "../ARMJIT_Memory.h"
 #include "../NDS.h"
 
+
+#ifdef LITEV_JIT_STORE_REPROMOTE
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#include <stdlib.h>
+#include <algorithm>
+#endif
+
 using namespace Arm64Gen;
 
 namespace melonDS
 {
+
+#ifdef LITEV_JIT_STORE_REPROMOTE
+u64 JitStoreRepromotions = 0;   // diagnosis counter (headless LITEV_FRAME_MS)
+
+static bool StoreRepromoteOn()   // debug.litev.storerepromote (default on), env LITEV_STOREREPROMOTE off the device
+{
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.storerepromote", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_STOREREPROMOTE");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on;
+}
+
+// Called by the fault handler for a fault on a code-protected page, before RewriteMemAccess.
+void Compiler::NoteProtectFault(u8* pc)
+{
+    if (!StoreRepromoteOn())
+        return;
+    auto it = LoadStorePatches.find(pc - GetRXBase());
+    if (it == LoadStorePatches.end())
+        return;   // RewriteMemAccess reports the JIT bug
+    ptrdiff_t start = (pc - GetRXBase()) + it->second.PatchOffset;
+    u32 frame = NDS.NumFrames;
+    SlowStoreSite& site = SlowStoreSites[start];
+    if (site.Orig.empty())
+    {
+        const u32* code = (const u32*)(GetRXBase() + start);
+        site.Orig.assign(code, code + it->second.PatchSize / 4);
+        site.Faults = 0;
+    }
+    else if (frame - site.RestoredFrame > 600)
+        site.Faults = 0;   // it ran fast for 10 s since the last retry: start the backoff over
+    else if (site.Faults < 10)
+        site.Faults++;
+    site.Slow = true;
+    site.RetryFrame = frame + (4u << site.Faults);
+    SlowStoreNextRetry = std::min(SlowStoreNextRetry, site.RetryFrame);
+}
+
+// Called at the end of NDS::RunFrame, where no JIT code is executing. Puts the original
+// fast-path bytes back, i.e. the exact code the compiler emitted, a state every other
+// fastmem site is in: a store to a page that holds code faults and is rewritten again.
+void Compiler::RepromoteStores()
+{
+    u32 frame = NDS.NumFrames;
+    if (frame < SlowStoreNextRetry)
+        return;
+    u32 next = ~0u;
+    ptrdiff_t cur = GetCodeOffset();
+    NDS.JIT.JitEnableWrite();
+    for (auto& [start, site] : SlowStoreSites)
+    {
+        if (!site.Slow)
+            continue;
+        if (frame < site.RetryFrame)
+        {
+            next = std::min(next, site.RetryFrame);
+            continue;
+        }
+        SetCodePtrUnsafe(start);
+        for (u32 w : site.Orig)
+            Write32(w);
+        FlushIcacheSection(GetRXBase() + start, (u8*)GetRXPtr());
+        site.Slow = false;
+        site.RestoredFrame = frame;
+        JitStoreRepromotions++;
+    }
+    SetCodePtrUnsafe(cur);
+    NDS.JIT.JitEnableExecute();
+    SlowStoreNextRetry = next;
+}
+#endif
 
 bool Compiler::IsJITFault(const u8* pc)
 {
@@ -42,6 +128,11 @@ u8* Compiler::RewriteMemAccess(u8* pc)
     if (it != LoadStorePatches.end())
     {
         LoadStorePatch patch = it->second;
+#ifdef LITEV_JIT_STORE_REPROMOTE
+        // kept: the site may be restored to this fast path later (the rewritten code has no
+        // memory access at this offset, so the stale entry can't be looked up meanwhile)
+        if (!StoreRepromoteOn())
+#endif
         LoadStorePatches.erase(it);
 
         ptrdiff_t curCodeOffset = GetCodeOffset();

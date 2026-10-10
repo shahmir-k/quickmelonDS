@@ -2396,6 +2396,10 @@ void Compiler::ICacheReset()
 void Compiler::Reset()
 {
     LoadStorePatches.clear();
+#ifdef LITEV_JIT_STORE_REPROMOTE
+    SlowStoreSites.clear();   // the code they point into is gone
+    SlowStoreNextRetry = ~0u;
+#endif
 #ifdef LITEV_JIT_PATCHMAP_RESERVE
     // one entry per compiled memory access: sized up front so compiling never rehashes it
     LoadStorePatches.reserve(1 << 15);

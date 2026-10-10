@@ -846,6 +846,10 @@ bool ARMJIT_Memory::FaultHandler(FaultDescription& faultDesc, melonDS::NDS& nds)
 
         if (memStatus[faultDesc.EmulatedFaultAddr >> PageShift] == memstate_Unmapped)
             rewriteToSlowPath = !nds.JIT.Memory.MapAtAddress(faultDesc.EmulatedFaultAddr);
+#if defined(LITEV_JIT_STORE_REPROMOTE) && defined(__aarch64__)
+        else if (memStatus[faultDesc.EmulatedFaultAddr >> PageShift] == memstate_MappedProtected)
+            nds.JIT.JITCompiler.NoteProtectFault(faultDesc.FaultPC);
+#endif
 
         if (rewriteToSlowPath)
         {
