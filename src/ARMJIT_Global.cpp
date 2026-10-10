@@ -52,6 +52,15 @@ void* AllocateCodeMem()
         int slice = __builtin_ctz(AvailableCodeMemSlices);
         AvailableCodeMemSlices &= ~(1 << slice);
         //printf("allocating slice %d\n", slice);
+#ifdef LITEV_JIT_PRETOUCH
+        // the slice is zero .bss: each 4 KB page faults on its first write, which landed in the
+        // middle of compile bursts (new game code loaded). Take those faults now, for the part
+        // of the slice a session fills (blocks are emitted from the start of the slice).
+        {
+            volatile u8* p = &GetAlignedCodeMemoryStart()[slice * CodeMemorySliceSize];
+            for (size_t off = 0; off < 16u * 1024 * 1024 && off < CodeMemorySliceSize; off += 4096) p[off] = 0;
+        }
+#endif
         return &GetAlignedCodeMemoryStart()[slice * CodeMemorySliceSize];
     }
 #endif
