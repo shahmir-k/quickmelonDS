@@ -65,7 +65,7 @@
 // 11. That DMA-end IRQ (PW, PB, W2: Thumb) natively at delivery like 3.: OS_IrqHandler -> OSi_IrqCallback -> MIi_DMACallback
 //    (OS_DisableIrqMask, GXSTAT, OS_SetIrqFunction, busy = 0, NNS G3D's "[arg] = 0" callback) with the same IO writes
 //    in order, the IRQ stack bytes and the banked IRQ registers.
-// 13. NNS G3D shape (PW, PB): SBC SHP -> SHP_InternalDefault -> NNS_G3dGeSendDL natively at SHP's entry: a list of
+// 13. NNS G3D shape (PW, PB; W2: Thumb): SBC SHP -> SHP_InternalDefault -> NNS_G3dGeSendDL natively at SHP's entry: a list of
 //    >= 0x100 bytes with 10.'s work (from the register file the guest has at MI_SendGXCommandAsync), a small one as
 //    NNS_G3dGeBufferOP_N's direct GXFIFO send (BulkWords); the frames, flags and registers up to SHP's return.
 //

@@ -222,7 +222,11 @@ constexpr Variant kW2 = {
     // MIi_DMACallback with its literals
     {{0x02079C54, 0x02079D3C}, {0x02079EC0, 0x02079EE4}, {0x0207857C, 0x020785C0}},
     0x0aa0dbea6ca9901full,
-    0, {}, 0, &kW2Mat,
+    // 13. (Thumb): SBC SHP; {SHP_InternalDefault + SBC SHP + literal, the GE flush .. NNS_G3dGeBufferOP_N with literals,
+    // MI_CpuSend32}
+    0x020669A8, {{0x02066918, 0x02066A10}, {0x02067BC8, 0x02067DD0}, {0x020786B0, 0x020786C8}},
+    0x396f02a263a36a88ull,
+    &kW2Mat,
 };
 constexpr const Variant* kVariants[] = {&kPW, &kPB, &kW2};
 constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
@@ -233,7 +237,7 @@ inline int Kind(const Variant& v, u32 addr, u32 instr, bool thumb = false)
     if (!thumb && v.shp && addr == v.shp && instr == 0xE92D4010) return 13;
     if (thumb) return !v.twl ? -1 : addr == v.set && instr == kSetInstrT ? 1 : addr == v.get && instr == kGetInstrT ? 2
                     : v.gx && addr == v.gx && instr == kGxInstrT ? 5 : v.matT && addr == v.matT->sbc && instr == 0xB570 ? 8
-                    : v.async && addr == v.async && instr == 0xB5F8 ? 10 : -1;
+                    : v.async && addr == v.async && instr == 0xB5F8 ? 10 : v.shp && addr == v.shp && instr == 0xB570 ? 13 : -1;
     return addr == v.wake && instr == kWakeInstr ? 0 : !v.twl && addr == v.set && instr == kSetInstr ? 1
          : !v.twl && addr == v.get && instr == kGetInstr ? 2 : v.gx && addr == v.gx && instr == kGxInstr ? 5 : -1;
 }
@@ -539,7 +543,7 @@ struct Mem
     bool logOnly;
     u32 n = 0;
     bool bad = false;
-    Wr log[80];
+    Wr log[128];
     Mem(melonDS::ARMv5* cpu, bool check) : c(cpu), logOnly(check) {}
 #else
     static constexpr bool logOnly = false;
@@ -564,7 +568,7 @@ struct Mem
     }
     // queue a word write (applied by Flush, after every check passed); a: guest address (word
     // aligned), bit 0 set for DTCM (never holds JIT code: no invalidation check)
-    struct Pw { u8* p; u32 a, v; } pw[64];
+    struct Pw { u8* p; u32 a, v; } pw[96];   // (the W2 shape fold queues ~71)
     u32 np = 0;
     __attribute__((always_inline)) void W(const Obj& x, u32 o, u32 v) { pw[np++] = {x.p + o, (x.a + o) | (u32)x.dtcm, v}; }
     // only changed words are written, main RAM with the JIT invalidation check of ARM9Write32
@@ -577,7 +581,7 @@ struct Mem
 #ifdef LITEV_HLE_DIAG
             if (__builtin_expect(logOnly, 0))
             {
-                if (n < 80) log[n++] = {w.a & ~1u, w.v, 4}; else bad = true;
+                if (n < 128) log[n++] = {w.a & ~1u, w.v, 4}; else bad = true;
                 continue;
             }
 #endif
@@ -2225,6 +2229,15 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     }
     if (addr == v.gx) { r = &v.gxCode; return 1; }
     if (v.matT && addr == v.matT->sbc) { r = v.matT->code; return 4; }
+    if (v.shp && addr == v.shp)
+    {
+        static thread_local Range sh[13];
+        for (int i = 0; i < 3; i++) sh[i] = v.shpCode[i];
+        for (int i = 0; i < 7; i++) sh[3 + i] = v.asyncCode[i];
+        sh[10] = v.gxCode; sh[11] = v.code[3]; sh[12] = v.code[9];
+        r = sh;
+        return 13;
+    }
     if (addr == v.async)
     {
         static thread_local Range as[10];
@@ -2250,8 +2263,10 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
 #ifdef LITEV_GX_BULK
         if (k == 8) return !s.matTOk ? 0 : MatTIntact(&nds.ARM9, s) ? 1 : 2;
         if (k == 10) return !s.gxOk || !s.asyncOk ? 0 : AsyncIntact(&nds.ARM9, s) && GxIntact(&nds.ARM9, s) && CodeIntact(&nds.ARM9, s, 0) ? 1 : 2;
+        if (k == 13) return !s.shpOk || !(s.mask & 512) ? 0 : ShpIntact(&nds.ARM9, s) && AsyncIntact(&nds.ARM9, s) && GxIntact(&nds.ARM9, s)
+                                                              && CodeIntact(&nds.ARM9, s, 0) ? 1 : 2;
 #else
-        if (k == 8 || k == 10) return 0;
+        if (k == 8 || k == 10 || k == 13) return 0;
 #endif
         return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
     }
@@ -2770,6 +2785,172 @@ out:
     Return(c, e, kAsyncCyc + kShpCyc);
     return true;
 }
+
+// 13. for the TWL SDK build (W2): the same chain in Thumb (SBC SHP 0x020669A8 -> SHP_InternalDefault -> NNS_G3dGeSendDL
+// -> 10. or NNS_G3dGeBufferOP_N), this build's frames, registers and the flags of SBC SHP's adds; 154 shapes a frame in
+// the W2 town. Category B as 13.
+// ponytail: fixed estimates (check mode, two W2 towns): 205 before 10. (80% of 6.3k lists; 208-210 the rest) + ~21 for
+// the pops; small lists 212 + 12 per parameter word (18k lists)
+constexpr s32 kShpCycT = 226, kShpSmallCycT0 = 212, kShpSmallCycWordT = 12;
+
+__attribute__((noinline)) bool RunShpT(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const Variant& v = *s.v;
+    const bool chk = g_Check || g_Dry;
+    Mem m(c, chk);
+    Expect e;
+    AsyncChk ck;
+    bool bad = false;
+    auto rd = [&](u32 a, u32 n) -> u32 {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    };
+    auto lit = [&](u32 a) { return R32(CodePtr(c, a)); };
+    const u32 rs = c->R[0], S = c->R[13], shpDef = v.shpCode[0].a, flush = v.shpCode[1].a, send = flush + 0x50, opn = send + 0x130;
+    int r = 0;
+    Obj RS, fr;
+    u32 sbc = 0, G = 0;
+    u32 R[16];
+    bool ok = !CheckPending && s.shpOk && (s.mask & 512) && (jit || (ShpIntact(c, s) && CodeIntact(c, s, 0)));
+    if (ok)
+    {
+        RS = m.O(rs, 0xE0); fr = m.O(S - 72, 72);
+        ok = RS && fr;
+    }
+    if (ok)
+    {
+        const u32 flag = RS.r(8);
+        sbc = RS.r(0);
+        const u32 idx = rd(sbc + 1, 1), ip = RS.r(0xDC);
+        ok = !(flag & 0x302) && (flag & 1) && ip && !bad;
+        u32 shp = 0, fn = 0, h = 0;
+        if (ok)
+        {
+            const u32 cnt = rd(ip + 1, 1), ofs = rd(ip + 6, 2);
+            const u32 ent = ip + ofs + 4 + rd(ip + ofs, 2) * idx;
+            ok = idx < cnt && !bad && ent;
+            if (ok) { shp = ip + rd(ent, 4); h = rd(shp, 2); fn = rd(lit(v.shp + 0x64) + h * 4, 4); ok = !bad && fn == (shpDef | 1); }
+        }
+        const u32 cbf = RS.r(0x20), r6 = cbf ? RS.p[0x91] : 0;
+        ok = ok && (r6 < 1 || r6 > 3);
+        u32 dl = 0, size = 0, dma = 0;
+        if (ok)
+        {
+            dl = shp + rd(shp + 8, 4); size = rd(shp + 0xC, 4);
+            dma = rd(lit(send + 0x100), 4);
+            G = lit(send + 0x104);
+            ok = !bad;
+        }
+        // GeSendDL push {r3-r5, lr} (S-48), SHP_InternalDefault push {r4-r6, lr} (S-32), SBC SHP push {r4-r6, lr} (S-16)
+        const u32 w0[12] = {idx, r6, rs, shpDef + 0x5B, rs, fn, h * 4, v.shp + 0x5B, c->R[4], c->R[5], c->R[6], c->R[14]};
+        if (ok && (size < 0x100 || dma == ~0u))
+        {
+            // small: NNS_G3dGeBufferOP_N(list[0], list + 1, size / 4 - 1), nothing being sent, no GE buffer or an empty one
+            melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
+            const u8* lp = m.P(dl);
+            const u32 gb = rd(G, 4);
+            ok = !bad && size >= 4 && !(size & 3) && !rd(G + 4, 4) && (!gb || !rd(gb, 4)) && !bad && lp && (dl >> 24) == 0x02
+                 && m.P(dl + size - 1) == lp + size - 1 && (dl & c->DTCMMask) != c->DTCMBase && ((dl + size - 1) & c->DTCMMask) != c->DTCMBase
+                 && (chk || (gx.GeometryEnabled && gx.BulkReady()));
+            if (!ok) goto out;
+            const u32 n = size / 4 - 1;
+            // OP_N push {r3-r7, lr} (S-72)
+            const u32 w1[6] = {idx, size, dl, shp, c->R[7], send + 0x27};
+            for (int i = 0; i < 6; i++) m.W(fr, i * 4, w1[i]);
+            for (int i = 0; i < 12; i++) m.W(fr, 24 + i * 4, w0[i]);
+            for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+            e.R[0] = sbc + 2; e.R[1] = 0x04000400; e.R[2] = n ? R32(lp + size - 4) : 0; e.R[3] = idx; e.R[12] = dl + size;
+            e.R[14] = opn + 0x7D;
+            e.retPc = c->R[14];
+            const u32 rr = sbc + 2, nzcv = (rr & 0x80000000) | ((rr == 0) << 30) | ((rr < sbc) << 29) | (((~(sbc ^ 2u) & (sbc ^ rr)) >> 31) << 28);
+            e.CPSR = (c->CPSR & 0x0FFFFFDF) | nzcv | ((e.retPc & 1) << 5);
+#ifdef LITEV_HLE_DIAG
+            if (chk)
+            {
+                m.Flush();      // logs only
+                if (g_Check)
+                {
+                    m.log[m.n++] = {rs, sbc + 2, 4};
+                    ArmCheck(c, 13, m, e);
+                    g_P.small = true;
+                    g_P.gx.assign((const u32*)lp, (const u32*)(lp + size));
+#ifdef LITEV_A9HLE_GXCHECK
+                    if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
+#endif
+                    g_P.fit[0] = size / 4;
+                }
+                s.checks[13]++;
+                GuestFallback(c);
+                return true;
+            }
+#endif
+            m.W(RS, 0, sbc + 2);
+            m.Flush();
+            gx.BulkWords((const u32*)lp, size / 4);
+            s.native[13]++;
+            Return(c, e, kShpSmallCycT0 + kShpSmallCycWordT * (s32)n);
+            return true;
+        }
+        if (ok)
+        {
+            // GeSendDL's DMA path: nothing being sent, the GE buffer empty, no TWL path, a DMA (1-3)
+            const u32 T = lit(v.code[9].a + 0x28), gb = rd(G, 4);
+            ok = !bad && dma >= 1 && dma <= 3 && !rd(G + 4, 4) && !rd(G + 8, 4) && (!gb || !rd(gb, 4))
+                 && rd(T + 0x1C, 4) && !rd(T + 4, 4) && !bad && lit(send + 0x10C) == ((flush + 0x48) | 1) && lit(send + 0x108) == G + 4;
+        }
+        if (ok)
+        {
+            // + the GE flush push {r3, lr} (S-56), GeSendDL's str r1, [sp] (the 5th argument) over its pushed r3
+            for (int i = 0; i < 12; i++) m.W(fr, 24 + i * 4, w0[i]);
+            m.W(fr, 16, idx); m.W(fr, 20, send + 0x2D);
+            m.W(fr, 24, G + 4);
+            const Obj g = m.O(G + 4, 4);
+            m.W(g, 0, 1);
+            for (int i = 0; i < 16; i++) R[i] = c->R[i];
+            R[0] = dma; R[1] = dl; R[2] = size; R[3] = (flush + 0x48) | 1; R[4] = size; R[5] = dl; R[6] = shp;
+            R[13] = S - 48; R[14] = send + 0xFF;
+            r = AsyncCore(c, s, m, R, c->CPSR, G + 4, jit, e, chk ? &ck : nullptr);
+        }
+    }
+out:
+    if (r == 2) { s.native[13]++; return true; }
+    if (r == 1)
+    {
+        // epilogue: GeSendDL pop {r3-r5, pc}, SHP_InternalDefault cmp r4, #2 / #3, pop {r4-r6, pc}, SBC SHP adds / pop
+        e.R[0] = sbc + 2; e.R[3] = G + 4; e.R[4] = c->R[4]; e.R[5] = c->R[5]; e.R[6] = c->R[6]; e.R[13] = S;
+        e.retPc = c->R[14];
+        const u32 rr = sbc + 2, nzcv = (rr & 0x80000000) | ((rr == 0) << 30) | ((rr < sbc) << 29) | (((~(sbc ^ 2u) & (sbc ^ rr)) >> 31) << 28);
+        e.CPSR = (c->CPSR & 0x0FFFFFDF) | nzcv | ((e.retPc & 1) << 5);
+    }
+    if (r == 1 && chk)
+    {
+#ifdef LITEV_HLE_DIAG
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 13, m, ck.e2);
+            g_P.small = false;
+            g_P.fit[0] = ck.words; g_P.io = ck.io;
+            g_P.fin = e; g_P.finA = rs; g_P.finV = sbc + 2;
+        }
+#endif
+        s.checks[13]++;
+        GuestFallback(c);
+        return true;
+    }
+    if (!r)
+    {
+        s.fallback[13] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    m.W(RS, 0, sbc + 2);
+    m.Flush();
+    s.native[13]++;
+    Return(c, e, kAsyncCycT + kShpCycT);
+    return true;
+}
 #endif
 
 // 0. wake hook reached in the JIT (an IRQ other than the native HBlank one), 1. set, 2. get
@@ -2830,6 +3011,7 @@ __attribute__((noinline)) bool RunThumb(melonDS::ARMv5* c, bool jit)
     if (k == 5) return RunGx(c, s, jit);
     if (k == 8) return RunMatT(c, s, jit);
     if (k == 10) return RunAsync(c, s, jit);
+    if (k == 13) return RunShpT(c, s, jit);
 #endif
     return RunOs(c, s, k, jit);
 }
