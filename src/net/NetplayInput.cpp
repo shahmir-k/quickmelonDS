@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <unistd.h>
@@ -326,6 +327,11 @@ NetplayFrameInput NetplayInput::Get(int player, int frame)
 
 void NetplayInput::ReceiveLoop()
 {
+#if defined(LITEV_NP_RX_PRIO) && defined(__linux__)
+    // the emulator threads run at nice -10..-16: at the default nice this thread waited for a core
+    // tens of ms under load (in-race round trips 50-100 ms on a 3-10 ms Wi-Fi link)
+    for (int nice = -16; nice < 0 && setpriority(PRIO_PROCESS, 0, nice) != 0; nice++) {}
+#endif
     std::multimap<u64, std::vector<u8>> pending; // artificial latency: (due time, packet)
     u8 buf[2048];
     u64 lastSend = 0;
