@@ -30,11 +30,11 @@
 // Profiling only: per-compiled-block entry counter + dump at exit (LITEV_BLOCKPROF_OUT).
 #include <deque>
 #include <cstdio>
-namespace { struct BPEnt { uint32_t addr, last; uint8_t num, thumb, idle; uint16_t n; uint64_t count; uint32_t instr[64]; uint32_t iaddr[64]; std::vector<uint8_t> host; };
+namespace { struct BPEnt { uint32_t addr, last; uint8_t num, thumb, idle, endb; uint16_t n; uint32_t seq; uint8_t bf[64]; uint64_t count; uint32_t instr[64]; uint32_t iaddr[64]; std::vector<uint8_t> host; };
 std::deque<BPEnt>& BP() { static std::deque<BPEnt> d; return d; }
 void BPDump() { const char* o = getenv("LITEV_BLOCKPROF_OUT"); FILE* f = fopen(o ? o : "/tmp/blockprof.txt", "w"); if (!f) return;
-  for (auto& e : BP()) if (e.count) { fprintf(f, "%d %d %08x %08x %d %d %llu", e.num, e.thumb, e.addr, e.last, e.n, e.idle, (unsigned long long)e.count);
-    for (int i = 0; i < e.n && i < 64; i++) fprintf(f, " %08x:%08x", e.iaddr[i], e.instr[i]);
+  for (auto& e : BP()) if (e.count || getenv("LITEV_BLOCKPROF_ALL")) { fprintf(f, "%d %d %08x %08x %d %d %llu %u %d", e.num, e.thumb, e.addr, e.last, e.n, e.idle, (unsigned long long)e.count, e.seq, e.endb);
+    for (int i = 0; i < e.n && i < 64; i++) fprintf(f, " %08x:%08x:%x", e.iaddr[i], e.instr[i], e.bf[i]);
     fprintf(f, " |"); for (uint8_t b : e.host) fprintf(f, "%02x", b); fprintf(f, "\n"); } fclose(f); } }
 #endif
 
@@ -2445,8 +2445,8 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         static bool reg = (BP(), atexit(BPDump), true); (void)reg;
         BP().push_back({});
         BPEnt& e = BP().back();
-        e.addr = instrs[0].Addr; e.last = instrs[instrsCount-1].Addr; e.num = cpu->Num; e.thumb = thumb; e.n = instrsCount; e.count = 0; e.idle = 0;
-        for (int i = 0; i < instrsCount; i++) { if (i < 64) { e.instr[i] = instrs[i].Instr; e.iaddr[i] = instrs[i].Addr; } if (instrs[i].BranchFlags & branch_IdleBranch) e.idle = 1; }
+        e.addr = instrs[0].Addr; e.last = instrs[instrsCount-1].Addr; e.num = cpu->Num; e.thumb = thumb; e.n = instrsCount; e.count = 0; e.idle = 0; e.seq = (uint32_t)BP().size(); e.endb = instrs[instrsCount-1].Info.EndBlock;
+        for (int i = 0; i < instrsCount; i++) { if (i < 64) { e.instr[i] = instrs[i].Instr; e.iaddr[i] = instrs[i].Addr; e.bf[i] = instrs[i].BranchFlags; } if (instrs[i].BranchFlags & branch_IdleBranch) e.idle = 1; }
         MOVP2R(X16, &e.count);
         LDR(INDEX_UNSIGNED, X17, X16, 0);
         ADD(X17, X17, 1);
