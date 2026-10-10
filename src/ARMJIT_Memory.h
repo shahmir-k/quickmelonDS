@@ -136,6 +136,9 @@ public:
     bool GetMirrorLocation(int region, u32 num, u32 addr, u32& memoryOffset, u32& mirrorStart, u32& mirrorSize) const noexcept;
     u32 LocaliseAddress(int region, u32 num, u32 addr) const noexcept;
     bool IsFastmemCompatible(int region) const noexcept;
+#ifdef LITEV_JIT_MEMBASE_PIN
+    void* FastMemStart(u32 num) const noexcept { return num == 0 ? FastMem9Start : FastMem7Start; }
+#endif
     void* GetFuncForAddr(ARM* cpu, u32 addr, bool store, int size) const noexcept;
     bool MapAtAddress(u32 addr) noexcept;
 

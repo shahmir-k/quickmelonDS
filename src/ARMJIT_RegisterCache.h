@@ -273,6 +273,13 @@ public:
             BitSet16 needValueLoaded(needToBeLoaded);
             if (thumb || instr.Cond() >= 0xE)
                 needValueLoaded = BitSet16(instr.Info.SrcRegs);
+#ifdef LITEV_JIT_R15_ELIDE
+            // r15 is never dirty (never written back) and unloaded before the next
+            // instruction, so a conditional instruction that only writes it (a branch)
+            // doesn't need its old value either.
+            if (ElideR15Value && !(instr.Info.SrcRegs & (1 << 15)))
+                needValueLoaded[15] = false;
+#endif
             for (int reg : needToBeLoaded)
                 LoadRegister(reg, needValueLoaded[reg]);
         }
@@ -313,6 +320,9 @@ public:
     u16 DirtyRegs = 0;
 
     u16 PCAllocatableAsSrc = 0;
+#ifdef LITEV_JIT_R15_ELIDE
+    bool ElideR15Value = false;
+#endif
 
     T* Compiler;
 

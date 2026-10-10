@@ -1360,7 +1360,11 @@ void ARMv5::Execute()
                 // interpreter-compile) outside the JIT slice.
                 JitNZCV = CPSR & 0xF0000000;
 #endif
+#ifdef LITEV_JIT_MEMBASE_PIN
+                ARM_Dispatch(this, block, NDS.JIT.Memory.FastMemStart(0));
+#else
                 ARM_Dispatch(this, block);
+#endif
 #ifdef LITEV_JIT_LAZYFLAGS
                 // Merge the slice's final NZCV nibble (canonical in JitNZCV at every block
                 // exit) back into ARM::CPSR before any C++ observes it (the IRQ dispatch
@@ -1598,7 +1602,11 @@ void ARMv4::Execute()
                 // CompileBlock (interpreter) path. See the ARM9 comment above.
                 JitNZCV = CPSR & 0xF0000000;
 #endif
+#ifdef LITEV_JIT_MEMBASE_PIN
+                ARM_Dispatch(this, block, NDS.JIT.Memory.FastMemStart(1));
+#else
                 ARM_Dispatch(this, block);
+#endif
 #ifdef LITEV_JIT_LAZYFLAGS
                 CPSR = (CPSR & 0x0FFFFFFF) | (JitNZCV & 0xF0000000);
 #endif
