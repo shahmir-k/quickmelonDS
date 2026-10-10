@@ -22,6 +22,7 @@
 #include <assert.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -127,8 +128,27 @@ void LitevSlowHistLine(int h, char* buf, int len)
         if (g_slowHist[h][r]) n += snprintf(buf + n, len - n, " reg%d=%llu", r, g_slowHist[h][r]);
 }
 #define SLOWHIST(h, cpu, addr) (g_slowHist[(h)][(cpu)->NDS.JIT.Memory.ClassifyAddress9((addr)) & 15]++)
+// DIAG (stm investigation): per-JIT-site attribution of slow main-RAM stores
+std::unordered_map<const void*, u32> g_slowSiteInfo;   // return address -> compile-time info
+static std::unordered_map<const void*, u64> g_slowSiteHits;
+void LitevSlowSiteNote(const void* ret, u32 info) { g_slowSiteInfo[ret] = info; }
+#define SLOWSITE(cpu, addr) do { if ((cpu)->NDS.JIT.Memory.ClassifyAddress9(addr) == ARMJIT_Memory::memregion_MainRAM) g_slowSiteHits[__builtin_return_address(0)]++; } while (0)
+namespace {
+struct SlowSiteDumper {
+    ~SlowSiteDumper() {
+        std::map<u32, u64> byInfo; u64 unk = 0;
+        for (auto& [k, v] : g_slowSiteHits) { auto it = g_slowSiteInfo.find(k); if (it == g_slowSiteInfo.end()) unk += v; else byInfo[it->second] += v; }
+        fprintf(stderr, "SLOWSITE unknown(thunk/other)=%llu\n", (unsigned long long)unk);
+        for (auto& [k, v] : byInfo)
+            fprintf(stderr, "SLOWSITE kind=%s target=%u cond=%x executed=%u thumb=%u usermode=%u stub=%u regs=%u hits=%llu\n",
+                (k >> 31) ? "block" : "single", k & 0xFF, (k >> 8) & 0xF, (k >> 12) & 1, (k >> 13) & 1, (k >> 14) & 1, (k >> 15) & 1, (k >> 16) & 0x1F, (unsigned long long)v);
+    }
+};
+static SlowSiteDumper g_slowSiteDumper;
+}
 #else
 #define SLOWHIST(h, cpu, addr) ((void)0)
+#define SLOWSITE(cpu, addr) ((void)0)
 #endif
 
 template <typename T, int ConsoleType>
@@ -190,6 +210,7 @@ void SlowWrite9(u32 addr, ARMv5* cpu, u32 val)
 {
     addr &= ~(sizeof(T) - 1);
     SLOWHIST(1, cpu, addr);
+    SLOWSITE(cpu, addr);
 
     if (addr < cpu->ITCMSize)
     {
@@ -235,6 +256,7 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.MemBlock9HelperCalls);
     addr &= ~0x3;
     SLOWHIST(Write ? 3 : 2, cpu, addr);
+    if (Write) SLOWSITE(cpu, addr);
 
 #ifdef LITEV_JIT_BLOCKXFER_FAST
     // Hoist the per-element region dispatch out of the loop for the two homogeneous,

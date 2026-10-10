@@ -24,7 +24,7 @@
 #include "../NDS.h"
 
 
-#if defined(LITEV_JIT_STORE_REPROMOTE) || defined(LITEV_JIT_COND_MEMGUESS)
+#if defined(LITEV_JIT_STORE_REPROMOTE) || defined(LITEV_JIT_COND_MEMGUESS) || defined(LITEV_JIT_USERSTM_FASTMEM)
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
@@ -33,6 +33,13 @@
 #endif
 
 using namespace Arm64Gen;
+
+#ifdef LITEV_SLOWMEM_HIST
+namespace melonDS { void LitevSlowSiteNote(const void* ret, u32 info); }
+#define NOTE_SLOW_SITE(info) LitevSlowSiteNote((const u8*)GetRXPtr() - 4, (info))
+#else
+#define NOTE_SLOW_SITE(info) ((void)0)
+#endif
 
 namespace melonDS
 {
@@ -173,6 +180,26 @@ bool Compiler::CondMemGuess(bool addrIsStatic)
     return false;
 #endif
 }
+
+#ifdef LITEV_JIT_USERSTM_FASTMEM
+// User-bank STM (STM ... ^, e.g. NitroSDK's thread context save STMIB r0, {r2-r14}^, ~200 per
+// frame in the PW overworld) always took the slow helper. It now takes the fastmem path like any
+// other STM: same words to the same addresses, banked registers read through ReadBanked exactly
+// as the slow path does. Guest-invisible.
+static bool UserStmFastOn()   // debug.litev.userstmfast (default on), env LITEV_USERSTMFAST off the device
+{
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.userstmfast", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_USERSTMFAST");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on;
+}
+#endif
 
 bool Compiler::Comp_MemLoadLiteral(int size, bool signExtend, int rd, u32 addr)
 {
@@ -440,6 +467,7 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
                     case 8: QuickCallFunction(X3, SlowWrite9<u8, 0>); break;
                     case 9: QuickCallFunction(X3, SlowWrite9<u8, 1>); break;
                     }
+                    NOTE_SLOW_SITE(expectedTarget | (CurInstr.Cond() << 8) | (CurInstr.DataExecuted << 12) | ((u32)Thumb << 13) | ((u32)(size >> 3) << 16));
                 }
                 else
                 {
@@ -676,6 +704,11 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         ? NDS.JIT.Memory.ClassifyAddress9(CurInstr.DataRegion)
         : NDS.JIT.Memory.ClassifyAddress7(CurInstr.DataRegion);
 
+#ifdef LITEV_JIT_USERSTM_FASTMEM
+    const bool userFast = usermode && store && UserStmFastOn();
+#else
+    const bool userFast = false;
+#endif
 #ifdef LITEV_JIT_LDM_FASTMEM
     // Loads take the fault-backed fastmem path too (LDP straight into the guest registers,
     // the helper call out of line in the far region), not only stores. A fault mid-transfer
@@ -683,10 +716,10 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     // loaded register), which rewrites every destination, so a partially loaded block leaves
     // no trace. Cycles were added above, identically for both paths.
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
-        && !usermode && ((CurInstr.Cond() < 0xE && !CondMemGuess(false)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+        && (!usermode || userFast) && ((CurInstr.Cond() < 0xE && !CondMemGuess(false)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
 #else
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
-        && store && !usermode && ((CurInstr.Cond() < 0xE && !CondMemGuess(false)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+        && store && (!usermode || userFast) && ((CurInstr.Cond() < 0xE && !CondMemGuess(false)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
 #endif
 
     {
@@ -706,15 +739,55 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     if (compileFastPath)
     {
         ptrdiff_t fastPathStart = GetCodeOffset();
-        ptrdiff_t loadStoreOffsets[8];
-
-        ADD(X1, RMemBase, X0);
+        ptrdiff_t loadStoreOffsets[16];
 
         u32 offset = 0;
         BitSet16::Iterator it = regs.begin();
         u32 i = 0;
 
-        if (regsCount & 1)
+        if (usermode)
+        {
+            // user-bank store (userFast): one STR per word; r8-r14 go through ReadBanked
+            // (W5 = mode, W1 = index, W3 = value in/out; clobbers X1, X2, flags, LR), so the
+            // host address lives in X6. On a fault the whole region becomes a call to the
+            // stub below, which redoes the transfer from W0 (untouched here).
+            if (regs & BitSet16(0x7f00))
+            {
+#ifdef LITEV_JIT_LAZYFLAGS
+                LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, CPSR));
+                UBFX(W5, W5, 0, 5);
+#else
+                UBFX(W5, RCPSR, 0, 5);
+#endif
+            }
+            ADD(X6, RMemBase, X0);
+            for (int reg : regs)
+            {
+                ARM64Reg val = W3;
+                if (RegCache.LoadedRegs & (1 << reg))
+                {
+                    if (reg >= 8 && reg < 15)
+                        MOV(W3, MapReg(reg));
+                    else
+                        val = MapReg(reg);
+                }
+                else
+                    LoadReg(reg, W3);
+                if (reg >= 8 && reg < 15)
+                {
+                    MOVI2R(W1, reg - 8);
+                    BL(ReadBanked);
+                }
+                loadStoreOffsets[i++] = GetCodeOffset();
+                STR(INDEX_UNSIGNED, val, X6, offset);
+                offset += 4;
+            }
+            it = regs.end();
+        }
+        else
+            ADD(X1, RMemBase, X0);
+
+        if (!usermode && (regsCount & 1))
         {
             int reg = *it;
             it++;
@@ -1102,6 +1175,9 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         case 2: QuickCallFunction(X4, SlowBlockTransfer9<true, 0>); break;
         case 3: QuickCallFunction(X4, SlowBlockTransfer9<true, 1>); break;
         }
+        if (store)
+            NOTE_SLOW_SITE((u32)expectedTarget | (CurInstr.Cond() << 8) | (CurInstr.DataExecuted << 12) | ((u32)Thumb << 13)
+                | ((u32)usermode << 14) | ((u32)compileFastPath << 15) | ((u32)regsCount << 16) | (1u << 31));
     }
     else
     {
