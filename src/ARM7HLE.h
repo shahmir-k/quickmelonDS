@@ -11,7 +11,16 @@
 // of ARM7 cycles instead of the real count, scratch registers/stack bytes are not written and
 // the channels' hardware-busy bits are sampled at entry. Deterministic and version-locked.
 // Runtime: debug.litev.a7hle (prop on Android, env elsewhere; default on), latched per NDS.
-// LITEV_A7HLE_CHECK=1 (env, interpreter mode): run native AND guest, compare, report.
+//
+// SND_SeqMain (the sequencer: players, tracks, SSEQ bytecode, track->channel parameter update,
+// ~20% of the ARM7's guest instructions) runs natively on a copy of the sound work area, the
+// shared work and the random state; it commits the changed words only when the whole call
+// stayed within what it handles. A note that needs a new channel (bank lookup + allocation)
+// falls back to the guest for that call (~4-14% of calls on PW).
+//
+// LITEV_A7HLE_CHECK=1 (env, interpreter mode): run native AND guest, compare everything the
+// native path writes at the guest's return, report diffs. LITEV_A7HLE_COMMITCHECK=1: after a
+// native sequencer commit, verify memory equals the native result. LITEV_A7HLE_STATS=1: counts.
 #pragma once
 #ifdef LITEV_A7HLE
 #include "types.h"
