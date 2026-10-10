@@ -210,6 +210,18 @@ void HybridRenderer::PreSavestate()
 void HybridRenderer::PostSavestate()
 {
     Rend3D->Reset();   // texture cache
+#ifdef LITEV_HYB_CAPTURE_ASYNC
+    // The capture readback ring holds 3D reads from before this savestate (NumFrames-tagged).
+    // After a load (same or nearby NumFrames: netplay resync, a quick reload) a capture would
+    // write that pre-load 3D into the restored VRAM. Drop them: the next capture starts a fresh
+    // run (reads its own 3D). Done on save too, so the saving console and the one loading its
+    // state capture the same pixels from here on. PreSavestate's Wait3D finished the GL jobs;
+    // a read still pending in CapPrevSlot is finished by the next job and ignored.
+    for (u32& f : CapFrameOf) f = GPU.NDS.NumFrames - 3;   // older than any caplag (<= 2)
+#ifdef LITEV_FF_CAP_PREFETCH
+    PrefColor = -1;
+#endif
+#endif
 }
 
 void HybridRenderer::SetRenderSettings(RendererSettings& settings)

@@ -90,10 +90,10 @@ protected:
     u32* Output3D;
     alignas(8) u32 Output2D[2][256];
 
-#ifdef LITEV_SOFT2D_THREADED
     // Deferred (DraStic-model) software 2D: snapshot the final-composite per-scanline
     // state on the emu thread; the whole frame's raster+composite runs at VBlank, off
     // the per-scanline critical path (later banded across helper threads).
+    // (The type is declared in every build: DoCapture takes one.)
     struct FrameLineSnap
     {
         u32 DispCntA, DispCntB;
@@ -109,6 +109,7 @@ protected:
         // checks dropped the capture -> white)
         u32 CaptureCnt, VRAMMapLCDC;
     };
+#ifdef LITEV_SOFT2D_THREADED
     FrameLineSnap FrameSnap[192];
     // Render-owned copy (see async pipeline): the emu thread copies FrameSnap ->
     // FrameSnapR at VBlank, and the async render thread reads only FrameSnapR.
