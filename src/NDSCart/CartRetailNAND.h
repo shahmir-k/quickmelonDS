@@ -40,6 +40,9 @@ public:
 
     void ROMCommandStart(NDSCart::NDSCartSlot& cartslot, const u8* cmd) override;
     u32 ROMCommandReceive() override;
+#ifdef LITEV_A9HLE
+    bool HleRomPlain() const override { return false; }
+#endif
     void ROMCommandTransmit(u32 val) override;
 
     // NAND cartridges have no SPI interface

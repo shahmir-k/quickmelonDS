@@ -69,6 +69,11 @@ void A_UNK(ARM* cpu)
 
 void T_UNK(ARM* cpu)
 {
+#ifdef LITEV_A9HLE
+    // the JIT compiles a hooked Thumb ARM9 function entry as this fallback (see ARMJIT CompileBlock)
+    if (cpu->Num == 0 && A9HLE::Run(cpu, true))
+        return;
+#endif
     Log(LogLevel::Warn, "undefined THUMB%d instruction %04X @ %08X\n", cpu->Num?7:9, cpu->CurInstr, cpu->R[15]-4);
 #ifdef GDBSTUB_ENABLED
     cpu->GdbStub.Enter(cpu->GdbStub.IsConnected(), Gdb::TgtStatus::FaultInsn, cpu->R[15]-4);
