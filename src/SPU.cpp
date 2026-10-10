@@ -570,6 +570,8 @@ static const struct ADPCMTables
 {
     u16 Diff[89][8];
     u8 Next[89][8];
+    s32 DiffS[89][16];   // signed step for the full nibble (bit 3 = subtract): branch-free decode
+    u8 Next16[89][16];
     ADPCMTables()
     {
         for (int i = 0; i < 89; i++)
@@ -583,6 +585,8 @@ static const struct ADPCMTables
                 Diff[i][n] = diff;
                 const int next = i + SPUChannel::ADPCMIndexTable[n];
                 Next[i][n] = next < 0 ? 0 : next > 88 ? 88 : next;
+                DiffS[i][n] = diff; DiffS[i][n + 8] = -(s32)diff;
+                Next16[i][n] = Next16[i][n + 8] = Next[i][n];
             }
     }
 } ADPCMTabs;
@@ -768,11 +772,13 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
             {
                 if (!(pos & 1)) curByte = ram[(src + (pos >> 1)) & mask];
                 else            curByte >>= 4;
-                const u32 nib = curByte & 0x7;
-                const s32 diff = ADPCMTabs.Diff[idx][nib];
-                if (curByte & 0x8) { val -= diff; if (val < -0x7FFF) val = -0x7FFF; }
-                else               { val += diff; if (val > 0x7FFF)  val = 0x7FFF; }
-                idx = ADPCMTabs.Next[idx][nib];
+                // branch-free: the sign bit was a coin flip for the in-order A55's predictor. val
+                // stays within +-0x7FFF, so clamping both ends == the one-sided clamps.
+                const u32 nib = curByte & 0xF;
+                val += ADPCMTabs.DiffS[idx][nib];
+                val = val < -0x7FFF ? -0x7FFF : val;
+                val = val > 0x7FFF ? 0x7FFF : val;
+                idx = ADPCMTabs.Next16[idx][nib];
                 if (pos == (s32)(LoopPos << 1)) { valLoop = val; idxLoop = idx; }
             }
             cur = val;

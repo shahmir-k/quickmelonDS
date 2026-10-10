@@ -558,6 +558,9 @@ protected:
     u16 SqrtCnt;
     alignas(u64) u32 SqrtVal[2];
     u32 SqrtRes;
+#ifdef LITEV_LAZY_DIV
+    bool DivDirty = false;   // DivDone pending: run on the next read of DIVCNT/DIV_RESULT or a savestate
+#endif
 #ifdef LITEV_LAZY_SQRT
     bool SqrtDirty = false;
 #endif

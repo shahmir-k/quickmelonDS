@@ -532,6 +532,9 @@ void NDS::Reset()
 
     DivCnt = 0;
     SqrtCnt = 0;
+#ifdef LITEV_LAZY_DIV
+    DivDirty = false;
+#endif
 #ifdef LITEV_LAZY_SQRT
     SqrtDirty = false;
 #endif
@@ -659,6 +662,9 @@ u32 NDS::GetSavestateConfig()
 
 bool NDS::DoSavestate(Savestate* file)
 {
+#ifdef LITEV_LAZY_DIV
+    if (DivDirty) { DivDirty = false; DivDone(0); }
+#endif
 #ifdef LITEV_LAZY_SQRT
     // SQRTCNT is in the state and SQRT_RESULT must be what the eager path left.
     if (SqrtDirty) { SqrtDirty = false; SqrtDone(0); }
@@ -2151,7 +2157,12 @@ void NDS::DivDone(u32 param)
 
 void NDS::StartDiv()
 {
-#ifdef LITEV_INSTANT_DIVSQRT
+#if defined(LITEV_LAZY_DIV)
+    // Lazy: DivDone (a pure function of the DIVCNT mode and the operands) runs on the next read of
+    // DIVCNT/DIV_RESULT/DIVREM_RESULT or at a savestate. PW's per-scanline IRQ handler restores
+    // the divider operands ~264x a frame and rarely reads a result.
+    DivDirty = true;
+#elif defined(LITEV_INSTANT_DIVSQRT)
     // Instant divide: compute now and skip the Event_Div completion. DivDone
     // clears the busy bit (0x8000) and fills the result registers, so the
     // result is ready same-cycle and busy is never observed set. Removes the
@@ -3147,6 +3158,9 @@ bool NDS::ARM7GetMemRegion(u32 addr, bool write, MemRegion* region)
 
 LITEV_MEM_SPLIT_NOINLINE u8 NDS::ARM9IORead8(u32 addr)
 {
+#ifdef LITEV_LAZY_DIV
+    if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
+#endif
 #ifdef LITEV_LAZY_SQRT
     if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
 #endif
@@ -3241,6 +3255,9 @@ LITEV_MEM_SPLIT_NOINLINE u8 NDS::ARM9IORead8(u32 addr)
 
 LITEV_MEM_SPLIT_NOINLINE u16 NDS::ARM9IORead16(u32 addr)
 {
+#ifdef LITEV_LAZY_DIV
+    if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
+#endif
 #ifdef LITEV_LAZY_SQRT
     if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
 #endif
@@ -3370,6 +3387,9 @@ LITEV_MEM_SPLIT_NOINLINE u16 NDS::ARM9IORead16(u32 addr)
 
 LITEV_MEM_SPLIT_NOINLINE u32 NDS::ARM9IORead32(u32 addr)
 {
+#ifdef LITEV_LAZY_DIV
+    if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
+#endif
 #ifdef LITEV_LAZY_SQRT
     if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
 #endif
