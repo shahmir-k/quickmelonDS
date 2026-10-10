@@ -29,6 +29,7 @@
 #include "../ARMJIT_RegisterCache.h"
 
 #include <unordered_map>
+#include <vector>
 
 namespace melonDS
 {
@@ -95,6 +96,61 @@ struct LoadStorePatch
     s32 PatchOffset;
     u32 PatchSize;
 };
+
+#ifdef LITEV_JIT_PATCHMAP_FLAT
+// Open-addressing map code offset -> LoadStorePatch for the few operations the compiler needs
+// (assign, find, erase, clear). std::unordered_map allocated a node per compiled memory access:
+// ~6% of a JIT compile burst on the RG DS was malloc + its page faults.
+class FlatPatchMap
+{
+public:
+    struct Slot { ptrdiff_t first; LoadStorePatch second; };
+    FlatPatchMap() { Grow(1 << 15); }
+    Slot* end() const { return nullptr; }
+    Slot* find(ptrdiff_t key)
+    {
+        for (size_t i = Hash(key);; i = (i + 1) & Mask)
+        {
+            if (Slots[i].first == key) return &Slots[i];
+            if (Slots[i].first == Empty) return nullptr;
+        }
+    }
+    void erase(Slot* s) { s->first = Tomb; Live--; }
+    LoadStorePatch& operator[](ptrdiff_t key)
+    {
+        if ((Used + 1) * 2 > Slots.size()) Grow(Live * 4 > Slots.size() ? Slots.size() * 2 : Slots.size());
+        Slot* tomb = nullptr;
+        for (size_t i = Hash(key);; i = (i + 1) & Mask)
+        {
+            if (Slots[i].first == key) return Slots[i].second;
+            if (Slots[i].first == Tomb) { if (!tomb) tomb = &Slots[i]; continue; }
+            if (Slots[i].first == Empty)
+            {
+                Slot* s = tomb ? tomb : &Slots[i];
+                if (!tomb) Used++;
+                Live++;
+                s->first = key; s->second = {};
+                return s->second;
+            }
+        }
+    }
+    void clear() { for (Slot& s : Slots) s.first = Empty; Used = Live = 0; }
+    void reserve(size_t) {}
+private:
+    static constexpr ptrdiff_t Empty = -1, Tomb = -2;
+    std::vector<Slot> Slots;
+    size_t Mask = 0, Used = 0, Live = 0;   // Used counts tombstones too (they lengthen probes)
+    size_t Hash(ptrdiff_t k) const { return (size_t)(((u64)k >> 2) * 0x9E3779B97F4A7C15ull >> 20) & Mask; }
+    void Grow(size_t n)
+    {
+        std::vector<Slot> old;
+        old.swap(Slots);
+        Slots.assign(n, Slot{Empty, {}});
+        Mask = n - 1; Used = Live = 0;
+        for (const Slot& s : old) if (s.first >= 0) (*this)[s.first] = s.second;
+    }
+};
+#endif
 
 class Compiler : public Arm64Gen::ARM64XEmitter
 {
@@ -514,7 +570,11 @@ public:
     u32 JitMemSecondarySize;
     u32 JitMemMainSize;
 
-    std::unordered_map<ptrdiff_t, LoadStorePatch> LoadStorePatches; 
+#ifdef LITEV_JIT_PATCHMAP_FLAT
+    FlatPatchMap LoadStorePatches;
+#else
+    std::unordered_map<ptrdiff_t, LoadStorePatch> LoadStorePatches;
+#endif
 
     RegisterCache<Compiler, Arm64Gen::ARM64Reg> RegCache;
 
