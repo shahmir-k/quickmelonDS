@@ -796,6 +796,16 @@ if (LITEV_GX_EARLY_REJECT)
 endif()
 # GX_BULK_LEAN: the bulk GX executor keeps its batch cursor in a register and skips the
 # push/pop counter that a bulk push/pop raises and lowers within its own handler. Exact.
+option(LITEV_GX_CMD_SLIM "Compact GX command executor: shared pre-delay/AddCycles/SubmitVertex, one matrix path (exact)" OFF)
+if (LITEV_GX_CMD_SLIM)
+    add_compile_definitions(LITEV_GX_CMD_SLIM=1)
+endif()
+
+option(LITEV_GX_CLIP_SLIM "Polygon clipper with the plane as a runtime argument: one copy instead of 3 axes x 2 sides (exact)" OFF)
+if (LITEV_GX_CLIP_SLIM)
+    add_compile_definitions(LITEV_GX_CLIP_SLIM=1)
+endif()
+
 option(LITEV_GX_BULK_LEAN "Bulk GX executor: batch cursor in a register (exact)" OFF)
 if (LITEV_GX_BULK_LEAN)
     add_compile_definitions(LITEV_GX_BULK_LEAN=1)
