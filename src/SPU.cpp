@@ -43,6 +43,11 @@
 #define LITEV_SPU_INL
 #endif
 
+#include <cstdlib>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+
 namespace melonDS
 {
 using Platform::Log;
@@ -679,6 +684,117 @@ LITEV_SPU_INL void SPUChannel::NextSample_ADPCM()
     CurSample = ADPCMVal;
 }
 
+#ifdef LITEV_SPU_FAST_ADPCM
+// Game-first ADPCM (debug.litev.spufast, default on): the same decode, loop and end handling as
+// NextSample_ADPCM + Run<2>, but over a batch with the channel state in locals and the sample
+// bytes read straight from main RAM (the hardware streams them through a 32-byte FIFO; reading at
+// decode time only differs if the game rewrites a sample while it plays). Audible output and the
+// channel's busy/end timing are otherwise the same. Main-RAM samples with linear/no interpolation.
+static bool SPUFastOn()
+{
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.spufast", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_SPUFAST");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on;
+}
+
+bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
+{
+    if (!SPUFastOn() || (SrcAddr >> 24) != 0x02) return false;
+    if (!(Cnt & (1u<<31)) || (Length + LoopPos) < 16)
+    {
+        for (int b = 0; b < n; b++) dst[b][col] = 0;
+        return true;
+    }
+    if (KeyOn) { Start(); KeyOn = false; }
+
+    const u8* ram = NDS.MainRAM;
+    const u32 mask = NDS.MainRAMMask;
+    const u32 src = SrcAddr;
+    const u32 total = LoopPos + Length;
+    const u32 repeat = (Cnt >> 27) & 0x3;
+    const bool interp = InterpType != AudioInterpolation::None;
+    const u32 reload = TimerReload;
+    u32 timer = Timer;
+    s32 pos = Pos, val = ADPCMVal, idx = ADPCMIndex, valLoop = ADPCMValLoop, idxLoop = ADPCMIndexLoop;
+    u32 curByte = ADPCMCurByte;
+    s32 cur = CurSample, p0 = PrevSample[0], p1 = PrevSample[1], p2 = PrevSample[2];
+    bool on = true;
+
+    for (int b = 0; b < n; b++)
+    {
+        if (!on) { dst[b][col] = 0; continue; }
+        timer += cycles;
+        while (timer >> 16)
+        {
+            timer = reload + (timer - 0x10000);
+            if (interp) { p2 = p1; p1 = p0; p0 = cur; }
+            pos++;
+            if (pos < 8)
+            {
+                if (pos == 0)
+                {
+                    const u32 header = *(const u32*)&ram[(src & ~3u) & mask];
+                    val = (s32)(s16)(header & 0xFFFF);
+                    idx = (header >> 16) & 0x7F;
+                    if (idx > 88) idx = 88;
+                    valLoop = val; idxLoop = idx;
+                }
+                continue;
+            }
+            if ((u32)(pos >> 1) >= total)
+            {
+                if (repeat & 1)
+                {
+                    pos = LoopPos << 1;
+                    val = valLoop; idx = idxLoop;
+                    curByte = ram[(src + LoopPos) & mask];
+                }
+                else if (repeat & 2)
+                {
+                    cur = 0;
+                    Cnt &= ~(1u<<31);
+                    on = false;
+                    break;
+                }
+            }
+            else
+            {
+                if (!(pos & 1)) curByte = ram[(src + (pos >> 1)) & mask];
+                else            curByte >>= 4;
+                const u32 nib = curByte & 0x7;
+                const s32 diff = ADPCMTabs.Diff[idx][nib];
+                if (curByte & 0x8) { val -= diff; if (val < -0x7FFF) val = -0x7FFF; }
+                else               { val += diff; if (val > 0x7FFF)  val = 0x7FFF; }
+                idx = ADPCMTabs.Next[idx][nib];
+                if (pos == (s32)(LoopPos << 1)) { valLoop = val; idxLoop = idx; }
+            }
+            cur = val;
+        }
+        if (!on || Volume == 0) { dst[b][col] = 0; continue; }
+        s32 v = cur;
+        if (interp)
+        {
+            const s32 frac = (timer >> 8) & 0xFF;
+            v = ((v * frac) + (p0 * (0xFF - frac))) >> 8;
+        }
+        v <<= VolumeShift;
+        dst[b][col] = v * Volume;
+    }
+
+    Timer = timer; Pos = pos; ADPCMVal = val; ADPCMIndex = idx;
+    ADPCMValLoop = valLoop; ADPCMIndexLoop = idxLoop; ADPCMCurByte = (u8)curByte;
+    CurSample = (s16)cur; PrevSample[0] = (s16)p0; PrevSample[1] = (s16)p1; PrevSample[2] = (s16)p2;
+    return true;
+}
+#endif
+
 LITEV_SPU_INL void SPUChannel::NextSample_PSG()
 {
     Pos++;
@@ -955,6 +1071,29 @@ void SPU::Mix(u32 spucycles)
     // coarsened. The ARM cores do not run between the batched samples, so SPU
     // IRQs / sound-capture writeback land up to (N-1) samples late -- a
     // deliberate FPS-first timing relaxation (flag default OFF).
+#ifdef LITEV_SPU_CHMAJOR
+    // Channel-major batch: run each enabled channel over the whole batch, then mix sample by sample.
+    // Channels don't read each other or the mix, and nothing else runs between batched samples, so
+    // each channel advances exactly as in the interleaved order (a disabled channel's Run returns 0
+    // before touching anything). Not with sound capture on (it writes the mix to RAM a channel may
+    // play) nor for a console nobody hears (its own path below).
+    s32 chmajor[LITEV_SPU_BATCH_N][16];
+    const bool chMajor = (Cnt & (1<<15)) && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7))
+                         && !LITEV_HEADLESS(Silent);
+    if (chMajor)
+    {
+        for (int i = 0; i < 16; i++)
+        {
+            SPUChannel& ch = Channels[i];
+            if (!(ch.Cnt & (1u<<31)))
+            {
+                for (u32 b = 0; b < (u32)(LITEV_SPU_BATCH_N); b++) chmajor[b][i] = 0;
+                continue;
+            }
+            ch.DoRunN(spucycles, chmajor, i, LITEV_SPU_BATCH_N);
+        }
+    }
+#endif
     for (u32 _spubatch = 0; _spubatch < (u32)(LITEV_SPU_BATCH_N); _spubatch++)
     {
 #endif
@@ -969,7 +1108,14 @@ void SPU::Mix(u32 spucycles)
         // A console nobody hears (Netplay's other players): the mix only feeds the speakers,
         // unless sound capture records it into memory, so skip it (and each channel's output value).
         const bool quiet = LITEV_HEADLESS(Silent) && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7)) && NDS.ConsoleType == 0;
+#ifdef LITEV_ACCESS_STATS
+        { extern u64 LitevAccess[6][0x10000]; for (int i = 0; i < 16; i++) if (Channels[i].Cnt & (1u<<31)) LitevAccess[5][0xD000 | ((((Channels[i].Cnt >> 29) & 3) << 10)) | ((0x10000 - Channels[i].TimerReload) >> 6 & 0x3FF)]++; }
+#endif
         s32 cv[16];
+#if defined(LITEV_SPU_CHMAJOR) && defined(LITEV_SPU_BATCH)
+        if (chMajor) memcpy(cv, chmajor[_spubatch], sizeof(cv));
+        else
+#endif
         for (int i = 0; i < 16; i++) cv[i] = Channels[i].DoRun(spucycles, !quiet);
         const s32 ch1 = cv[1], ch3 = cv[3];   // raw values for the routing switch below
 

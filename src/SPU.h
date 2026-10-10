@@ -137,6 +137,37 @@ public:
     // out=false: advance and decode exactly, but skip the output value (nobody hears it)
     template<u32 type> s32 Run(u32 cycles, bool out = true);
 
+#ifdef LITEV_SPU_FAST_ADPCM
+    // approximate ADPCM channel over n output ticks: state in locals, sample bytes read straight
+    // from main RAM instead of through the 32-byte channel FIFO. false = not applicable
+    bool RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n);
+#endif
+#ifdef LITEV_SPU_CHMAJOR
+    // n samples of this channel into dst[0..n)[col], the type switch hoisted out of the loop
+    template<u32 type> void RunN(u32 cycles, s32 (*dst)[16], int col, int n)
+    {
+        for (int b = 0; b < n; b++) dst[b][col] = Run<type>(cycles, true);
+    }
+    void DoRunN(u32 cycles, s32 (*dst)[16], int col, int n)
+    {
+        switch ((Cnt >> 29) & 0x3)
+        {
+        case 0: RunN<0>(cycles, dst, col, n); return;
+        case 1: RunN<1>(cycles, dst, col, n); return;
+        case 2:
+#ifdef LITEV_SPU_FAST_ADPCM
+            if (RunADPCMFast(cycles, dst, col, n)) return;
+#endif
+            RunN<2>(cycles, dst, col, n); return;
+        case 3:
+            if (Num >= 14) { RunN<4>(cycles, dst, col, n); return; }
+            if (Num >= 8)  { RunN<3>(cycles, dst, col, n); return; }
+            [[fallthrough]];
+        default:
+            for (int b = 0; b < n; b++) dst[b][col] = 0;
+        }
+    }
+#endif
     s32 DoRun(u32 cycles, bool out = true)
     {
         switch ((Cnt >> 29) & 0x3)

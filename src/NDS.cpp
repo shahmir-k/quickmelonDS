@@ -46,6 +46,15 @@
 #include "ARMJIT_Memory.h"
 #include "LiteProfile.h"
 
+// LITEV_MEM_SPLIT: keep the IO register handlers out of line, so ARM9Read32/ARM9Write32 (every
+// slow-path access: VRAM, palette, OAM, rewritten main RAM stores) stay a small switch instead of
+// carrying the IO switch + divider math in their prologue/epilogue (~35% of ARM9Write32 on device)
+#ifdef LITEV_MEM_SPLIT
+#define LITEV_MEM_SPLIT_NOINLINE __attribute__((noinline))
+#else
+#define LITEV_MEM_SPLIT_NOINLINE
+#endif
+
 namespace melonDS
 {
 #ifdef LITEV_ACCESS_STATS
@@ -3136,7 +3145,7 @@ bool NDS::ARM7GetMemRegion(u32 addr, bool write, MemRegion* region)
     case (addr+2): return ((val) >> 16) & 0xFF; \
     case (addr+3): return (val) >> 24;
 
-u8 NDS::ARM9IORead8(u32 addr)
+LITEV_MEM_SPLIT_NOINLINE u8 NDS::ARM9IORead8(u32 addr)
 {
 #ifdef LITEV_LAZY_SQRT
     if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
@@ -3230,7 +3239,7 @@ u8 NDS::ARM9IORead8(u32 addr)
     return 0;
 }
 
-u16 NDS::ARM9IORead16(u32 addr)
+LITEV_MEM_SPLIT_NOINLINE u16 NDS::ARM9IORead16(u32 addr)
 {
 #ifdef LITEV_LAZY_SQRT
     if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
@@ -3359,7 +3368,7 @@ u16 NDS::ARM9IORead16(u32 addr)
     return 0;
 }
 
-u32 NDS::ARM9IORead32(u32 addr)
+LITEV_MEM_SPLIT_NOINLINE u32 NDS::ARM9IORead32(u32 addr)
 {
 #ifdef LITEV_LAZY_SQRT
     if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
@@ -3589,7 +3598,7 @@ u32 NDS::ARM9IORead32(u32 addr)
     return 0;
 }
 
-void NDS::ARM9IOWrite8(u32 addr, u8 val)
+LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite8(u32 addr, u8 val)
 {
     switch (addr)
     {
@@ -3708,7 +3717,7 @@ void NDS::ARM9IOWrite8(u32 addr, u8 val)
     Log(LogLevel::Debug, "unknown ARM9 IO write8 %08X %02X %08X\n", addr, val, ARM9.R[15]);
 }
 
-void NDS::ARM9IOWrite16(u32 addr, u16 val)
+LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite16(u32 addr, u16 val)
 {
     switch (addr)
     {
@@ -3885,7 +3894,7 @@ void NDS::ARM9IOWrite16(u32 addr, u16 val)
     Log(LogLevel::Debug, "unknown ARM9 IO write16 %08X %04X %08X\n", addr, val, ARM9.R[15]);
 }
 
-void NDS::ARM9IOWrite32(u32 addr, u32 val)
+LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite32(u32 addr, u32 val)
 {
 #ifdef LITEV_IO_DISPATCH_TABLE
     // Fast O(1) dispatch for word-aligned accesses in the primary 8 KB I/O window

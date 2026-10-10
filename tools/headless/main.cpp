@@ -57,6 +57,7 @@ static void DumpAccessStats()
     for (size_t i = 0; i < v.size() && i < 40; i++)
     {
         int a = v[i].second.second;
+        if (a >= 0xD000 && a < 0xE000) { int step = (a & 0x3FF) << 6; fprintf(stderr, "SPUCH type %d rate ~%d Hz (timer step %d) channel-samples %llu\n", (a >> 10) & 3, step ? (int)(33513982.0 / 2 / step) : 0, step, (unsigned long long)v[i].first); continue; }
         if (a >= 0xE000 && a < 0xF000) { fprintf(stderr, "IRQ %s source %d %llu\n", v[i].second.first == 4 ? "ARM9" : "ARM7", a & 0xFF, (unsigned long long)v[i].first); continue; }
         if (a >= 0xF000) fprintf(stderr, "ACCESS %s region %02X:%X %llu\n", kinds[v[i].second.first], (a >> 4) & 0xFF, a & 0xF, (unsigned long long)v[i].first);
         else fprintf(stderr, "ACCESS %s io %08X %llu\n", kinds[v[i].second.first], a >= 0x2000 ? 0x04100000 | (a & 0xFF) : 0x04000000 | a, (unsigned long long)v[i].first);
