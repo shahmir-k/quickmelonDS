@@ -73,7 +73,7 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr);
 // so any write there invalidates the block (and the next compile re-verifies)
 struct Range { u32 a, b; };
 constexpr int kNumCode = 17;
-int Deps(u32 addr, const Range*& r);
+int Deps(melonDS::NDS& nds, u32 addr, const Range*& r);
 // Execute the hook at R15-8 (native, or the guest instruction on fallback). jit: reached from a
 // JIT-compiled hook (code already verified); else the code is compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).

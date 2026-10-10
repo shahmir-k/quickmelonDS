@@ -927,13 +927,16 @@ struct Pending
     const char* name = "";
     u64* diffs = nullptr;
     std::vector<std::pair<u32, std::vector<u8>>> regions;   // address, expected bytes
+    bool irq = false;           // an IRQ handler ran inside the guest call
 } g_Pending;
+u64 g_IrqDiffs = 0;             // differences with an IRQ in the guest window (the native call takes it after)
 
 void ArmCheck(melonDS::ARM* cpu, const char* name, u64* diffs)
 {
     g_Pending.ret = cpu->R[14] & ~1u;
     g_Pending.name = name;
     g_Pending.diffs = diffs;
+    g_Pending.irq = false;
     CheckPending = true;
 }
 #endif
@@ -950,6 +953,9 @@ struct StatsDump
             fprintf(stderr, "A7HLE seq: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu\n",
                     s.status, (unsigned long long)s.calls, (unsigned long long)s.native,
                     (unsigned long long)s.fallbacks, (unsigned long long)s.checks, (unsigned long long)s.checkDiffs);
+#ifdef LITEV_HLE_DIAG
+        if (g_IrqDiffs) fprintf(stderr, "A7HLE check: %llu differences with an IRQ inside the guest call (not counted above)\n", (unsigned long long)g_IrqDiffs);
+#endif
     }
 } g_StatsDump;
 }
@@ -1145,7 +1151,8 @@ bool Run(melonDS::ARM* cpu, bool jit)
 #ifdef LITEV_HLE_DIAG
 void CheckAt(melonDS::ARM* cpu, u32 pc)
 {
-    if (pc != g_Pending.ret || (cpu->CPSR & 0x1F) == 0x12) return;
+    if ((cpu->CPSR & 0x1F) == 0x12) { g_Pending.irq = true; return; }
+    if (pc != g_Pending.ret) return;
     CheckPending = false;
     melonDS::NDS& nds = cpu->NDS;
     bool diff = false;
@@ -1162,8 +1169,9 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         }
     if (diff)
     {
-        if (*g_Pending.diffs < 10) fprintf(stderr, "\n");
-        (*g_Pending.diffs)++;
+        if (*g_Pending.diffs < 10) fprintf(stderr, "%s\n", g_Pending.irq ? " (IRQ in the guest window: not counted)" : "");
+        if (g_Pending.irq) g_IrqDiffs++;
+        else (*g_Pending.diffs)++;
     }
 }
 #endif
