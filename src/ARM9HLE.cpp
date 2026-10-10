@@ -247,15 +247,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 14;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 4095;
+constexpr int kKinds = 15;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 8191;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -290,9 +290,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -1951,6 +1951,87 @@ __attribute__((noinline)) bool RunMatT(melonDS::ARMv5* c, State& s, bool jit)
 }
 #endif
 
+// ---- 14. VEC_Normalize (NitroSDK fx32 vector normalize) ----------------------------------------------------------
+// len2 = x*x + y*y + z*z (64-bit), the divider in 64/64 mode for 2^56 / len2 and the square root unit in 64-bit mode
+// for sqrt(len2 * 4), two busy-wait loops, then three 64-bit fixed-point products: 66 guest instructions, 14 JIT blocks /
+// 11 KB of host code (the wait loops split it), 58 calls a frame in the PW title. Natively at its entry: the same 8 IO
+// stores (the divider / sqrt registers end as the guest leaves them, results through the normal IO reads, so a zero
+// length behaves as the hardware), the results, the stack frame, registers and flags. Position independent (exact
+// code words; PW, PB, W2). Category B: a fixed cycle estimate.
+constexpr u32 kVecInstr = 0xE92D4FF8;   // push {r3-r11, lr}
+constexpr u32 kVecCode[69] = {
+    0xE92D4FF8, 0xE5902004, 0xE5903000, 0xE0C76292, 0xE0E76393, 0xE5902008, 0xE59F50E8, 0xE0E76292, 0xE3A03002, 0xE1C530B0,
+    0xE3A04000, 0xE5854010, 0xE3A03401, 0xE5853014, 0xE5856018, 0xE1A02107, 0xE585701C, 0xE3A03001, 0xE1C533B0, 0xE1A04106,
+    0xE5854038, 0xE1822F26, 0xE585203C, 0xE1D523B0, 0xE3120902, 0x1AFFFFFC, 0xE59F209C, 0xE592C000, 0xE2423034, 0xE1D320B0,
+    0xE3120902, 0x1AFFFFFC, 0xE59F7088, 0xE5908000, 0xE5976000, 0xE9904020, 0xE0823C96, 0xE1A00FCC, 0xE0222096, 0xE597B004,
+    0xE089A893, 0xE1A04FC8, 0xE0222C9B, 0xE0299493, 0xE0299892, 0xE1A00FC5, 0xE0867593, 0xE0266093, 0xE29AA000, 0xE2A90A01,
+    0xE1A046C0, 0xE5814000, 0xE1A00FCE, 0xE08C4E93, 0xE02CC093, 0xE0266592, 0xE2970000, 0xE2A60A01, 0xE1A036C0, 0xE02CCE92,
+    0xE2940000, 0xE2AC0A01, 0xE1A006C0, 0xE5813004, 0xE5810008, 0xE8BD8FF8, 0x04000280, 0x040002B4, 0x040002A0};
+// ponytail: fixed estimate (check-mode guest average, PW title)
+constexpr s32 kVecCyc = 213;   // (every one of 22.9k check-mode calls: 213)
+
+bool VecAt(melonDS::ARMv5* c, u32 a, int n)
+{
+    if (a & 3) return false;
+    for (int i = 0; i < n; i++) { const u8* p = CodePtr(c, a + i * 4); if (!p || R32(p) != kVecCode[i]) return false; }
+    return true;
+}
+
+__attribute__((noinline)) bool RunVec(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && !VecAt(c, pc, 69)) return false;
+    s.calls[14]++;
+    melonDS::NDS& nds = c->NDS;
+    const u32 src = c->R[0], dst = c->R[1], sp = c->R[13];
+    Mem m(c, g_Check || g_Dry);
+    Obj sv = m.O(src, 12), dv = m.O(dst, 12), st = m.O(sp - 40, 40);
+    // the IO page passes the protection unit (else the guest's data abort)
+    bool ok = !CheckPending && sv && dv && st && (c->PU_Map[0x04000280 >> 12] & 0x03) == 0x03;
+    if (!ok)
+    {
+        s.fallback[14] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    const s32 x = (s32)sv.r(0), y = (s32)sv.r(4), z = (s32)sv.r(8);
+    const u64 l2 = (u64)((s64)x * x) + (u64)((s64)y * y) + (u64)((s64)z * z);
+    const u32 lo = (u32)l2, hi = (u32)(l2 >> 32);
+    // the guest's stores (in check mode too: the guest repeats them with the same values), then the results
+    nds.ARM9Write16(0x04000280, 2);
+    nds.ARM9Write32(0x04000290, 0); nds.ARM9Write32(0x04000294, 0x01000000);
+    nds.ARM9Write32(0x04000298, lo); nds.ARM9Write32(0x0400029C, hi);
+    nds.ARM9Write16(0x040002B0, 1);
+    nds.ARM9Write32(0x040002B8, lo << 2); nds.ARM9Write32(0x040002BC, (hi << 2) | (lo >> 30));
+    const u32 sq = nds.ARM9Read32(0x040002B4), dlo = nds.ARM9Read32(0x040002A0), dhi = nds.ARM9Read32(0x040002A4);
+    const u64 f = ((u64)dhi << 32 | dlo) * (u64)(s64)(s32)sq;
+    auto comp = [&](s32 v, u32& plo) { const u64 p = f * (u64)(s64)v; plo = (u32)p; return (u32)((s32)((u32)(p >> 32) + 0x1000) >> 13); };
+    u32 px, py, pz;
+    const u32 rx = comp(x, px), ry = comp(y, py), rz = comp(z, pz);
+    for (int i = 0; i < 9; i++) m.W(st, i * 4, c->R[3 + i]);
+    m.W(st, 36, c->R[14]);
+    m.W(dv, 0, rx); m.W(dv, 4, ry); m.W(dv, 8, rz);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = rz; e.R[2] = (u32)(f >> 32); e.R[12] = (u32)((f * (u64)(s64)z) >> 32); e.R[14] = (u32)z;   // ldmib r0, {r5, lr}
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFDF) | (pz & 0x80000000) | ((pz == 0) << 30) | ((e.retPc & 1) << 5);    // adds r0, r4, #0
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check) ArmCheck(c, 14, m, e);
+        s.checks[14]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    m.Flush();
+    s.native[14]++;
+    Return(c, e, kVecCyc);
+    return true;
+}
+
 // ---- 9. _ll_sdiv: 64-bit signed divide of the compiler runtime -----------------------------------
 // r1:r0 / r3:r2 by shift-and-subtract (~750 guest instructions a call; PW: 2-3 calls a frame from one
 // caller in 3D scenes). Natively: the quotient, r3:r2 = |divisor| normalized (shifted left until bit
@@ -2204,6 +2285,13 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return 3;
     }
 #endif
+    if (instr == kVecInstr)
+    {
+        static thread_local Range vn;
+        vn = {addr, addr + 69 * 4};
+        r = &vn;
+        return 1;
+    }
     if (instr == kSdivInstr)
     {
         static thread_local Range sd;
@@ -2287,6 +2375,12 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return s.on && (s.mask & 128) ? MatAt(&nds.ARM9, addr, def, opn, snd) : 0;
     }
 #endif
+    if (instr == kVecInstr)
+    {
+        State& s = St(&nds.ARM9);
+        if (!s.on || !(s.mask & 4096) || !VecAt(&nds.ARM9, addr, 3)) return 0;
+        return VecAt(&nds.ARM9, addr, 69) ? 1 : 2;
+    }
     if (instr == kSdivInstr)
     {
         State& s = St(&nds.ARM9);
@@ -3045,6 +3139,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
     {
         State& s = St(c);
         return s.on && (s.mask & 256) && RunSdiv(c, s, jit);
+    }
+    if (in == kVecInstr)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 4096) && RunVec(c, s, jit);
     }
     State& s = Get(c, pc, in);
     if (s.status != 1) return false;

@@ -26,7 +26,7 @@
 // 0 off, 1 all, other values = the mask below.
 // Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material,
 // 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ,
-// 2048 G3D shape (needs 512); 8 needs 1)
+// 2048 G3D shape (needs 512), 4096 VEC_Normalize; 8 needs 1)
 // for A/B of single hooks.
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
@@ -69,6 +69,8 @@
 //    >= 0x100 bytes with 10.'s work (from the register file the guest has at MI_SendGXCommandAsync), a small one as
 //    NNS_G3dGeBufferOP_N's direct GXFIFO send (BulkWords); the frames, flags and registers up to SHP's return.
 //
+// 14. VEC_Normalize (position independent: PW, PB, W2): the divider / sqrt stores, results, frame, registers natively.
+//
 // Diagnostics (build with LITEV_HLE_DIAG; compiled out of shipping builds):
 //
 // LITEV_A9HLE_CHECK=1 (env, interpreter mode): compute the native result, run the guest code
@@ -90,7 +92,7 @@ namespace melonDS::A9HLE
 {
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
 inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001 || instr == 0xE5942000
-                                        || instr == 0xE92D4010 || instr == 0xE92D58F0; }
+                                        || instr == 0xE92D4010 || instr == 0xE92D58F0 || instr == 0xE92D4FF8; }
 // Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4} / MIi_FIFOCallback
 // push {r3-r7, lr} / SBC MAT push {r4-r6, lr}); instr: the halfword
 inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8 || instr == 0xB570; }
