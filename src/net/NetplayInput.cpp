@@ -123,6 +123,9 @@ NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const
     Faults.LatencyMs = latencyMs;
     for (int p = 0; p < kMaxPlayers; p++)
         PeerAck[p] = RemoteUpTo[p] = delayFrames - 1; // frames before Delay are never sent
+#ifdef LITEV_NP_SPEED
+    LocalUpTo = delayFrames - 1;
+#endif
 
     Socket = socket(AF_INET, SOCK_DGRAM, 0);
     if (Socket < 0) return;
@@ -168,7 +171,12 @@ void NetplayInput::Adapt(int frame)
 {
     s64 rtt = RttMaxUs.load();
     if (rtt < 0 || frame < DelayFrames) return;
-    int need = std::clamp((int)std::ceil(rtt / 2.0 / (1e6 / 60)) + 1, 1, kMaxDelay);
+#ifdef LITEV_NP_SPEED
+    const double periodUs = FramePeriodUs.load();   // fast-forward: the same round trip is more frames
+#else
+    const double periodUs = 1e6 / 60;
+#endif
+    int need = std::clamp((int)std::ceil(rtt / 2.0 / periodUs) + 1, 1, kMaxDelay);
     int cur = CurDelay.load();
     if (need > cur) { CurDelay = need; LowFrames = 0; }
     else if (need < cur && ++LowFrames >= 120) { CurDelay = cur - 1; LowFrames = 90; }   // then -1 per 30 frames
@@ -188,7 +196,11 @@ void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
         // the applied frames stay contiguous: a longer delay holds the previous input over the
         // gap, a shorter one merges this sample into the next (its presses are kept)
         NetplayFrameInput in = input;
+#ifdef LITEV_NP_SPEED
+        in.Keys &= Carry.Keys | ~0xFFFu;    // active low; the speed request bits are this sample's
+#else
         in.Keys &= Carry.Keys;  // active low
+#endif
         if (in.TouchX < 0) { in.TouchX = Carry.TouchX; in.TouchY = Carry.TouchY; }
         if (LastApplied >= 0 && applied <= LastApplied) { Carry = in; return; }
         Carry = {};
@@ -196,6 +208,9 @@ void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
         {
             Inputs[Local][f] = LastInput;
             Unacked.emplace_back(f, LastInput);
+#ifdef LITEV_NP_SPEED
+            NoteSpeed(Local, f, LastInput);
+#endif
         }
         LastApplied = applied;
         LastInput = in;
@@ -204,6 +219,9 @@ void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
 #endif
         Inputs[Local][applied] = in;
         Unacked.emplace_back(applied, in);
+#ifdef LITEV_NP_SPEED
+        NoteSpeed(Local, applied, in);
+#endif
         Changed.notify_all();
     }
     Send();
@@ -254,6 +272,51 @@ void NetplayInput::Send()
         sendto(Socket, packet.data(), packet.size(), 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
     }
 }
+
+#ifdef LITEV_NP_SPEED
+void NetplayInput::NoteSpeed(int player, int frame, const NetplayFrameInput& in)
+{
+    int code = NetplaySpeed::Of(in);
+    if (player == Local) LocalUpTo = std::max(LocalUpTo, frame);
+    if (code != SpeedLast[player]) { SpeedChanges[player][frame] = code; SpeedLast[player] = code; }
+}
+
+int NetplayInput::SpeedAt(int frame, u32* requesters)
+{
+    if (requesters) *requesters = 0;
+    frame -= kSpeedLag;
+    if (frame < 0) return 0;
+    std::unique_lock<std::mutex> lk(Lock);
+    auto known = [&]
+    {
+        if (!Running) return true;
+        if (LocalUpTo < frame) return false;
+        for (int peer : Peers) if (RemoteUpTo[peer] < frame && !Dropped(peer)) return false;
+        return true;
+    };
+    if (!known())
+    {
+        u64 start = NowUs();
+        while (!Changed.wait_for(lk, std::chrono::seconds(2), known))
+            Platform::Log(Platform::LogLevel::Warn, "Netplay: still waiting for every player's input at frame %d (session speed)\n", frame);
+        PeerWaitUs += NowUs() - start;
+    }
+    int best = 0;
+    u32 who = 0;
+    for (int p = 0; p < kMaxPlayers; p++)
+    {
+        auto& ch = SpeedChanges[p];
+        auto it = ch.upper_bound(frame);
+        if (it == ch.begin()) continue;
+        int code = std::prev(it)->second;
+        ch.erase(ch.begin(), std::prev(it));    // older changes are never asked for again
+        if (code) who |= 1u << p;
+        best = std::max(best, code);
+    }
+    if (requesters) *requesters = who;
+    return best;
+}
+#endif
 
 void NetplayInput::SendHash(int frame, u64 hash)
 {
@@ -411,7 +474,11 @@ void NetplayInput::ReceiveLoop()
                     RttMaxUs = worst;
                 }
 #endif
+#ifdef LITEV_NP_SPEED
+                while (inputs.count(RemoteUpTo[from] + 1)) { RemoteUpTo[from]++; NoteSpeed(from, RemoteUpTo[from], inputs[RemoteUpTo[from]]); }
+#else
                 while (inputs.count(RemoteUpTo[from] + 1)) RemoteUpTo[from]++;
+#endif
                 PeerAck[from] = std::max(PeerAck[from], header.Ack);
                 int allAcked = INT32_MAX;
                 for (int peer : Peers) allAcked = std::min(allAcked, PeerAck[peer]);

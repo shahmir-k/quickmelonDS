@@ -322,6 +322,16 @@ NetplayFrameInput ScriptInput(BuiltNDS& b, int frame)
     return in;
 }
 
+#ifdef LITEV_NP_SPEED
+std::string SpeedName(int code)
+{
+    char b[16];
+    if (code == NetplaySpeed::kUncapped) return "uncapped";
+    snprintf(b, sizeof(b), "%.2fx", NetplaySpeed::Multiplier(code));
+    return b;
+}
+#endif
+
 // Netplay's way to apply an input
 void ApplyNetInput(NDS& nds, const NetplayFrameInput& in)
 {
@@ -790,6 +800,9 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     // jitter=MS, loss=PCT: more simulated network faults on receive; pace=FPS: this player's own
     // console runs at most FPS frames per second (the app: 60), the others as their inputs allow.
     // adaptive=0|1: input delay follows the measured round trip (NetplayInput::Adaptive).
+    // ff=F:M/F:M...: (LITEV_NP_SPEED) from this player's sampled frame F on, it requests session speed
+    // M (multiplier of pace; 1 = none, 0 or -1 = uncapped), as the app's fast-forward key does.
+    std::map<int, float> ffPlan;
     int player = 0, delay = -1, port = 7100, latency = 0, players = 0, jitter = 0, loss = 0, pace = 0, adaptive = -1;
     std::string peer, host = "127.0.0.1:7100";
     const char* np = getenv("LITEV_NETPLAY");
@@ -813,6 +826,14 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             else if (k == "loss") loss = atoi(v.c_str());
             else if (k == "pace") pace = atoi(v.c_str());
             else if (k == "adaptive") adaptive = atoi(v.c_str());
+            else if (k == "ff")
+                for (size_t q = 0; q < v.size();)
+                {
+                    size_t sl = v.find('/', q), c = v.find(':', q);
+                    if (c < sl) ffPlan[atoi(v.substr(q, c - q).c_str())] = (float)atof(v.substr(c + 1, sl - c - 1).c_str());
+                    if (sl == std::string::npos) break;
+                    q = sl + 1;
+                }
             if (end == std::string::npos) break;
             pos = end + 1;
         }
@@ -1131,6 +1152,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                         local.Keys = bi.inputScript.Loaded() ? bi.inputScript.KeyMaskForFrame(f) : 0xFFF;
                         int tx, ty;
                         if (bi.inputScript.HasTouch() && bi.inputScript.TouchForFrame(f, tx, ty)) { local.TouchX = tx; local.TouchY = ty; }
+#ifdef LITEV_NP_SPEED
+                        auto plan = ffPlan.upper_bound(f);
+                        if (plan != ffPlan.begin()) NetplaySpeed::Set(local, NetplaySpeed::Encode(std::prev(plan)->second));
+#endif
                         net->SubmitLocal(f, local);
                     }
                     NetplayFrameInput in = net->Get(inst, f);
@@ -1142,7 +1167,41 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_EVENT_TRACE
                 if (inst == 1 && getenv("LITEV_MP_EVTRACE_FROM")) gEvTraceOn = f + 1 >= atoi(getenv("LITEV_MP_EVTRACE_FROM"));
 #endif
+#ifdef LITEV_NP_SPEED
+                auto runT0 = std::chrono::steady_clock::now();
+#endif
                 bi.nds->RunFrame();
+#ifdef LITEV_NP_SPEED
+                // per console: emulation wall time per frame (incl. link waits), and for the local
+                // console the session speed, waits for the other players' input and pacing sleeps
+                static thread_local double runMs = 0, waitMs0 = 0, sleepMs = 0, workEma = 16.667;
+                static thread_local auto next = std::chrono::steady_clock::now();
+                static thread_local int lastCode = 0;
+                double runNow = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - runT0).count();
+                runMs += runNow;
+                if (net && np && inst == net->LocalPlayer() && f < frames)
+                {
+                    u32 who = 0;
+                    int code = net->SpeedAt(f, &who);
+                    if (code != lastCode)
+                    {
+                        printf("inst%d npspeed switch frame %d: %s requested by 0x%x\n", inst, f, SpeedName(code).c_str(), who);
+                        lastCode = code;
+                    }
+                    float m = NetplaySpeed::Multiplier(code);
+                    workEma = workEma * 0.9 + runNow * 0.1;
+                    auto now = std::chrono::steady_clock::now();
+                    if (pace > 0 && m > 0)
+                    {   // no catch-up after a stall (a burst would hide it in the average)
+                        next = std::max(next + std::chrono::microseconds((int)(1e6 / (pace * m))), now);
+                        std::this_thread::sleep_until(next);
+                        sleepMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now).count();
+                    }
+                    else next = now;
+                    net->SetFramePeriodUs(pace > 0 && m > 0 ? (int)(1e6 / (pace * m)) : (int)(workEma * 1000));
+                }
+                else
+#endif
                 if (pace > 0 && net && inst == net->LocalPlayer())
                 {   // no catch-up after a stall (a burst would hide it in the average)
                     static thread_local auto next = std::chrono::steady_clock::now();
@@ -1195,6 +1254,24 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                                w.Calls[1] / fr, w.Blocked[1] / fr, w.Ns[1] / 1e6 / fr, w.Calls[2] / fr, w.Blocked[2] / fr, w.Ns[2] / 1e6 / fr, w.Wakeups / fr, w.Contended / fr, w.LockNs / 1e6 / fr, w.Missed / fr);
                         lastCpu = cpu;
                     }
+#ifdef LITEV_NP_SPEED
+                    if (net && np)
+                    {
+                        timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+                        double cpu = ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+                        static thread_local double lastCpu = 0, lastWait = 0;
+                        if (inst == net->LocalPlayer())
+                        {
+                            double w = net->PeerWaitMs();
+                            printf("inst%d npspeed %d: speed %s fps %.1f | run %.2f cpu %.2f ms/f | wait for peers %.2f ms/f | sleep %.2f ms/f | delay %d\n", inst, f + 1,
+                                   SpeedName(lastCode).c_str(), every * 1000.0 / std::chrono::duration<double, std::milli>(now - lastT).count(),
+                                   runMs / every, (cpu - lastCpu) / every, (w - lastWait) / every, sleepMs / every, net->CurrentDelay());
+                            lastWait = w;
+                        }
+                        else printf("inst%d npcost %d: run %.2f cpu %.2f ms/f\n", inst, f + 1, runMs / every, (cpu - lastCpu) / every);
+                        lastCpu = cpu; runMs = sleepMs = 0;
+                    }
+#endif
                     if (net && np && inst == net->LocalPlayer())
                         printf("inst%d net %d: delay %d frames, peer round trip %.1f ms, stalled %.1f s\n", inst, f + 1, net->CurrentDelay(), net->PeerRttMs(), net->StallMs() / 1000);
                     lastT = now;
