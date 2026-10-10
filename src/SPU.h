@@ -297,6 +297,9 @@ public:
     void SetDegrade10Bit(bool enable);
     // Netplay: nobody hears this console; Mix skips the output path (state unchanged)
     bool Silent = false;
+    // LITEV_SPU_RATE_DIV: the app's Audio quality (1 full, 2 balanced, 4 performance): mix at
+    // 32768/RateDiv Hz. debug.litev.spudiv overrides it for testing.
+    u32 RateDiv = 1;
     void SetDegrade10Bit(AudioBitDepth depth);
     void SetApplyBias(bool enable);
 

@@ -712,16 +712,14 @@ static int BenchDiv = 0, BenchMemo = -1;
 // Each channel still steps every sample of its own (exact Timer/Pos/end/busy at the batch end, which
 // is all the ARM cores can see), but its output value, the pan mix and the blip delta are computed
 // once per div ticks. Only with the channel-major batch (no sound capture, someone listening).
-static u32 SPURateDiv()
+static u32 SPURateDiv(u32 setting)
 {
-    static const u32 d = [] {
-        const int v = SPUProp("debug.litev.spudiv", "LITEV_SPUDIV", 1);
-        return (u32)((v == 2 || v == 4) && (LITEV_SPU_BATCH_N) % v == 0 ? v : 1);
-    }();
+    static const int forced = SPUProp("debug.litev.spudiv", "LITEV_SPUDIV", 0);   // 0 = the setting
+    const u32 v = forced > 0 ? (u32)forced : setting;
 #ifdef LITEV_SPU_BENCH
     if (BenchDiv) return BenchDiv;
 #endif
-    return d;
+    return ((v == 2 || v == 4) && (LITEV_SPU_BATCH_N) % v == 0) ? v : 1;
 }
 #endif
 
@@ -1330,7 +1328,7 @@ void SPU::MixSamples(u32 spucycles)
     const bool chMajor = (Cnt & (1<<15)) && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7))
                          && !LITEV_HEADLESS(Silent);
 #ifdef LITEV_SPU_RATE_DIV
-    const u32 rateDiv = chMajor ? SPURateDiv() : 1;
+    const u32 rateDiv = chMajor ? SPURateDiv(RateDiv) : 1;
     const u32 nticks = (u32)(LITEV_SPU_BATCH_N) / rateDiv;
     const u32 mixcyc = spucycles * rateDiv;
 #else
