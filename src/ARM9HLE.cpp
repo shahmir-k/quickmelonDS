@@ -218,7 +218,11 @@ constexpr Variant kW2 = {
         {0, 0},
     },
     0x6d62f51b28952570ull,
-    {}, 0, 0, {}, 0, &kW2Mat,
+    // 11. (Thumb): OSi_IrqCallback + literals + the 12 OSi_IrqDma/Timer stubs (+0x58, 12 bytes each), OS_DisableIrqMask,
+    // MIi_DMACallback with its literals
+    {{0x02079C54, 0x02079D3C}, {0x02079EC0, 0x02079EE4}, {0x0207857C, 0x020785C0}},
+    0x0aa0dbea6ca9901full,
+    0, {}, 0, &kW2Mat,
 };
 constexpr const Variant* kVariants[] = {&kPW, &kPB, &kW2};
 constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
@@ -1002,8 +1006,9 @@ bool IrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, int&
 // order (IF, IE, GXSTAT, IE; IME toggles left out: IRQs are off and IME ends unchanged), the IRQ stack bytes,
 // the tables, flags and banked IRQ registers the guest leaves. Category B: a fixed cycle estimate.
 // ponytail: fixed estimate (guest average in check mode, IRQ entry to the BIOS return)
-constexpr s32 kDmaIrqCycles = 870;
+constexpr s32 kDmaIrqCycles = 870, kDmaIrqCyclesT = 785;     // PW/PB; W2 (Thumb build: 783-788 in check mode)
 constexpr u32 kClearCb[3] = {0xE3A01000, 0xE5801000, 0xE12FFF1E};    // mov r1, #0; str r1, [r0]; bx lr
+constexpr u16 kClearCbT[3] = {0x2100, 0x6001, 0x4770};                 // Thumb (W2): movs r1, #0; str r1, [r0]; bx lr
 
 struct IoPlan { u32 n = 0, a[4], v[4]; void Add(u32 x, u32 y) { a[n] = x; v[n++] = y; } };
 bool DmaIrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, u32 bit, IoPlan& io)
@@ -1021,12 +1026,13 @@ bool DmaIrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, u
     __builtin_prefetch(fs.p); __builtin_prefetch(fs.p + 64);
     const u32 cbFn = v.dmaCode[0].a, mdc = v.dmaCode[2].a;
     // the handler chain: BIOS -> OS_IrqHandler -> OSi_IrqDma<n> -> MIi_DMACallback; an empty thread queue, no reschedule
-    if (R32(s.fhp) != v.code[0].a || R32(s.ftab + bit * 4) != cbFn + 0x88 + n * 16 || R32(s.fq)
+    const u32 stub = v.twl ? (cbFn + 0x58 + n * 12) | 1 : cbFn + 0x88 + n * 16;
+    if (R32(s.fhp) != v.code[0].a || R32(s.ftab + bit * 4) != stub || R32(s.fq)
         || R16(s.fosi + (v.info - v.osi)) || !(nds.IME[0] & 1)) return false;
     const Obj tab{s.ftab, kIrqTable, s.ftabD}, tab2{s.ftab2, v.irqTable2, s.ftab2D};
-    if (tab2.r(n * 12) != mdc) return false;
+    if (tab2.r(n * 12) != (mdc | v.twl)) return false;     // (W2: a Thumb address)
     // the IRQ bit of entry n (OSi_IrqCallback's u16 table)
-    const u8* bt = m.P(R32(CodePtr(c, cbFn + 0x78)) + n * 2);
+    const u8* bt = m.P(R32(CodePtr(c, cbFn + (v.twl ? 0x40 : 0x78))) + n * 2);
     if (!bt || R16(bt) != bit) return false;
     Obj P = m.O(v.gxParams, 0x20);
     if (!P || P.dtcm) return false;
@@ -1034,8 +1040,8 @@ bool DmaIrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, u
     Obj A;
     if (ucb)
     {
-        const u8* q = CodePtr(c, ucb);
-        if ((ucb & 3) || !q || memcmp(q, kClearCb, 12)) return false;
+        const u8* q = CodePtr(c, ucb & ~1u);
+        if (!q || ((ucb & 1) ? (ucb & 2) || memcmp(q, kClearCbT, 6) : (ucb & 3) || memcmp(q, kClearCb, 12))) return false;
         A = m.O(arg, 4);
         if (!A) return false;
     }
@@ -1043,11 +1049,31 @@ bool DmaIrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, u
     const u32 ie0 = nds.IE[0], ie1 = ie0 & ~0x200000u, en = tab2.r(n * 12 + 4), ie2 = en ? ie1 : ie1 & ~(1u << bit);
     // IRQ stack (fs = sp - 92): OS_SetIrqFunction push {r4-r10, lr} | MIi_DMACallback push {r3-r5, lr} |
     // OSi_IrqCallback push {r3-r5, lr} | OS_IrqHandler push {lr} | BIOS push {r0-r3, r12, lr}
-    const u32 w[23] = {v.gxParams, 0x200000, c->R[6], c->R[7], c->R[8], c->R[9], c->R[10], mdc + 0x38,
-                       bit, 1u << bit, n * 12, cbFn + 0x44,
-                       0x80000000, c->R[4], c->R[5], v.code[0].a + 0x58,
-                       s.biosRet, c->R[0], c->R[1], c->R[2], c->R[3], c->R[12], lrIrq};
-    for (int i = 0; i < 23; i++) m.W(fs, i * 4, w[i]);
+    if (v.twl)
+    {
+        // TWL SDK build (Thumb), fs + 16 = sp - 76, in write order: OSi_IrqCallback push {r3-r5, lr} (sp-44), MIi_DMACallback
+        // push {r3-r5, lr} (sp-60), OS_DisableIrqMask push {r3, r4} (sp-68), OS_SetIrqFunction push {r4-r7} (sp-76),
+        // OS_DisableIrqMask(DMA bit) push {r3, r4} (sp-52, when the entry's enable flag is clear)
+        // (r3 = the stub's ldr r3, =OSi_IrqCallback | 1 in every push)
+        const u32 d = 1u << bit, r3 = cbFn | 1;
+        struct { u32 o, v; } w[] = {
+            {64, s.biosRet}, {68, c->R[0]}, {72, c->R[1]}, {76, c->R[2]}, {80, c->R[3]}, {84, c->R[12]}, {88, lrIrq},
+            {48, r3}, {52, c->R[4]}, {56, c->R[5]}, {60, v.code[0].a + 0x58},
+            {32, r3}, {36, d}, {40, n * 12}, {44, cbFn + 0x25},
+            {24, r3}, {28, d},
+            {16, v.gxParams}, {20, 0x200000}, {24, c->R[6]}, {28, c->R[7]},
+        };
+        for (auto& x : w) m.W(fs, x.o, x.v);
+        if (!tab2.r(n * 12 + 4)) { m.W(fs, 40, r3); m.W(fs, 44, d); }
+    }
+    else
+    {
+        const u32 w[23] = {v.gxParams, 0x200000, c->R[6], c->R[7], c->R[8], c->R[9], c->R[10], mdc + 0x38,
+                           bit, 1u << bit, n * 12, cbFn + 0x44,
+                           0x80000000, c->R[4], c->R[5], v.code[0].a + 0x58,
+                           s.biosRet, c->R[0], c->R[1], c->R[2], c->R[3], c->R[12], lrIrq};
+        for (int i = 0; i < 23; i++) m.W(fs, i * 4, w[i]);
+    }
     m.W(tab2, n * 12, 0);
     m.W(tab, 21 * 4, P.r(0x1C));
     m.W(P, 0, 0);
@@ -2096,7 +2122,7 @@ int IrqOne(melonDS::ARMv5* c, State& s, bool halted, bool jit, u32 low)
     if (kind == 4) { c->R_SVC[1] = e.SVC[1]; c->R_SVC[2] = e.SVC[2]; }
     c->R_IRQ[1] = e.IRQ[1];
     c->R_IRQ[2] = e.IRQ[2];
-    c->Cycles += kind == 4 ? kIrqWakeCycles : kind == 3 ? kIrqCycles : kDmaIrqCycles;
+    c->Cycles += kind == 4 ? kIrqWakeCycles : kind == 3 ? kIrqCycles : s.v->twl ? kDmaIrqCyclesT : kDmaIrqCycles;
     if (g_Time) s.ns += Now() - t0;
     return 1;
 }
