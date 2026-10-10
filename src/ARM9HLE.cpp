@@ -8,6 +8,10 @@
 #include "GPU.h"
 #include "DMA_Timings.h"
 #endif
+#include "NDSCart.h"
+#ifdef LITEV_HLE_DIAG
+#include "Savestate.h"
+#endif
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -166,19 +170,20 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
+constexpr int kKinds = 8;     // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = 31 | 64;             // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 64 LZ (32: card, not shipped)
+    u32 mask = 127;                 // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ
     std::vector<u8> code, irqCode, gxCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool irqOk = false;             // IRQ path code matches the variant (3.)
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
-    u64 calls[7] = {}, native[7] = {}, fallback[7] = {}, checks[7] = {}, diffs[7] = {}, irqDuring[7] = {};
-    u64 guestCyc[7] = {}, guestN[7] = {}, getBits = 0, gxWords = 0, lzBytes = 0, lzEst = 0;
+    u64 calls[kKinds] = {}, native[kKinds] = {}, fallback[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, irqDuring[kKinds] = {};
+    u64 guestCyc[kKinds] = {}, guestN[kKinds] = {}, getBits = 0, gxWords = 0, lzBytes = 0, lzEst = 0, cardWords = 0;
     u32 biosOk = 0;                 // BIOS IRQ epilogue address verified once
     u64 ns = 0;                     // stats: host time inside Run (native calls)
     // host pointers of the fixed-address OS objects, valid for fkey (DTCM base/mask, ITCM size)
@@ -201,9 +206,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[7] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -1132,13 +1137,193 @@ __attribute__((noinline)) bool RunLz(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
+// ---- 7. CARD ROM read loop: the page natively -------------------------------------------------
+// NitroSDK CARD's CPU read (PW/PB: in 0x02076e64; position independent, 9 exact words): poll
+// ROMCTRL, read ROMDATA while DATA_READY, store the first 128 words at r5 + r3*4 (r3 counts), loop
+// while BUSY. PW streams map/graphics data with it every frame (~600-800 polls/frame in loading and
+// title; 13% of the ARM9's guest instructions in f12000 after hook 6), each poll and read an IO
+// access through the bus handlers. Native, at the loop head: the reads through NDSCartSlot::HleRead9
+// (the CART_SYNC refill inlined, the cart's plain ROM read; one call per page instead of two IO
+// dispatches per word), the stores as one copy into main RAM (JIT invalidation per 16-byte granule:
+// overlays are read straight to their destination), registers and flags as after the guest's last
+// data iteration, handed back at the loop head (the guest's last poll sees BUSY clear and leaves).
+// Category B: a fixed cycle estimate per word; an IRQ that would arrive inside the page is taken
+// after it (one page at most per call, ~4k cycles).
+constexpr u32 kCardInstr = 0xE5942000;      // ldr r2, [r4] (the loop head)
+constexpr u32 kCardLoop[9] = {0xE5942000, 0xE3120502, 0x0A000003, 0xE59B1000, 0xE3530080, 0x37851103, 0x32833001, 0xE3120102, 0x1AFFFFF6};
+// ponytail: fixed estimate per word (guest average in check mode without IRQs, PW f12000/f1300)
+constexpr s32 kCardCycWord = 30;
+
+bool CardCodeAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a & 3) return false;
+    for (u32 i = 0; i < 9; i++)
+    {
+        const u8* p = CodePtr(c, a + i * 4);
+        if (!p || R32(p) != kCardLoop[i]) return false;
+    }
+    return true;
+}
+
+// the registers the loop uses, and the stores of words r3.. (< 128) go to one main-RAM host block
+// the guest may write (protection unit), not under a TCM; false: the guest runs the loop
+bool CardArgsOk(melonDS::ARMv5* c)
+{
+    melonDS::NDS& nds = c->NDS;
+    if (c->R[4] != 0x040001A4 || c->R[11] != 0x04100010) return false;
+    // IO reads pass the protection unit (else the guest's data abort)
+    if (!(c->PU_Map[0x040001A4 >> 12] & 0x01) || !(c->PU_Map[0x04100010 >> 12] & 0x01)) return false;
+    const u32 r3 = c->R[3];
+    if (r3 >= 128) return true;
+    // (a DTCM of >= 16 KB overlapping a range of <= 512 bytes holds one of its ends)
+    const u32 r5 = c->R[5], a = r5 + r3 * 4, b = r5 + 511;
+    return !((r5 & 3) || (a >> 24) != 0x02 || (b >> 24) != 0x02 || a < c->ITCMSize || ((a & c->DTCMMask) == c->DTCMBase)
+             || ((b & c->DTCMMask) == c->DTCMBase) || ((a & nds.MainRAMMask) > (b & nds.MainRAMMask))
+             || !(c->PU_Map[a >> 12] & 0x02) || !(c->PU_Map[b >> 12] & 0x02));
+}
+
+// n words read: stores, registers, flags (NZCV of the last tst r2, #BUSY with BUSY set; V of cmp r3, #128)
+void CardCommit(melonDS::ARMv5* c, const u32* w, u32 n, u32 lastCnt)
+{
+    melonDS::NDS& nds = c->NDS;
+    u32 r3 = c->R[3];
+    if (r3 < 128)
+    {
+        const u32 k = n < 128 - r3 ? n : 128 - r3, a = c->R[5] + r3 * 4;
+        memcpy(&nds.MainRAM[a & nds.MainRAMMask], w, k * 4);
+        for (u32 g = a & ~15u; g < a + k * 4; g += 16)
+            nds.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(g);
+        r3 += k;
+    }
+    c->R[1] = w[n - 1]; c->R[2] = lastCnt; c->R[3] = r3;
+    c->CPSR = (c->CPSR & 0x0FFFFFFF) | 0xA0000000;
+}
+
+#ifdef LITEV_HLE_DIAG
+// check mode (interpreter): the guest runs the loop; at its exit the native path reruns from the
+// entry state (the cart's ROM-read state restored), plus the guest's final poll, and must leave
+// the same registers, flags, stores, cart state and transfer IRQ
+struct CardPending
+{
+    bool on = false;
+    u32 r[16] = {}, cpsr = 0, ifr = 0, exit = 0;
+    std::vector<u8> cart, buf;
+    u64 t0 = 0, steps = 0;
+    bool irq = false;
+} g_Card;
+
+std::vector<u8> CartState(melonDS::NDS& nds)
+{
+    melonDS::Savestate st(1 << 16);
+    nds.NDSCartSlot.HleRomState(&st);
+    st.Finish();
+    const u8* b = (const u8*)st.Buffer();
+    return std::vector<u8>(b, b + st.Length());
+}
+void CartLoad(melonDS::NDS& nds, std::vector<u8>& v)
+{
+    melonDS::Savestate st(v.data(), (u32)v.size(), false);
+    nds.NDSCartSlot.HleRomState(&st);
+}
+
+__attribute__((noinline, cold)) void CardCheckStart(melonDS::ARMv5* c, State& s, u32 pc)
+{
+    melonDS::NDS& nds = c->NDS;
+    g_Card.on = true; g_Card.exit = pc + 0x24;
+    for (int i = 0; i < 16; i++) g_Card.r[i] = c->R[i];
+    g_Card.cpsr = c->CPSR; g_Card.ifr = nds.IF[0];
+    g_Card.cart = CartState(nds);
+    g_Card.buf.assign(512, 0);
+    for (u32 i = 0; i < 512; i++) g_Card.buf[i] = nds.MainRAM[(c->R[5] + i) & nds.MainRAMMask];
+    g_Card.t0 = nds.ARM9Timestamp + c->Cycles; g_Card.steps = 0; g_Card.irq = false;
+    CheckPending = true;
+    s.checks[7]++;
+}
+
+__attribute__((noinline, cold)) void CardCheckAt(melonDS::ARMv5* c, u32 pc)
+{
+    melonDS::NDS& nds = c->NDS;
+    State& s = g_State[&nds];
+    if (++g_Card.steps > 2000000) { fprintf(stderr, "A9HLE CHECK cardread: guest never left the loop\n"); g_Card.on = CheckPending = false; s.diffs[7]++; return; }
+    if (pc == c->ExceptionBase + 0x18 && !g_Card.irq) { s.irqDuring[7]++; g_Card.irq = true; }
+    if (pc != g_Card.exit || (c->CPSR & 0x3F) != (g_Card.cpsr & 0x3F)) return;
+    g_Card.on = CheckPending = false;
+    const u64 gcyc = nds.ARM9Timestamp + c->Cycles - g_Card.t0;
+    const u32 g1 = c->R[1], g2 = c->R[2], g3 = c->R[3], gfl = c->CPSR & 0xF0000000, gif = nds.IF[0];
+    std::vector<u8> gbuf(512), gcart = CartState(nds);
+    for (u32 i = 0; i < 512; i++) gbuf[i] = nds.MainRAM[(g_Card.r[5] + i) & nds.MainRAMMask];
+    // native from the entry state, on copies of the registers and the buffer
+    CartLoad(nds, g_Card.cart);
+    nds.IF[0] = g_Card.ifr;
+    u32 w[4096], cnt = 0, n = nds.NDSCartSlot.HleRead9(w, 4096, cnt);
+    u32 n1 = g_Card.r[1], n2 = g_Card.r[2], n3 = g_Card.r[3], nfl = g_Card.cpsr & 0xF0000000;
+    std::vector<u8> nbuf = g_Card.buf;
+    if (n)
+    {
+        for (u32 i = 0; i < n && n3 < 128; i++, n3++) memcpy(&nbuf[n3 * 4], &w[i], 4);
+        n1 = w[n - 1]; n2 = cnt; nfl = 0xA0000000;
+    }
+    // the guest's final poll at the loop head: no data, BUSY clear -> exit (tst r2, #BUSY: Z, C from the immediate)
+    const u32 fin = nds.NDSCartSlot.ReadROMCnt(0);
+    bool ok = n && !(fin & 0x80800000);
+    if (ok) { n2 = fin; nfl = 0x60000000 | (nfl & 0x10000000); }
+    const u32 nif = nds.IF[0];
+    std::vector<u8> ncart = CartState(nds);
+    nds.IF[0] = gif;
+    nds.UpdateIRQ(0);
+    CartLoad(nds, gcart);
+    char b[512]; int bl = 0, nd = 0;
+    auto d = [&](const char* what, u32 g, u32 v) { if (g != v) { if (nd < 8) bl += snprintf(b + bl, sizeof(b) - bl, " %s guest %08x native %08x;", what, g, v); nd++; } };
+    if (!ok) { bl += snprintf(b + bl, sizeof(b) - bl, " native %s;", n ? "did not reach the end" : "did nothing"); nd++; }
+    else
+    {
+        d("r1", g1, n1); d("r2", g2, n2); d("r3", g3, n3); d("nzcv", gfl, nfl);
+        d("xfer irq", (gif & ~g_Card.ifr) & (1u << 19), (nif & ~g_Card.ifr) & (1u << 19));
+        for (u32 i = 0; i < 512; i++) if (gbuf[i] != nbuf[i]) { d("buf", gbuf[i], nbuf[i]); break; }
+        if (gcart != ncart) { bl += snprintf(b + bl, sizeof(b) - bl, " cart state;"); nd++; }
+    }
+    if (nd)
+    {
+        if (s.diffs[7] < 10) fprintf(stderr, "A9HLE CHECK cardread %d diffs:%s\n", nd, b);
+        s.diffs[7]++;
+    }
+    if (ok && !g_Card.irq) { s.guestCyc[7] += gcyc; s.guestN[7] += n; }   // cycles per word without IRQs
+}
+#endif
+
+__attribute__((noinline)) bool RunCard(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && !CardCodeAt(c, pc)) return false;
+    s.calls[7]++;
+    bool ok = !CheckPending && CardArgsOk(c);
+#ifdef LITEV_HLE_DIAG
+    // (from the first poll that finds data: before that the guest only polls)
+    if (ok && g_Check) { if (c->NDS.NDSCartSlot.ReadROMCnt(0) & 0x800000) CardCheckStart(c, s, pc); ok = false; }
+#endif
+    u32 w[128], cnt = 0, n = 0;
+    if (ok) n = c->NDS.NDSCartSlot.HleRead9(w, 128, cnt);
+    if (!n)
+    {
+        s.fallback[7] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    CardCommit(c, w, n, cnt);
+    s.native[7]++;
+    s.cardWords += n;
+    c->Cycles += kCardCycWord * (s32)n;
+    c->JumpTo(pc);
+    return true;
+}
+
 struct StatsDump
 {
     ~StatsDump()
     {
         if (!g_Stats) return;
         for (auto& [k, s] : g_State)
-            for (int i = 0; i < 7; i++)
+            for (int i = 0; i < kKinds; i++)
                 fprintf(stderr, "A9HLE %s: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu irq_during=%llu guest_cyc_avg=%.0f\n",
                         kName[i], s.status, (unsigned long long)s.calls[i], (unsigned long long)s.native[i],
                         (unsigned long long)s.fallback[i], (unsigned long long)s.checks[i], (unsigned long long)s.diffs[i],
@@ -1148,6 +1333,7 @@ struct StatsDump
             u64 n = s.native[0] + s.native[1] + s.native[2] + s.native[3] + s.native[4] + s.native[5];
             if (s.native[5]) fprintf(stderr, "A9HLE gxsend: %.1f words per native call\n", (double)s.gxWords / s.native[5]);
             if (s.native[6]) fprintf(stderr, "A9HLE lz: %.1f bytes per native call\n", (double)s.lzBytes / s.native[6]);
+            if (s.native[7]) fprintf(stderr, "A9HLE cardread: %.1f words per native call\n", (double)s.cardWords / s.native[7]);
             if (s.checks[6] && s.guestN[6]) fprintf(stderr, "A9HLE lz check: %.1f bytes per call, guest cycles %llu, estimate %llu\n",
                                                    (double)s.lzBytes / s.checks[6], (unsigned long long)s.guestCyc[6], (unsigned long long)s.lzEst);
             if (n && g_Time) fprintf(stderr, "A9HLE: %.1f ns per native call (Run, timer pair %.1f ns subtracted)\n", (double)s.ns / n - TimerNs(), TimerNs());
@@ -1224,6 +1410,13 @@ bool Irq(melonDS::ARMv5* c, bool halted)
 
 int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
 {
+    if (instr == kCardInstr)
+    {
+        static thread_local Range card;
+        card = {addr, addr + 9 * 4};
+        r = &card;
+        return 1;
+    }
     if (instr == kLzInstr)
     {
         static thread_local Range lz;
@@ -1249,6 +1442,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return k < 0 || !(s.mask & Bit(k)) ? 0 : CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
     }
     if (!MaybeHook(instr)) return 0;
+    if (instr == kCardInstr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 32) && CardCodeAt(&nds.ARM9, addr) ? 1 : 0;
+    }
     if (instr == kLzInstr)
     {
         // position independent: the code bytes around addr
@@ -1373,6 +1571,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 64) && RunLz(c, s, jit);
     }
+    if (in == kCardInstr)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 32) && RunCard(c, s, jit);
+    }
     State& s = Get(c, pc, in);
     if (s.status != 1) return false;
     const int k = Kind(*s.v, pc, in);
@@ -1388,6 +1591,7 @@ bool Run(melonDS::ARM* cpu, bool jit)
 void CheckAt(melonDS::ARM* cpu, u32 pc)
 {
     auto* c = (melonDS::ARMv5*)cpu;
+    if (g_Card.on) { CardCheckAt(c, pc); return; }
     const Expect& e = g_P.e;
     // guest registers as seen in the interrupted mode after the return
     u32 gR[15], gI[3] = {c->R_IRQ[0], c->R_IRQ[1], c->R_IRQ[2]}, gS[3] = {c->R_SVC[0], c->R_SVC[1], c->R_SVC[2]};

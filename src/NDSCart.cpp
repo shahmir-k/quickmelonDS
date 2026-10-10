@@ -1150,6 +1150,60 @@ void NDSCartSlot::Interface::CheckDMA()
     }
 }
 
+#ifdef LITEV_A9HLE
+#ifdef LITEV_HLE_DIAG
+void NDSCartSlot::HleRomState(Savestate* file) noexcept
+{
+    file->Section("HLEC");
+    file->Var64(&Key2_X);
+    file->Var64(&Key2_Y);
+    Interfaces[0].DoSavestate(file);
+    if (Cart) Cart->CartCommon::DoSavestate(file);
+}
+#endif
+u32 NDSCartSlot::HleRead9(u32* out, u32 max, u32& lastCnt)
+{
+#ifdef LITEV_CART_SYNC
+    Interface& I = Interfaces[0];
+    if (!CartActive || CPUSelect != 0 || LogicalNum != 0 || (I.ROMCnt & (1<<30)) || !CartSync()
+        || NDS.DMAsInMode(0, 0x05) || !Cart->HleRomPlain())
+        return 0;
+    CartCommon& cart = *Cart;
+    u32 n = 0;
+    // ReadROMData -> ROMAdvanceReceive -> ROMReceiveData (the CART_SYNC refill) per word, inlined;
+    // RaiseDRQ's CheckDMA has no card DMA to start (checked above, and no guest code runs here)
+    while (n < max && (I.ROMCnt & (1<<23)))
+    {
+        lastCnt = I.ROMCnt;
+        out[n++] = I.ROMData[I.ROMDataPosCPU];
+        I.ROMDataPosCPU ^= 1;
+        if (I.ROMDataCount > 0) I.ROMDataCount--;
+        I.ROMCnt &= ~(1<<23);
+        if (I.ROMTransferPos < I.ROMTransferLen)
+        {
+            if (!I.ROMDataLate) continue;
+            I.ROMDataLate = false;
+            for (;;)
+            {
+                I.ROMData[I.ROMDataPosCart] = cart.HleRomRead32();
+                I.ROMDataPosCart ^= 1;
+                I.ROMDataCount++;
+                I.ROMTransferPos += 4;
+                I.ROMCnt |= (1<<23);
+                if (I.ROMDataCount >= 2) { I.ROMDataLate = true; break; }
+                if (I.ROMTransferPos >= I.ROMTransferLen) break;
+            }
+        }
+        else if (I.ROMDataCount == 0) I.ROMEndTransfer(0);
+        else I.ROMCnt |= (1<<23);
+    }
+    return n;
+#else
+    return 0;
+#endif
+}
+#endif
+
 u32 NDSCartSlot::Interface::ReadROMData()
 {
     u32 ret = ROMData[ROMDataPosCPU];
