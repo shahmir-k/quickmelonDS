@@ -22,7 +22,7 @@
 // it (no per-call compare); MI_CpuCopy32 from ARM7 WRAM to main RAM copies through host
 // pointers with the JIT invalidation check per 16-byte granule instead of two bus calls a word.
 //
-// LITEV_A7HLE_CHECK=1 (env, interpreter mode): run native AND guest, compare everything the
+// Diagnostics (build with LITEV_HLE_DIAG): LITEV_A7HLE_CHECK=1 (env, interpreter mode): run native AND guest, compare everything the
 // native path writes at the guest's return, report diffs. LITEV_A7HLE_COMMITCHECK=1: after a
 // native sequencer commit, verify memory equals the native result. LITEV_A7HLE_STATS=1: counts.
 #pragma once
@@ -46,7 +46,12 @@ int Deps(u32 addr, u32 instr, Range* out);   // up to 4
 // Returns false if cpu is not at a hook (caller does its normal thing).
 bool Run(melonDS::ARM* cpu, bool jit);
 // interpreter check mode: called before every ARM7 instruction while a check is pending
+#ifdef LITEV_HLE_DIAG
 extern bool CheckPending;
 void CheckAt(melonDS::ARM* cpu, u32 pc);
+#else
+constexpr bool CheckPending = false;   // compare mode compiled out (LITEV_HLE_DIAG)
+inline void CheckAt(melonDS::ARM*, u32) {}
+#endif
 }
 #endif

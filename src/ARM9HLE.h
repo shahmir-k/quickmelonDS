@@ -44,6 +44,7 @@
 //    estimate per elided IRQ. Check mode (build with LITEV_A9HLE_GXCHECK) compares the words
 //    the guest sends to GXFIFO, and src/length where the native path would leave them.
 //
+// Diagnostics (build with LITEV_HLE_DIAG; compiled out of shipping builds):
 // LITEV_A9HLE_CHECK=1 (env, interpreter mode): compute the native result, run the guest code
 // instead, and at the guest's return compare all of main RAM, ITCM, DTCM and the registers
 // with the native prediction. LITEV_A9HLE_STATS=1: counts, host ns per native call (and measured
@@ -86,12 +87,18 @@ void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
 // ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted)
 void BlockGone(melonDS::NDS& nds, const void* block);
 // interpreter check mode: called before every ARM9 instruction while a check is pending
+// (compiled out without LITEV_HLE_DIAG)
+#ifdef LITEV_HLE_DIAG
 extern bool CheckPending;
+void CheckAt(melonDS::ARM* cpu, u32 pc);
+#else
+constexpr bool CheckPending = false;
+inline void CheckAt(melonDS::ARM*, u32) {}
+#endif
 #ifdef LITEV_A9HLE_GXCHECK
 // check mode of 5. (diagnostic build): words written to GXFIFO / other geometry command writes
 extern std::vector<u32>* GxTap;
 extern bool GxOtherSeen;
 #endif
-void CheckAt(melonDS::ARM* cpu, u32 pc);
 }
 #endif
