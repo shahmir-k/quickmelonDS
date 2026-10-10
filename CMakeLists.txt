@@ -579,6 +579,13 @@ if (LITEV_JIT_RAS)
     endif()
 endif()
 
+# A7PROF (diagnostic): per-guest-function ARM7 profile in the interpreter (--mode interp,
+# env LITEV_A7PROF=<out prefix>). See src/ARM7Prof.h. Never in a shipping build.
+option(LITEV_A7PROF "Diagnostic: ARM7 per-function guest profile (interpreter)" OFF)
+if (LITEV_A7PROF)
+    add_compile_definitions(LITEV_A7PROF=1)
+endif()
+
 # CP15_INLINE: the JIT emits ARM9 data-cache maintenance MCRs (c7, no-ops in CP15Write) and
 # the DTCM-setting MRC (c9,c1,0) inline instead of an interpreter fallback (full register
 # spill + C++ call). Same cycles -> exact. Runtime: debug.litev.cp15inline (prop on
