@@ -43,15 +43,16 @@ namespace melonDS
 #include "OpenGL_shaders/3DFinalPassFogFS.h"
 #include "OpenGL_shaders/3DFinalPassFogFetchFS.h"
 
-bool GLRenderer3D::BuildRenderShader(bool wbuffer)
+bool GLRenderer3D::BuildRenderShader(int flags)
 {
+    const bool wbuffer = flags & 1;
     std::string wbufdef = "#define WBuffer\n";
 #ifdef LITEV_GL_WBUF_EARLYZ
     if (WEarlyZ()) wbufdef += "#define WEarlyZ\n";
 #endif
 
     char shadername[32];
-    snprintf(shadername, sizeof(shadername), "RenderShader%c", wbuffer?'W':'Z');
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s", wbuffer?'W':'Z', (flags & 2) ? "N" : "");
 
     std::string vsbuf = k3DRenderVS;
     if (wbuffer)
@@ -67,6 +68,11 @@ bool GLRenderer3D::BuildRenderShader(bool wbuffer)
     {
         auto pos = fsbuf.find('\n') + 1;
         fsbuf = fsbuf.substr(0, pos) + wbufdef + fsbuf.substr(pos);
+    }
+    if (flags & 2)
+    {
+        auto pos = fsbuf.find('\n') + 1;
+        fsbuf = fsbuf.substr(0, pos) + "#define NoDiscard\n" + fsbuf.substr(pos);
     }
 
     GLuint prog;
@@ -90,20 +96,29 @@ bool GLRenderer3D::BuildRenderShader(bool wbuffer)
     uni_id = glGetUniformLocation(prog, "Capture256Texture");
     glUniform1i(uni_id, 2);
 
-    RenderShader[(int)wbuffer] = prog;
+    RenderShader[flags] = prog;
 
     return true;
 }
 
-void GLRenderer3D::UseRenderShader(bool wbuffer)
+void GLRenderer3D::UseRenderShader(int flags)
 {
-    int flags = (int)wbuffer;
     if (CurShaderID == flags) return;
     glUseProgram(RenderShader[flags]);
     CurShaderID = flags;
 
     RenderModeULoc = glGetUniformLocation(RenderShader[flags], "uRenderMode");
 }
+
+#ifdef LITEV_GL_OPAQUE_NODISCARD
+// Opaque polygons that can't produce a transparent pixel use a shader without the alpha test.
+// debug.litev.glnodiscard=0 turns it off.
+bool GLRenderer3D::NoDiscard()
+{
+    static const bool on = OpenGL::Prop("glnodiscard", 1) != 0;
+    return on;
+}
+#endif
 
 #ifdef LITEV_GL_WBUF_EARLYZ
 // W-buffer frames: depth from the rasterizer (1 - z0/w is affine in 1/w, so exact per polygon)
@@ -191,6 +206,10 @@ bool GLRenderer3D::Init()
 
     if (!BuildRenderShader(true))
         return false;
+#ifdef LITEV_GL_OPAQUE_NODISCARD
+    if (NoDiscard() && (!BuildRenderShader(2) || !BuildRenderShader(3)))
+        return false;
+#endif
 
     if (!OpenGL::CompileVertexFragmentProgram(FinalPassEdgeShader,
             k3DFinalPassVS, k3DFinalPassEdgeFS,
@@ -389,7 +408,7 @@ GLRenderer3D::~GLRenderer3D()
 
     glDeleteBuffers(1, &ShaderConfigUBO);
 
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 4; i++)
     {
         if (!RenderShader[i]) continue;
         glDeleteProgram(RenderShader[i]);
@@ -513,6 +532,19 @@ void GLRenderer3D::SetupPolygon(GLRenderer3D::RendererPolygon* rp, Polygon* poly
     u32 texattr = (polygon->TexParam >> 16) & 0x3FF;
     if (TexEnable && (textype != 0))
         rp->RenderKey |= (0x80000 | (texattr << 20));
+
+#ifdef LITEV_GL_OPAQUE_NODISCARD
+    // an opaque polygon whose every pixel has alpha 31: untextured, decal (alpha = vertex alpha),
+    // or a paletted texture (formats 2-4) without colour-0 transparency. Formats 5 and 7 have
+    // transparent texels (7 can also be a display capture), 1 and 6 are translucent.
+    if (NoDiscard() && !polygon->IsShadowMask && !polygon->Translucent && ((polygon->Attr >> 16) & 0x1F) == 31)
+    {
+        const bool untextured = !(TexEnable && textype != 0);
+        const bool decal = ((polygon->Attr >> 4) & 0x3) == 1;
+        const bool solidpal = textype >= 2 && textype <= 4 && !(polygon->TexParam & (1<<29));
+        if (untextured || decal || solidpal) rp->RenderKey |= RenderKey_NoDiscard;
+    }
+#endif
 }
 
 u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32* vptr) const
@@ -1091,7 +1123,14 @@ int GLRenderer3D::RenderPolygonEdgeBatch(int i) const
 void GLRenderer3D::RenderSceneChunk(int y, int h)
 {
     SC_Reset();
-    bool flags = S.RenderPolygonRAM[0]->WBuffer;
+    int flags = S.RenderPolygonRAM[0]->WBuffer ? 1 : 0;
+#ifdef LITEV_GL_OPAQUE_NODISCARD
+    if (NoDiscard())
+    {
+        UseRenderShader(flags | 2);
+        if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[3], "uWZ0"), WZ0);
+    }
+#endif
     UseRenderShader(flags);
     if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[1], "uWZ0"), WZ0);
 
@@ -1159,8 +1198,14 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
         glStencilMask(0xFF);
 
+#ifdef LITEV_GL_OPAQUE_NODISCARD
+        if (NoDiscard()) UseRenderShader(flags | ((rp->RenderKey & RenderKey_NoDiscard) ? 2 : 0));
+#endif
         i += RenderPolygonBatch(i);
     }
+#ifdef LITEV_GL_OPAQUE_NODISCARD
+    UseRenderShader(flags);   // the passes below set uRenderMode on this program
+#endif
 
     // if edge marking is enabled, mark all opaque edges
     // TODO BETTER EDGE MARKING!!! THIS SUCKS

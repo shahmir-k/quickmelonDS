@@ -99,8 +99,8 @@ private:
     bool TexEnable;
     TexcacheOpenGL Texcache;
 
-    bool BuildRenderShader(bool wbuffer);
-    void UseRenderShader(bool wbuffer);
+    bool BuildRenderShader(int flags);   // bit0 W-buffer, bit1 no alpha test (LITEV_GL_OPAQUE_NODISCARD)
+    void UseRenderShader(int flags);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32* vptr) const;
     void BuildPolygons(RendererPolygon* polygons, int npolys, int captureinfo[16]);
@@ -118,18 +118,20 @@ private:
         RenderMode_ShadowMask,
         RenderMode_OpaqueBlended,   // LITEV_GL_BATCH_NEEDOPAQUE: opaque and translucent texels in one draw
     };
+    static constexpr u32 RenderKey_NoDiscard = 0x40000000;   // LITEV_GL_OPAQUE_NODISCARD (bits 20-29 = texattr)
 
 
     GLuint ClearShaderPlain {};
     GLuint ClearShaderBitmap {};
 
-    GLuint RenderShader[2] {};
+    GLuint RenderShader[4] {};
     GLint RenderModeULoc = 0;
     GLuint CurShaderID = -1;
     // LITEV_GL_WBUF_EARLYZ: this frame's W-buffer depth mapping, window depth = 1 - WZ0/w
     // (0: the plain z/2^24 mapping)
     float WZ0 = 0;
     static bool WEarlyZ();
+    static bool NoDiscard();
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};

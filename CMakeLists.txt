@@ -874,6 +874,10 @@ option(LITEV_GL_WBUF_EARLYZ "GL 3D: W-buffer depth without gl_FragDepth (early-Z
 if (LITEV_GL_WBUF_EARLYZ)
     add_compile_definitions(LITEV_GL_WBUF_EARLYZ=1)
 endif()
+option(LITEV_GL_OPAQUE_NODISCARD "GL 3D: opaque polygons without transparent texels skip the alpha test (Mali early-Z/FPK)" OFF)
+if (LITEV_GL_OPAQUE_NODISCARD)
+    add_compile_definitions(LITEV_GL_OPAQUE_NODISCARD=1)
+endif()
 
 # GL 3D: skip the edge-marking final pass, which can't mark anything in this renderer (no shader
 # writes the edge flag it tests) but split the 3D render pass. Exact. Runtime: debug.litev.gledgenoop=0 off.
