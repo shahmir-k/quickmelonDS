@@ -28,7 +28,7 @@ smooth in vec4 fColor;
 smooth in highp vec2 fTexcoord;
 flat in ivec3 fPolygonAttr;
 
-#ifdef WBuffer
+#if defined(WBuffer) && !defined(WEarlyZ)
 smooth in highp float fZ;
 #endif
 
@@ -106,6 +106,12 @@ vec4 FinalColor()
 
 void main()
 {
+#ifdef NoDiscard
+    // opaque pass, polygon that can't produce a transparent pixel: no alpha test, so the Mali
+    // keeps its early depth test and hidden-surface removal (any discard in the shader loses both)
+    oColor = FinalColor();
+    oAttr = vec4(float((fPolygonAttr.x >> 24) & 0x3F) / 63.0, max(gl_FragCoord.z, 1.0/255.0), float((fPolygonAttr.x >> 15) & 0x1), 1.0);
+#else
     if (uRenderMode == 2)
     {
         oColor = vec4(0,0,0,1);
@@ -113,15 +119,17 @@ void main()
     else
     {
         vec4 col = FinalColor();
-        if (uRenderMode == 0)
+        if (uRenderMode == 0 || uRenderMode == 3)
         {
-            // opaque pixels
-            if (col.a < 30.5/31.0) discard;
+            // opaque pixels (3: translucent texels too, blended by the caller)
+            if (col.a < (uRenderMode == 0 ? 30.5/31.0 : 0.5/31.0)) discard;
 
             oAttr.r = float((fPolygonAttr.x >> 24) & 0x3F) / 63.0;
-            oAttr.g = 0.0;
+            oAttr.g = max(gl_FragCoord.z, 1.0/255.0);   // opaque pixel: 8-bit depth for edge marking (0 = none)
             oAttr.b = float((fPolygonAttr.x >> 15) & 0x1);
-            oAttr.a = 1.0;
+            // 3: a translucent texel keeps the attributes under it (the pass blends with SRC_ALPHA,
+            // attachment 1 too): its polygon ID / edge flag outlined whole shadow decals
+            oAttr.a = (uRenderMode == 3 && col.a < 30.5/31.0) ? 0.0 : 1.0;
         }
         else
         {
@@ -135,8 +143,9 @@ void main()
 
         oColor = col;
     }
+#endif
 
-#ifdef WBuffer
+#if defined(WBuffer) && !defined(WEarlyZ)
     // depth-equal polygons: the DS's +-0xFF W-buffer margin (see 3DRenderVS)
     gl_FragDepth = ((fPolygonAttr.x & 0x4000) != 0) ? fZ - 255.0 / 16777216.0 : fZ;
 #endif

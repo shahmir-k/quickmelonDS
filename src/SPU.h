@@ -20,6 +20,9 @@
 #define SPU_H
 
 #include "Savestate.h"
+#include <memory>
+#include <vector>
+#include <unordered_map>
 #include "Platform.h"
 
 struct blip_t;
@@ -137,6 +140,50 @@ public:
     // out=false: advance and decode exactly, but skip the output value (nobody hears it)
     template<u32 type> s32 Run(u32 cycles, bool out = true);
 
+#ifdef LITEV_SPU_ADPCM_MEMO
+    // decoded ADPCM states of the channel's current sample, by position (see RunADPCMFast)
+    struct ADPCMMemo
+    {
+        std::vector<u32> St;    // pos -> (u16)val | idx << 16, valid for 8 <= pos < Hi
+        std::vector<u8> Raw;    // the sample bytes they were decoded from
+        u32 Src = 0, Loop = 0, Total = 0;
+        s32 Hi = 0;
+    };
+    ADPCMMemo* Memo = nullptr;  // the SPU's memo of the current sample (shared by all channels)
+    u32 MemoGen = 0;
+    bool MemoCheck(ADPCMMemo& m, s32 pos, s32& okUntil);
+#endif
+#ifdef LITEV_SPU_FAST_ADPCM
+    // approximate ADPCM channel over n output ticks: state in locals, sample bytes read straight
+    // from main RAM instead of through the 32-byte channel FIFO. false = not applicable
+    bool RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n);
+#endif
+#ifdef LITEV_SPU_CHMAJOR
+    // n samples of this channel into dst[0..n)[col], the type switch hoisted out of the loop
+    template<u32 type> void RunN(u32 cycles, s32 (*dst)[16], int col, int n)
+    {
+        for (int b = 0; b < n; b++) dst[b][col] = Run<type>(cycles, true);
+    }
+    void DoRunN(u32 cycles, s32 (*dst)[16], int col, int n)
+    {
+        switch ((Cnt >> 29) & 0x3)
+        {
+        case 0: RunN<0>(cycles, dst, col, n); return;
+        case 1: RunN<1>(cycles, dst, col, n); return;
+        case 2:
+#ifdef LITEV_SPU_FAST_ADPCM
+            if (RunADPCMFast(cycles, dst, col, n)) return;
+#endif
+            RunN<2>(cycles, dst, col, n); return;
+        case 3:
+            if (Num >= 14) { RunN<4>(cycles, dst, col, n); return; }
+            if (Num >= 8)  { RunN<3>(cycles, dst, col, n); return; }
+            [[fallthrough]];
+        default:
+            for (int b = 0; b < n; b++) dst[b][col] = 0;
+        }
+    }
+#endif
     s32 DoRun(u32 cycles, bool out = true)
     {
         switch ((Cnt >> 29) & 0x3)
@@ -227,6 +274,12 @@ class SPU
 {
 public:
     explicit SPU(melonDS::NDS& nds, AudioBitDepth bitdepth, AudioInterpolation interpolation, double outputSampleRate);
+#ifdef LITEV_SPU_ADPCM_MEMO
+    std::unordered_map<u64, std::unique_ptr<SPUChannel::ADPCMMemo>> Memos;   // by (src, loop, total)
+    size_t MemoBytes = 0;
+    u32 MemoGen = 1;    // bumped when Memos is cleared (channels drop their pointers)
+    SPUChannel::ADPCMMemo* GetMemo(u32 src, u32 loop, u32 total);
+#endif
     ~SPU();
     void Reset();
     void DoSavestate(Savestate* file);
@@ -244,10 +297,17 @@ public:
     void SetDegrade10Bit(bool enable);
     // Netplay: nobody hears this console; Mix skips the output path (state unchanged)
     bool Silent = false;
+    // LITEV_SPU_RATE_DIV: the app's Audio quality (1 full, 2 balanced, 4 performance): mix at
+    // 32768/RateDiv Hz. debug.litev.spudiv overrides it for testing.
+    u32 RateDiv = 1;
     void SetDegrade10Bit(AudioBitDepth depth);
     void SetApplyBias(bool enable);
 
     void Mix(u32 spucycles);
+    void MixSamples(u32 spucycles);
+#ifdef LITEV_SPU_BENCH
+    void Bench(u32 spucycles);
+#endif
     void BufferAudio();
 
     void TrimOutput();

@@ -26,7 +26,22 @@
 #include "../ARMJIT_x64/ARMJIT_Offsets.h"
 #include "../LiteProfile.h"
 
+#ifdef LITEV_BLOCKPROF
+// Profiling only: per-compiled-block entry counter + dump at exit (LITEV_BLOCKPROF_OUT).
+#include <deque>
+#include <cstdio>
+namespace { struct BPEnt { uint32_t addr, last; uint8_t num, thumb, idle; uint16_t n; uint64_t count; uint32_t instr[64]; uint32_t iaddr[64]; std::vector<uint8_t> host; };
+std::deque<BPEnt>& BP() { static std::deque<BPEnt> d; return d; }
+void BPDump() { const char* o = getenv("LITEV_BLOCKPROF_OUT"); FILE* f = fopen(o ? o : "/tmp/blockprof.txt", "w"); if (!f) return;
+  for (auto& e : BP()) if (e.count) { fprintf(f, "%d %d %08x %08x %d %d %llu", e.num, e.thumb, e.addr, e.last, e.n, e.idle, (unsigned long long)e.count);
+    for (int i = 0; i < e.n && i < 64; i++) fprintf(f, " %08x:%08x", e.iaddr[i], e.instr[i]);
+    fprintf(f, " |"); for (uint8_t b : e.host) fprintf(f, "%02x", b); fprintf(f, "\n"); } fclose(f); } }
+#endif
+
 #include <stdlib.h>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 #include <cstddef>
 
 using namespace Arm64Gen;
@@ -186,6 +201,9 @@ namespace litev_perfmap
 // independent, but the assert is kept under the A64 guard to mirror where the
 // offsets are consumed.
 #ifdef __aarch64__
+#ifdef LITEV_JIT_RAS
+static_assert(offsetof(ARM, RasRing) + sizeof(ARM::RasRing) < 16384, "RAS fields need a scaled 12-bit LDR/STR offset");
+#endif
 static_assert(offsetof(ARM, Cycles) == ARM_Cycles_offset,
     "ARM_Cycles_offset out of sync with ARM::Cycles");
 static_assert(offsetof(ARM, StopExecution) == ARM_StopExecution_offset,
@@ -374,6 +392,43 @@ void Compiler::A_Comp_MRS()
 #endif
     }
 }
+
+#ifdef LITEV_JIT_CP15_INLINE
+// ARM9 coprocessor ops the JIT used to hand to the interpreter (spill every register,
+// call A_MCR/A_MRC, reload) although they do nothing to emulated state. PW's overworld
+// runs ~830 data-cache maintenance MCRs (c7: 761/7A4/7E1) and ~280 DTCM-setting reads
+// (MRC c9,c1,0, in the IRQ path) per frame. Same cycles as A_MCR/A_MRC (CodeCycles + 2 / + 3).
+// A block compiled in user mode keeps the fallback (there both ops are undefined instructions).
+bool Compiler::CP15InlineOK()
+{
+    if (!Cp15InlineOn || Num != 0 || Thumb || NDS.ConsoleType != 0)
+        return false;
+    if ((CurCPU->CPSR & 0x1F) == 0x10)
+        return false;
+    u32 instr = CurInstr.Instr;
+    if (((instr >> 8) & 0xF) != 15)
+        return false;
+    u32 id = (((instr >> 16) & 0xF) << 8) | ((instr & 0xF) << 4) | ((instr >> 5) & 0x7);
+    if (CurInstr.Info.Kind == ARMInstrInfo::ak_MCR)
+        // every c7 write but wait-for-interrupt and the icache invalidates is a no-op in CP15Write
+        return (id & 0xF00) == 0x700 && id != 0x704 && id != 0x782
+            && id != 0x750 && id != 0x751 && id != 0x752;
+    // CP15Read(0x910) == DTCMSetting
+    return id == 0x910 && ((instr >> 12) & 0xF) != 15;
+}
+
+void Compiler::A_Comp_MCR_CacheOp()
+{
+    Comp_AddCycles_CI(1 + 1);
+}
+
+void Compiler::A_Comp_MRC_DTCM()
+{
+    Comp_AddCycles_CI(2 + 1);
+    ARM64Reg rd = MapReg(CurInstr.A_Reg(12));
+    LDR(INDEX_UNSIGNED, rd, RCPU, offsetof(ARMv5, DTCMSetting));
+}
+#endif
 
 void UpdateModeTrampoline(ARM* arm, u32 oldmode, u32 newmode)
 {
@@ -954,6 +1009,14 @@ FixupBranch Compiler::CheckCondition(u32 cond)
         // conditionally-skipped body still observes a canonical CPSR word).
         // Comp_MaterializeFlags leaves PSTATE untouched.
         bool condValid = NZCVCondValid;
+#ifdef LITEV_JIT_NZ_BRANCH
+        // LITEV_JIT_NZ_BRANCH: EQ/NE read only Z, MI/PL only N. When that flag is one of the
+        // host-resident ones (a logical producer's N,Z), branch on host NZCV like a full
+        // producer instead of reloading the slot just written.
+        const u8 needed = (cond <= 1) ? 0x4 : (cond == 4 || cond == 5) ? 0x8 : 0;
+        if (JitQOn(jitq_NZBranch) && !condValid && needed && (NZCVDeferred & needed))
+            condValid = true;
+#endif
         Comp_MaterializeFlags();
         if (condValid)
         {
@@ -1225,7 +1288,10 @@ void* Compiler::Gen_Dispatcher(u32 num)
   #else
     FixupBranch exitStopUnmasked = TBZ(RCPSR, 7);
   #endif
-  #ifdef LITEV_JIT_ICACHE
+  #if defined(LITEV_JIT_ICACHE) && !defined(LITEV_JIT_EXIT_PROTO)
+    // Without EXIT_PROTO a linked exit's stop path reaches here with W9 unset. Under
+    // EXIT_PROTO every way in sets W9 (block exit: its site; link stub: 0; guard stub:
+    // its site), so the hop keeps its site's inline cache.
     MOVI2R(W9, 0);
   #endif
     SetJumpTarget(noStop);
@@ -1295,6 +1361,26 @@ void* Compiler::Gen_Dispatcher(u32 num)
     SetJumpTarget(icEpochMiss);
     SetJumpTarget(icNoCache);
     // miss -> fall through to the region-bounds + tag lookup, which WRITES BACK below.
+#endif
+#ifdef LITEV_JIT_RAS
+    // (d.6-RAS) second chance: W10 = the caller's call-site slot popped by a guest
+    // return (0 = none). Same epoch + key check as above, 1-way (key0/ptr0).
+    FixupBranch rasHit;
+    if (RasOn)
+    {
+        FixupBranch rasNone = CBZ(W10);
+        MOVP2R(X2, (void*)ICacheTable[num]);
+        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICacheEntryShift));
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        LDR(INDEX_UNSIGNED, W4, RCPU, offsetof(ARM, ICacheEpoch));
+        CMP(W3, W4);
+        FixupBranch rasEpochMiss = B(CC_NEQ);
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key0));
+        CMP(W3, W0);
+        rasHit = B(CC_EQ);
+        SetJumpTarget(rasEpochMiss);
+        SetJumpTarget(rasNone);
+    }
 #endif
 
     // (e) region bounds: offset = instrAddr - FastBlockLookupStart, exit if >= Size (unsigned;
@@ -1389,6 +1475,19 @@ void* Compiler::Gen_Dispatcher(u32 num)
         STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
         SetJumpTarget(wbSkip);
     }
+#ifdef LITEV_JIT_RAS
+    if (RasOn)
+    {
+        FixupBranch rasSkip = CBZ(W10);
+        MOVP2R(X2, (void*)ICacheTable[num]);
+        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICacheEntryShift));
+        STR(INDEX_UNSIGNED, W0, X2, offsetof(ICacheEntry, key0));
+        STR(INDEX_UNSIGNED, X6, X2, offsetof(ICacheEntry, ptr0));
+        LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, ICacheEpoch));
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        SetJumpTarget(rasSkip);
+    }
+#endif
   #if LITEV_PROFILE
     MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.DispatcherHits);
     LDR(INDEX_UNSIGNED, X5, X4, 0);
@@ -1431,6 +1530,24 @@ void* Compiler::Gen_Dispatcher(u32 num)
     BR(X0);
 #endif
 
+#ifdef LITEV_JIT_RAS
+    if (RasOn)
+    {
+        // RAS hit (X2 = the call-site entry). CPSR is canonical in memory (LAZYFLAGS).
+        SetJumpTarget(rasHit);
+  #ifndef LITEV_JIT_LAZYFLAGS
+        STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+  #endif
+        LDR(INDEX_UNSIGNED, X5, X2, offsetof(ICacheEntry, ptr0));
+  #if LITEV_PROFILE
+        MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.RasHits);
+        LDR(INDEX_UNSIGNED, X3, X4, 0);
+        ADD(X3, X3, 1);
+        STR(INDEX_UNSIGNED, X3, X4, 0);
+  #endif
+        BR(X5);
+    }
+#endif
 #ifdef LITEV_JIT_ICACHE
     // ICACHE hit tails (reached from (d.5-ICACHE); X2 still holds the entry pointer).
     // Under LAZYFLAGS ARM::CPSR is already canonical (as at step (g)); otherwise commit
@@ -1544,6 +1661,18 @@ void Compiler::EmitBlockExit()
 #ifdef LITEV_JIT_DIRECTPATCH
     u32 dpSite = ICacheAssignSite();
     MOVI2R(W9, dpSite);
+#ifdef LITEV_JIT_RAS
+    // W10 = the call-site slot this path's taken return popped (0 = none), the
+    // dispatcher's second chance after a W9 miss. Cleared so a not-taken path of a
+    // conditional return never sees a stale slot.
+    if (RasRetBlock)
+    {
+        LDR(INDEX_UNSIGNED, W10, RCPU, offsetof(ARM, RasSite));
+        STR(INDEX_UNSIGNED, WZR, RCPU, offsetof(ARM, RasSite));
+    }
+    else if (RasOn)
+        MOVI2R(W10, 0);
+#endif
     // Record the RX offset of the patchable exit `B` so DIRECTPATCH can later rewrite
     // it to a guard stub. Compile-time; survives until the next ICacheReset (which
     // zeroes the whole table, incl. patchOff/hitCount/promoted). Site 0 = no cache.
@@ -1554,6 +1683,207 @@ void Compiler::EmitBlockExit()
 #endif
 #endif
     B(DispatcherEntry[Num]);
+}
+#endif
+
+#if defined(LITEV_JIT_EXIT_TAIL) || defined(LITEV_JIT_LDR_ALIGNCHK) || defined(LITEV_JIT_COLD_EXITS)
+void Compiler::EmitTailStubs()
+{
+    // index loop: a cold exit emitted here appends its own link stub to TailStubs
+    for (size_t k = 0; k < TailStubs.size(); k++)
+    {
+        TailStub t = TailStubs[k];
+#ifdef LITEV_JIT_COLD_EXITS
+        if (t.Kind == 2)
+        {
+            SetJumpTarget(t.A);
+            EmitColdExit(ColdExits[t.Index]);
+            continue;
+        }
+#endif
+        if (t.Kind == 0)
+        {
+            // link exit: budget spent -> undo the subtraction, then the unlinked stub
+            SetJumpTarget(t.A);
+            ADD(RBudget, RBudget, RCycles);
+            SetJumpTarget(t.B);
+  #ifdef LITEV_JIT_ICACHE
+            MOVI2R(W9, 0);   // a linkable exit opts out of the per-site cache (0 = no cache)
+  #endif
+  #ifdef LITEV_JIT_RAS
+            if (RasOn)
+                MOVI2R(W10, 0);
+  #endif
+            if (t.PCElided)
+            {
+                MOVI2R(W0, t.NewPC);
+                STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
+            }
+            B(DispatcherEntry[Num]);
+        }
+        else
+        {
+            // misaligned load: the slow-path thunk (W0 = address) rotates exactly like the
+            // fastmem sequence it replaces did
+            SetJumpTarget(t.A);
+            BL(t.Func);
+            B(t.Back);
+        }
+    }
+    TailStubs.clear();
+#ifdef LITEV_JIT_COLD_EXITS
+    ColdExits.clear();
+#endif
+}
+#endif
+
+#ifdef LITEV_JIT_COLD_EXITS
+void Compiler::SaveCompState(CompState& s)
+{
+    s.RegCache = RegCache;
+    s.CurInstr = CurInstr; s.R15 = R15; s.CodeRegion = CodeRegion; s.ConstantCycles = ConstantCycles;
+    s.Exit = Exit; s.IrregularCycles = IrregularCycles; s.CPSRDirty = CPSRDirty;
+#ifdef LITEV_JIT_CYCLE_BATCH
+    s.PendingCycles = PendingCycles; s.DeferCycles = DeferCycles;
+#endif
+#ifdef LITEV_JIT_FIXEDREG
+    s.NZCVDeferred = NZCVDeferred; s.NZCVCondValid = NZCVCondValid;
+#endif
+#ifdef LITEV_JIT_LAZYFLAGS
+    s.FlagsLiveInCur = FlagsLiveInCur; s.CarryInHostResident = CarryInHostResident;
+#ifdef LITEV_EXIT_PROTO_NZCV
+    s.NZCVHostSynced = NZCVHostSynced; s.LastFlushFull = LastFlushFull;
+#endif
+#endif
+#ifdef LITEV_JIT_LINK
+    s.HasStaticExit = HasStaticExit; s.StaticExitCond = StaticExitCond;
+    s.StaticExitTarget = StaticExitTarget; s.StaticExitNewPC = StaticExitNewPC;
+#endif
+#ifdef LITEV_EXIT_PROTO_PC
+    s.PCElided = PCElided;
+#endif
+#ifdef LITEV_JIT_RAS
+    s.RasRetBlock = RasRetBlock;
+#endif
+}
+
+void Compiler::LoadCompState(const CompState& s)
+{
+    RegCache = s.RegCache;
+    CurInstr = s.CurInstr; R15 = s.R15; CodeRegion = s.CodeRegion; ConstantCycles = s.ConstantCycles;
+    Exit = s.Exit; IrregularCycles = s.IrregularCycles; CPSRDirty = s.CPSRDirty;
+#ifdef LITEV_JIT_CYCLE_BATCH
+    PendingCycles = s.PendingCycles; DeferCycles = s.DeferCycles;
+#endif
+#ifdef LITEV_JIT_FIXEDREG
+    NZCVDeferred = s.NZCVDeferred; NZCVCondValid = s.NZCVCondValid;
+#endif
+#ifdef LITEV_JIT_LAZYFLAGS
+    FlagsLiveInCur = s.FlagsLiveInCur; CarryInHostResident = s.CarryInHostResident;
+#ifdef LITEV_EXIT_PROTO_NZCV
+    NZCVHostSynced = s.NZCVHostSynced; LastFlushFull = s.LastFlushFull;
+#endif
+#endif
+#ifdef LITEV_JIT_LINK
+    HasStaticExit = s.HasStaticExit; StaticExitCond = s.StaticExitCond;
+    StaticExitTarget = s.StaticExitTarget; StaticExitNewPC = s.StaticExitNewPC;
+#endif
+#ifdef LITEV_EXIT_PROTO_PC
+    PCElided = s.PCElided;
+#endif
+#ifdef LITEV_JIT_RAS
+    RasRetBlock = s.RasRetBlock;
+#endif
+}
+
+void Compiler::SaveCpuJumpFields(CpuJumpFields& f)
+{
+    f.CodeRegion = CurCPU->CodeRegion; f.CodeCycles = CurCPU->CodeCycles;
+    f.RegionCodeCycles = Num == 0 ? ((ARMv5*)CurCPU)->RegionCodeCycles : 0;
+    f.CodeMem = CurCPU->CodeMem; f.R15 = CurCPU->R[15];
+}
+
+void Compiler::LoadCpuJumpFields(const CpuJumpFields& f)
+{
+    CurCPU->CodeRegion = f.CodeRegion; CurCPU->CodeCycles = f.CodeCycles;
+    if (Num == 0)
+        ((ARMv5*)CurCPU)->RegionCodeCycles = f.RegionCodeCycles;
+    CurCPU->CodeMem = f.CodeMem; CurCPU->R[15] = f.R15;
+}
+
+// Idle-loop branches stay in place: their taken edge registers an IDLE2 site at compile time,
+// in compile order.
+bool Compiler::ColdExitOK() const
+{
+    return JitQOn(jitq_ColdExits)
+        && (CurInstr.BranchFlags & (branch_FollowCondTaken | branch_FollowCondNotTaken))
+        && !(CurInstr.BranchFlags & branch_IdleBranch)
+#ifdef LITEV_JIT_IDLE2
+        && !(CurInstr.BranchFlags & branch_Idle2Cand)
+#endif
+        ;
+}
+
+// `from` jumps to the exit; the current compiler state is what that edge starts with
+void Compiler::DeferColdExit(FixupBranch from, u8 kind)
+{
+    ColdExit e;
+    SaveCompState(e.State);
+    e.Kind = kind;
+    ColdExits.push_back(e);
+    TailStub t{};
+    t.Kind = 2;
+    t.A = from;
+    t.Index = (u32)(ColdExits.size() - 1);
+    TailStubs.push_back(t);
+    if (kind != 1)
+    {
+        // The taken edge's Comp_JumpTo changes CPU fields at compile time; whatever compiles
+        // last leaves them for C++. Make that change here, in program order, by compiling it
+        // into scratch space (the far region past its live end, which the next far-code
+        // emission overwrites); the tail compile of it restores the fields it changes.
+        ptrdiff_t at = GetCodeOffset();
+        SetCodePtrUnsafe(OtherCodeRegion);
+  #ifdef LITEV_JIT_ICACHE
+        u32 sites = ICacheNextSite;
+  #endif
+        if (kind == 0)
+            A_Comp_BranchImm();
+        else
+            Comp_JumpTo(R15 + ((s32)(CurInstr.Instr << 24) >> 23) + 1, true);
+  #ifdef LITEV_JIT_ICACHE
+        ICacheNextSite = sites;
+  #endif
+        SetCodePtrUnsafe(at);
+        LoadCompState(e.State);
+    }
+}
+
+// The same calls, in the same order and state, as the in-place edge (CompileBlock's ARM
+// conditional path / T_Comp_BCOND). Everything they change in the compiler is local to the
+// exit, except what the caller applies to the continuing path itself (see the callers).
+void Compiler::EmitColdExit(const ColdExit& e)
+{
+    CompState cur;
+    SaveCompState(cur);
+    CpuJumpFields cpu;
+    SaveCpuJumpFields(cpu);
+    LoadCompState(e.State);
+    if (e.Kind == 0)
+    {
+        A_Comp_BranchImm();
+        Comp_BranchSpecialBehaviour(true);
+    }
+    else if (e.Kind == 1)
+        Comp_BranchSpecialBehaviour(false);
+    else
+    {
+        s32 offset = (s32)(CurInstr.Instr << 24) >> 23;
+        Comp_JumpTo(R15 + offset + 1, true);
+        Comp_BranchSpecialBehaviour(true);
+    }
+    LoadCpuJumpFields(cpu);
+    LoadCompState(cur);
 }
 #endif
 
@@ -1602,9 +1932,39 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
     u32 patchOffset = (u32)((u8*)GetRXPtr() - GetRXBase());
     FixupBranch slot = B();   // the patch slot; unlinked it branches to the stub below
     SetJumpTarget(slot);
+#ifdef LITEV_JIT_EXIT_TAIL
+    if (JitQOn(jitq_ExitTail))
+    {
+        // The stub and the budget-expired path go to the block tail; the word after the
+        // slot (still its unlinked target, UnlinkedSiteTarget) only branches there. Same
+        // instructions run on every path, two more taken branches on the cold ones.
+        TailStub t{};
+        t.Kind = 0;
+        t.A = toCold;
+        t.B = B();
+  #ifdef LITEV_EXIT_PROTO_PC
+        t.PCElided = PCElided;
+        t.NewPC = newPC;
+        PCElided = false;
+  #endif
+        TailStubs.push_back(t);
+        if (NumLinkExits < MaxOutgoingLinks)
+        {
+            LinkExits[NumLinkExits].PatchOffset = patchOffset;
+            LinkExits[NumLinkExits].TargetAddr = targetAddr;
+            NumLinkExits++;
+        }
+        LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinkSitesEmitted);
+        return;
+    }
+#endif
     const void* stub = GetRXPtr();
   #ifdef LITEV_JIT_ICACHE
     MOVI2R(W9, 0);   // a linkable exit opts out of the per-site cache (0 = no cache)
+  #endif
+  #ifdef LITEV_JIT_RAS
+    if (RasOn)
+        MOVI2R(W10, 0);
   #endif
   #ifdef LITEV_EXIT_PROTO_PC
     if (PCElided)
@@ -1662,6 +2022,10 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
 #ifdef LITEV_JIT_ICACHE
     MOVI2R(W9, 0);   // a linkable exit opts out of the per-site cache (0 = no cache)
 #endif
+#ifdef LITEV_JIT_RAS
+    if (RasOn)
+        MOVI2R(W10, 0);
+#endif
     u32 patchOffset = (u32)((u8*)GetRXPtr() - GetRXBase());
     B(DispatcherEntry[Num]);   // the patch slot (unlinked state)
 
@@ -1676,7 +2040,7 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
     B(DispatcherEntry[Num]);
 #endif  // LITEV_JIT_EXIT_PROTO
 
-    if (NumLinkExits < 2)
+    if (NumLinkExits < MaxOutgoingLinks)
     {
         LinkExits[NumLinkExits].PatchOffset = patchOffset;
         LinkExits[NumLinkExits].TargetAddr = targetAddr;
@@ -1844,6 +2208,9 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
 
     e.stubOff = stubOff;
     e.promoted = 1;
+#ifdef LITEV_JIT_DP_REVERTLIST
+    if (!e._dp0) { e._dp0 = 1; DirectPatchListed[num].push_back(site); }
+#endif
 #if LITEV_PROFILE
     melonDS::LiteProfile::g_Frame.DirectPromotions.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -1882,6 +2249,24 @@ void Compiler::DirectPatchRevertAll()
     {
         if (!ICacheTable[num]) continue;
         u32 dispOff = (u32)((u8*)DispatcherEntry[num] - GetRXBase());
+#ifdef LITEV_JIT_DP_REVERTLIST
+        // Every promoted site is listed (Promote lists it, only this clears the list), so
+        // this reverts exactly the sites the full scan below would.
+        for (u32 s : DirectPatchListed[num])
+        {
+            ICacheEntry& e = ICacheTable[num][s];
+            e._dp0 = 0;
+            if (e.promoted)
+            {
+                DirectPatchWriteBranch(e.patchOff, dispOff);
+                e.promoted = 0;
+                e.hitCount = 0;
+                any = true;
+            }
+        }
+        DirectPatchListed[num].clear();
+        continue;
+#endif
         u32 n = ICacheNextSite;   // only [1, ICacheNextSite) were ever handed out
         if (n > ICacheSites) n = ICacheSites;
         for (u32 s = 1; s < n; s++)
@@ -1917,6 +2302,35 @@ static void LiteV_DirectPatchDemote(Compiler* c, u32 num, u32 site)
 
 void Compiler::Comp_BranchSpecialBehaviour(bool taken)
 {
+#ifdef LITEV_JIT_IDLE2
+    if (taken && (CurInstr.BranchFlags & branch_Idle2Cand) && Num == 0)
+    {
+        // Candidate wait-loop back-edge: while the site's enable byte is set, exit to C++
+        // with IdleLoop = 2 (ARMv5::Idle2Handle proves/skips the loop), exactly like the
+        // classic idle branch below.
+        if (u8* en = ((ARMv5*)CurCPU)->Idle2EnableByte(CurInstr.Addr | (Thumb ? 1 : 0)))
+        {
+            MOVP2R(X16, en);
+            LDRB(INDEX_UNSIGNED, W17, X16, 0);
+            FixupBranch off = CBZ(W17);
+            MOVI2R(W17, CurInstr.Addr | (Thumb ? 1 : 0));
+            STR(INDEX_UNSIGNED, W17, RCPU, offsetof(ARM, Idle2Site));
+            MOVI2R(W0, 2);
+            STRB(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, IdleLoop));
+#ifdef LITEV_JIT_DISPATCH
+#ifdef LITEV_JIT_BUDGET_REG
+            SXTW(X17, RBudget);
+            LDR(INDEX_UNSIGNED, X16, RCPU, offsetof(ARM, JitTsBase));
+            SUB(X16, X16, X17);
+            STR(INDEX_UNSIGNED, X16, RCPU, offsetof(ARM, JitTsBase));
+            MOVI2R(RBudget, 0);
+#endif
+            STR(INDEX_UNSIGNED, WZR, RCPU, offsetof(ARM, CyclesBudget));
+#endif
+            SetJumpTarget(off);
+        }
+    }
+#endif
     if (taken && CurInstr.BranchFlags & branch_IdleBranch)
     {
         MOVI2R(W0, 1);
@@ -1983,6 +2397,35 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
     }
 }
 
+#ifdef LITEV_JIT_R15_ELIDE
+// Will Comp_MemAccess take the literal path (Comp_MemLoadLiteral succeeds) for this ARM
+// instruction? Mirrors its conditions exactly: LDR/LDRB/LDRH/LDRSB/LDRSH, pre-indexed,
+// immediate offset, no writeback, rn = pc, rd != pc, literal not invalidated.
+bool Compiler::R15LiteralLoadFolds(CompileFunc comp)
+{
+    const u32 in = CurInstr.Instr;
+    bool wb = comp == &Compiler::A_Comp_MemWB, hd = comp == &Compiler::A_Comp_MemHD;
+    if (!(wb || hd) || !NDS.JIT.LiteralOptimizationsEnabled())
+        return false;
+    if (!(in & (1 << 20)) || ((in >> 16) & 0xF) != 15 || ((in >> 12) & 0xF) == 15
+        || !(in & (1 << 24)) || (in & (1 << 21)))
+        return false;
+    u32 imm;
+    if (wb)
+    {
+        if (in & (1 << 25)) return false;
+        imm = in & 0xFFF;
+    }
+    else
+    {
+        if (!(in & (1 << 22))) return false;
+        imm = (in & 0xF) | ((in >> 4) & 0xF0);
+    }
+    u32 addr = R15 + imm * ((in & (1 << 23)) ? 1 : -1);
+    return NDS.JIT.InvalidLiterals.Find(NDS.JIT.LocaliseCodeAddress(Num, addr)) == -1;
+}
+#endif
+
 JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[], int instrsCount, bool hasMemInstr)
 {
     if (JitMemMainSize - GetCodeOffset() < 1024 * 16)
@@ -1997,6 +2440,19 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     }
 
     JitBlockEntry res = (JitBlockEntry)GetRXPtr();
+#ifdef LITEV_BLOCKPROF
+    {
+        static bool reg = (BP(), atexit(BPDump), true); (void)reg;
+        BP().push_back({});
+        BPEnt& e = BP().back();
+        e.addr = instrs[0].Addr; e.last = instrs[instrsCount-1].Addr; e.num = cpu->Num; e.thumb = thumb; e.n = instrsCount; e.count = 0; e.idle = 0;
+        for (int i = 0; i < instrsCount; i++) { if (i < 64) { e.instr[i] = instrs[i].Instr; e.iaddr[i] = instrs[i].Addr; } if (instrs[i].BranchFlags & branch_IdleBranch) e.idle = 1; }
+        MOVP2R(X16, &e.count);
+        LDR(INDEX_UNSIGNED, X17, X16, 0);
+        ADD(X17, X17, 1);
+        STR(INDEX_UNSIGNED, X17, X16, 0);
+    }
+#endif
 
     Thumb = thumb;
     Num = cpu->Num;
@@ -2006,7 +2462,11 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     PendingCycles = 0;
     DeferCycles = false;
 #endif
+#ifdef LITEV_JIT_REGALLOC_USEMASK
+    RegCache.Reset(this, instrs, instrsCount, true);
+#else
     RegCache = RegisterCache<Compiler, ARM64Reg>(this, instrs, instrsCount, true);
+#endif
 #ifdef LITEV_JIT_GLOBALREG
     // GLOBALREG: install the fixed guest->host map. These regs are already resident
     // in their host regs (loaded by ARM_Dispatch at slice entry, preserved across
@@ -2040,12 +2500,21 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     HasStaticExit = false;
     LastInstrCompiledNonBranch = false;
 #endif
+#ifdef LITEV_JIT_RAS
+    RasRetBlock = false;
+#endif
 #ifdef LITEV_EXIT_PROTO_PC
     PCElided = false;
     BlockStartAddr = instrs[0].Addr;
 #endif
+#if defined(LITEV_JIT_EXIT_TAIL) || defined(LITEV_JIT_LDR_ALIGNCHK) || defined(LITEV_JIT_COLD_EXITS)
+    TailStubs.clear();
+#endif
+#ifdef LITEV_JIT_COLD_EXITS
+    ColdExits.clear();
+#endif
 
-    if (hasMemInstr)
+    if (hasMemInstr && !JitQOn(jitq_MemBasePin))   // pinned: ARM_Dispatch set x26 for the slice
         MOVP2R(RMemBase, Num == 0 ? NDS.JIT.Memory.FastMem9Start : NDS.JIT.Memory.FastMem7Start);
 
     for (int i = 0; i < instrsCount; i++)
@@ -2070,6 +2539,12 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         CompileFunc comp = Thumb
             ? T_Comp[CurInstr.Info.Kind]
             : A_Comp[CurInstr.Info.Kind];
+#ifdef LITEV_JIT_CP15_INLINE
+        if (!comp && !Thumb && (CurInstr.Info.Kind == ARMInstrInfo::ak_MCR
+                || CurInstr.Info.Kind == ARMInstrInfo::ak_MRC) && CP15InlineOK())
+            comp = CurInstr.Info.Kind == ARMInstrInfo::ak_MCR
+                ? &Compiler::A_Comp_MCR_CacheOp : &Compiler::A_Comp_MRC_DTCM;
+#endif
 
         Exit = i == (instrsCount - 1) || (CurInstr.BranchFlags & branch_FollowCondNotTaken);
 
@@ -2115,7 +2590,10 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
                 MOVI2R(W0, CurInstr.Instr);
                 STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, CurInstr));
             }
-            if (Num == 0)
+            // ARMv5::CodeCycles is read only by interpreter instructions (AddCycles_*), and
+            // every C++ path that runs one sets it first (CodeRead32 / the compile pass);
+            // JIT code never reads it. So only an interpreter fallback here needs the store.
+            if (Num == 0 && (comp == NULL || !JitQOn(jitq_CodeCyclesDead)))
             {
                 MOVI2R(W0, (s32)CurInstr.CodeCycles);
                 STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, CodeCycles));
@@ -2138,7 +2616,20 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 #endif
         }
         else
+        {
+#ifdef LITEV_JIT_R15_ELIDE
+            // An ARM literal load (LDR rd, [pc, #imm]) the literal optimisation will turn into
+            // a constant never reads r15: don't materialise it into a host register.
+            const u16 srcRegs = instrs[i].Info.SrcRegs;
+            RegCache.ElideR15Value = JitQOn(jitq_R15Elide);
+            if (RegCache.ElideR15Value && !Thumb && R15LiteralLoadFolds(comp))
+                instrs[i].Info.SrcRegs &= ~(1 << 15);
+#endif
             RegCache.Prepare(Thumb, i);
+#ifdef LITEV_JIT_R15_ELIDE
+            instrs[i].Info.SrcRegs = srcRegs;
+#endif
+        }
 
         if (Thumb)
         {
@@ -2187,6 +2678,34 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
             {
                 IrregularCycles = comp == NULL;
 
+#ifdef LITEV_JIT_COLD_EXITS
+                if (cond < 0xE && comp == &Compiler::A_Comp_BranchImm && ColdExitOK())
+                {
+                    if (CurInstr.BranchFlags & branch_FollowCondNotTaken)
+                    {
+                        // taken edge = exit, in the tail; then the not-taken edge's compile-time
+                        // effects, exactly as the in-place code: the body (Comp_JumpTo) made the
+                        // cycles irregular and the not-taken path counts this instruction's cycles
+                        DeferColdExit(CheckCondition(cond ^ 1), 0);
+                        IrregularCycles = true;
+                        Comp_AddCycles_C(true);
+                    }
+                    else
+                    {
+                        // not-taken edge = exit, in the tail; the taken edge (the body) runs on
+                        FixupBranch notTaken = CheckCondition(cond);
+                        (this->*comp)();
+                        Comp_BranchSpecialBehaviour(true);
+                        if (IrregularCycles)
+                            Comp_AddCycles_C(true);
+                        DeferColdExit(notTaken, 1);
+  #ifdef LITEV_EXIT_PROTO_PC
+                        PCElided = false;   // the exit's EmitLinkExit consumes it
+  #endif
+                    }
+                    goto instrDone;
+                }
+#endif
                 FixupBranch skipExecute;
                 if (cond < 0xE)
                     skipExecute = CheckCondition(cond);
@@ -2233,6 +2752,9 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
             }
         }
 
+#ifdef LITEV_JIT_COLD_EXITS
+    instrDone:
+#endif
         if (comp == NULL)
         {
             LoadCycles();
@@ -2352,10 +2874,23 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     QuickTailCall(X0, ARM_Ret);
 #endif
 
+#if defined(LITEV_JIT_EXIT_TAIL) || defined(LITEV_JIT_LDR_ALIGNCHK) || defined(LITEV_JIT_COLD_EXITS)
+    EmitTailStubs();
+#endif
+#ifdef LITEV_BLOCKPROF
+    BP().back().host.assign((const uint8_t*)res, (const uint8_t*)GetRXPtr());
+#endif
+#ifdef LITEV_JIT_COMPILE_STATS
+    const u64 flushT0 = JitTicks();
+#endif
     FlushIcache();
+#ifdef LITEV_JIT_COMPILE_STATS
+    JitCompileTicks[JitPhase_Flush] += JitTicks() - flushT0;
+#endif
 
 
 #ifdef LITEV_JIT_PERFMAP
+    if (litev_perfmap::g_state == 1)   // armed: name the block (formatting it costs ~2% of a compile)
     {
         char nm[24];
         snprintf(nm, sizeof(nm), "jit_a%d_%x", Num == 0 ? 9 : 7, (unsigned)instrs[0].Addr);
@@ -2385,6 +2920,9 @@ void Compiler::ICacheReset()
     for (int c = 0; c < 2; c++)
     {
         if (ICacheTable[c]) memset(ICacheTable[c], 0, (size_t)ICacheSites * sizeof(ICacheEntry));
+#if defined(LITEV_JIT_DIRECTPATCH) && defined(LITEV_JIT_DP_REVERTLIST)
+        DirectPatchListed[c].clear();
+#endif
     }
     ICacheNextSite = 1;
     NDS.ARM9.ICacheEpoch++;
@@ -2395,6 +2933,14 @@ void Compiler::ICacheReset()
 void Compiler::Reset()
 {
     LoadStorePatches.clear();
+#ifdef LITEV_JIT_STORE_REPROMOTE
+    SlowStoreSites.clear();   // the code they point into is gone
+    SlowStoreNextRetry = ~0u;
+#endif
+#ifdef LITEV_JIT_PATCHMAP_RESERVE
+    // one entry per compiled memory access: sized up front so compiling never rehashes it
+    LoadStorePatches.reserve(1 << 15);
+#endif
 
 #ifdef LITEV_JIT_ICACHE
     // Allocate the per-CPU inline-cache tables BEFORE Gen_Dispatcher bakes their base
@@ -2402,6 +2948,66 @@ void Compiler::Reset()
     ICacheAllocOnce();
     ICacheReset();
 #endif
+#ifdef LITEV_JIT_CP15_INLINE
+    {
+#if defined(__ANDROID__)
+        char b[8] = {0}; int n = __system_property_get("debug.litev.cp15inline", b);
+        Cp15InlineOn = (n > 0) ? (atoi(b) != 0) : true;
+#else
+        const char* e = getenv("debug.litev.cp15inline"); Cp15InlineOn = e ? (atoi(e) != 0) : true;
+#endif
+    }
+#endif
+#ifdef LITEV_JIT_RAS
+    {
+#if defined(__ANDROID__)
+        char b[8] = {0}; int n = __system_property_get("debug.litev.jitras", b);
+        RasOn = (n > 0) ? (atoi(b) != 0) : true;
+#else
+        const char* e = getenv("debug.litev.jitras"); RasOn = e ? (atoi(e) != 0) : true;
+#endif
+    }
+#endif
+
+    {
+        // debug.litev.jitq: JIT code-quality lever bits (see Compiler::jitq_*), default all
+        // compiled-in levers on; 0 = the code the build emitted before them
+        u32 on = 0
+#ifdef LITEV_JIT_EXIT_TAIL
+            | jitq_ExitTail
+#endif
+#ifdef LITEV_JIT_MEMBASE_PIN
+            | jitq_MemBasePin
+#endif
+#ifdef LITEV_JIT_FLAGS_BFXIL
+            | jitq_FlagsBfxil
+#endif
+#ifdef LITEV_JIT_R15_ELIDE
+            | jitq_R15Elide
+#endif
+#ifdef LITEV_JIT_LDR_ALIGNCHK
+            | jitq_LdrAlignChk
+#endif
+#ifdef LITEV_JIT_CODECYCLES_DEAD
+            | jitq_CodeCyclesDead
+#endif
+#ifdef LITEV_JIT_COLD_EXITS
+            | jitq_ColdExits
+#endif
+#ifdef LITEV_JIT_NZ_BRANCH
+            | jitq_NZBranch
+#endif
+#ifdef LITEV_JIT_MOV_ELIDE
+            | jitq_MovElide
+#endif
+            ;
+#if defined(__ANDROID__)
+        char b[16] = {0}; int n = __system_property_get("debug.litev.jitq", b);
+        JitQ = on & ((n > 0) ? (u32)strtoul(b, nullptr, 0) : ~0u);
+#else
+        const char* e = getenv("debug.litev.jitq"); JitQ = on & (e ? (u32)strtoul(e, nullptr, 0) : ~0u);
+#endif
+    }
 
 #ifdef LITEV_JIT_PERFMAP
     // Wholesale block-cache reset: truncate the perf map and rewrite the

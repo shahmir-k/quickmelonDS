@@ -18,12 +18,20 @@ layout(std140) uniform uConfig
     int uFogShift;
 };
 
+#ifdef ShaderBlend
+layout(location = 0) inout vec4 oColor;
+#else
 layout(location = 0) out vec4 oColor;
+#endif
 layout(location = 1) inout vec4 oAttr;
+
+uniform float uWZ0;
 
 vec4 CalculateFog(float depth)
 {
-    int idepth = int(depth * 16777216.0);
+    // W-buffer early-Z frames store 1 - z0/w (GPU3D_OpenGL WZ0): back to w
+    int idepth = uWZ0 > 0.0 ? int(min(uWZ0 / max(1.0 - depth, 1.0 / 16777216.0), 16777215.0))
+                            : int(depth * 16777216.0);
     int densityid, densityfrac;
 
     if (idepth < uFogOffset)
@@ -56,5 +64,14 @@ void main()
 {
     vec4 ret = vec4(0,0,0,0);
     if (oAttr.b != 0.0) ret = CalculateFog(gl_LastFragDepthARM);
+#ifdef ShaderBlend
+    // the fog blend done here (blending off): the constant-colour blend it replaces made the
+    // Mali driver compile a blend shader per fog colour (~23 ms on the GL thread)
+    float d = ret.a;
+    vec4 dst = oColor;
+    if ((uDispCnt & (1<<6)) != 0) oColor = vec4(dst.rgb, uFogColor.a * d + dst.a * (1.0 - d));   // fog alpha only
+    else                          oColor = uFogColor * d + dst * (1.0 - d);
+#else
     oColor = ret;
+#endif
 }

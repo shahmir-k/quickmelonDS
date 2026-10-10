@@ -629,6 +629,11 @@ public:
     int FrameskipTarget = 0;
     int FrameskipCounter = 0;
     bool SkipThisFrame = false;
+#ifdef LITEV_FF_SKIP_PRESENT
+    // the frameskip schedule skips this frame's display: no present (the frontend), even when it is
+    // drawn anyway because a recording keeps every capture (KeepCaptures)
+    bool SkipDisplay = false;
+#endif
     static constexpr int LITEV_FRAMESKIP_MAX = 9;
 
     // Netplay: a console nobody looks at (another player's) draws nothing. Rendering does not
@@ -637,6 +642,12 @@ public:
     // ponytail: the very first capture's 3D layer is the stale one (3D for a frame is drawn
     // during the previous one); render 3D every frame for that if a game desyncs on it.
     bool Headless = false;
+#ifdef LITEV_FF_HEADLESS3D
+    // fast-forward (set by the frontend each frame): a frame whose 3D won't be rendered builds its
+    // geometry like a console nobody watches (GPU3D::Headless)
+    bool FFHeadless3D = false, FFHeadlessWas = false;
+    void FFHeadlessDecide(bool frameStart) noexcept;
+#endif
     bool CaptureSeen = false;
     // Record mode: skipping a frame's drawing must not change guest state, but a display capture
     // writes the drawn picture into VRAM. Once the game has captured, draw every frame (fast-forward

@@ -69,7 +69,7 @@ bool IsImmArithmetic(uint64_t input, u32* val, bool* shift)
 }
 
 // For AND/TST/ORR/EOR etc
-bool IsImmLogical(uint64_t value, unsigned int width, unsigned int* n, unsigned int* imm_s,
+bool IsImmLogicalUncached(uint64_t value, unsigned int width, unsigned int* n, unsigned int* imm_s,
                   unsigned int* imm_r)
 {
   // DCHECK((n != NULL) && (imm_s != NULL) && (imm_r != NULL));
@@ -278,6 +278,31 @@ bool IsImmLogical(uint64_t value, unsigned int width, unsigned int* n, unsigned 
   return true;
 }
 
+#ifdef LITEV_JIT_IMMLOGICAL_CACHE
+// The JIT asks about the same few mask constants on every memory access; IsImmLogical is a
+// pure function of (value, width), so a small per-thread memo returns the same answer.
+bool IsImmLogical(uint64_t value, unsigned int width, unsigned int* n, unsigned int* imm_s,
+                  unsigned int* imm_r)
+{
+  struct Entry { uint64_t value; unsigned int width; bool valid, ok; unsigned int n, s, r; };
+  static thread_local Entry cache[64];
+  Entry& e = cache[(value ^ (value >> 17) ^ (value >> 37) ^ width) & 63];
+  if (!e.valid || e.value != value || e.width != width)
+  {
+    e.ok = IsImmLogicalUncached(value, width, &e.n, &e.s, &e.r);
+    e.value = value; e.width = width; e.valid = true;
+  }
+  if (e.ok) { *n = e.n; *imm_s = e.s; *imm_r = e.r; }
+  return e.ok;
+}
+#else
+bool IsImmLogical(uint64_t value, unsigned int width, unsigned int* n, unsigned int* imm_s,
+                  unsigned int* imm_r)
+{
+  return IsImmLogicalUncached(value, width, n, imm_s, imm_r);
+}
+#endif
+
 float FPImm8ToFloat(u8 bits)
 {
   const u32 sign = bits >> 7;
@@ -414,18 +439,33 @@ void ARM64XEmitter::FlushIcacheSection(u8* start, u8* end)
   icache_line_size = isize = icache_line_size < isize ? icache_line_size : isize;
   dcache_line_size = dsize = dcache_line_size < dsize ? dcache_line_size : dsize;
 
-  addr = (u64)start & ~(u64)(dsize - 1);
-  for (; addr < (u64)end; addr += dsize)
-    // use "civac" instead of "cvau", as this is the suggested workaround for
-    // Cortex-A53 errata 819472, 826319, 827319 and 824069.
-    __asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
+#ifdef LITEV_JIT_FLUSH_CTR
+  // CTR_EL0.IDC: the data cache needn't be cleaned for instruction fetches to see new code
+  // (the RG DS's A55 reports it); DIC: nor the instruction cache invalidated. The kernel shows a
+  // value that is safe on every core. Skipping a clean to the point of coherency per line was
+  // ~1 us per compiled block on the A55.
+  const bool needDC = !((ctr_el0 >> 28) & 1), needIC = !((ctr_el0 >> 29) & 1);
+#else
+  const bool needDC = true, needIC = true;
+#endif
+  if (needDC)
+  {
+    addr = (u64)start & ~(u64)(dsize - 1);
+    for (; addr < (u64)end; addr += dsize)
+      // use "civac" instead of "cvau", as this is the suggested workaround for
+      // Cortex-A53 errata 819472, 826319, 827319 and 824069.
+      __asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
+  }
   __asm__ volatile("dsb ish" : : : "memory");
 
-  addr = (u64)start & ~(u64)(isize - 1);
-  for (; addr < (u64)end; addr += isize)
-    __asm__ volatile("ic ivau, %0" : : "r"(addr) : "memory");
+  if (needIC)
+  {
+    addr = (u64)start & ~(u64)(isize - 1);
+    for (; addr < (u64)end; addr += isize)
+      __asm__ volatile("ic ivau, %0" : : "r"(addr) : "memory");
 
-  __asm__ volatile("dsb ish" : : : "memory");
+    __asm__ volatile("dsb ish" : : : "memory");
+  }
   __asm__ volatile("isb" : : : "memory");
 #endif
 }

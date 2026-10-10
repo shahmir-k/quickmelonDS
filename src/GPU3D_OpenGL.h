@@ -19,6 +19,7 @@
 #pragma once
 
 #ifdef OGLRENDERER_ENABLED
+#include <string>
 #include "GPU3D.h"
 #include "OpenGLSupport.h"
 #include "GPU3D_TexcacheOpenGL.h"
@@ -54,7 +55,9 @@ public:
     // slot: up to two prepared frames may be outstanding (one rendering, one queued);
     // beforeVRAMWrite runs before PrepareFrame modifies the flat texture VRAM a running
     // frame may still be reading (the caller waits for it there).
-    void PrepareFrame(int slot = 0, const std::function<void()>& beforeVRAMWrite = {});
+    // copyPolys=false (LITEV_GL_NOSNAPCOPY): the job reads GPU3D's polygon/vertex bank in place;
+    // returns that bank (0/1, -1: none read), which the caller must keep unwritten until the job ends.
+    int PrepareFrame(int slot = 0, const std::function<void()>& beforeVRAMWrite = {}, bool copyPolys = true);
 #ifdef LITEV_HYB_TEXSTAGE
     void EnableTexStaging() { Texcache.EnableStaging(); }
 #endif
@@ -68,6 +71,8 @@ public:
     void SetColorRing(int n) noexcept;
     [[nodiscard]] int GetCurColor() const noexcept { return CurColor; }
     [[nodiscard]] GLuint GetColorTex(int i) const noexcept { return ColorBufferTex[i]; }
+    // that frame's 256x192 edge-marking overlay (rgb colour, a coverage), 0 if it has none
+    [[nodiscard]] GLuint GetEdgeTex(int i) const noexcept { return EdgeValid[i] ? EdgeTex[i] : 0; }
 
 private:
     GLRenderer* Parent;
@@ -99,8 +104,8 @@ private:
     bool TexEnable;
     TexcacheOpenGL Texcache;
 
-    bool BuildRenderShader(bool wbuffer);
-    void UseRenderShader(bool wbuffer);
+    bool BuildRenderShader(int flags);   // bit0 W-buffer, bit1 no alpha test (LITEV_GL_OPAQUE_NODISCARD)
+    void UseRenderShader(int flags);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32* vptr) const;
     void BuildPolygons(RendererPolygon* polygons, int npolys, int captureinfo[16]);
@@ -109,6 +114,10 @@ private:
     int RenderPolygonBatch(int i) const;
     int RenderPolygonEdgeBatch(int i) const;
     void RenderSceneChunk(int y, int h);
+#ifdef LITEV_GL_WARM_VARIANTS
+    void WarmVariants();
+    bool Warmed = false;
+#endif
 
 
     enum
@@ -116,15 +125,24 @@ private:
         RenderMode_Opaque = 0,
         RenderMode_Translucent,
         RenderMode_ShadowMask,
+        RenderMode_OpaqueBlended,   // LITEV_GL_BATCH_NEEDOPAQUE: opaque and translucent texels in one draw
     };
+    static constexpr u32 RenderKey_NoDiscard = 0x40000000;   // LITEV_GL_OPAQUE_NODISCARD (bits 20-29 = texattr)
 
 
     GLuint ClearShaderPlain {};
     GLuint ClearShaderBitmap {};
 
-    GLuint RenderShader[2] {};
+    GLuint RenderShader[4] {};
     GLint RenderModeULoc = 0;
     GLuint CurShaderID = -1;
+    // LITEV_GL_WBUF_EARLYZ: this frame's W-buffer depth mapping, window depth = 1 - WZ0/w
+    // (0: the plain z/2^24 mapping)
+    float WZ0 = 0;
+    static bool WEarlyZ();
+    static bool NoDiscard();
+    static bool FogShaderBlend();
+    static std::string FogFetchSource();
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};
@@ -209,6 +227,9 @@ private:
     void AllocColorBuffers() noexcept;
 
     GLuint MainFramebuffer {};
+    GLuint FinalFramebuffer {};   // colour only: the fog texture pass samples depth + attributes
+    GLuint EdgeTex[MaxColorRing] {}, EdgeFramebuffer {};   // 1x edge marking per ring entry
+    bool EdgeValid[MaxColorRing] {};
     GLuint WrapSampler[9] {};   // [wrapS * 3 + wrapT], 0 clamp / 1 repeat / 2 mirror
 };
 }

@@ -10,6 +10,7 @@ uniform usampler2D ClearBitmapDepth;
 
 uniform vec2 uClearBitmapOffset;
 uniform uint uOpaquePolyID;
+uniform float uWZ0;   // > 0: W-buffer early-Z depth mapping (GPU3D_OpenGL WZ0)
 
 smooth in vec2 fTexcoord;
 
@@ -23,6 +24,7 @@ void main()
     vec4 color = vec4(texture(ClearBitmapColor, pos)) / vec4(63,63,63,31);
     uint depth = texture(ClearBitmapDepth, pos).r;
     float fdepth = float(depth & 0xFFFFFFu) / 16777216.0;
+    if (uWZ0 > 0.0) fdepth = 1.0 - uWZ0 / max(float(depth & 0xFFFFFFu), uWZ0);
 
 #ifdef GL_ES
     oColor = color.bgra; // Mali: 3D layer emitted BGRA (see 3DRenderFS)

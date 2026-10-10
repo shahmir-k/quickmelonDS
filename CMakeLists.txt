@@ -565,6 +565,74 @@ if (LITEV_JIT_DIRECTPATCH)
     endif()
 endif()
 
+# RAS: guest return-address stack for the dispatcher's inline cache. Each guest call
+# site gets its own ICACHE site (monomorphic: the return lands on one address); calls
+# push it, returns pop it and use it instead of their own polymorphic site. Only the
+# host cache index changes; the dispatcher's commit/stop/budget path is unchanged ->
+# exact. Runtime: debug.litev.jitras (prop on Android, env elsewhere; default on).
+option(LITEV_JIT_RAS "Return-address stack: guest returns use the caller's ICACHE site (needs DIRECTPATCH)" OFF)
+if (LITEV_JIT_RAS)
+    if (LITEV_JIT_DIRECTPATCH)
+        add_compile_definitions(LITEV_JIT_RAS=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_RAS requires LITEV_JIT_DIRECTPATCH (and so ICACHE).")
+    endif()
+endif()
+
+# A7HLE: Pokemon Black/White's NitroSDK ARM7 sound driver SND_ExChannelMain (envelope/LFO/
+# sweep/volume/pitch/pan per channel, ~1/3 of the ARM7's guest instructions in the PW overworld)
+# and SND_SeqMain (sequencer, ~1/5) run as native C++ writing the same bytes; detected by code
+# signature, fall back to the guest code for channel callbacks / notes needing a new channel. Category B: guest memory identical, ARM7 cycles of the
+# call are a fixed estimate. Runtime: debug.litev.a7hle (default on). See src/ARM7HLE.h.
+option(LITEV_A7HLE "ARM7 HLE of the NitroSDK SND_ExChannelMain (PW/PB, approximate cycles)" OFF)
+if (LITEV_A7HLE)
+    add_compile_definitions(LITEV_A7HLE=1)
+endif()
+
+# A9HLE: Pokemon Black/White's NitroSDK ARM9 OS: spurious OS_WaitIrq wake-ups (the IRQ handler
+# switching to the VBlank-waiting main thread and back on every HBlank, 25-50% of ARM9 guest
+# instructions) are skipped with the exact memory/register result, and OS_SetIrqFunction /
+# OS_GetIrqFunction run natively. Signature-detected (JIT: hook block depends on the code bytes), guest fallback;
+# cycles are a fixed estimate. Runtime: debug.litev.a9hle (default on). See src/ARM9HLE.h.
+option(LITEV_A9HLE "ARM9 HLE of NitroSDK OS IRQ wake-ups / IRQ table functions (PW/PB, approximate cycles)" OFF)
+if (LITEV_A9HLE)
+    add_compile_definitions(LITEV_A9HLE=1)
+endif()
+# A9HLE_GXCHECK (diagnostic): records the words reaching GXFIFO so LITEV_A9HLE_CHECK=1 (interpreter)
+# can check the MI_SendGXCommandAsync hook (A9HLE 5.) against the guest. Never in a shipping build.
+option(LITEV_A9HLE_GXCHECK "Diagnostic: A9HLE GX send compare mode (GXFIFO word tap)" OFF)
+if (LITEV_A9HLE_GXCHECK)
+    add_compile_definitions(LITEV_A9HLE_GXCHECK=1)
+endif()
+
+# A7PROF (diagnostic): per-guest-function ARM7 (and ARM9: env LITEV_A9PROF) profile in the interpreter (--mode interp,
+# env LITEV_A7PROF=<out prefix>). See src/ARM7Prof.h. Never in a shipping build.
+option(LITEV_A7PROF "Diagnostic: ARM7 per-function guest profile (interpreter)" OFF)
+if (LITEV_A7PROF)
+    add_compile_definitions(LITEV_A7PROF=1)
+endif()
+
+# CP15_INLINE: the JIT emits ARM9 data-cache maintenance MCRs (c7, no-ops in CP15Write) and
+# the DTCM-setting MRC (c9,c1,0) inline instead of an interpreter fallback (full register
+# spill + C++ call). Same cycles -> exact. Runtime: debug.litev.cp15inline (prop on
+# Android, env elsewhere; default on), latched at each block-cache reset.
+option(LITEV_JIT_CP15_INLINE "JIT: inline no-op cache-maintenance MCRs and the DTCM-setting MRC" OFF)
+if (LITEV_JIT_CP15_INLINE)
+    add_compile_definitions(LITEV_JIT_CP15_INLINE=1)
+endif()
+
+# IDLE2: generalized ARM9 wait-loop skipping. (1) classic idle-loop detection also over
+# back-edges whose in-block path crosses followed branches; (2) back-edges of loops that
+# store or call (not provable statically) exit to C++, which traces two iterations in the
+# interpreter (taint: timer/DIV values and loop-carried stores may only feed data, never
+# control flow / addresses / accumulators) and then skips to the slice target like the
+# classic idle loop. Approximate (deterministic). Runtime: debug.litev.idle2 (prop on
+# Android, env elsewhere; default on).
+option(LITEV_JIT_IDLE2 "JIT: generalized idle/wait-loop skipping (ARM9)" OFF)
+if (LITEV_JIT_IDLE2)
+    add_compile_definitions(LITEV_JIT_IDLE2=1)
+endif()
+
 # Unit 5 (M2.1): event-true scheduler slices. When ON, each scheduler iteration
 # runs the CPUs to the TRUE next deadline (next scheduled event / frame end /
 # next timer overflow) instead of the fixed kMaxIterationCycles cap, so the CPUs
@@ -677,9 +745,74 @@ option(LITEV_GXFIFO_UNIFIED "GX command PIPE and FIFO in one ring: FIFO->PIPE mo
 if (LITEV_GXFIFO_UNIFIED)
     add_compile_definitions(LITEV_GXFIFO_UNIFIED=1)
 endif()
+option(LITEV_GX_BULK "Geometry DMA in bulk: a GXFIFO DMA with an empty FIFO decodes its words in chunks of 64 and runs them through the geometry engine at once (deterministic, approximate GX timing). Needs LITEV_DMA_GXFIFO_FAST, LITEV_GXFIFO_THREADED, LITEV_GXFIFO_UNIFIED. Runtime off: debug.litev.gxbulk=0 (headless: LITEV_GXBULK=0)" OFF)
+if (LITEV_GX_BULK)
+    add_compile_definitions(LITEV_GX_BULK=1)
+endif()
+
+# GX_CPUSEND: NitroSDK MI_CpuSend32 to GXFIFO (a display list sent by the CPU, one slow IO store
+# per word) runs through the bulk geometry path (LITEV_GX_BULK). Hooked by code signature at JIT
+# compile; category B (fixed cycle estimate, the FIFO never fills). Runtime off: debug.litev.gxsend=0.
+option(LITEV_GX_CPUSEND "MI_CpuSend32 to GXFIFO through the bulk geometry path (needs LITEV_GX_BULK; approximate timing)" OFF)
+if (LITEV_GX_CPUSEND)
+    add_compile_definitions(LITEV_GX_CPUSEND=1)
+endif()
+
+# GX_DMA_PREFETCH: the bulk geometry DMA loop (LITEV_GX_BULK) keeps its state in registers and
+# prefetches the display list a chunk ahead (the in-order A55 stalls on every source line miss).
+# Exact: same words, same cycles.
+option(LITEV_GX_DMA_PREFETCH "Bulk geometry DMA: register loop state + source prefetch (exact)" OFF)
+if (LITEV_GX_DMA_PREFETCH)
+    add_compile_definitions(LITEV_GX_DMA_PREFETCH=1)
+endif()
+
+# GX_POLY_LEAN: polygon setup for the in-order A55: SubmitPolygon out of line (vertices that close
+# no polygon skip its prologue), and one 32-bit divide per axis gives both the hi-res and the
+# 9/8-bit screen position (was two 32-bit + two 64-bit divides). Exact.
+option(LITEV_GX_POLY_LEAN "Lean polygon setup: SubmitPolygon out of line, merged viewport divides (exact)" OFF)
+if (LITEV_GX_POLY_LEAN)
+    add_compile_definitions(LITEV_GX_POLY_LEAN=1)
+endif()
+
+# GX_CLIP_REJECT: polygons entirely past one clip plane (PW town: ~835 of ~1720 a frame) get the
+# clipper's result (0 vertices) without its vertex copy passes. Exact.
+option(LITEV_GX_CLIP_REJECT "Trivial reject before the polygon clipper (exact)" OFF)
+if (LITEV_GX_CLIP_REJECT)
+    add_compile_definitions(LITEV_GX_CLIP_REJECT=1)
+endif()
+
+# GX_SEND_DIRECT: the native display-list send (A9HLE hook 5) hands the list to the GX engine
+# straight from main RAM instead of copying it word by word, and adds the DMA cycles from a
+# per-chunk prefix sum of the same burst table. Exact.
+option(LITEV_GX_SEND_DIRECT "Native GX display-list send reads the list in place (exact)" OFF)
+if (LITEV_GX_SEND_DIRECT)
+    add_compile_definitions(LITEV_GX_SEND_DIRECT=1)
+endif()
+# GX_EARLY_REJECT (needs GX_CLIP_REJECT): SubmitPolygon tests a polygon the clipper would
+# reject before the backface-cull math and vertex copies; both paths end the same way. Exact.
+option(LITEV_GX_EARLY_REJECT "Reject off-screen polygons before culling (exact)" OFF)
+if (LITEV_GX_EARLY_REJECT)
+    add_compile_definitions(LITEV_GX_EARLY_REJECT=1)
+endif()
+# GX_BULK_LEAN: the bulk GX executor keeps its batch cursor in a register and skips the
+# push/pop counter that a bulk push/pop raises and lowers within its own handler. Exact.
+option(LITEV_GX_BULK_LEAN "Bulk GX executor: batch cursor in a register (exact)" OFF)
+if (LITEV_GX_BULK_LEAN)
+    add_compile_definitions(LITEV_GX_BULK_LEAN=1)
+endif()
+# GX_CLIP_LEAN: the polygon clipper (ClipAgainstPlane) reads vertices in place instead of copying
+# each one, and skips a plane side with no vertex past it (that pass only copies). Exact.
+option(LITEV_GX_CLIP_LEAN "Polygon clipper without the per-vertex copies (exact)" OFF)
+if (LITEV_GX_CLIP_LEAN)
+    add_compile_definitions(LITEV_GX_CLIP_LEAN=1)
+endif()
 option(LITEV_JIT_CYCLE_BATCH "Batch the per-instruction cycle adds of unconditional non-branch instructions into one add before the next cycle read (AArch64, exact)" OFF)
 if (LITEV_JIT_CYCLE_BATCH)
     add_compile_definitions(LITEV_JIT_CYCLE_BATCH=1)
+endif()
+option(LITEV_JIT_USERSTM_FASTMEM "Fault-backed fastmem path for user-bank STM (STM ^, OS context save) (AArch64; prop debug.litev.userstmfast)" OFF)
+if (LITEV_JIT_USERSTM_FASTMEM)
+    add_compile_definitions(LITEV_JIT_USERSTM_FASTMEM=1)
 endif()
 option(LITEV_JIT_LDM_FASTMEM "Fault-backed fastmem path for LDM/POP block loads, not only stores (AArch64)" OFF)
 if (LITEV_JIT_LDM_FASTMEM)
@@ -695,6 +828,43 @@ endif()
 option(LITEV_JIT_BLOCKXFER_FAST "Hoist SlowBlockTransfer9's region dispatch for whole-in-TCM blocks (bit-exact)" OFF)
 if (LITEV_JIT_BLOCKXFER_FAST)
     add_compile_definitions(LITEV_JIT_BLOCKXFER_FAST=1)
+endif()
+
+# With LITEV_JIT_BLOCKXFER_FAST: also hoist the dispatch for LDM/STM blocks wholly in DS main RAM
+# (bit-exact; the JIT invalidation check stays per word).
+option(LITEV_JIT_BLOCKXFER_MAINRAM "SlowBlockTransfer9 fast path for whole-in-MainRAM blocks (bit-exact)" OFF)
+if (LITEV_JIT_BLOCKXFER_MAINRAM)
+    add_compile_definitions(LITEV_JIT_BLOCKXFER_MAINRAM=1)
+endif()
+
+# SPU: ADPCM decode from precomputed difference / next-index tables (bit-exact).
+option(LITEV_SPU_ADPCM_TABLE "SPU: table-driven ADPCM decode (bit-exact)" OFF)
+if (LITEV_SPU_ADPCM_TABLE)
+    add_compile_definitions(LITEV_SPU_ADPCM_TABLE=1)
+endif()
+
+# Fast-forward: frames whose 3D isn't rendered (FF frameskip) build their geometry like an unwatched
+# netplay console (render-only work skipped, emulation exact); a polygon bank built that way is
+# never rendered. Frontend sets GPU::FFHeadless3D. Runtime: debug.litev.ffheadless=0 off.
+option(LITEV_PACE_CATCHUP "App frame limiter: catch up to N frames of debt after a slow frame (debug.litev.pacedebt)" OFF)
+if (LITEV_PACE_CATCHUP)
+    add_compile_definitions(LITEV_PACE_CATCHUP=1)
+endif()
+option(LITEV_FF_SKIP_PRESENT "Fast-forward/frameskip: no present (merge + hand-off) on frames whose drawing was skipped (frontend; runtime debug.litev.ffskippresent)" OFF)
+if (LITEV_FF_SKIP_PRESENT)
+    add_compile_definitions(LITEV_FF_SKIP_PRESENT=1)
+endif()
+option(LITEV_FF_ADAPTIVE_SKIP "Fast-forward below its target speed skips more frames, up to the max frameskip setting (frontend; runtime debug.litev.ffadapt)" OFF)
+if (LITEV_FF_ADAPTIVE_SKIP)
+    add_compile_definitions(LITEV_FF_ADAPTIVE_SKIP=1)
+endif()
+option(LITEV_FF_CAP_PREFETCH "Frameskip: read the 3D back for the next display capture on the GL 3D thread at VCount 215 (hybrid; runtime debug.litev.capprefetch)" OFF)
+if (LITEV_FF_CAP_PREFETCH)
+    add_compile_definitions(LITEV_FF_CAP_PREFETCH=1)
+endif()
+option(LITEV_FF_HEADLESS3D "Fast-forward: skip render-only geometry work on skipped frames" OFF)
+if (LITEV_FF_HEADLESS3D)
+    add_compile_definitions(LITEV_FF_HEADLESS3D=1)
 endif()
 
 # DraStic JIT emit-quality (teardown 01, FUN_001912f0): merge the host NZCV flags into
@@ -790,6 +960,14 @@ endif()
 # stale (a 64-bit sqrt writes three registers, each ran the 32-step bit loop); it is
 # computed on the next read of SQRTCNT/SQRT_RESULT or at a savestate, from the FPU with an
 # exact integer correction. Same values as INSTANT_DIVSQRT wherever they can be read.
+option(LITEV_GX_VTX_PREFETCH "GPU3D: prefetch the vertex RAM lines a polygon will be stored to (exact)" OFF)
+if (LITEV_GX_VTX_PREFETCH)
+    add_compile_definitions(LITEV_GX_VTX_PREFETCH=1)
+endif()
+option(LITEV_LAZY_DIV "Compute the divider's result on read of DIVCNT/results or at a savestate (exact)" OFF)
+if (LITEV_LAZY_DIV)
+    add_compile_definitions(LITEV_LAZY_DIV=1)
+endif()
 option(LITEV_LAZY_SQRT "Compute the sqrt unit's result on read, with an exact FPU root (exact vs INSTANT_DIVSQRT)" OFF)
 if (LITEV_LAZY_SQRT)
     if (LITEV_INSTANT_DIVSQRT)
@@ -820,6 +998,224 @@ option(LITEV_HYB_CAPTURE_ASYNC "Hybrid renderer: display capture reads its 3D ba
 if (LITEV_HYB_CAPTURE_ASYNC)
     add_compile_definitions(LITEV_HYB_CAPTURE_ASYNC=1)
 endif()
+
+# Hybrid renderer, with LITEV_HYB_CAPTURE_ASYNC: finish each capture read (wait, map, copy, convert)
+# on the GL 3D thread instead of the emu thread. Runtime: debug.litev.capoff=0 off.
+option(LITEV_HYB_CAPTURE_OFFTHREAD "Hybrid: capture readback finished on the GL 3D thread" OFF)
+if (LITEV_HYB_CAPTURE_OFFTHREAD)
+    add_compile_definitions(LITEV_HYB_CAPTURE_OFFTHREAD=1)
+endif()
+
+# Hybrid renderer: a screen with no 3D is merged at 1x and blitted up to Nx (same pixels; at 3x
+# the 2D-only screen's per-pixel merge was ~2 ms of GPU a frame). Runtime: debug.litev.hybmerge1x=0 off.
+option(LITEV_HYB_MERGE_1X_2D "Hybrid: merge 2D-only screens at 1x, then blit up" OFF)
+if (LITEV_HYB_MERGE_1X_2D)
+    add_compile_definitions(LITEV_HYB_MERGE_1X_2D=1)
+endif()
+
+# Hybrid renderer: lines showing the 3D straight through merge with a copy shader, the rest with
+# the full merge (scissored runs of lines; same pixels). Runtime: debug.litev.hybfastlines=0 off.
+# Hybrid renderer: the async software 2D is split into line bands on persistent threads (it was
+# the slowest pipeline stage once the 3D moved to the GPU). Same pixels. Runtime:
+# debug.litev.s2dbands=N (1 = off).
+option(LITEV_SOFT2D_HYB_BANDS "Hybrid: software 2D in parallel line bands" OFF)
+if (LITEV_SOFT2D_HYB_BANDS)
+    add_compile_definitions(LITEV_SOFT2D_HYB_BANDS=1)
+endif()
+
+# Hybrid renderer: 4 descriptor/framebuffer slots instead of 3, so the 2D kick no longer waits for
+# the async present of the frame that was just finished (it reuses the slot presented 2 frames ago).
+option(LITEV_HYB_SLOTS4 "Hybrid: 4 framebuffer slots" OFF)
+if (LITEV_HYB_SLOTS4)
+    add_compile_definitions(LITEV_HYB_SLOTS4=1)
+endif()
+
+option(LITEV_HYB_MERGE_FASTLINES "Hybrid: fast merge for plain-3D lines" OFF)
+if (LITEV_HYB_MERGE_FASTLINES)
+    add_compile_definitions(LITEV_HYB_MERGE_FASTLINES=1)
+endif()
+
+# GL 3D, W-buffer frames: depth 1 - z0/w from the rasterizer instead of gl_FragDepth, so the GPU's
+# early depth test works (display only; same depth order, fog converts back to w).
+# Runtime: debug.litev.glwearlyz=0 off.
+option(LITEV_GL_NOSNAPCOPY "GL 3D (threaded): render from GPU3D's polygon/vertex bank in place, no per-frame copy (waits at VBlank if a job still reads a reused bank)" OFF)
+if (LITEV_GL_NOSNAPCOPY)
+    add_compile_definitions(LITEV_GL_NOSNAPCOPY=1)
+endif()
+
+option(LITEV_GL_WBUF_EARLYZ "GL 3D: W-buffer depth without gl_FragDepth (early-Z)" OFF)
+if (LITEV_GL_WBUF_EARLYZ)
+    add_compile_definitions(LITEV_GL_WBUF_EARLYZ=1)
+endif()
+option(LITEV_MEM_SPLIT "ARM9 IO handlers out of line: light ARM9Read32/Write32 prologue (exact)" OFF)
+if (LITEV_MEM_SPLIT)
+    add_compile_definitions(LITEV_MEM_SPLIT=1)
+endif()
+option(LITEV_SPU_FAST_ADPCM "Game-first ADPCM: batched, state in registers, sample bytes from RAM (approximate; needs LITEV_SPU_CHMAJOR)" OFF)
+if (LITEV_SPU_FAST_ADPCM)
+    add_compile_definitions(LITEV_SPU_FAST_ADPCM=1)
+endif()
+option(LITEV_SPU_ADPCM_MEMO "SPU: replay looped/re-keyed ADPCM samples from a per-channel decode memo (debug.litev.spumemo; needs LITEV_SPU_FAST_ADPCM)" OFF)
+if (LITEV_SPU_ADPCM_MEMO)
+    add_compile_definitions(LITEV_SPU_ADPCM_MEMO=1)
+endif()
+option(LITEV_SPU_RATE_DIV "SPU quality-for-speed: mix at 32768/div Hz (debug.litev.spudiv; needs LITEV_SPU_CHMAJOR)" OFF)
+if (LITEV_SPU_RATE_DIV)
+    add_compile_definitions(LITEV_SPU_RATE_DIV=1)
+endif()
+option(LITEV_SPU_CHMAJOR "SPU batch: run each channel over the whole batch, then mix (exact; needs LITEV_SPU_BATCH)" OFF)
+if (LITEV_SPU_CHMAJOR)
+    add_compile_definitions(LITEV_SPU_CHMAJOR=1)
+endif()
+option(LITEV_SPU_FAST_FETCH "SPU: channel FIFO reads main RAM directly (exact)" OFF)
+if (LITEV_SPU_FAST_FETCH)
+    add_compile_definitions(LITEV_SPU_FAST_FETCH=1)
+endif()
+option(LITEV_SPU_INLINE "SPU: inline the per-sample decoders into the channel loop (exact)" OFF)
+if (LITEV_SPU_INLINE)
+    add_compile_definitions(LITEV_SPU_INLINE=1)
+endif()
+option(LITEV_ACCESS_STATS "Diagnostic: count slow-path ARM9 accesses by register/region (logged at replay end)" OFF)
+if (LITEV_ACCESS_STATS)
+    add_compile_definitions(LITEV_ACCESS_STATS=1)
+endif()
+option(LITEV_CART_SYNC "Cart ROM reads: refill the FIFO at once instead of an event per word (deterministic timing change)" OFF)
+if (LITEV_CART_SYNC)
+    add_compile_definitions(LITEV_CART_SYNC=1)
+endif()
+option(LITEV_JIT_PRETOUCH "JIT: pre-fault the first 16 MB of the code slice at start (exact)" OFF)
+if (LITEV_JIT_PRETOUCH)
+    add_compile_definitions(LITEV_JIT_PRETOUCH=1)
+endif()
+option(LITEV_JIT_STORE_REPROMOTE "JIT: a fastmem store rewritten to the slow path by a code-page fault is restored to the fast path at a later frame boundary (exact)" OFF)
+if (LITEV_JIT_STORE_REPROMOTE)
+    add_compile_definitions(LITEV_JIT_STORE_REPROMOTE=1)
+endif()
+option(LITEV_JIT_COND_MEMGUESS "JIT: a conditional ARM load/store that ran while compiling picks fastmem by its observed region like unconditional ones, no first-run fault on IO (exact)" OFF)
+if (LITEV_JIT_COND_MEMGUESS)
+    add_compile_definitions(LITEV_JIT_COND_MEMGUESS=1)
+endif()
+option(LITEV_JIT_DP_REVERTLIST "JIT: DIRECTPATCH revert-all walks a list of promoted sites, not all 2x16383 slots (exact)" OFF)
+if (LITEV_JIT_DP_REVERTLIST)
+    add_compile_definitions(LITEV_JIT_DP_REVERTLIST=1)
+endif()
+option(LITEV_JIT_POOL_ALLOC "JIT: free-list allocator for blocks, block-list buffers and block/link map nodes instead of malloc per compile (exact, host-only)" OFF)
+if (LITEV_JIT_POOL_ALLOC)
+    add_compile_definitions(LITEV_JIT_POOL_ALLOC=1)
+endif()
+option(LITEV_JIT_PATCHLOG "JIT: load/store patch map as an offset-sorted vector (appends while compiling) instead of a hash table (exact, host-only)" OFF)
+if (LITEV_JIT_PATCHLOG)
+    add_compile_definitions(LITEV_JIT_PATCHLOG=1)
+endif()
+option(LITEV_JIT_FLATMAPS "JIT: block maps (JitBlocks9/7, RestoreCandidates) as open-addressing hash maps (exact, host-only)" OFF)
+if (LITEV_JIT_FLATMAPS)
+    add_compile_definitions(LITEV_JIT_FLATMAPS=1)
+endif()
+option(LITEV_JIT_FLUSH_CTR "JIT: new-code cache maintenance skips the data-cache clean / icache invalidate when CTR_EL0 says they're not needed (IDC/DIC; host-only)" OFF)
+if (LITEV_JIT_FLUSH_CTR)
+    add_compile_definitions(LITEV_JIT_FLUSH_CTR=1)
+endif()
+option(LITEV_JIT_REGALLOC_USEMASK "JIT register allocator: per-register use bitmasks (rank = popcount) instead of per-block suffix rank tables, cache reset in place (exact)" OFF)
+if (LITEV_JIT_REGALLOC_USEMASK)
+    add_compile_definitions(LITEV_JIT_REGALLOC_USEMASK=1)
+endif()
+option(LITEV_JIT_EXIT_TAIL "JIT code layout: link-exit stubs and budget-expired paths at the block tail, out of the executed code (exact, host-only; needs EXIT_PROTO + STOP)" OFF)
+if (LITEV_JIT_EXIT_TAIL)
+    if (NOT LITEV_JIT_EXIT_PROTO OR NOT LITEV_EXIT_PROTO_STOP)
+        message(FATAL_ERROR "LITEV_JIT_EXIT_TAIL requires LITEV_JIT_EXIT_PROTO and LITEV_EXIT_PROTO_STOP.")
+    endif()
+    add_compile_definitions(LITEV_JIT_EXIT_TAIL=1)
+endif()
+option(LITEV_JIT_MEMBASE_PIN "JIT: fastmem base (x26) set once per slice by ARM_Dispatch instead of 3 instructions per block (exact, host-only)" OFF)
+if (LITEV_JIT_MEMBASE_PIN)
+    add_compile_definitions(LITEV_JIT_MEMBASE_PIN=1)
+endif()
+option(LITEV_JIT_FLAGS_BFXIL "JIT lazy flags: N,Z(,C) slot writes as MRS+BFXIL instead of CSET/BFI per flag (exact, host-only; needs LAZYFLAGS)" OFF)
+if (LITEV_JIT_FLAGS_BFXIL)
+    add_compile_definitions(LITEV_JIT_FLAGS_BFXIL=1)
+endif()
+option(LITEV_JIT_R15_ELIDE "JIT: no r15 constant for conditional branches and folded ARM literal loads (exact, host-only)" OFF)
+if (LITEV_JIT_R15_ELIDE)
+    add_compile_definitions(LITEV_JIT_R15_ELIDE=1)
+endif()
+option(LITEV_JIT_LDR_ALIGNCHK "JIT fastmem: word/halfword loads test alignment and load the address directly, misaligned via the slow thunk in the block tail (exact, host-only)" OFF)
+if (LITEV_JIT_LDR_ALIGNCHK)
+    add_compile_definitions(LITEV_JIT_LDR_ALIGNCHK=1)
+endif()
+option(LITEV_JIT_CODECYCLES_DEAD "JIT: drop the ARM9 CodeCycles store at block ends (only interpreter fallbacks read it; exact)" OFF)
+if (LITEV_JIT_CODECYCLES_DEAD)
+    add_compile_definitions(LITEV_JIT_CODECYCLES_DEAD=1)
+endif()
+option(LITEV_JIT_COLD_EXITS "JIT code layout: the exit edge of a followed conditional branch is compiled at the block tail (exact, host-only)" OFF)
+if (LITEV_JIT_COLD_EXITS)
+    add_compile_definitions(LITEV_JIT_COLD_EXITS=1)
+endif()
+option(LITEV_JIT_NZ_BRANCH "JIT lazy flags: EQ/NE/MI/PL branch on the host N,Z a logical producer left resident instead of reloading the slot (exact)" OFF)
+if (LITEV_JIT_NZ_BRANCH)
+    add_compile_definitions(LITEV_JIT_NZ_BRANCH=1)
+endif()
+option(LITEV_JIT_MOV_ELIDE "JIT: no self-move before the dynamic-branch stub (exact)" OFF)
+if (LITEV_JIT_MOV_ELIDE)
+    add_compile_definitions(LITEV_JIT_MOV_ELIDE=1)
+endif()
+option(LITEV_JIT_COMPILE_STATS "JIT diagnosis: per-phase compile time counters (JitCompileTicks), printed per frame by the app replay log / headless LITEV_FRAME_MS" OFF)
+if (LITEV_JIT_COMPILE_STATS)
+    add_compile_definitions(LITEV_JIT_COMPILE_STATS=1)
+endif()
+option(LITEV_JIT_PATCHMAP_FLAT "JIT: open-addressing load/store patch map, no allocation per compiled memory access (exact)" OFF)
+if (LITEV_JIT_PATCHMAP_FLAT)
+    add_compile_definitions(LITEV_JIT_PATCHMAP_FLAT=1)
+endif()
+option(LITEV_JIT_PATCHMAP_RESERVE "JIT: reserve the load/store patch map so compiling never rehashes it" OFF)
+if (LITEV_JIT_PATCHMAP_RESERVE)
+    add_compile_definitions(LITEV_JIT_PATCHMAP_RESERVE=1)
+endif()
+option(LITEV_JIT_IMMLOGICAL_CACHE "JIT emitter: memoize the logical-immediate encoder (same code)" OFF)
+if (LITEV_JIT_IMMLOGICAL_CACHE)
+    add_compile_definitions(LITEV_JIT_IMMLOGICAL_CACHE=1)
+endif()
+option(LITEV_JIT_REGALLOC_SUFFIX "JIT register allocator: per-block suffix tables instead of a rescan per instruction (same code)" OFF)
+if (LITEV_JIT_REGALLOC_SUFFIX)
+    add_compile_definitions(LITEV_JIT_REGALLOC_SUFFIX=1)
+endif()
+option(LITEV_GL_OPAQUE_NODISCARD "GL 3D: opaque polygons without transparent texels skip the alpha test (Mali early-Z/FPK)" OFF)
+if (LITEV_GL_OPAQUE_NODISCARD)
+    add_compile_definitions(LITEV_GL_OPAQUE_NODISCARD=1)
+endif()
+
+# GL 3D: skip the edge-marking final pass, which can't mark anything in this renderer (no shader
+# writes the edge flag it tests) but split the 3D render pass. Exact. Runtime: debug.litev.gledgenoop=0 off.
+option(LITEV_GL_EDGE_MARK "GL 3D: DS edge marking (outlines); debug.litev.gledge=0 turns it off" OFF)
+if (LITEV_GL_EDGE_MARK)
+    add_compile_definitions(LITEV_GL_EDGE_MARK=1)
+endif()
+option(LITEV_GL_SKIP_NOOP_EDGE "GL 3D: skip the no-op edge marking pass" OFF)
+if (LITEV_GL_SKIP_NOOP_EDGE)
+    add_compile_definitions(LITEV_GL_SKIP_NOOP_EDGE=1)
+endif()
+# GL 3D: draw every program x blend x colour-mask combination once while the renderer is set up,
+# so the Mali driver's per-variant compile (11-24 ms on first use) doesn't land mid-game on the GL
+# thread the emu thread waits for. Exact. Runtime: debug.litev.glwarm=0 off.
+option(LITEV_GL_WARM_VARIANTS "GL 3D: compile the driver's program variants at start-up" OFF)
+if (LITEV_GL_WARM_VARIANTS)
+    add_compile_definitions(LITEV_GL_WARM_VARIANTS=1)
+endif()
+# GL 3D texture cache: the first array of every texture size is created at start-up (small: at
+# most 256 KB, ~16 MB in all) and later arrays double a size's capacity up to the old 8 MB. Creating
+# an array costs ~1-2 ms (once 11 ms) on the Mali GL thread, so a scene with 7-11 new sizes stalled
+# the emu thread 10-25 ms. Exact (storage only).
+option(LITEV_GL_TEXARRAY_PREALLOC "GL 3D: texture arrays created at start-up" OFF)
+if (LITEV_GL_TEXARRAY_PREALLOC)
+    add_compile_definitions(LITEV_GL_TEXARRAY_PREALLOC=1)
+endif()
+# GL 3D: fog by framebuffer fetch blends in the shader instead of with a constant blend colour,
+# for which the Mali driver compiled a blend shader per fog colour (~23 ms on the GL thread the
+# first time a fog colour shows). Display only (blend in fp32 instead of the blend unit: at most
+# 1 LSB). Runtime: debug.litev.glfogblend=0 off.
+option(LITEV_GL_FOG_SHADER_BLEND "GL 3D: fog-fetch pass blends in the shader" OFF)
+if (LITEV_GL_FOG_SHADER_BLEND)
+    add_compile_definitions(LITEV_GL_FOG_SHADER_BLEND=1)
+endif()
 # Display-only: a game that changes MASTER_BRIGHT once in the middle of a frame (a fade step
 # landing late because the game missed VBlank, e.g. Pokemon White's area loads) tears that frame
 # (top dark, bottom bright). A single mid-frame change now applies from the next frame; two or
@@ -834,6 +1230,15 @@ endif()
 option(LITEV_GL_SORT_OPAQUE "GL 3D: sort opaque polygons by state/texture so draw calls merge" OFF)
 if (LITEV_GL_SORT_OPAQUE)
     add_compile_definitions(LITEV_GL_SORT_OPAQUE=1)
+endif()
+
+# GL 3D: draw runs of same-state alpha-31 polygons that use alpha textures (needopaque) in one
+# blended draw instead of two draws per polygon (opaque + translucent texels). Render-only
+# approximation (edge texels write depth like opaque ones). Runtime: debug.litev.glneedop=0 off,
+# 1 batched two-pass, 2 one pass (default).
+option(LITEV_GL_BATCH_NEEDOPAQUE "GL 3D: batch alpha-31 alpha-textured translucent polygons" OFF)
+if (LITEV_GL_BATCH_NEEDOPAQUE)
+    add_compile_definitions(LITEV_GL_BATCH_NEEDOPAQUE=1)
 endif()
 
 option(LITEV_SKIP_REPEAT_FRAMES "Display-only: skip 2D drawing + present of frames whose 3D repeats the previous frame while a game draws 3D at 30 Hz (runtime: GPU.SkipRepeatEnabled)" OFF)

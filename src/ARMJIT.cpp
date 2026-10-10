@@ -17,11 +17,14 @@
 */
 
 #include "ARMJIT.h"
+#include "ARM7HLE.h"
+#include "ARM9HLE.h"
 #include "ARMJIT_Memory.h"
 #include <string.h>
 #include <assert.h>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -118,9 +121,36 @@ struct SlowHistDumper {
 };
 static SlowHistDumper g_slowHistDumper;
 }
+// the app logs it at the end of a replay (no process exit there)
+void LitevSlowHistLine(int h, char* buf, int len)
+{
+    static const char* hn[4] = {"read", "write", "blockload", "blockstore"};
+    int n = snprintf(buf, len, "SLOWHIST %s:", hn[h]);
+    for (int r = 0; r < 16 && n < len; r++)
+        if (g_slowHist[h][r]) n += snprintf(buf + n, len - n, " reg%d=%llu", r, g_slowHist[h][r]);
+}
 #define SLOWHIST(h, cpu, addr) (g_slowHist[(h)][(cpu)->NDS.JIT.Memory.ClassifyAddress9((addr)) & 15]++)
+// DIAG (stm investigation): per-JIT-site attribution of slow main-RAM stores
+std::unordered_map<const void*, u32> g_slowSiteInfo;   // return address -> compile-time info
+static std::unordered_map<const void*, u64> g_slowSiteHits;
+void LitevSlowSiteNote(const void* ret, u32 info) { g_slowSiteInfo[ret] = info; }
+#define SLOWSITE(cpu, addr) do { if ((cpu)->NDS.JIT.Memory.ClassifyAddress9(addr) == ARMJIT_Memory::memregion_MainRAM) g_slowSiteHits[__builtin_return_address(0)]++; } while (0)
+namespace {
+struct SlowSiteDumper {
+    ~SlowSiteDumper() {
+        std::map<u32, u64> byInfo; u64 unk = 0;
+        for (auto& [k, v] : g_slowSiteHits) { auto it = g_slowSiteInfo.find(k); if (it == g_slowSiteInfo.end()) unk += v; else byInfo[it->second] += v; }
+        fprintf(stderr, "SLOWSITE unknown(thunk/other)=%llu\n", (unsigned long long)unk);
+        for (auto& [k, v] : byInfo)
+            fprintf(stderr, "SLOWSITE kind=%s target=%u cond=%x executed=%u thumb=%u usermode=%u stub=%u regs=%u hits=%llu\n",
+                (k >> 31) ? "block" : "single", k & 0xFF, (k >> 8) & 0xF, (k >> 12) & 1, (k >> 13) & 1, (k >> 14) & 1, (k >> 15) & 1, (k >> 16) & 0x1F, (unsigned long long)v);
+    }
+};
+static SlowSiteDumper g_slowSiteDumper;
+}
 #else
 #define SLOWHIST(h, cpu, addr) ((void)0)
+#define SLOWSITE(cpu, addr) ((void)0)
 #endif
 
 template <typename T, int ConsoleType>
@@ -182,6 +212,7 @@ void SlowWrite9(u32 addr, ARMv5* cpu, u32 val)
 {
     addr &= ~(sizeof(T) - 1);
     SLOWHIST(1, cpu, addr);
+    SLOWSITE(cpu, addr);
 
     if (addr < cpu->ITCMSize)
     {
@@ -227,6 +258,7 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.MemBlock9HelperCalls);
     addr &= ~0x3;
     SLOWHIST(Write ? 3 : 2, cpu, addr);
+    if (Write) SLOWSITE(cpu, addr);
 
 #ifdef LITEV_JIT_BLOCKXFER_FAST
     // Hoist the per-element region dispatch out of the loop for the two homogeneous,
@@ -269,6 +301,31 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
             }
             return;
         }
+#ifdef LITEV_JIT_BLOCKXFER_MAINRAM
+        // whole block in DS main RAM, clear of both TCMs (a <= 64 B block whose ends are both
+        // outside the >= 16 KB DTCM has no word inside it): per word exactly what
+        // NDS::ARM9Write32/ARM9Read32 do there (JIT invalidation check, plain access), without
+        // the per-word ITCM/DTCM/region dispatch. LDM/STM to main RAM through this slow path
+        // were ~4% of the emu thread on the PW title screen. Bit-exact.
+        if (ConsoleType == 0 && (addr & 0xFF000000) == 0x02000000 && (last & 0xFF000000) == 0x02000000
+            && addr >= cpu->ITCMSize
+            && (addr & cpu->DTCMMask) != cpu->DTCMBase && (last & cpu->DTCMMask) != cpu->DTCMBase)
+        {
+            NDS& nds = cpu->NDS;
+            for (u32 i = 0; i < num; i++)
+            {
+                const u32 a = addr + (i << 2);
+                if (Write)
+                {
+                    nds.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(a);
+                    *(u32*)&nds.MainRAM[a & nds.MainRAMMask] = (u32)data[i];
+                }
+                else
+                    data[i] = *(u32*)&nds.MainRAM[a & nds.MainRAMMask];
+            }
+            return;
+        }
+#endif
     }
 #endif
 
@@ -544,6 +601,55 @@ bool IsIdleLoop(bool thumb, FetchedInstr* instrs, int instrsCount)
     return true;
 }
 
+#ifdef LITEV_JIT_IDLE2
+// Static class of a loop whose whole path instrs[0..n) is in the block (the last one is
+// the back-edge; earlier branches must be followed ones): 0 = classic idle loop (no
+// stores, no register recurrence), 1 = only stores keep it from being one (a candidate
+// for the run-time proof in ARMv5::Idle2Handle), 2 = not a wait loop (register
+// recurrence such as a counter or a walking pointer, coprocessor, call).
+static int Idle2LoopClass(bool thumb, FetchedInstr* instrs, int n)
+{
+    u16 written = 0, readFirst = 0;
+    bool store = false;
+    for (int i = 0; i < n; i++)
+    {
+        const ARMInstrInfo::Info& in = instrs[i].Info;
+        if (!thumb && in.Kind >= ARMInstrInfo::ak_MSR_IMM && in.Kind <= ARMInstrInfo::ak_SVC)
+            return 2;
+        if (i < n - 1 && in.Branches() && (in.EndBlock || (in.DstRegs & (1 << 14))))
+            return 2;
+        if (in.SpecialKind == ARMInstrInfo::special_WriteMem)
+            store = true;
+        const u16 src = in.SrcRegs & ~(1 << 15), dst = in.DstRegs & ~(1 << 15);
+        readFirst |= src & ~written;
+        if (dst & readFirst)
+            return 2;
+        written |= dst;
+    }
+    return store ? 1 : 0;
+}
+
+// Cheap static filter for back-edges whose loop leaves the block (only the block's
+// instrs[0..n) are visible): a register (other than SP/LR) read before written and then
+// written in the visible part is a counter or walking pointer -> not a wait loop.
+static bool Idle2TailOK(bool thumb, FetchedInstr* instrs, int n)
+{
+    u16 written = 0, readFirst = 0;
+    for (int i = 0; i < n; i++)
+    {
+        const ARMInstrInfo::Info& in = instrs[i].Info;
+        if (!thumb && in.Kind >= ARMInstrInfo::ak_MSR_IMM && in.Kind <= ARMInstrInfo::ak_SVC)
+            return false;
+        const u16 src = in.SrcRegs & 0x1FFF, dst = in.DstRegs & 0x1FFF;
+        readFirst |= src & ~written;
+        if (dst & readFirst)
+            return false;
+        written |= dst;
+    }
+    return true;
+}
+#endif
+
 typedef void (*InterpreterFunc)(ARM* cpu);
 
 void NOP(ARM* cpu) {}
@@ -643,6 +749,9 @@ ARMJIT::ARMJIT(melonDS::NDS& nds, std::optional<JITArgs> jit) noexcept :
 
 void ARMJIT::RetireJitBlock(JitBlock* block) noexcept
 {
+#ifdef LITEV_A9HLE
+    A9HLE::BlockGone(NDS, block);
+#endif
     auto it = RestoreCandidates.find(block->InstrHash);
     if (it != RestoreCandidates.end())
     {
@@ -691,12 +800,24 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
         }
         else
         {
+#ifdef LITEV_JIT_FLATMAPS
+            pending.insert(link.TargetAddr, LinkSite{block->StartAddr, link.PatchOffset});
+#else
             pending.insert({link.TargetAddr, LinkSite{block->StartAddr, link.PatchOffset}});
+#endif
         }
     }
 
     // (b) drain pending links waiting on THIS block's start address.
     u32 entryOff = JITCompiler.SubEntryOffset(block->EntryPoint);
+#ifdef LITEV_JIT_FLATMAPS
+    pending.drain(block->StartAddr, [&](const LinkSite& site)
+    {
+        JITCompiler.PatchLinkSite(site.PatchOffset, entryOff);
+        block->Incoming.Add(site);
+        LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
+    });
+#else
     auto range = pending.equal_range(block->StartAddr);
     for (auto it = range.first; it != range.second; ++it)
     {
@@ -706,6 +827,7 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
         LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
     }
     pending.erase(range.first, range.second);
+#endif
 
     JitEnableExecute();
 
@@ -726,7 +848,11 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
     {
         LinkSite site = block->Incoming[i];
         JITCompiler.PatchLinkSite(site.PatchOffset, JITCompiler.UnlinkedSiteTarget(block->Num, site.PatchOffset));
+#ifdef LITEV_JIT_FLATMAPS
+        pending.insert(block->StartAddr, site);
+#else
         pending.insert({block->StartAddr, site});
+#endif
         LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksUnlinked);
     }
     block->Incoming.Clear();
@@ -738,6 +864,10 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
     {
         const OutgoingLink& link = block->Outgoing[i];
 
+#ifdef LITEV_JIT_FLATMAPS
+        bool found = pending.remove_one(link.TargetAddr, [&](const LinkSite& s)
+            { return s.PatchOffset == link.PatchOffset && s.SourceBlockAddr == block->StartAddr; });
+#else
         bool found = false;
         auto range = pending.equal_range(link.TargetAddr);
         for (auto pit = range.first; pit != range.second; ++pit)
@@ -750,6 +880,7 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
                 break;
             }
         }
+#endif
         if (!found)
         {
             auto it = blocks.find(link.TargetAddr);
@@ -814,7 +945,7 @@ void ARMJIT::ValidateLinkSites() noexcept
         }
     };
 
-    auto walk = [&](std::unordered_map<u32, JitBlock*>& map)
+    auto walk = [&](auto& map)
     {
         for (auto& kv : map)
         {
@@ -871,8 +1002,21 @@ void ARMJIT::SetFastMemory(bool enabled) noexcept
     SetJITArgs(JITArgs{static_cast<unsigned>(MaxBlockSize), LiteralOptimizations, BranchOptimizations, enabled});
 }
 
+u64 JitCompileCount = 0;   // blocks compiled so far (headless LITEV_FRAME_MS)
+#ifdef LITEV_JIT_COMPILE_STATS
+// time per compile phase in timer ticks (JitTicks(); JitTicksPerSec), see JitPhase
+u64 JitCompileTicks[JitPhase_Count] = {};
+#define JIT_PHASE(p) do { u64 t_ = JitTicks(); JitCompileTicks[p] += t_ - jitT; jitT = t_; } while (0)
+#else
+#define JIT_PHASE(p) do {} while (0)
+#endif
+
 void ARMJIT::CompileBlock(ARM* cpu) noexcept
 {
+    JitCompileCount++;
+#ifdef LITEV_JIT_COMPILE_STATS
+    u64 jitT = JitTicks();
+#endif
     bool thumb = cpu->CPSR & 0x20;
 
     u32 blockAddr = cpu->R[15] - (thumb ? 2 : 4);
@@ -915,11 +1059,49 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     FetchedInstr instrs[MaxBlockSize];
     int i = 0;
     u32 r15 = cpu->R[15];
+    JIT_PHASE(JitPhase_Lookup);
 
-    u32 addressRanges[MaxBlockSize];
-    u32 addressMasks[MaxBlockSize];
-    memset(addressMasks, 0, MaxBlockSize * sizeof(u32));
+#if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
+    // + room for an A9HLE/A7HLE hook block's dependency ranges (see below)
+    const int maxRanges = MaxBlockSize + 48;
+#else
+    const int maxRanges = MaxBlockSize;
+#endif
+#ifdef LITEV_A9HLE
+    u32 a9HookAt = 0;           // verified hook in this block (its address), see A9HLE::HookCompiled
+#endif
+#ifdef LITEV_A7HLE
+    bool a7Hook = false;        // block compiled with a verified A7HLE hook
+#endif
+    u32 addressRanges[maxRanges];
+    u32 addressMasks[maxRanges];
+    memset(addressMasks, 0, maxRanges * sizeof(u32));
     u32 numAddressRanges = 0;
+    // add [a, b) of guest code to this block's dependencies, keeping the last range last
+    // (a write there invalidates the block like a write to its own code)
+    auto addDeps = [&](u32 num, u32 a0, u32 b0)
+    {
+        u32 cur = numAddressRanges - 1;
+        for (u32 a = a0 & ~15u; a < b0; a += 16)
+        {
+            u32 ta = LocaliseCodeAddress(num, a);
+            u32 tr = ta & ~0x1FF, j = 0;
+            for (; j < numAddressRanges; j++)
+                if (addressRanges[j] == tr) break;
+            if (j == numAddressRanges)
+            {
+                assert(numAddressRanges < (u32)maxRanges);
+                addressRanges[numAddressRanges++] = tr;
+            }
+            addressMasks[j] |= 1 << ((ta & 0x1FF) / 16);
+        }
+        if (cur != numAddressRanges - 1)
+        {
+            std::swap(addressRanges[cur], addressRanges[numAddressRanges - 1]);
+            std::swap(addressMasks[cur], addressMasks[numAddressRanges - 1]);
+        }
+    };
+    (void)addDeps;
 
     u32 numLiterals = 0;
     u32 literalLoadAddrs[MaxBlockSize];
@@ -1005,6 +1187,49 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
             instrs[i].CodeCycles = cpu->CodeCycles;
         }
         instrs[i].Info = ARMInstrInfo::Decode(thumb, cpu->Num, instrs[i].Instr, LiteralOptimizations);
+#ifdef LITEV_A7HLE
+        // HLE'd ARM7 function entry: compile it as an interpreter fallback that ends the block
+        // (decoded as an undefined instruction); A_UNK runs the native function or the original
+        // instruction. Keeps Instr, so the code hash / invalidation still see the real bytes.
+        if (int hook = cpu->Num == 1 && !thumb ? A7HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr) : 0)
+        {
+            // verified now; the block depends on the hooked code (no per-call compare in Run)
+            A7HLE::Range dep[4];
+            int nd = A7HLE::Deps(instrs[i].Addr, instrs[i].Instr, dep);
+            for (int d = 0; d < nd; d++) addDeps(1, dep[d].a, dep[d].b);
+            if (hook == 1)
+            {
+                instrs[i].Info = ARMInstrInfo::Decode(false, 1, 0xE7F000F0, false);
+                a7Hook = true;
+            }
+        }
+#endif
+#ifdef LITEV_GX_CPUSEND
+        if (cpu->Num == 0 && !thumb && GXSend::MaybeHook(instrs[i].Instr) && GXSend::IsHook(NDS, instrs[i].Addr, instrs[i].Instr))
+        {
+            // the hook block depends on the whole MI_CpuSend32 body (verified now)
+            u32 da, db;
+            GXSend::Deps(instrs[i].Addr, da, db);
+            addDeps(0, da, db);
+            instrs[i].Info = ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
+        }
+#endif
+#ifdef LITEV_A9HLE
+        if (int hook = cpu->Num == 0 && !thumb ? A9HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr) : 0)
+        {
+            // The hook block also covers every byte of guest code the native version replaces:
+            // a write there invalidates it like a write to its own code, and recompiling
+            // re-verifies (IsHook). That is what lets A9HLE::Run skip a per-call code compare.
+            const A9HLE::Range* dep;
+            int nd = A9HLE::Deps(instrs[i].Addr, dep);
+            for (int d = 0; d < nd; d++) addDeps(0, dep[d].a, dep[d].b);
+            if (hook == 1)
+            {
+                instrs[i].Info = ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
+                a9HookAt = instrs[i].Addr;
+            }
+        }
+#endif
 
         hasMemoryInstr |= thumb
             ? (instrs[i].Info.Kind >= ARMInstrInfo::tk_LDR_PCREL && instrs[i].Info.Kind <= ARMInstrInfo::tk_STMIA)
@@ -1020,6 +1245,9 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                 && instrs[i].Instr & (1 << 16)))
             hasLink = false;
 
+#ifdef LITEV_JIT_COND_MEMGUESS
+        instrs[i].DataExecuted = 1;
+#endif
         if (thumb)
         {
             InterpretTHUMB[instrs[i].Info.Kind](cpu);
@@ -1040,7 +1268,12 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                 if (cpu->CheckCondition(instrs[i].Cond()))
                     InterpretARM[instrs[i].Info.Kind](cpu);
                 else
+                {
                     cpu->AddCycles_C();
+#ifdef LITEV_JIT_COND_MEMGUESS
+                    instrs[i].DataExecuted = 0;
+#endif
+                }
             }
         }
 
@@ -1114,6 +1347,33 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                     }
                 }
 
+#ifdef LITEV_JIT_IDLE2
+                // A back-edge to before the current block segment (the loop path crosses
+                // followed branches, or leaves the block through calls) is never followed:
+                // classic idle loop if its in-block path qualifies, else an ARM9 candidate
+                // for the run-time wait-loop proof (ARMv5::Idle2Handle).
+                bool idle2Done = false;
+                if (cond < 0xE && target < instrs[i].Addr && target < lastSegmentStart && LiteIdle2On())
+                {
+                    int j = -1;
+                    for (int k = 0; k < i; k++)
+                        if (instrs[k].Addr == target) { j = k; break; }
+                    const int cls = j >= 0 ? Idle2LoopClass(thumb, &instrs[j], i - j + 1)
+                                           : Idle2TailOK(thumb, instrs, i + 1) ? 1 : 2;
+                    if (cls == 0)
+                    {
+                        instrs[i].BranchFlags |= branch_IdleBranch;
+                        idle2Done = true;
+                    }
+                    else if (cls == 1 && cpu->Num == 0)
+                    {
+                        instrs[i].BranchFlags |= branch_Idle2Cand;
+                        idle2Done = true;
+                    }
+                }
+                if (idle2Done) {}
+                else
+#endif
                 if (cond < 0xE && target < instrs[i].Addr && target >= lastSegmentStart)
                 {
                     // we might have an idle loop
@@ -1123,6 +1383,11 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                         instrs[i].BranchFlags |= branch_IdleBranch;
                         JIT_DEBUGPRINT("found %s idle loop %d in block %08x\n", thumb ? "thumb" : "arm", cpu->Num, blockAddr);
                     }
+#ifdef LITEV_JIT_IDLE2
+                    else if (cpu->Num == 0 && LiteIdle2On()
+                        && Idle2LoopClass(thumb, &instrs[i - backwardsOffset], backwardsOffset + 1) == 1)
+                        instrs[i].BranchFlags |= branch_Idle2Cand;
+#endif
                 }
                 else if (hasBranched && !isBackJump && i + 1 < MaxBlockSize)
                 {
@@ -1168,6 +1433,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
             FloodFillSetFlags(instrs, i - 2, !secondaryFlagReadCond ? instrs[i - 1].Info.ReadFlags : 0xF);
     } while(!instrs[i - 1].Info.EndBlock && i < MaxBlockSize && !cpu->Halted && (!cpu->IRQ || (cpu->CPSR & 0x80)));
 
+    JIT_PHASE(JitPhase_Decode);
     if (numLiterals)
     {
         for (u32 j = 0; j < numWriteAddrs; j++)
@@ -1190,6 +1456,14 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
 
     u32 literalHash = (u32)XXH3_64bits(literalValues, numLiterals * 4);
     u32 instrHash = (u32)XXH3_64bits(instrValues, numInstrs * 4);
+#ifdef LITEV_A9HLE
+    // a block compiled with a native hook must never be restored for the same bytes compiled
+    // without it (hook site whose dependencies changed): different restore key
+    if (a9HookAt) instrHash ^= 0x5A9E1A9Eu;
+#endif
+#ifdef LITEV_A7HLE
+    if (a7Hook) instrHash ^= 0xA7E1A7E1u;
+#endif
 
     auto prevBlockIt = RestoreCandidates.find(instrHash);
     JitBlock* prevBlock = NULL;
@@ -1221,6 +1495,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         mayRestore = false;
     }
 
+    JIT_PHASE(JitPhase_Hash);
     JitBlock* block;
     if (!mayRestore)
     {
@@ -1241,10 +1516,12 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         block->StartAddrLocal = localAddr;
 
         FloodFillSetFlags(instrs, i - 1, 0xF);
+        JIT_PHASE(JitPhase_Alloc);
 
         JitEnableWrite();
         block->EntryPoint = JITCompiler.CompileBlock(cpu, thumb, instrs, i, hasMemoryInstr);
         JitEnableExecute();
+        JIT_PHASE(JitPhase_Emit);
 
 #ifdef LITEV_JIT_LINK
         // Carry the compiler's recorded outgoing link sites onto the block (a
@@ -1263,6 +1540,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         block = prevBlock;
     }
 
+    JIT_PHASE(JitPhase_Alloc);
     assert((localAddr & 1) == 0);
     for (u32 j = 0; j < numAddressRanges; j++)
     {
@@ -1280,8 +1558,14 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         range->Blocks.Add(block);
     }
 
+    JIT_PHASE(JitPhase_Protect);
     if (cpu->Num == 0)
+    {
         JitBlocks9[blockAddr] = block;
+#ifdef LITEV_A9HLE
+        if (a9HookAt) A9HLE::HookCompiled(NDS, a9HookAt, block);
+#endif
+    }
     else
         JitBlocks7[blockAddr] = block;
 
@@ -1289,11 +1573,13 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     *entry = ((u64)blockAddr | cpu->Num) << 32;
     *entry |= JITCompiler.SubEntryOffset(block->EntryPoint);
 
+    JIT_PHASE(JitPhase_Insert);
 #ifdef LITEV_JIT_LINK
     // Block is now in JitBlocks + FastBlockLookup: resolve its outgoing links and
     // drain any pending links that were waiting for a block at this StartAddr.
     LinkBlock(block);
 #endif
+    JIT_PHASE(JitPhase_Link);
 }
 
 void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
@@ -1409,6 +1695,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
         }
         else
         {
+#ifdef LITEV_A9HLE
+            A9HLE::BlockGone(NDS, block);
+#endif
             delete block;
         }
     }
@@ -1542,12 +1831,18 @@ template void ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWR
 void ARMJIT::ResetBlockCache() noexcept
 {
     Log(LogLevel::Debug, "Resetting JIT block cache...\n");
+#ifdef LITEV_JIT_IDLE2
+    NDS.ARM9.Idle2Reset(); // wait-loop proofs live exactly as long as the compiled blocks
+#endif
 
     // could be replace through a function which only resets
     // the permissions but we're too lazy
     Memory.Reset();
 
     InvalidLiterals.Clear();
+#ifdef LITEV_A9HLE
+    NDS.ARM9.A9HLEGuard = nullptr;
+#endif
     for (int i = 0; i < ARMJIT_Memory::memregions_Count; i++)
     {
         if (FastBlockLookupRegions[i])

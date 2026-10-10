@@ -21,6 +21,10 @@
 #include <memory>
 #include <optional>
 #include <chrono>
+#include <algorithm>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include "types.h"
 #include "Args.h"
@@ -33,13 +37,48 @@
 #include "Savestate.h"
 #include "SPI_Firmware.h"
 #include "FreeBIOS.h"
+#ifdef __APPLE__
+extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsystem_kernel
+#endif
 
 #include "xxhash/xxhash.h"
 
 #include "PlatformHeadless.h"
+#ifdef __APPLE__
+// Instructions retired / cycles of the calling thread (Apple Silicon PMU, libsystem_kernel).
+extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);
+static uint64_t EmuThreadInstr = 0, EmuThreadCycles = 0;
+#endif
 #include "LiteProfile.h"
 #include "VerifyTrace.h"
 #include "InputScript.h"
+namespace melonDS { extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults, JitStoreRepromotions; }
+#ifdef LITEV_JIT_COMPILE_STATS
+#include "ARMJIT_Internal.h"
+#endif
+#ifdef LITEV_ACCESS_STATS
+namespace melonDS { extern u64 LitevAccess[6][0x10000]; extern u64 LitevRomctrlPC[0x100000]; }
+static void DumpAccessStats()
+{
+    static const char* kinds[6] = {"R16", "R32", "W16", "W32", "R8", "W8"};
+    std::vector<std::pair<unsigned long long, std::pair<int, int>>> v;
+    for (int k = 0; k < 6; k++)
+        for (int a = 0; a < 0x10000; a++)
+            if (melonDS::LitevAccess[k][a]) v.push_back({melonDS::LitevAccess[k][a], {k, a}});
+    std::sort(v.rbegin(), v.rend());
+    for (int a = 0; a < 0x100000; a++)
+        if (melonDS::LitevRomctrlPC[a] > 1000) fprintf(stderr, "ROMCTRL-PC %05X %llu\n", a << 1, (unsigned long long)melonDS::LitevRomctrlPC[a]);
+    for (size_t i = 0; i < v.size() && i < 60; i++)
+    {
+        int a = v[i].second.second;
+        if (a >= 0xC000 && a < 0xD000) { fprintf(stderr, "GXCMD %02X entries %llu\n", a & 0xFF, (unsigned long long)v[i].first); continue; }
+        if (a >= 0xD000 && a < 0xE000) { int step = (a & 0x3FF) << 6; fprintf(stderr, "SPUCH type %d rate ~%d Hz (timer step %d) channel-samples %llu\n", (a >> 10) & 3, step ? (int)(33513982.0 / 2 / step) : 0, step, (unsigned long long)v[i].first); continue; }
+        if (a >= 0xE000 && a < 0xF000) { fprintf(stderr, "IRQ %s source %d %llu\n", v[i].second.first == 4 ? "ARM9" : "ARM7", a & 0xFF, (unsigned long long)v[i].first); continue; }
+        if (a >= 0xF000) fprintf(stderr, "ACCESS %s region %02X:%X %llu\n", kinds[v[i].second.first], (a >> 4) & 0xFF, a & 0xF, (unsigned long long)v[i].first);
+        else fprintf(stderr, "ACCESS %s io %08X %llu\n", kinds[v[i].second.first], a >= 0x2000 ? 0x04100000 | (a & 0xFF) : 0x04000000 | a, (unsigned long long)v[i].first);
+    }
+}
+#endif
 #ifdef LITEV_HEADLESS_LAN
 #include <thread>
 #include "MPInterface.h"
@@ -371,6 +410,13 @@ bool LoadSavestate(NDS& nds, const std::string& path)
         fprintf(stderr, "error: failed to load savestate into emulator\n");
         return false;
     }
+    // the hardware divider/sqrt registers as loaded (state 14.1 carries them; for re-creating
+    // them in emulators whose savestates don't, e.g. stock melonDS)
+    if (getenv("LITEV_PRINT_DIV"))
+        printf("DIVREGS %04X %08X %08X %08X %08X %04X %08X %08X\n", nds.ARM9IORead16(0x04000280),
+               nds.ARM9IORead32(0x04000290), nds.ARM9IORead32(0x04000294),
+               nds.ARM9IORead32(0x04000298), nds.ARM9IORead32(0x0400029C),
+               nds.ARM9IORead16(0x040002B0), nds.ARM9IORead32(0x040002B8), nds.ARM9IORead32(0x040002BC));
     return true;
 }
 
@@ -553,8 +599,17 @@ int main(int argc, char** argv)
     XXH3_64bits_reset(audioHashState);
     u64 audioSampleCount = 0;                 // stereo frames drained
     std::vector<s16> audioDrain(2048 * 2);    // interleaved L/R scratch buffer
+    // LITEV_WAV=<path>: also write the output as a 48 kHz 16-bit stereo WAV (listening tests)
+    FILE* wav = getenv("LITEV_WAV") ? fopen(getenv("LITEV_WAV"), "wb") : nullptr;
+    if (wav) fseek(wav, 44, SEEK_SET);
 
     auto wallStart = std::chrono::steady_clock::now();
+#ifdef __APPLE__
+    // emu-thread instructions/cycles (this thread only; render workers excluded): deterministic
+    // A/B metric on a loaded Mac, where wall time is noise.
+    uint64_t thsc0[2] = {0, 0};
+    thread_selfcounts(1, thsc0, sizeof(thsc0));
+#endif
 
     // --bench-window: measured span within the full run. windowStart is stamped
     // just before frame benchWindowStart's RunFrame; windowEnd just after frame
@@ -566,7 +621,7 @@ int main(int argc, char** argv)
     // Run totals: g_Frame is reset every frame, so accumulate each frame's counters
     // into totals here to observe whole-run behaviour (esp. the Unit 4 link counters).
     struct { uint64_t linksPatched=0, linksUnlinked=0, pendingPeak=0,
-                       cppReentries=0, dispatcherMisses=0, dispatcherHits=0, icacheHits=0,
+                       cppReentries=0, dispatcherMisses=0, dispatcherHits=0, icacheHits=0, rasHits=0,
                        linkSitesEmitted=0, dispatchOnlyExits=0,
                        schedIterations=0, schedEventsFired=0,
                        arm9ExecNs=0, arm7ExecNs=0, gpu3dNs=0, runSystemNs=0, spuMixNs=0,
@@ -651,8 +706,19 @@ int main(int argc, char** argv)
         video = popen(cmd.c_str(), "w");
     }
 
+#ifdef LITEV_FF_HEADLESS3D
+    if (getenv("LITEV_FFHEADLESS")) nds->GPU.FFHeadless3D = atoi(getenv("LITEV_FFHEADLESS")) != 0;   // the app's fast-forward mode
+#endif
+    // LITEV_LOOP=<n>: run the --frames window n more times from --savestate (profile a short burst)
+    int loopsLeft = getenv("LITEV_LOOP") ? atoi(getenv("LITEV_LOOP")) : 0;
     for (int frame = 0; frame < opt.frames; frame++)
     {
+        if (frame == opt.frames - 1 && loopsLeft > 0 && !opt.savestate.empty())
+        {
+            loopsLeft--;
+            if (!LoadSavestate(*nds, opt.savestate)) { fprintf(stderr, "error: loop reload failed\n"); return 1; }
+            frame = 0;
+        }
         if (frame == opt.reloadAt && !opt.savestate.empty())
         {
             if (!LoadSavestate(*nds, opt.savestate)) { fprintf(stderr, "error: reload failed\n"); return 1; }
@@ -668,11 +734,84 @@ int main(int argc, char** argv)
             else if (inputScript.HasTouch()) nds->ReleaseScreen();
         }
 
+        // test hook: LITEV_POKE32="frame:addr:value,..." writes a guest word (ARM9 bus) before
+        // that frame runs, e.g. to check that code rewrites invalidate JIT/HLE assumptions
+        if (static const char* pk = getenv("LITEV_POKE32"); pk)
+            for (const char* q = pk; *q; )
+            {
+                unsigned long pf = strtoul(q, (char**)&q, 0); q += (*q == ':');
+                unsigned long pa = strtoul(q, (char**)&q, 0); q += (*q == ':');
+                unsigned long pv = strtoul(q, (char**)&q, 0); q += (*q == ',');
+                if ((int)pf == frame) { nds->ARM9Write32((u32)pa, (u32)pv); fprintf(stderr, "poke32 frame %d %08lx = %08lx\n", frame, pa, pv); }
+            }
+        // same through the ARM7 bus (ARM7 WRAM code)
+        if (static const char* pk = getenv("LITEV_POKE32_ARM7"); pk)
+            for (const char* q = pk; *q; )
+            {
+                unsigned long pf = strtoul(q, (char**)&q, 0); q += (*q == ':');
+                unsigned long pa = strtoul(q, (char**)&q, 0); q += (*q == ':');
+                unsigned long pv = strtoul(q, (char**)&q, 0); q += (*q == ',');
+                if ((int)pf == frame) { nds->ARM7Write32((u32)pa, (u32)pv); fprintf(stderr, "poke32 arm7 frame %d %08lx = %08lx\n", frame, pa, pv); }
+            }
         if (haveWindow && frame == opt.benchWindowStart)
             windowStart = std::chrono::steady_clock::now();
 
         LITE_PROFILE_RESET_FRAME();
+        static const bool frameMs = getenv("LITEV_FRAME_MS") != nullptr;   // per-frame time + JIT compiles
+        const auto fms0 = std::chrono::steady_clock::now();
+        const u64 jit0 = melonDS::JitCompileCount, prot0 = melonDS::JitProtectCalls, flt0 = melonDS::JitProtectFaults;
+#ifdef __APPLE__
+        uint64_t tc0[2] = {};
+        thread_selfcounts(1, tc0, sizeof(tc0));
+#endif
+#ifdef __linux__
+        {   // LITEV_MARKFRAMES=A-B: name the thread "markframes" during frames A..B (perf report --comm)
+            static int ma = -1, mb = -2;
+            static bool once = [] { if (const char* m = getenv("LITEV_MARKFRAMES")) sscanf(m, "%d-%d", &ma, &mb); return true; }();
+            (void)once;
+            if (frame == ma) prctl(PR_SET_NAME, "markframes");
+            if (frame == mb + 1) prctl(PR_SET_NAME, "headless");
+        }
+#endif
         nds->RunFrame();
+#ifdef __APPLE__
+        {
+            uint64_t tc1[2] = {};
+            thread_selfcounts(1, tc1, sizeof(tc1));
+            EmuThreadInstr += tc1[0] - tc0[0];
+            EmuThreadCycles += tc1[1] - tc0[1];
+        }
+#endif
+        if (frameMs)
+            printf("FRAME %d %.3f ms jit %llu mprotect %llu rewrites %llu\n", frame,
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fms0).count(),
+                   (unsigned long long)(melonDS::JitCompileCount - jit0),
+                   (unsigned long long)(melonDS::JitProtectCalls - prot0), (unsigned long long)(melonDS::JitProtectFaults - flt0));
+#ifdef LITEV_JIT_COMPILE_STATS
+        if (frameMs)
+        {   // compile time per phase this frame, microseconds (src/ARMJIT_Internal.h JitPhase)
+            static u64 last[melonDS::JitPhase_Count];
+            static const double us = 1e6 / melonDS::JitTicksPerSec();
+            printf("JITPHASE %d", frame);
+            for (int p = 0; p < melonDS::JitPhase_Count; p++)
+            {
+                printf(" %.0f", (melonDS::JitCompileTicks[p] - last[p]) * us);
+                last[p] = melonDS::JitCompileTicks[p];
+            }
+            printf("\n");
+        }
+#endif
+#ifdef LITEV_JIT_STORE_REPROMOTE
+        if (frameMs) printf("REPROMOTED %d %llu\n", frame, (unsigned long long)melonDS::JitStoreRepromotions);
+#endif
+        {   // LITEV_PRINT_REGS=<frame>: display registers after that frame (diagnosis)
+            static const int regsAt = getenv("LITEV_PRINT_REGS") ? atoi(getenv("LITEV_PRINT_REGS")) : -1;
+            if (frame == regsAt)
+                printf("REGS frame %d DISPCNT_A %08X DISPCNT_B %08X DISPCAPCNT %08X POWCNT %04X VRAMCNT %08X %08X BG0CNT %04X DISP3DCNT %04X MASTERBRIGHT %04X\n",
+                       frame, nds->ARM9IORead32(0x04000000), nds->ARM9IORead32(0x04001000), nds->ARM9IORead32(0x04000064),
+                       nds->ARM9IORead16(0x04000304), nds->ARM9IORead32(0x04000240), nds->ARM9IORead32(0x04000244),
+                       nds->ARM9IORead16(0x04000008), nds->ARM9IORead16(0x04000060), nds->ARM9IORead16(0x0400006C));
+        }
 
         static const bool emitHashes = getenv("LITEV_RECORD_EMIT") != nullptr;   // print them (tests)
         if ((!recordedHashes.empty() || emitHashes) && ((frame + 1) % 60) == 0)
@@ -742,6 +881,7 @@ int main(int argc, char** argv)
             profTotals.dispatcherMisses+= g_Frame.DispatcherMisses.load(std::memory_order_relaxed);
             profTotals.dispatcherHits  += g_Frame.DispatcherHits.load(std::memory_order_relaxed);
             profTotals.icacheHits      += g_Frame.ICacheHits.load(std::memory_order_relaxed);
+            profTotals.rasHits         += g_Frame.RasHits.load(std::memory_order_relaxed);
 #ifdef LITEV_JIT_DIRECTPATCH
             profTotals.directGuardHits   += g_Frame.DirectGuardHits.load(std::memory_order_relaxed);
             profTotals.directGuardMisses += g_Frame.DirectGuardMisses.load(std::memory_order_relaxed);
@@ -782,6 +922,7 @@ int main(int argc, char** argv)
             if (got <= 0) break;
             XXH3_64bits_update(audioHashState, audioDrain.data(),
                                (size_t)got * 2 * sizeof(s16));
+            if (wav) fwrite(audioDrain.data(), 4, (size_t)got, wav);
             audioSampleCount += (u64)got;
             if (got < 2048) break;
         }
@@ -858,6 +999,14 @@ int main(int argc, char** argv)
     printf("mode:        %s\n", opt.jit ? "jit" : "interp");
     printf("frames:      %d\n", opt.frames);
     printf("wall_time_s: %.4f\n", wallSec);
+#ifdef __APPLE__
+    {
+        uint64_t thsc1[2] = {0, 0};
+        if (thread_selfcounts(1, thsc1, sizeof(thsc1)) == 0)
+            printf("emu_thread_instructions: %llu\nemu_thread_cycles: %llu\n",
+                   (unsigned long long)(thsc1[0] - thsc0[0]), (unsigned long long)(thsc1[1] - thsc0[1]));
+    }
+#endif
     printf("avg_fps:     %.2f\n", avgFps);
     if (haveWindow)
     {
@@ -871,6 +1020,19 @@ int main(int argc, char** argv)
     printf("fb_changing: %s\n", anyChange ? "yes" : "no");
     printf("audio_hash:  %016llx\n", (unsigned long long)audioHash);
     printf("audio_samples: %llu\n", (unsigned long long)audioSampleCount);
+#ifdef __APPLE__
+    // emulation thread only (RunFrame), so render/worker threads don't dilute A/B deltas
+    printf("emu_thread_instructions: %llu\nemu_thread_cycles: %llu\n",
+           (unsigned long long)EmuThreadInstr, (unsigned long long)EmuThreadCycles);
+#endif
+    if (wav)
+    {
+        const u32 n = (u32)audioSampleCount * 4, r = n + 36, rate = 48000, bps = rate * 4;
+        const u8 h[44] = {'R','I','F','F', u8(r), u8(r>>8), u8(r>>16), u8(r>>24), 'W','A','V','E','f','m','t',' ',
+                          16,0,0,0, 1,0, 2,0, u8(rate), u8(rate>>8), u8(rate>>16), 0, u8(bps), u8(bps>>8), u8(bps>>16), 0,
+                          4,0, 16,0, 'd','a','t','a', u8(n), u8(n>>8), u8(n>>16), u8(n>>24)};
+        fseek(wav, 0, SEEK_SET); fwrite(h, 1, 44, wav); fclose(wav);
+    }
 #if LITEV_PROFILE
     printf("links_patched:   %llu\n", (unsigned long long)profTotals.linksPatched);
     printf("links_unlinked:  %llu\n", (unsigned long long)profTotals.linksUnlinked);
@@ -879,6 +1041,7 @@ int main(int argc, char** argv)
     printf("dispatcher_miss: %llu\n", (unsigned long long)profTotals.dispatcherMisses);
     printf("dispatcher_hits: %llu\n", (unsigned long long)profTotals.dispatcherHits);
     printf("icache_hits:     %llu\n", (unsigned long long)profTotals.icacheHits);
+    printf("ras_hits:        %llu\n", (unsigned long long)profTotals.rasHits);
     {
         unsigned long long ic = profTotals.icacheHits, dh = profTotals.dispatcherHits;
         unsigned long long tot = ic + dh;
@@ -1085,5 +1248,16 @@ int main(int argc, char** argv)
         }
     }
 
+#ifdef LITEV_ACCESS_STATS
+    DumpAccessStats();
+    if (getenv("LITEV_DUMPMEM"))
+    {
+        u32 a = strtoul(getenv("LITEV_DUMPMEM"), nullptr, 16);
+        FILE* f = fopen("/tmp/claude-501/memdump.bin", "wb");
+        for (u32 i = 0; i < 0x100; i += 4) { u32 w = nds->ARM9Read32(a + i); fwrite(&w, 4, 1, f); }
+        fclose(f);
+        fprintf(stderr, "CPSR %08X PC %08X\n", nds->ARM9.CPSR, nds->ARM9.R[15]);
+    }
+#endif
     return 0;
 }

@@ -41,6 +41,9 @@ ARM_Dispatch:
     stp x29, x30, [sp, #80]
 
     mov RCPU, x0
+#ifdef LITEV_JIT_MEMBASE_PIN
+    mov x26, x2     // fastmem base for the whole slice (callee-saved: helpers keep it)
+#endif
     ldr RCycles, [RCPU, ARM_Cycles_offset]
 #ifndef LITEV_JIT_LAZYFLAGS
     // FULL LAZY-FLAGS deletes RCPSR (w27) as the CPSR carrier: the guest CPSR lives only

@@ -21,6 +21,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include "NDS.h"
+#include "ARM7Prof.h"
 #include "ARM.h"
 #include "NDSCart.h"
 #include "GBACart.h"
@@ -46,8 +47,29 @@
 #include "ARMJIT_Memory.h"
 #include "LiteProfile.h"
 
+// LITEV_MEM_SPLIT: keep the IO register handlers out of line, so ARM9Read32/ARM9Write32 (every
+// slow-path access: VRAM, palette, OAM, rewritten main RAM stores) stay a small switch instead of
+// carrying the IO switch + divider math in their prologue/epilogue (~35% of ARM9Write32 on device)
+#ifdef LITEV_MEM_SPLIT
+#define LITEV_MEM_SPLIT_NOINLINE __attribute__((noinline))
+#else
+#define LITEV_MEM_SPLIT_NOINLINE
+#endif
+
 namespace melonDS
 {
+#ifdef LITEV_ACCESS_STATS
+// diagnosis: slow-path ARM9 accesses by kind and address (headless LITEV_ACCESS_STATS dump)
+u64 LitevAccess[6][0x10000];
+u64 LitevRomctrlPC[0x100000];
+void LitevAccessCount(int kind, u32 addr)
+{
+    u32 key = (addr >> 24) != 0x04 ? (0xF000 | ((addr >> 24) << 4) | ((addr >> 20) & 0xF))
+            : (addr & 0x00F00000) ? (0x2000 | (addr & 0xFF)) : (addr & 0x1FFF);
+    LitevAccess[kind][key & 0xFFFF]++;
+    if (addr == 0x040001A4 && NDS::Current) LitevRomctrlPC[(NDS::Current->ARM9.R[15] >> 1) & 0xFFFFF]++;
+}
+#endif
 using namespace Platform;
 
 const s32 kMaxIterationCycles = 64;
@@ -511,6 +533,9 @@ void NDS::Reset()
 
     DivCnt = 0;
     SqrtCnt = 0;
+#ifdef LITEV_LAZY_DIV
+    DivDirty = false;
+#endif
 #ifdef LITEV_LAZY_SQRT
     SqrtDirty = false;
 #endif
@@ -638,6 +663,9 @@ u32 NDS::GetSavestateConfig()
 
 bool NDS::DoSavestate(Savestate* file)
 {
+#ifdef LITEV_LAZY_DIV
+    if (DivDirty) { DivDirty = false; DivDone(0); }
+#endif
 #ifdef LITEV_LAZY_SQRT
     // SQRTCNT is in the state and SQRT_RESULT must be what the eager path left.
     if (SqrtDirty) { SqrtDirty = false; SqrtDone(0); }
@@ -1092,6 +1120,9 @@ template <CPUExecuteMode cpuMode>
 u32 NDS::RunFrame()
 {
     Current = this;
+#ifdef LITEV_JIT_IDLE2
+    ARM9.Idle2Frame();
+#endif
 
     // M6.11: parent timer for the whole RunFrame call. The per-slice ARM9 /
     // GPU3D / ARM7 / DMA / RunSystem child buckets carve this up; residual =
@@ -1272,6 +1303,11 @@ u32 NDS::RunFrame()
     // Ensure the last audio samples produced for this frame are available to the frontend immediately
     SPU.BufferAudio();
 
+#if defined(LITEV_JIT_STORE_REPROMOTE) && defined(JIT_ENABLED) && defined(__aarch64__)
+    if constexpr (cpuMode == CPUExecuteMode::JIT)
+        JIT.JITCompiler.RepromoteStores();   // frame boundary: no JIT code is running
+#endif
+
     // In the context of TASes, frame count is traditionally the primary measure of emulated time,
     // so it needs to be tracked even if NDS is powered off.
     NumFrames++;
@@ -1286,6 +1322,30 @@ u32 NDS::RunFrame()
 
 u32 NDS::RunFrame()
 {
+#ifdef LITEV_A7PROF
+    if (A7Prof::g.EndFrame())
+    {
+        // ARM7 view of main RAM (4 MB) + shared WRAM window + ARM7 WRAM, for disassembly
+        std::string o = std::string(A7Prof::g.out) + ".mem";
+        if (FILE* f = fopen(o.c_str(), "wb"))
+        {
+            for (u32 a = 0x02000000; a < 0x02400000; a += 4) { u32 v = ARM7Read32(a); fwrite(&v, 4, 1, f); }
+            for (u32 a = 0x037F8000; a < 0x03810000; a += 4) { u32 v = ARM7Read32(a); fwrite(&v, 4, 1, f); }
+            fclose(f);
+        }
+    }
+    if (A7Prof::g9.EndFrame())
+    {
+        // ARM9 view: main RAM (4 MB, bus) + ITCM (32 KB, at 0x01FF8000 in NitroSDK games)
+        std::string o = std::string(A7Prof::g9.out) + ".mem";
+        if (FILE* f = fopen(o.c_str(), "wb"))
+        {
+            for (u32 a = 0x02000000; a < 0x02400000; a += 4) { u32 v = ARM9Read32(a); fwrite(&v, 4, 1, f); }
+            fwrite(ARM9.ITCM, 1, sizeof(ARM9.ITCM), f);
+            fclose(f);
+        }
+    }
+#endif
 #ifdef JIT_ENABLED
     if (EnableJIT)
         return RunFrame<CPUExecuteMode::JIT>();
@@ -1647,6 +1707,9 @@ void NDS::UpdateIRQ(u32 cpu)
 
 void NDS::SetIRQ(u32 cpu, u32 irq)
 {
+#ifdef LITEV_ACCESS_STATS
+    if (IE[cpu] & (1 << irq)) LitevAccess[cpu ? 5 : 4][0xE000 | irq]++;   // enabled IRQs raised, by source
+#endif
     IF[cpu] |= (1 << irq);
     UpdateIRQ(cpu);
 
@@ -2127,7 +2190,12 @@ void NDS::DivDone(u32 param)
 
 void NDS::StartDiv()
 {
-#ifdef LITEV_INSTANT_DIVSQRT
+#if defined(LITEV_LAZY_DIV)
+    // Lazy: DivDone (a pure function of the DIVCNT mode and the operands) runs on the next read of
+    // DIVCNT/DIV_RESULT/DIVREM_RESULT or at a savestate. PW's per-scanline IRQ handler restores
+    // the divider operands ~264x a frame and rarely reads a result.
+    DivDirty = true;
+#elif defined(LITEV_INSTANT_DIVSQRT)
     // Instant divide: compute now and skip the Event_Div completion. DivDone
     // clears the busy bit (0x8000) and fills the result registers, so the
     // result is ready same-cycle and busy is never observed set. Removes the
@@ -2269,6 +2337,9 @@ return;
 
 u8 NDS::ARM9Read8(u32 addr)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(4, addr);
+#endif
     if ((addr & 0xFFFFF000) == 0xFFFF0000)
     {
         return *(u8*)&ARM9BIOS[addr & 0xFFF];
@@ -2328,6 +2399,9 @@ u8 NDS::ARM9Read8(u32 addr)
 
 u16 NDS::ARM9Read16(u32 addr)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(0, addr);
+#endif
     addr &= ~0x1;
 
     if ((addr & 0xFFFFF000) == 0xFFFF0000)
@@ -2388,6 +2462,9 @@ u16 NDS::ARM9Read16(u32 addr)
 
 u32 NDS::ARM9Read32(u32 addr)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(1, addr);
+#endif
     addr &= ~0x3;
 
     if ((addr & 0xFFFFF000) == 0xFFFF0000)
@@ -2451,6 +2528,9 @@ u32 NDS::ARM9Read32(u32 addr)
 
 void NDS::ARM9Write8(u32 addr, u8 val)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(5, addr);
+#endif
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
@@ -2490,6 +2570,9 @@ void NDS::ARM9Write8(u32 addr, u8 val)
 
 void NDS::ARM9Write16(u32 addr, u16 val)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(2, addr);
+#endif
     addr &= ~0x1;
 
     switch (addr & 0xFF000000)
@@ -2550,6 +2633,9 @@ void NDS::ARM9Write16(u32 addr, u16 val)
 
 void NDS::ARM9Write32(u32 addr, u32 val)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(3, addr);
+#endif
     addr &= ~0x3;
 
     switch (addr & 0xFF000000)
@@ -3103,8 +3189,14 @@ bool NDS::ARM7GetMemRegion(u32 addr, bool write, MemRegion* region)
     case (addr+2): return ((val) >> 16) & 0xFF; \
     case (addr+3): return (val) >> 24;
 
-u8 NDS::ARM9IORead8(u32 addr)
+LITEV_MEM_SPLIT_NOINLINE u8 NDS::ARM9IORead8(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0);
+#endif
+#ifdef LITEV_LAZY_DIV
+    if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
+#endif
 #ifdef LITEV_LAZY_SQRT
     if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
 #endif
@@ -3197,8 +3289,14 @@ u8 NDS::ARM9IORead8(u32 addr)
     return 0;
 }
 
-u16 NDS::ARM9IORead16(u32 addr)
+LITEV_MEM_SPLIT_NOINLINE u16 NDS::ARM9IORead16(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0);
+#endif
+#ifdef LITEV_LAZY_DIV
+    if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
+#endif
 #ifdef LITEV_LAZY_SQRT
     if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
 #endif
@@ -3326,8 +3424,14 @@ u16 NDS::ARM9IORead16(u32 addr)
     return 0;
 }
 
-u32 NDS::ARM9IORead32(u32 addr)
+LITEV_MEM_SPLIT_NOINLINE u32 NDS::ARM9IORead32(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0);
+#endif
+#ifdef LITEV_LAZY_DIV
+    if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
+#endif
 #ifdef LITEV_LAZY_SQRT
     if (SqrtDirty && (u32)(addr - 0x040002B0) < 8) { SqrtDirty = false; SqrtDone(0); }
 #endif
@@ -3556,8 +3660,11 @@ u32 NDS::ARM9IORead32(u32 addr)
     return 0;
 }
 
-void NDS::ARM9IOWrite8(u32 addr, u8 val)
+LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite8(u32 addr, u8 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(0, val, 0x00FF); return;
@@ -3675,8 +3782,11 @@ void NDS::ARM9IOWrite8(u32 addr, u8 val)
     Log(LogLevel::Debug, "unknown ARM9 IO write8 %08X %02X %08X\n", addr, val, ARM9.R[15]);
 }
 
-void NDS::ARM9IOWrite16(u32 addr, u16 val)
+LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite16(u32 addr, u16 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(0, val, 0xFFFF); return;
@@ -3852,8 +3962,11 @@ void NDS::ARM9IOWrite16(u32 addr, u16 val)
     Log(LogLevel::Debug, "unknown ARM9 IO write16 %08X %04X %08X\n", addr, val, ARM9.R[15]);
 }
 
-void NDS::ARM9IOWrite32(u32 addr, u32 val)
+LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite32(u32 addr, u32 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0x80000000);
+#endif
 #ifdef LITEV_IO_DISPATCH_TABLE
     // Fast O(1) dispatch for word-aligned accesses in the primary 8 KB I/O window
     // (see NDS::ARM9IORead32 for the full rationale). Every case is a verbatim copy of
@@ -4214,6 +4327,9 @@ void NDS::ARM9IOWrite32(u32 addr, u32 val)
 
 u8 NDS::ARM7IORead8(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0);
+#endif
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[1] & 0xFF;
@@ -4266,6 +4382,9 @@ u8 NDS::ARM7IORead8(u32 addr)
 
 u16 NDS::ARM7IORead16(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0);
+#endif
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[1];
@@ -4341,6 +4460,9 @@ u16 NDS::ARM7IORead16(u32 addr)
 
 u32 NDS::ARM7IORead32(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0);
+#endif
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[1] | (GPU.VCount << 16);
@@ -4420,6 +4542,9 @@ u32 NDS::ARM7IORead32(u32 addr)
 
 void NDS::ARM7IOWrite8(u32 addr, u8 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(1, val, 0x00FF); return;
@@ -4522,6 +4647,9 @@ void NDS::ARM7IOWrite8(u32 addr, u8 val)
 
 void NDS::ARM7IOWrite16(u32 addr, u16 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(1, val, 0xFFFF); return;
@@ -4670,6 +4798,9 @@ void NDS::ARM7IOWrite16(u32 addr, u16 val)
 
 void NDS::ARM7IOWrite32(u32 addr, u32 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004:

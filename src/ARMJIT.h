@@ -29,6 +29,9 @@
 
 #ifdef JIT_ENABLED
 #include "JitBlock.h"
+#ifdef LITEV_JIT_FLATMAPS
+#include "FlatBlockMap.h"
+#endif
 
 #if defined(__APPLE__) && defined(__aarch64__)
     #include <pthread.h>
@@ -95,17 +98,46 @@ public:
     void SetFastMemory(bool enabled) noexcept;
 
     Compiler JITCompiler;
-    std::unordered_map<u32, JitBlock*> JitBlocks9 {};
-    std::unordered_map<u32, JitBlock*> JitBlocks7 {};
+#ifdef LITEV_JIT_POOL_ALLOC
+    template <typename K, typename V> using BlockMap = std::unordered_map<K, V, std::hash<K>, std::equal_to<K>, JitPool::Allocator<std::pair<const K, V>>>;
+    template <typename K, typename V> using BlockMultiMap = std::unordered_multimap<K, V, std::hash<K>, std::equal_to<K>, JitPool::Allocator<std::pair<const K, V>>>;
+#else
+    template <typename K, typename V> using BlockMap = std::unordered_map<K, V>;
+    template <typename K, typename V> using BlockMultiMap = std::unordered_multimap<K, V>;
+#endif
+#ifdef LITEV_JIT_FLATMAPS
+    FlatBlockMap<JitBlock*> JitBlocks9 {};
+    FlatBlockMap<JitBlock*> JitBlocks7 {};
 
-    std::unordered_map<u32, JitBlock*> RestoreCandidates {};
+    FlatBlockMap<JitBlock*> RestoreCandidates {};
+#else
+    BlockMap<u32, JitBlock*> JitBlocks9 {};
+    BlockMap<u32, JitBlock*> JitBlocks7 {};
+
+    BlockMap<u32, JitBlock*> RestoreCandidates {};
+#endif
 
 #ifdef LITEV_JIT_LINK
     // liteDS-v2 Unit 4 (direct block linking). Per-CPU pending links keyed by the
     // targetAddr a source site is waiting to be compiled. All mutation happens on
     // the emulator thread while it owns execution -> no locking.
-    std::unordered_multimap<u32, LinkSite> PendingLinks9 {};
-    std::unordered_multimap<u32, LinkSite> PendingLinks7 {};
+#ifdef LITEV_JIT_FLATMAPS
+    struct PendingAlloc
+    {
+#ifdef LITEV_JIT_POOL_ALLOC
+        static void* Alloc(size_t n) { return JitPool::Alloc(n); }
+        static void Free(void* p, size_t n) { JitPool::Free(p, n); }
+#else
+        static void* Alloc(size_t n) { return ::operator new(n); }
+        static void Free(void* p, size_t) { ::operator delete(p); }
+#endif
+    };
+    PendingSiteMap<LinkSite, PendingAlloc> PendingLinks9 {};
+    PendingSiteMap<LinkSite, PendingAlloc> PendingLinks7 {};
+#else
+    BlockMultiMap<u32, LinkSite> PendingLinks9 {};
+    BlockMultiMap<u32, LinkSite> PendingLinks7 {};
+#endif
 
     // Resolve a freshly-compiled-or-restored block's outgoing links + drain any
     // pending links waiting on its StartAddr. Block must already be in JitBlocks +
@@ -198,7 +230,12 @@ public:
 }
 
 // Defined in assembly
+#ifdef LITEV_JIT_MEMBASE_PIN
+// memBase: this CPU's fastmem base, kept in x26 for the whole slice (blocks no longer load it)
+extern "C" void ARM_Dispatch(melonDS::ARM* cpu, melonDS::JitBlockEntry entry, void* memBase);
+#else
 extern "C" void ARM_Dispatch(melonDS::ARM* cpu, melonDS::JitBlockEntry entry);
+#endif
 #else
 namespace melonDS
 {

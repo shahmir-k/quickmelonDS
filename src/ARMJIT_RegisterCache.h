@@ -50,7 +50,55 @@ public:
         PCAllocatableAsSrc = ~(pcAllocatableAsSrc
             ? 0
             : (1 << 15));
+#if defined(LITEV_JIT_REGALLOC_USEMASK)
+        InitUseMask();
+#elif defined(LITEV_JIT_REGALLOC_SUFFIX)
+        // Prepare(i) needs, over instructions i..end, which registers are used and how often:
+        // one backward pass per block instead of a rescan per instruction (same values)
+        SuffixNeeded[instrsCount] = 0;
+        for (int r = 0; r < 16; r++) SuffixRank[instrsCount][r] = 0;
+        for (int j = instrsCount - 1; j >= 0; j--)
+        {
+            u16 regs = (Instrs[j].Info.SrcRegs & ~(1 << 15)) | Instrs[j].Info.DstRegs;
+            SuffixNeeded[j] = SuffixNeeded[j + 1] | regs;
+            regs &= ~Instrs[j].Info.NotStrictlyNeeded;
+            for (int r = 0; r < 16; r++) SuffixRank[j][r] = SuffixRank[j + 1][r] + ((regs >> r) & 1);
+        }
+#endif
     }
+
+#ifdef LITEV_JIT_REGALLOC_USEMASK
+    // Per register, a bit per instruction that strictly needs it: the eviction rank Prepare(i)
+    // wants (uses at or after i) is popcount(UseMask[r] >> i). Built from the few set register
+    // bits per instruction, instead of filling a 33x16 table per block, and ranks are only
+    // computed when a register has to be evicted. Same values as LITEV_JIT_REGALLOC_SUFFIX.
+    u32 UseMask[16];
+    void InitUseMask()
+    {
+        SuffixNeeded[InstrsCount] = 0;
+        for (int r = 0; r < 16; r++) UseMask[r] = 0;
+        for (int j = InstrsCount - 1; j >= 0; j--)
+        {
+            u16 regs = (Instrs[j].Info.SrcRegs & ~(1 << 15)) | Instrs[j].Info.DstRegs;
+            SuffixNeeded[j] = SuffixNeeded[j + 1] | regs;
+            for (u32 m = regs & ~Instrs[j].Info.NotStrictlyNeeded; m; m &= m - 1)
+                UseMask[__builtin_ctz(m)] |= 1u << j;
+        }
+    }
+    // re-initialise in place (the compiler did RegCache = RegisterCache(...): a ~700 byte copy)
+    void Reset(T* compiler, FetchedInstr instrs[], int instrsCount, bool pcAllocatableAsSrc)
+    {
+        Compiler = compiler; Instrs = instrs; InstrsCount = instrsCount;
+        for (int i = 0; i < 16; i++)
+            Mapping[i] = (Reg)-1;
+        PCAllocatableAsSrc = ~(pcAllocatableAsSrc ? 0 : (1 << 15));
+        LiteralsLoaded = 0; NativeRegsUsed = 0; LoadedRegs = 0; DirtyRegs = 0;
+#ifdef LITEV_JIT_GLOBALREG
+        PinnedRegs = 0;
+#endif
+        InitUseMask();
+    }
+#endif
 
 #ifdef LITEV_JIT_GLOBALREG
     // GLOBALREG (DraStic teardown 01 §6.1): globally-pinned guest regs kept live
@@ -161,6 +209,14 @@ public:
         for (int reg : invalidedLiterals)
             UnloadLiteral(reg);
 
+#if defined(LITEV_JIT_REGALLOC_USEMASK)
+        const u16 futureNeeded = SuffixNeeded[i];
+        auto rankOf = [&](int reg) { return __builtin_popcount(UseMask[reg] >> i); };
+#elif defined(LITEV_JIT_REGALLOC_SUFFIX)
+        const u16 futureNeeded = SuffixNeeded[i];
+        const u8* ranking = SuffixRank[i];
+        auto rankOf = [&](int reg) { return (int)ranking[reg]; };
+#else
         u16 futureNeeded = 0;
         int ranking[16];
         for (int j = 0; j < 16; j++)
@@ -173,6 +229,8 @@ public:
             for (int reg : regsNeeded)
                 ranking[reg]++;
         }
+        auto rankOf = [&](int reg) { return ranking[reg]; };
+#endif
 
         // we'll unload all registers which are never used again
         BitSet16 neverNeededAgain(LoadedRegs & ~futureNeeded);
@@ -198,10 +256,10 @@ public:
                     if (PinnedRegs & (1 << reg))
                         continue;
 #endif
-                    if (!((1 << reg) & necessaryRegs) && ranking[reg] < rank)
+                    if (!((1 << reg) & necessaryRegs) && rankOf(reg) < rank)
                     {
                         leastReg = reg;
-                        rank = ranking[reg];
+                        rank = rankOf(reg);
                     }
                 }
 
@@ -215,6 +273,13 @@ public:
             BitSet16 needValueLoaded(needToBeLoaded);
             if (thumb || instr.Cond() >= 0xE)
                 needValueLoaded = BitSet16(instr.Info.SrcRegs);
+#ifdef LITEV_JIT_R15_ELIDE
+            // r15 is never dirty (never written back) and unloaded before the next
+            // instruction, so a conditional instruction that only writes it (a branch)
+            // doesn't need its old value either.
+            if (ElideR15Value && !(instr.Info.SrcRegs & (1 << 15)))
+                needValueLoaded[15] = false;
+#endif
             for (int reg : needToBeLoaded)
                 LoadRegister(reg, needValueLoaded[reg]);
         }
@@ -240,6 +305,12 @@ public:
     static const Reg NativeRegAllocOrder[];
     static const int NativeRegsAvailable;
 
+#if defined(LITEV_JIT_REGALLOC_USEMASK)
+    u16 SuffixNeeded[33];      // MaxBlockSize <= 32 (ARMJIT.cpp clamps it)
+#elif defined(LITEV_JIT_REGALLOC_SUFFIX)
+    u16 SuffixNeeded[33];      // MaxBlockSize <= 32 (ARMJIT.cpp clamps it)
+    u8 SuffixRank[33][16];
+#endif
     Reg Mapping[16];
     u32 LiteralValues[16];
 
@@ -249,6 +320,9 @@ public:
     u16 DirtyRegs = 0;
 
     u16 PCAllocatableAsSrc = 0;
+#ifdef LITEV_JIT_R15_ELIDE
+    bool ElideR15Value = false;
+#endif
 
     T* Compiler;
 

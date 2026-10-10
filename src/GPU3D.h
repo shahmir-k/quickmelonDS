@@ -113,6 +113,12 @@ public:
     // so DMA::Run9's per-word geometry-DMA loop can inline the whole producer path. Public because
     // DMA.cpp calls it; byte-exact with WriteToGXFIFO (single source — the public fn delegates here).
     void WriteToGXFIFO_Inline(u32 val) noexcept;
+#ifdef LITEV_GX_BULK
+    // Geometry DMA in bulk (DMA::Run9): with the FIFO empty, decode `n` DMA words and run their
+    // commands now; a SWAP_BUFFERS and everything after it is queued in the FIFO as usual.
+    bool BulkReady() const noexcept;
+    void BulkWords(const u32* words, u32 n) noexcept;
+#endif
 
     u8 Read8(u32 addr) noexcept;
     u16 Read16(u32 addr) noexcept;
@@ -134,11 +140,21 @@ private:
 
     } CmdFIFOEntry;
 
+#ifdef LITEV_GX_BULK
+    // Bulk = run commands from [BulkPtr, BulkEnd) (no FIFO reads, no wait on CycleCount)
+    template<bool Bulk> void ExecuteCommandT() noexcept;
+    const CmdFIFOEntry* BulkPtr = nullptr;
+    const CmdFIFOEntry* BulkEnd = nullptr;
+#endif
     void UpdateClipMatrix() noexcept;
     void ResetRenderingState() noexcept;
     void AddCycles(s32 num) noexcept;
     void NextVertexSlot() noexcept;
     void StallPolygonPipeline(s32 delay, s32 nonstalldelay) noexcept;
+#ifdef LITEV_GX_POLY_LEAN
+    // out of line: most vertices don't close a polygon and skip its big prologue/epilogue
+    __attribute__((noinline))
+#endif
     void SubmitPolygon() noexcept;
     void SubmitVertex() noexcept;
     void CalculateLighting() noexcept;
@@ -200,6 +216,20 @@ public:
     // lighting just accounts its cycles (which depend only on the enabled lights), and VBlank
     // skips preparing the frame for the renderer. Cleared once the game uses display capture.
     bool Headless = false;
+#ifdef LITEV_FF_HEADLESS3D
+    // BankBuiltHeadless: the bank being built got polygons while Headless (fast-forward), so it
+    // has no bounds/sort/depth. RenderStale: the last buffer swap skipped preparing the render
+    // list (a Headless frame or such a bank); renders are skipped until a prepared swap.
+    bool BankBuiltHeadless = false, RenderStale = false;
+    // swap rhythm, so fast-forward only builds unwatched the banks that will land on a skipped
+    // frame (Pokemon White swaps every 2nd frame): frame count, frame of the last swap, frames
+    // between swaps; FFBackoff > 0 = a prediction missed, build everything for that many frames
+    u32 FFFrame = 0, FFLastFlush = 0, FFPeriod = 1, FFBackoff = 0;
+    // Headless because of fast-forward: lighting and texgen still run (they leave the current
+    // vertex colour / texcoords, which later, rendered banks use); only per-polygon render data
+    // (which stays inside the bank) is skipped
+    bool FFHeadlessNow = false;
+#endif
     melonDS::NDS& NDS;
     melonDS::GPU& GPU;
 
@@ -291,6 +321,7 @@ public:
 
     u16 RenderToonTable[32] {};
     u16 RenderEdgeTable[8] {};
+    bool EdgeMarkEnabled = true;   // frontend "Edge outlines" setting (GL renderer, LITEV_GL_EDGE_MARK)
 
     u32 RenderFogColor = 0;
     u32 RenderFogOffset = 0;
@@ -421,5 +452,23 @@ protected:
 };
 
 }
+
+#ifdef LITEV_GX_CPUSEND
+// LITEV_GX_CPUSEND: NitroSDK MI_CpuSend32(src, dst, size) (ARM, position independent:
+//   add ip,r0,r2 / cmp r0,ip / ldmlt r0!,{r2} / strlt r2,[r1] / blt -> cmp / bx lr)
+// sending a display list from main RAM to GXFIFO (PW: ~1600 words a frame, one slow IO store and
+// one non-bulk geometry command each) goes through GPU3D::BulkWords like a bulk geometry DMA.
+// Hooked at JIT compile by the exact code bytes (the hook block depends on them), guest fallback
+// otherwise. Category B (like LITEV_GX_BULK): same words and registers, fixed cycle estimate, the
+// FIFO never fills. Runtime off: debug.litev.gxsend=0 (headless: env LITEV_GXSEND=0).
+namespace melonDS { class ARM; class NDS; }
+namespace melonDS::GXSend
+{
+inline bool MaybeHook(u32 instr) { return instr == 0xE080C002; }
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr);    // 1: hook (code verified), 0: not
+inline void Deps(u32 addr, u32& a, u32& b) { a = addr; b = addr + 24; }
+bool Run(melonDS::ARM* cpu, bool jit);                 // false: not at a hook
+}
+#endif
 
 #endif

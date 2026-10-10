@@ -4,6 +4,12 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <ctime>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#include <unistd.h>
+#endif
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <sys/prctl.h>
@@ -23,6 +29,87 @@ void NameThread(const char* n)
 #else
     (void)n;
 #endif
+}
+
+namespace
+{
+struct RingEnt { double t, cpu; int ev; int tid; };
+std::atomic<int> RingN { 0 };
+}
+
+void Ev(int ev)
+{
+    // magic statics: thread-safe one-time init
+    static const int RingCap = [] {
+        int cap = 0;
+#ifdef __ANDROID__
+        char b[PROP_VALUE_MAX] = {};
+        if (__system_property_get("debug.litev.pipering", b) > 0) cap = atoi(b);
+#endif
+        return cap > 0 ? cap : 0;
+    }();
+    static RingEnt* const Ring = RingCap ? (RingEnt*)calloc(RingCap, sizeof(RingEnt)) : nullptr;
+    if (!Ring) return;
+    const int i = RingN.fetch_add(1, std::memory_order_relaxed);
+    if (i >= RingCap) return;
+    timespec c; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c);
+    Ring[i] = { NowMs(), c.tv_sec * 1e3 + c.tv_nsec / 1e6, ev, 
+#ifdef __ANDROID__
+        (int)gettid()
+#else
+        0
+#endif
+    };
+    if (i == RingCap - 1)
+    {
+        if (FILE* f = fopen("/sdcard/Android/data/com.sereneds.app/files/pipering.csv", "w"))
+        {
+            fprintf(f, "t_ms,cpu_ms,ev,tid\n");
+            for (int k = 0; k < RingCap; k++)
+                fprintf(f, "%.3f,%.3f,%d,%d\n", Ring[k].t, Ring[k].cpu, Ring[k].ev, Ring[k].tid);
+            fclose(f);
+        }
+        Platform::Log(Platform::LogLevel::Info, "LITEV_PIPERING wrote %d events\n", RingCap);
+    }
+}
+
+bool StallLogOn()
+{
+    static const bool on = [] {
+#ifdef __ANDROID__
+        char b[PROP_VALUE_MAX] = {};
+        return __system_property_get("debug.litev.stalllog", b) > 0 && atoi(b) != 0;
+#else
+        const char* e = getenv("LITEV_STALLLOG");
+        return e && atoi(e) != 0;
+#endif
+    }();
+    return on;
+}
+
+GLJobStat GLJ;
+
+void StallWait(const char* site, double ms, unsigned frame)
+{
+    if (ms >= 3.0) Platform::Log(Platform::LogLevel::Info, "LITEV_STALL wait %s %.1f ms frame %u t %.3f\n", site, ms, frame, NowMs());
+}
+
+void StallGLJob(unsigned frame, double wall, double cpu)
+{
+    GLJobStat& j = GLJ;
+    if (wall >= 10.0)
+        Platform::Log(Platform::LogLevel::Info, "LITEV_STALL gljob frame %u wall %.1f cpu %.1f texnew %d/%.1f texup %d/%.1f draws %d/%.1f max %.1f key %08x t %.3f\n",
+                      frame, wall, cpu, j.TexNewN, j.TexNew, j.TexUpN, j.TexUp, j.DrawN, j.Draw, j.DrawMax, j.DrawMaxKey, NowMs());
+    j = GLJobStat{};
+}
+
+void StallFrame(unsigned frame)
+{
+    static double last = 0;
+    const double t = NowMs();
+    if (last > 0 && t - last > 20.0)
+        Platform::Log(Platform::LogLevel::Info, "LITEV_STALL vbl frame %u gap %.1f t %.3f\n", frame, t - last, t);
+    last = t;
 }
 
 void Tick()

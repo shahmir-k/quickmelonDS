@@ -13,10 +13,17 @@
 
 uniform usampler2DArray DescTex;   // 513x192x2 RGBA8UI: 2 planes x 256 + control column
 uniform sampler2D Tex3D;           // Nx 3D colour buffer
+uniform sampler2D EdgeTex;         // 256x192 edge-marking overlay of that 3D frame (3DFinalPassEdgeFS)
+uniform int uEdge;                 // 1: the frame has one
 uniform int uScale;
 uniform int uSingle;     // -1: both screens (MRT); 0/1: only that screen, to output 0
 uniform ivec2 uOrigin;   // viewport origin of this draw in the target
 smooth in highp vec2 fNative;
+// LITEV_HYB_MERGE_FASTLINES: the lines drawn now show the 3D straight through (no 2D blend or
+// brightness, 3D x offset 0: checked by the CPU), so a pixel is just its 3D colour, or the 2D
+// layer under it where the 3D is empty
+uniform int uFast;       // 1 + bright mode (0 none, 1 up, 2 down) for these lines; 0 = full merge
+uniform int uFastEvy;
 
 FRAGLOC(0) out vec4 oTopColor;
 FRAGLOC(1) out vec4 oBottomColor;
@@ -29,10 +36,15 @@ ivec4 Desc(int x, int y, int layer)
 ivec4 Get3D(ivec2 pos)
 {
     if (pos.x < 0 || pos.x >= 256 * uScale) return ivec4(0);
-#ifdef GL_ES
-    vec4 c = texelFetch(Tex3D, pos, 0).bgra;   // the GLES 3D pass emits BGRA (3DRenderFS)
-#else
     vec4 c = texelFetch(Tex3D, pos, 0);
+    if (uEdge != 0)
+    {
+        highp vec2 p = vec2(pos) + 0.5;
+        vec4 e = texelFetch(EdgeTex, ivec2(p / float(uScale)), 0);
+        c.rgb = mix(c.rgb, e.rgb, e.a);
+    }
+#ifdef GL_ES
+    c = c.bgra;   // the GLES 3D pass emits BGRA (3DRenderFS)
 #endif
     return ivec4(round(c * vec4(63.0, 63.0, 63.0, 31.0)));
 }
@@ -45,6 +57,15 @@ vec4 Screen(int layer, ivec2 P)
 #else
     ivec2 n = P / uScale;
 #endif
+    if (uFast != 0)
+    {
+        ivec4 c3 = Get3D(P);
+        ivec4 px = c3.a == 0 ? Desc(n.x + 256, n.y, layer) : c3;
+        if (uFast == 2)      px += ((0x3F - px) * uFastEvy) >> 4;
+        else if (uFast == 3) px -= ((px * uFastEvy) + 0xF) >> 4;
+        ivec3 cf = (px.rgb << 2) | (px.rgb >> 4);
+        return vec4(vec3(cf.bgr) / 255.0, 1.0);
+    }
     ivec4 ctl = Desc(512, n.y, layer);
     int dispmode = ctl.b & 0x3;
     ivec4 pix = Desc(n.x, n.y, layer);

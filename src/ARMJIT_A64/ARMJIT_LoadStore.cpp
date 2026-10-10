@@ -23,10 +23,103 @@
 #include "../ARMJIT_Memory.h"
 #include "../NDS.h"
 
+
+#if defined(LITEV_JIT_STORE_REPROMOTE) || defined(LITEV_JIT_COND_MEMGUESS) || defined(LITEV_JIT_USERSTM_FASTMEM)
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#include <stdlib.h>
+#include <algorithm>
+#endif
+
 using namespace Arm64Gen;
+
+#ifdef LITEV_SLOWMEM_HIST
+namespace melonDS { void LitevSlowSiteNote(const void* ret, u32 info); }
+#define NOTE_SLOW_SITE(info) LitevSlowSiteNote((const u8*)GetRXPtr() - 4, (info))
+#else
+#define NOTE_SLOW_SITE(info) ((void)0)
+#endif
 
 namespace melonDS
 {
+
+#ifdef LITEV_JIT_STORE_REPROMOTE
+u64 JitStoreRepromotions = 0;   // diagnosis counter (headless LITEV_FRAME_MS)
+
+static bool StoreRepromoteOn()   // debug.litev.storerepromote (default on), env LITEV_STOREREPROMOTE off the device
+{
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.storerepromote", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_STOREREPROMOTE");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on;
+}
+
+// Called by the fault handler for a fault on a code-protected page, before RewriteMemAccess.
+void Compiler::NoteProtectFault(u8* pc)
+{
+    if (!StoreRepromoteOn())
+        return;
+    auto it = LoadStorePatches.find(pc - GetRXBase());
+    if (it == LoadStorePatches.end())
+        return;   // RewriteMemAccess reports the JIT bug
+    ptrdiff_t start = (pc - GetRXBase()) + it->second.PatchOffset;
+    u32 frame = NDS.NumFrames;
+    SlowStoreSite& site = SlowStoreSites[start];
+    if (site.Orig.empty())
+    {
+        const u32* code = (const u32*)(GetRXBase() + start);
+        site.Orig.assign(code, code + it->second.PatchSize / 4);
+        site.Faults = 0;
+    }
+    else if (frame - site.RestoredFrame > 600)
+        site.Faults = 0;   // it ran fast for 10 s since the last retry: start the backoff over
+    else if (site.Faults < 10)
+        site.Faults++;
+    site.Slow = true;
+    site.RetryFrame = frame + (4u << site.Faults);
+    SlowStoreNextRetry = std::min(SlowStoreNextRetry, site.RetryFrame);
+}
+
+// Called at the end of NDS::RunFrame, where no JIT code is executing. Puts the original
+// fast-path bytes back, i.e. the exact code the compiler emitted, a state every other
+// fastmem site is in: a store to a page that holds code faults and is rewritten again.
+void Compiler::RepromoteStores()
+{
+    u32 frame = NDS.NumFrames;
+    if (frame < SlowStoreNextRetry)
+        return;
+    u32 next = ~0u;
+    ptrdiff_t cur = GetCodeOffset();
+    NDS.JIT.JitEnableWrite();
+    for (auto& [start, site] : SlowStoreSites)
+    {
+        if (!site.Slow)
+            continue;
+        if (frame < site.RetryFrame)
+        {
+            next = std::min(next, site.RetryFrame);
+            continue;
+        }
+        SetCodePtrUnsafe(start);
+        for (u32 w : site.Orig)
+            Write32(w);
+        FlushIcacheSection(GetRXBase() + start, (u8*)GetRXPtr());
+        site.Slow = false;
+        site.RestoredFrame = frame;
+        JitStoreRepromotions++;
+    }
+    SetCodePtrUnsafe(cur);
+    NDS.JIT.JitEnableExecute();
+    SlowStoreNextRetry = next;
+}
+#endif
 
 bool Compiler::IsJITFault(const u8* pc)
 {
@@ -42,6 +135,11 @@ u8* Compiler::RewriteMemAccess(u8* pc)
     if (it != LoadStorePatches.end())
     {
         LoadStorePatch patch = it->second;
+#ifdef LITEV_JIT_STORE_REPROMOTE
+        // kept: the site may be restored to this fast path later (the rewritten code has no
+        // memory access at this offset, so the stale entry can't be looked up meanwhile)
+        if (!StoreRepromoteOn())
+#endif
         LoadStorePatches.erase(it);
 
         ptrdiff_t curCodeOffset = GetCodeOffset();
@@ -60,6 +158,48 @@ u8* Compiler::RewriteMemAccess(u8* pc)
     Log(LogLevel::Error, "this is a JIT bug! %08x\n", __builtin_bswap32(*(u32*)pc));
     abort();
 }
+
+// A conditional ARM access normally takes the fastmem path whatever its region looked like,
+// since a condition that failed while compiling left DataRegion stale. When it did run, its
+// region is known: an IO/VRAM access then goes straight to the slow path instead of faulting
+// once (a signal + rewrite, ~50-80 us on the A55). Fast or slow path is guest-invisible.
+bool Compiler::CondMemGuess(bool addrIsStatic)
+{
+#ifdef LITEV_JIT_COND_MEMGUESS
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.condmemguess", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_CONDMEMGUESS");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on && (addrIsStatic || CurInstr.DataExecuted);
+#else
+    return false;
+#endif
+}
+
+#ifdef LITEV_JIT_USERSTM_FASTMEM
+// User-bank STM (STM ... ^, e.g. NitroSDK's thread context save STMIB r0, {r2-r14}^, ~200 per
+// frame in the PW overworld) always took the slow helper. It now takes the fastmem path like any
+// other STM: same words to the same addresses, banked registers read through ReadBanked exactly
+// as the slow path does. Guest-invisible.
+static bool UserStmFastOn()   // debug.litev.userstmfast (default on), env LITEV_USERSTMFAST off the device
+{
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.userstmfast", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_USERSTMFAST");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on;
+}
+#endif
 
 bool Compiler::Comp_MemLoadLiteral(int size, bool signExtend, int rd, u32 addr)
 {
@@ -189,7 +329,7 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
         ? NDS.JIT.Memory.ClassifyAddress9(addrIsStatic ? staticAddress : CurInstr.DataRegion)
         : NDS.JIT.Memory.ClassifyAddress7(addrIsStatic ? staticAddress : CurInstr.DataRegion);
 
-    if (NDS.JIT.FastMemoryEnabled() && ((!Thumb && CurInstr.Cond() != 0xE) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget)))
+    if (NDS.JIT.FastMemoryEnabled() && ((!Thumb && CurInstr.Cond() != 0xE && !CondMemGuess(addrIsStatic)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget)))
     {
         ptrdiff_t memopStart = GetCodeOffset();
         LoadStorePatch patch;
@@ -203,10 +343,41 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
             ? PatchedStoreFuncs[NDS.ConsoleType][Num][__builtin_ctz(size) - 3][rdMapped]
             : PatchedLoadFuncs[NDS.ConsoleType][Num][__builtin_ctz(size) - 3][!!(flags & memop_SignExtend)][rdMapped];
 
+#ifdef LITEV_JIT_LDR_ALIGNCHK
+        // Word / halfword LOAD: test the alignment and load from the address itself, instead of
+        // masking it (and rotating a word afterwards). An aligned access, the normal case, then
+        // has no ALU op between the address and the load nor between the load and its user
+        // (2 cycles less on the A55's load chain); a misaligned one runs the slow-path thunk
+        // from the block tail, which rotates / masks exactly as the fastmem sequence did.
+        if (!(flags & memop_Store) && size > 8 && !(size == 32 && addrIsStatic) && JitQOn(jitq_LdrAlignChk))
+        {
+            FixupBranch misaligned;
+            if (size == 32)
+            {
+                ANDI2R(W1, W0, 3);
+                misaligned = CBNZ(W1);
+            }
+            else
+                misaligned = TBNZ(W0, 0);
+            ptrdiff_t loadPosition = GetCodeOffset();
+            LDRGeneric(size, flags & memop_SignExtend, rdMapped, X0, RMemBase);
+            patch.PatchOffset = memopStart - loadPosition;
+            patch.PatchSize = GetCodeOffset() - memopStart;
+            LoadStorePatches[loadPosition] = patch;
+            TailStub t{};
+            t.Kind = 1;
+            t.A = misaligned;
+            t.Func = patch.PatchFunc;
+            t.Back = (const u8*)GetRXPtr();
+            TailStubs.push_back(t);
+        }
+        else
+#endif
+        {
         // take a chance at fastmem
         if (size > 8)
             ANDI2R(W1, W0, addressMask);
-        
+
         ptrdiff_t loadStorePosition = GetCodeOffset();
         if (flags & memop_Store)
         {
@@ -225,6 +396,7 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
         patch.PatchOffset = memopStart - loadStorePosition;
         patch.PatchSize = GetCodeOffset() - memopStart;
         LoadStorePatches[loadStorePosition] = patch;
+        }
     }
     else
     {
@@ -327,6 +499,7 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
                     case 8: QuickCallFunction(X3, SlowWrite9<u8, 0>); break;
                     case 9: QuickCallFunction(X3, SlowWrite9<u8, 1>); break;
                     }
+                    NOTE_SLOW_SITE(expectedTarget | (CurInstr.Cond() << 8) | (CurInstr.DataExecuted << 12) | ((u32)Thumb << 13) | ((u32)(size >> 3) << 16));
                 }
                 else
                 {
@@ -563,6 +736,11 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         ? NDS.JIT.Memory.ClassifyAddress9(CurInstr.DataRegion)
         : NDS.JIT.Memory.ClassifyAddress7(CurInstr.DataRegion);
 
+#ifdef LITEV_JIT_USERSTM_FASTMEM
+    const bool userFast = usermode && store && UserStmFastOn();
+#else
+    const bool userFast = false;
+#endif
 #ifdef LITEV_JIT_LDM_FASTMEM
     // Loads take the fault-backed fastmem path too (LDP straight into the guest registers,
     // the helper call out of line in the far region), not only stores. A fault mid-transfer
@@ -570,10 +748,10 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     // loaded register), which rewrites every destination, so a partially loaded block leaves
     // no trace. Cycles were added above, identically for both paths.
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
-        && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+        && (!usermode || userFast) && ((CurInstr.Cond() < 0xE && !CondMemGuess(false)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
 #else
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
-        && store && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+        && store && (!usermode || userFast) && ((CurInstr.Cond() < 0xE && !CondMemGuess(false)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
 #endif
 
     {
@@ -593,15 +771,55 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     if (compileFastPath)
     {
         ptrdiff_t fastPathStart = GetCodeOffset();
-        ptrdiff_t loadStoreOffsets[8];
-
-        ADD(X1, RMemBase, X0);
+        ptrdiff_t loadStoreOffsets[16];
 
         u32 offset = 0;
         BitSet16::Iterator it = regs.begin();
         u32 i = 0;
 
-        if (regsCount & 1)
+        if (usermode)
+        {
+            // user-bank store (userFast): one STR per word; r8-r14 go through ReadBanked
+            // (W5 = mode, W1 = index, W3 = value in/out; clobbers X1, X2, flags, LR), so the
+            // host address lives in X6. On a fault the whole region becomes a call to the
+            // stub below, which redoes the transfer from W0 (untouched here).
+            if (regs & BitSet16(0x7f00))
+            {
+#ifdef LITEV_JIT_LAZYFLAGS
+                LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, CPSR));
+                UBFX(W5, W5, 0, 5);
+#else
+                UBFX(W5, RCPSR, 0, 5);
+#endif
+            }
+            ADD(X6, RMemBase, X0);
+            for (int reg : regs)
+            {
+                ARM64Reg val = W3;
+                if (RegCache.LoadedRegs & (1 << reg))
+                {
+                    if (reg >= 8 && reg < 15)
+                        MOV(W3, MapReg(reg));
+                    else
+                        val = MapReg(reg);
+                }
+                else
+                    LoadReg(reg, W3);
+                if (reg >= 8 && reg < 15)
+                {
+                    MOVI2R(W1, reg - 8);
+                    BL(ReadBanked);
+                }
+                loadStoreOffsets[i++] = GetCodeOffset();
+                STR(INDEX_UNSIGNED, val, X6, offset);
+                offset += 4;
+            }
+            it = regs.end();
+        }
+        else
+            ADD(X1, RMemBase, X0);
+
+        if (!usermode && (regsCount & 1))
         {
             int reg = *it;
             it++;
@@ -989,6 +1207,9 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         case 2: QuickCallFunction(X4, SlowBlockTransfer9<true, 0>); break;
         case 3: QuickCallFunction(X4, SlowBlockTransfer9<true, 1>); break;
         }
+        if (store)
+            NOTE_SLOW_SITE((u32)expectedTarget | (CurInstr.Cond() << 8) | (CurInstr.DataExecuted << 12) | ((u32)Thumb << 13)
+                | ((u32)usermode << 14) | ((u32)compileFastPath << 15) | ((u32)regsCount << 16) | (1u << 31));
     }
     else
     {

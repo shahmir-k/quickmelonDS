@@ -30,6 +30,9 @@
 // so the public WriteToGXFIFO/CmdFIFOWrite delegate to the SAME code DMA.cpp inlines (no duplication).
 // The extern decl inside also gives CmdNumParams (defined below) external linkage for other TUs.
 #include "GPU3D_GXFIFO_inl.h"
+#ifdef LITEV_GX_CPUSEND
+#include "ARMInterpreter.h"
+#endif
 
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
@@ -42,7 +45,7 @@ static int litevGxPropDefault(const char* name, int def) {
 }
 #endif
 
-#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2) || defined(LITEV_GEOM_NEON3)) && defined(__ARM_NEON)
+#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2) || defined(LITEV_GEOM_NEON3) || defined(LITEV_GX_EARLY_REJECT)) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 
@@ -1012,7 +1015,7 @@ void GPU3D::StallPolygonPipeline(s32 delay, s32 nonstalldelay) noexcept
 
 
 template<int comp, s32 plane, bool attribs>
-void ClipSegment(Vertex* outbuf, Vertex* vin, Vertex* vout)
+void ClipSegment(Vertex* outbuf, const Vertex* vin, const Vertex* vout)
 {
     s64 factor_num = vin->Position[3] - (plane*vin->Position[comp]);
     s32 factor_den = factor_num - (vout->Position[3] - (plane*vout->Position[comp]));
@@ -1064,6 +1067,70 @@ int ClipAgainstPlane(const GPU3D& gpu, Vertex* vertices, int nverts, int clipsta
             }
             return nverts;
         }
+    }
+#endif
+#ifdef LITEV_GX_CLIP_LEAN
+    // Same result with fewer 64-byte vertex copies: vertices are read in place (no local copy per
+    // vertex), and a side with no vertex past it skips its pass (the pass would copy them through
+    // unchanged); the result lands in temp or vertices, copied back only when it ends in temp.
+    {
+        Vertex temp[10];
+        const Vertex* in = vertices;
+        int n = nverts;
+        bool plus = false;
+        for (int i = clipstart; i < n; i++) plus |= vertices[i].Position[comp] > vertices[i].Position[3];
+        if (plus)
+        {
+            int c = clipstart;
+            if (clipstart == 2) { temp[0] = vertices[0]; temp[1] = vertices[1]; }
+            for (int i = clipstart; i < n; i++)
+            {
+                const Vertex* vtx = &vertices[i];
+                if (vtx->Position[comp] > vtx->Position[3])
+                {
+                    if ((comp == 2) && (!(gpu.CurPolygonAttr & (1<<12)))) return 0;
+                    const Vertex* vprev = &vertices[i == 0 ? n - 1 : i - 1];
+                    if (vprev->Position[comp] <= vprev->Position[3]) ClipSegment<comp, 1, attribs>(&temp[c++], vtx, vprev);
+                    const Vertex* vnext = &vertices[i + 1 >= n ? 0 : i + 1];
+                    if (vnext->Position[comp] <= vnext->Position[3]) ClipSegment<comp, 1, attribs>(&temp[c++], vtx, vnext);
+                }
+                else
+                    temp[c++] = *vtx;
+            }
+            in = temp; n = c;
+        }
+        bool minus = false;
+        for (int i = clipstart; i < n; i++) minus |= in[i].Position[comp] < -in[i].Position[3];
+        if (minus)
+        {
+            Vertex* out = in == vertices ? temp : vertices;
+            int c = clipstart;
+            if (clipstart == 2 && out == temp) { temp[0] = vertices[0]; temp[1] = vertices[1]; }
+            for (int i = clipstart; i < n; i++)
+            {
+                const Vertex* vtx = &in[i];
+                if (vtx->Position[comp] < -vtx->Position[3])
+                {
+                    const Vertex* vprev = &in[i == 0 ? n - 1 : i - 1];
+                    if (vprev->Position[comp] >= -vprev->Position[3]) ClipSegment<comp, -1, attribs>(&out[c++], vtx, vprev);
+                    const Vertex* vnext = &in[i + 1 >= n ? 0 : i + 1];
+                    if (vnext->Position[comp] >= -vnext->Position[3]) ClipSegment<comp, -1, attribs>(&out[c++], vtx, vnext);
+                }
+                else
+                    out[c++] = *vtx;
+            }
+            in = out; n = c;
+        }
+        if (in != vertices)
+            for (int i = 0; i < n; i++) vertices[i] = in[i];
+        for (int i = 0; i < n; i++)
+        {
+            Vertex* vtx = &vertices[i];
+            vtx->Color[0] &= ~0xFFF; vtx->Color[0] += 0xFFF;
+            vtx->Color[1] &= ~0xFFF; vtx->Color[1] += 0xFFF;
+            vtx->Color[2] &= ~0xFFF; vtx->Color[2] += 0xFFF;
+        }
+        return n;
     }
 #endif
     Vertex temp[10];
@@ -1177,8 +1244,76 @@ bool ClipCoordsEqual(Vertex* a, Vertex* b)
            a->Position[3] == b->Position[3];
 }
 
+#ifdef LITEV_GX_CLIP_REJECT
+// ClipPolygon returns 0 for these without the copy passes (clipstart 0 only: kept strip vertices
+// make the clipper return at least 2). Planes in its order (Z, Y, X); the first one with a vertex
+// outside decides: every vertex past the same side -> 0 (the + pass, or the - pass after the +
+// pass copied them all), a vertex past the far plane without attr bit 12 -> 0; anything else clips.
+// Planes with no vertex outside leave the positions as they are.
+static bool ClipTrivialReject(const Vertex* v, int n, u32 attr)
+{
+    for (int comp = 2; comp >= 0; comp--)
+    {
+        bool anyOut = false, allPlus = true, allMinus = true;
+        for (int i = 0; i < n; i++)
+        {
+            const s32 p = v[i].Position[comp], w = v[i].Position[3];
+            const bool plus = p > w, minus = !plus && p < -w;
+            if (comp == 2 && plus && !(attr & (1<<12))) return true;
+            anyOut |= plus | minus; allPlus &= plus; allMinus &= minus;
+        }
+        if (anyOut) return allPlus || allMinus;
+    }
+    return false;
+}
+#endif
+
+#if defined(LITEV_GX_EARLY_REJECT) && defined(LITEV_GX_CLIP_REJECT)
+// One pass over the 3-4 vertices for both clip shortcuts: bit 0 = ClipTrivialReject's answer,
+// bit 1 = the trivial-accept test (every W > 0 and no vertex past any plane). Same comparisons.
+static inline int ClipClassify(const Vertex* v, int n, u32 attr)
+{
+#if defined(__ARM_NEON)
+    const int32x4_t p0 = vld1q_s32(v[0].Position), p1 = vld1q_s32(v[1].Position), p2 = vld1q_s32(v[2].Position);
+    const int32x4_t p3 = n == 4 ? vld1q_s32(v[3].Position) : p0;   // a repeated vertex changes no any/all
+    const int32x4x2_t a = vtrnq_s32(p0, p1), b = vtrnq_s32(p2, p3);
+    const int32x4_t X = vcombine_s32(vget_low_s32(a.val[0]), vget_low_s32(b.val[0]));
+    const int32x4_t Z = vcombine_s32(vget_high_s32(a.val[0]), vget_high_s32(b.val[0]));
+    const int32x4_t Y = vcombine_s32(vget_low_s32(a.val[1]), vget_low_s32(b.val[1]));
+    const int32x4_t W = vcombine_s32(vget_high_s32(a.val[1]), vget_high_s32(b.val[1]));
+    const int32x4_t nW = vnegq_s32(W);
+    const uint32x4_t zp = vcgtq_s32(Z, W), zm = vbicq_u32(vcltq_s32(Z, nW), zp);
+    const uint32x4_t yp = vcgtq_s32(Y, W), ym = vbicq_u32(vcltq_s32(Y, nW), yp);
+    const uint32x4_t xp = vcgtq_s32(X, W), xm = vbicq_u32(vcltq_s32(X, nW), xp);
+    if (vmaxvq_u32(zp) && !(attr & (1<<12))) return 1;
+    if (vmaxvq_u32(vorrq_u32(zp, zm))) return (vminvq_u32(zp) | vminvq_u32(zm)) ? 1 : 0;
+    if (vmaxvq_u32(vorrq_u32(yp, ym))) return (vminvq_u32(yp) | vminvq_u32(ym)) ? 1 : 0;
+    if (vmaxvq_u32(vorrq_u32(xp, xm))) return (vminvq_u32(xp) | vminvq_u32(xm)) ? 1 : 0;
+    return vminvq_u32(vcgtzq_s32(W)) ? 2 : 0;
+#else
+    if (ClipTrivialReject(v, n, attr)) return 1;
+    for (int i = 0; i < n; i++)
+    {
+        const s32 w = v[i].Position[3], x = v[i].Position[0], y = v[i].Position[1], z = v[i].Position[2];
+        if (w <= 0 || x > w || x < -w || y > w || y < -w || z > w || z < -w) return 0;
+    }
+    return 2;
+#endif
+}
+#endif
+
 void GPU3D::SubmitPolygon() noexcept
 {
+#ifdef LITEV_GX_VTX_PREFETCH
+    // the polygon's vertices are stored at CurVertexRAM[NumVertices..] (a 384 KB bank, colder than
+    // the caches): start the write-allocate of the next lines now, while it clips (no state change)
+    if (NumVertices + 8 <= 6144)
+    {
+        const char* p = (const char*)&CurVertexRAM[NumVertices];
+        __builtin_prefetch(p + 64, 1, 3); __builtin_prefetch(p + 128, 1, 3);
+        __builtin_prefetch(p + 192, 1, 3); __builtin_prefetch(p + 256, 1, 3);
+    }
+#endif
     Vertex clippedvertices[10];
     Vertex* reusedvertices[2];
     int clipstart = 0;
@@ -1206,6 +1341,23 @@ void GPU3D::SubmitPolygon() noexcept
     v1 = &TempVertexBuffer[1];
     v2 = &TempVertexBuffer[2];
     v3 = &TempVertexBuffer[3];
+
+#if defined(LITEV_GX_EARLY_REJECT) && defined(LITEV_GX_CLIP_REJECT)
+    // A polygon with no strip vertices to reuse (clipstart 0) that the clipper would reject
+    // ends exactly like a culled one (LastStripPolygon = NULL, nothing stored), so test it
+    // first and skip the cull normal and the vertex copies. Town: ~750 of ~1900 per frame.
+    // cls: -1 = not classified (strip vertices may be reused), else ClipClassify's bits
+    int cls = -1;
+    if (!(PolygonMode >= 2 && LastStripPolygon))
+    {
+        cls = ClipClassify(TempVertexBuffer, nverts, CurPolygonAttr);
+        if (cls & 1)
+        {
+            LastStripPolygon = NULL;
+            return;
+        }
+    }
+#endif
 
 #if defined(LITEV_GEOM_NEON2) && defined(__ARM_NEON)
     // LITEV_GEOM_NEON2: the per-polygon backface-cull normal is a (x,y,w) cross
@@ -1349,6 +1501,10 @@ void GPU3D::SubmitPolygon() noexcept
     // disables it for A/B.
     static const int _trivclip = litevGxPropDefault("debug.litev.trivclip", 1);
     bool _trivial = (_trivclip != 0);
+#if defined(LITEV_GX_EARLY_REJECT) && defined(LITEV_GX_CLIP_REJECT)
+    if (_trivial && cls >= 0) _trivial = (cls & 2) != 0;   // classified above, same vertices (clipstart 0)
+    else
+#endif
     if (_trivial)
     {
         for (int i = 0; i < nverts; i++)
@@ -1372,6 +1528,14 @@ void GPU3D::SubmitPolygon() noexcept
         }
         // nverts unchanged; skip ClipPolygon.
     }
+    else
+#endif
+#ifdef LITEV_GX_CLIP_REJECT
+#if defined(LITEV_GX_EARLY_REJECT)
+    if (clipstart == 0 && cls < 0 && ClipTrivialReject(clippedvertices, nverts, CurPolygonAttr)) nverts = 0;   // cls >= 0: not a reject
+#else
+    if (clipstart == 0 && ClipTrivialReject(clippedvertices, nverts, CurPolygonAttr)) nverts = 0;
+#endif
     else
 #endif
     nverts = ClipPolygon<true>(*this, clippedvertices, nverts, clipstart);
@@ -1411,6 +1575,23 @@ void GPU3D::SubmitPolygon() noexcept
             posX = 0;
             posY = 0;
         }
+#ifdef LITEV_GX_POLY_LEAN
+        // common case (w <= 0xFFFF, vertex inside the clip volume): one 32-bit divide gives the
+        // hi-res position, and the 9/8-bit position is it >> 4 (floor(floor(16n/d)/16) =
+        // floor(n/d); 16 * 2w * 511 < 2^32, so nothing wraps). Same values as below.
+        else if (w <= 0xFFFF && (u32)(vtx->Position[0] + (s32)w) <= 2 * w && (u32)(-vtx->Position[1] + (s32)w) <= 2 * w
+                 && !LITEV_HEADLESS(Headless))
+        {
+            const u32 den = w << 1;
+            const u32 hx = (((u32)(vtx->Position[0] + (s32)w) * Viewport[4]) << 4) / den;
+            const u32 hy = (((u32)(-vtx->Position[1] + (s32)w) * Viewport[5]) << 4) / den;
+            vtx->FinalPosition[0] = ((hx >> 4) + Viewport[0]) & 0x1FF;
+            vtx->FinalPosition[1] = ((hy >> 4) + Viewport[3]) & 0xFF;
+            vtx->HiresPosition[0] = (hx + (Viewport[0] << 4)) & 0x1FFF;
+            vtx->HiresPosition[1] = (hy + (Viewport[3] << 4)) & 0xFFF;
+            continue;
+        }
+#endif
         else
         {
             posX = vtx->Position[0] + w;
@@ -1564,6 +1745,9 @@ void GPU3D::SubmitPolygon() noexcept
     if (LITEV_HEADLESS(Headless))
     {
         LastStripPolygon = (PolygonMode >= 2) ? poly : NULL;
+#ifdef LITEV_FF_HEADLESS3D
+        BankBuiltHeadless = true;
+#endif
         return;
     }
 
@@ -1770,7 +1954,11 @@ void GPU3D::CalculateLighting() noexcept
 {
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LightingCalls);
 
+#ifdef LITEV_FF_HEADLESS3D
+    if (LITEV_HEADLESS(Headless) && !FFHeadlessNow)
+#else
     if (LITEV_HEADLESS(Headless))
+#endif
     {
         s32 c = __builtin_popcount(CurPolygonAttr & 0xF);
         NormalPipeline = 7;
@@ -2126,7 +2314,17 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 #endif
 }
 
+#ifdef LITEV_GX_BULK
+#if !defined(LITEV_GXFIFO_THREADED) || !defined(LITEV_GXFIFO_UNIFIED) || !defined(LITEV_DMA_GXFIFO_FAST)
+#error "LITEV_GX_BULK needs LITEV_GXFIFO_THREADED, LITEV_GXFIFO_UNIFIED and LITEV_DMA_GXFIFO_FAST"
+#endif
+void GPU3D::ExecuteCommand() noexcept { ExecuteCommandT<false>(); }
+
+template<bool Bulk>
+void GPU3D::ExecuteCommandT() noexcept
+#else
 void GPU3D::ExecuteCommand() noexcept
+#endif
 {
 #ifdef LITEV_GXFIFO_THREADED
     // DraStic #3 (backlog D.7 §3): batched threaded-code interpreter. Run()'s
@@ -2135,13 +2333,41 @@ void GPU3D::ExecuteCommand() noexcept
     // per-command bl/ret or prologue/epilogue. Reuses the computed-goto
     // tables below. Bit-exact (CmdFIFORead still fires per command
     // in identical order, keeping DMA/IRQ/audio timing).
+#if defined(LITEV_GX_BULK) && defined(LITEV_GX_BULK_LEAN)
+    // bulk batch cursor in a register for the whole batch (the handlers' calls made the compiler
+    // reload BulkPtr/BulkEnd from memory before every command); written back on return
+    const CmdFIFOEntry* bp = BulkPtr;
+    const CmdFIFOEntry* const be = BulkEnd;
+#endif
 gxfifo_threaded_top:
 #endif
     // M6.11: count GXFIFO commands (cheap add only; GPU3DNs times the whole
     // Run()/drain batch so per-command clock_gettime does not distort it).
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.GXCommands);
 
+#ifdef LITEV_GX_BULK
+    CmdFIFOEntry entry;
+    if constexpr (Bulk)
+    {
+        // a SWAP_BUFFERS waits for its turn in the FIFO (it resets CycleCount)
+#ifdef LITEV_GX_BULK_LEAN
+        if (bp == be || bp->Command == 0x50) { BulkPtr = bp; return; }
+        entry = *bp++;
+        // a push/pop is counted up and down within its own handler here: skip both (test
+        // commands span several entries, possibly two batches: counted as before)
+        if (entry.Command >= 0x70 && entry.Command <= 0x72) NumTestCommands++;
+#else
+        if (BulkPtr == BulkEnd || BulkPtr->Command == 0x50) return;
+        entry = *BulkPtr++;
+        // CmdFIFOWrite counts these per entry; their handlers count them down
+        if (entry.Command == 0x11 || entry.Command == 0x12) NumPushPopCommands++;
+        else if (entry.Command >= 0x70 && entry.Command <= 0x72) NumTestCommands++;
+#endif
+    }
+    else entry = CmdFIFORead();
+#else
     CmdFIFOEntry entry = CmdFIFORead();
+#endif
 
     //printf("FIFO: processing %02X %08X. Levels: FIFO=%d, PIPE=%d\n", entry.Command, entry.Param, CmdFIFO->Level(), CmdPIPE->Level());
 
@@ -2149,6 +2375,9 @@ gxfifo_threaded_top:
     // commands (presumably) run when all the needed parameters have been read
     // which is where we add the remaining cycles if any
 
+#ifdef LITEV_ACCESS_STATS
+    { extern u64 LitevAccess[6][0x10000]; LitevAccess[5][0xC000 | entry.Command]++; }   // GX FIFO entries by command
+#endif
     u32 paramsRequiredCount = CmdNumParams[entry.Command];
     if (paramsRequiredCount <= 1)
     {
@@ -2188,6 +2417,9 @@ gxfifo_threaded_top:
 
         gxf_11: // push matrix
             VertexPipelineCmdDelayed4();
+            #ifdef LITEV_GX_BULK_LEAN
+            if constexpr (!Bulk)
+#endif
             NumPushPopCommands--;
             if (MatrixMode == 0)
             {
@@ -2216,6 +2448,9 @@ gxfifo_threaded_top:
 
         gxf_12: // pop matrix
             VertexPipelineCmdDelayed4();
+            #ifdef LITEV_GX_BULK_LEAN
+            if constexpr (!Bulk)
+#endif
             NumPushPopCommands--;
             if (MatrixMode == 0)
             {
@@ -3320,6 +3555,9 @@ gxfifo_threaded_top:
     // Threaded loop-tail: instead of returning, re-run the whole ExecuteCommand
     // body for the next queued command (mirrors Run()'s drain-loop condition).
     // One call drains the batch -> no per-command bl/ret or prologue/epilogue.
+#ifdef LITEV_GX_BULK
+    if constexpr (Bulk) goto gxfifo_threaded_top;
+#endif
     if (CycleCount <= 0 && !PipeEmpty())
     {
         if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
@@ -3328,6 +3566,169 @@ gxfifo_threaded_top:
     }
 #endif
 }
+
+#ifdef LITEV_GX_BULK
+bool GPU3D::BulkReady() const noexcept
+{
+    return !FlushRequest && PipeEmpty() && FifoEmpty() && CmdStallQueue.IsEmpty();
+}
+
+// Geometry DMA in bulk (deterministic, approximate timing). Called by DMA::Run9 with the FIFO
+// empty. The words are decoded exactly as WriteToGXFIFO does and the commands run at once,
+// ahead of the guest clock: their cycles pile up in CycleCount, so the engine stays busy
+// (GXSTAT bit 27) for the same total time, which Run() then counts down. The game sees the
+// FIFO empty throughout instead of filling and draining.
+void GPU3D::BulkWords(const u32* words, u32 n) noexcept
+{
+    Run(); // bring the engine clock up to now (the FIFO is empty: only time passes)
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap) A9HLE::GxTap->insert(A9HLE::GxTap->end(), words, words + n);
+#endif
+
+    CmdFIFOEntry q[4*64]; // a word holds at most 4 commands; Run9 passes <= 64 words
+    u32 m = 0;
+    u32 numCmds = NumCommands, cur = CurCommand, pc = ParamCount, tp = TotalParams;
+    for (u32 i = 0; i < n; i++)
+    {
+        const u32 val = words[i];
+        // same decode as WriteToGXFIFO_Inline, with the state in registers
+        if (numCmds == 0)
+        {
+            numCmds = 4;
+            cur = val;
+            pc = 0;
+            tp = CmdNumParams[cur & 0xFF];
+            if (tp > 0) continue;
+        }
+        else
+            pc++;
+
+        for (;;)
+        {
+            if ((cur & 0xFF) || (numCmds == 4 && cur == 0))
+            {
+                q[m]._contents = 0;
+                q[m].Command = cur & 0xFF;
+                q[m].Param = val;
+                m++;
+            }
+
+            if (pc >= tp)
+            {
+                cur >>= 8;
+                numCmds--;
+                if (numCmds == 0) break;
+
+                pc = 0;
+                tp = CmdNumParams[cur & 0xFF];
+            }
+            if (pc < tp)
+                break;
+        }
+    }
+    NumCommands = numCmds; CurCommand = cur; ParamCount = pc; TotalParams = tp;
+    if (m == 0) return;
+
+    GXStat |= (1<<27);
+    BulkPtr = q; BulkEnd = q + m;
+    ExecuteCommandT<true>();
+    // from a SWAP_BUFFERS on: the FIFO, as usual (fits: the FIFO+PIPE hold 260)
+    for (; BulkPtr < BulkEnd; BulkPtr++) CmdFIFOWrite_Inline(*BulkPtr);
+    BulkPtr = BulkEnd = nullptr;
+
+    if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
+    if (NumTestCommands == 0)    GXStat &= ~(1<<0);
+    CheckFIFODMA();
+    CheckFIFOIRQ();
+}
+#endif
+
+
+#ifdef LITEV_GX_CPUSEND
+namespace GXSend
+{
+namespace
+{
+constexpr u32 kSend32[6] = {0xE080C002, 0xE150000C, 0xB8B00004, 0xB5812000, 0xBAFFFFFB, 0xE12FFF1E};
+// ponytail: fixed estimate of the guest loop (cmp + ldm main RAM + str IO + branch per word)
+constexpr s32 kCyclesBase = 6, kCyclesPerWord = 12;
+
+bool On()
+{
+#if defined(__ANDROID__)
+    static const bool on = litevGxPropDefault("debug.litev.gxsend", 1) != 0;
+#else
+    static const bool on = !getenv("LITEV_GXSEND") || atoi(getenv("LITEV_GXSEND")) != 0;
+#endif
+    return on;
+}
+
+bool IsSend32(melonDS::NDS& nds, u32 addr)
+{
+    for (u32 i = 1; i < 6; i++)
+        if (nds.ARM9Read32(addr + i * 4) != kSend32[i]) return false;
+    return true;
+}
+}
+
+int IsHook(NDS& nds, u32 addr, u32 instr)
+{
+    return instr == kSend32[0] && On() && IsSend32(nds, addr) ? 1 : 0;
+}
+
+bool Run(melonDS::ARM* cpu, bool jit)
+{
+    if (cpu->Num != 0 || (cpu->CPSR & 0x20) || cpu->CurInstr != kSend32[0] || !On()) return false;
+    const u32 pc = cpu->R[15] - 8;
+    melonDS::NDS& nds = cpu->NDS;
+    if (!jit && !IsSend32(nds, pc)) return false;
+    GPU3D& gx = nds.GPU.GPU3D;
+    const u32 src = cpu->R[0], dst = cpu->R[1], size = cpu->R[2];
+    // main RAM or DTCM (all of the range in one, no wrap) -> GXFIFO, whole words, FIFO empty:
+    // else the guest loop runs
+    auto* c9 = (melonDS::ARMv5*)cpu;
+    const u32* w = nullptr;
+    if ((dst & ~0x3Fu) == 0x04000400 && !(src & 3) && !(size & 3) && (s32)size > 0 && size <= 0x4000
+        && gx.GeometryEnabled && gx.BulkReady())
+    {
+        const u32 last = src + size - 4;
+        const bool d0 = (src & c9->DTCMMask) == c9->DTCMBase, d1 = (last & c9->DTCMMask) == c9->DTCMBase;
+        if (d0 && d1 && (src & (DTCMPhysicalSize - 1)) <= (last & (DTCMPhysicalSize - 1)))
+            w = (const u32*)&c9->DTCM[src & (DTCMPhysicalSize - 1)];
+        else if (!d0 && !d1 && src >= c9->ITCMSize && (src >> 24) == 0x02 && (last >> 24) == 0x02
+                 && (src & nds.MainRAMMask) <= (last & nds.MainRAMMask))
+            w = (const u32*)&nds.MainRAM[src & nds.MainRAMMask];
+    }
+    if (!w)
+    {
+        u32 icode = ((cpu->CurInstr >> 4) & 0xF) | ((cpu->CurInstr >> 16) & 0xFF0);
+        ARMInterpreter::ARMInstrTable[icode](cpu);   // the add; the guest loop follows
+        return true;
+    }
+    const u32 n = size >> 2;
+    u32 done = 0;
+    while (done < n && gx.BulkReady())
+    {
+        const u32 m = n - done < 64 ? n - done : 64;
+        gx.BulkWords(w + done, m);
+        done += m;
+    }
+    const u32 end = src + size;
+    cpu->R[2] = w[done - 1];
+    cpu->R[0] = src + done * 4;
+    cpu->R[12] = end;
+    cpu->Cycles += kCyclesBase + kCyclesPerWord * (s32)done;
+    if (done < n)
+    {
+        cpu->JumpTo(pc + 4);        // FIFO no longer empty (a SWAP_BUFFERS queued): the guest loop goes on
+        return true;
+    }
+    cpu->CPSR = (cpu->CPSR & 0x0FFFFFFF) | 0x60000000;   // cmp r0, ip: equal
+    cpu->JumpTo(cpu->R[14]);
+    return true;
+}
+}
+#endif
 
 s32 GPU3D::CyclesToRunFor() const noexcept
 {
@@ -3453,7 +3854,23 @@ void GPU3D::VBlank() noexcept
     {
         // a console nobody watches skips preparing the frame for the renderer (polygon sort,
         // Render* copies): only the renderer reads that state
+#ifdef LITEV_FF_HEADLESS3D
+        // a bank partly built unwatched is never handed to the renderer: skip its preparation and
+        // the render it would feed (the last rendered 3D stays on screen)
+        const bool badBank = FlushRequest && BankBuiltHeadless;
+        if (FlushRequest)
+        {
+            const u32 period = FFFrame - FFLastFlush;
+            FFPeriod = (period >= 1 && period <= 4) ? period : 1;
+            FFLastFlush = FFFrame;
+            // a bank partly built unwatched lands on a frame that renders 3D: the guess was wrong
+            if (badBank && !GPU.SkipThisFrame) FFBackoff = 120;
+        }
+        if (FlushRequest) RenderStale = !RenderingEnabled || LITEV_HEADLESS(Headless) || badBank;
+        if (RenderingEnabled && !LITEV_HEADLESS(Headless) && !badBank)
+#else
         if (RenderingEnabled && !LITEV_HEADLESS(Headless))
+#endif
         {
 #ifdef LITEV_SOFT3D_ASYNC
         // LITEV_SOFT3D_ASYNC: if this VBlank changes nothing the renderer reads, skip
@@ -3559,6 +3976,9 @@ void GPU3D::VBlank() noexcept
             NumVertices = 0;
             NumPolygons = 0;
             NumOpaquePolygons = 0;
+#ifdef LITEV_FF_HEADLESS3D
+            BankBuiltHeadless = false;
+#endif
 
             FlushRequest = 0;
         }
@@ -3719,6 +4139,9 @@ u32 GPU3D::Read32(u32 addr) noexcept
 
 void GPU3D::Write8(u32 addr, u8 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap && addr >= 0x04000400 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
+#endif
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 
@@ -3769,6 +4192,9 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
 
 void GPU3D::Write16(u32 addr, u16 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap && addr >= 0x04000400 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
+#endif
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 
@@ -3856,6 +4282,9 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
 
 void GPU3D::Write32(u32 addr, u32 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap && addr >= 0x04000440 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
+#endif
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 

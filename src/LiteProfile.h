@@ -125,6 +125,7 @@ struct FrameCounters
     std::atomic<uint64_t> CommitStubEntries{0};  // commit-stub entries (runtime, emitted in the stub)
     std::atomic<uint64_t> DispatchOnlyExits{0};  // ineligible exit sites (plain dispatcher)
     std::atomic<uint64_t> ICacheHits{0};         // per-site inline-cache hits (runtime, LITEV_JIT_ICACHE)
+    std::atomic<uint64_t> RasHits{0};            // dispatcher hits via the return-address stack (LITEV_JIT_RAS)
 #ifdef LITEV_JIT_DIRECTPATCH
     // --- DIRECTPATCH: monomorphic exit-site promotion (LITEV_JIT_DIRECTPATCH) ---
     std::atomic<uint64_t> DirectGuardHits{0};    // promoted guard stub hits -> DIRECT B to target (runtime)
@@ -185,6 +186,7 @@ struct FrameCounters
         CommitStubEntries.store(0, std::memory_order_relaxed);
         DispatchOnlyExits.store(0, std::memory_order_relaxed);
         ICacheHits.store(0, std::memory_order_relaxed);
+        RasHits.store(0, std::memory_order_relaxed);
 #ifdef LITEV_JIT_DIRECTPATCH
         DirectGuardHits.store(0, std::memory_order_relaxed);
         DirectGuardMisses.store(0, std::memory_order_relaxed);

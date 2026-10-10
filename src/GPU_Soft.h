@@ -74,18 +74,26 @@ protected:
     // Part 3: THREE framebuffers for the depth-2 flip (one rendering, one queued, one
     // presenting). Depth-1 (pipedepth==1) uses only [0]/[1] exactly as before -> byte-
     // identical. Allocated/freed/cleared in the ctor/dtor/Reset/Stop under the flag.
-    u32* Framebuffer[3][2];
+#ifdef LITEV_HYB_SLOTS4
+    // hybrid only: a 4th framebuffer/descriptor slot (round robin over 4; the software 3D
+    // backends keep 3)
+    static constexpr int NFB = 4;
 #else
+    static constexpr int NFB = 3;
+#endif
+    u32* Framebuffer[NFB][2];
+#else
+    static constexpr int NFB = 3;
     u32* Framebuffer[2][2];
 #endif
 
     u32* Output3D;
     alignas(8) u32 Output2D[2][256];
 
-#ifdef LITEV_SOFT2D_THREADED
     // Deferred (DraStic-model) software 2D: snapshot the final-composite per-scanline
     // state on the emu thread; the whole frame's raster+composite runs at VBlank, off
     // the per-scanline critical path (later banded across helper threads).
+    // (The type is declared in every build: DoCapture takes one.)
     struct FrameLineSnap
     {
         u32 DispCntA, DispCntB;
@@ -95,7 +103,13 @@ protected:
         u8  CaptureEnable;
         u8  Valid;
         u16 XPos3D;          // BG0HOFS as seen by the 3D layer (hybrid merge)
+        // display capture as the console had it on this line: the async render runs frames
+        // later, when the game may have remapped the destination bank for display (Pokemon
+        // White's battle intro captures its room into VRAM D, then shows D as a BG: the live
+        // checks dropped the capture -> white)
+        u32 CaptureCnt, VRAMMapLCDC;
     };
+#ifdef LITEV_SOFT2D_THREADED
     FrameLineSnap FrameSnap[192];
     // Render-owned copy (see async pipeline): the emu thread copies FrameSnap ->
     // FrameSnapR at VBlank, and the async render thread reads only FrameSnapR.
@@ -135,7 +149,21 @@ protected:
     // therefore STEALS a core from the 3D bands during the raster phase — and the old
     // NBANDS=2 path also spawned+joined a std::thread EVERY frame.
     // NBANDS=1: one persistent thread, no per-frame spawn, 3 full cores for the 3D.
+#ifdef LITEV_SOFT2D_HYB_BANDS
+    // Hybrid only: the 3D is on the GPU, so the cores 0-2 have room and the 2D thread is the
+    // pipeline's slowest stage (PW overworld 3x: ~10 ms/frame = the frame period). Split its lines
+    // over S2DBandsN persistent threads (debug.litev.s2dbands, 1..S2D_NBANDS).
+    static constexpr int S2D_NBANDS = 3;
+    int S2DBandsN = 1;
+    Platform::Thread* S2DHelper[S2D_NBANDS] {};
+    Platform::Semaphore* S2DHelpStart[S2D_NBANDS] {};
+    Platform::Semaphore* S2DHelpDone[S2D_NBANDS] {};
+    u32 S2DHelpY0[S2D_NBANDS] {}, S2DHelpY1[S2D_NBANDS] {};
+    std::atomic<bool> S2DHelpQuit { false };
+    void S2DHelperFunc(int b);
+#else
     static constexpr int S2D_NBANDS = 1;
+#endif
     struct S2DBand
     {
         std::unique_ptr<GPU2D> unit[2];
@@ -217,10 +245,10 @@ protected:
     // in bits 24-31 and 23). HybHas3D[b][screen]: some line of that screen has descriptors
     // (else only plane 1 + the control column need uploading).
     static constexpr int HybStride = 256*2 + 1;
-    bool HybHas3D[3][2] {};
+    bool HybHas3D[NFB][2] {};
     bool Hybrid = false;
-    u32* HybFB[3] {};
-    int HybTag[3] {};              // 3D colour-ring index the slot's frame pairs with
+    u32* HybFB[NFB] {};
+    int HybTag[NFB] {};              // 3D colour-ring index the slot's frame pairs with
     u32* Hyb3D[2] {};              // capture frames: the 1x 3D read back (per snap slot)
     bool Hyb3DValid[2] {};
     virtual int HybridCurrentTag() { return 0; }
@@ -228,7 +256,7 @@ protected:
     // into HybMap[b]; the 2D thread copies the finished frame's descriptors into it, so
     // the emu thread's upload is just a GPU-side copy
     virtual void HybridKick(int b) {}
-    u8* HybMap[3] {};
+    u8* HybMap[NFB] {};
     void HybridStage(int b);
     virtual void HybridReadback3D(u32* dst) {}
     void HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32* descB, const u32* l3d, bool has3D);
@@ -248,7 +276,8 @@ protected:
     void DrawScanlineA(u32 line, u32* dst, const u32* src2d, u32 dispcnt, u16 mbright);
     void DrawScanlineB(u32 line, u32* dst, const u32* src2d, u32 dispcnt, u16 mbright);
 
-    void DoCapture(u32 line, const u32* srcA2d, const u32* src3d);
+    // snap: the line's register snapshot (async render), else the live registers
+    void DoCapture(u32 line, const u32* srcA2d, const u32* src3d, const FrameLineSnap* snap = nullptr);
 
     void ApplyMasterBrightness(u16 regval, u32* dst);
     void ExpandColor(u32* dst);

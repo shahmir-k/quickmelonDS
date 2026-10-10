@@ -42,6 +42,9 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
 #ifdef LITEV_JIT_FIXEDREG
     Comp_MaterializeFlags();
 #endif
+#ifdef LITEV_JIT_RAS
+    Comp_RasCallRet(false, false);
+#endif
     IrregularCycles = true;
 
     u32 newPC;
@@ -369,12 +372,18 @@ void Compiler::Comp_JumpTo(Arm64Gen::ARM64Reg addr, bool switchThumb, bool resto
     // CPSR is saved-restored.
     Comp_MaterializeFlags();
 #endif
+#ifdef LITEV_JIT_RAS
+    Comp_RasCallRet(true, restoreCPSR);
+#endif
     IrregularCycles = true;
 
     if (!restoreCPSR)
     {
         if (switchThumb)
             CPSRDirty = true;
+#ifdef LITEV_JIT_MOV_ELIDE
+        if (addr != W0 || !JitQOn(jitq_MovElide))   // `mov w0, w0` when the caller computed it there
+#endif
         MOV(W0, addr);
         BL((Num ? JumpToFuncs7 : JumpToFuncs9)[switchThumb ? 0 : (Thumb + 1)]);
     }
@@ -410,6 +419,46 @@ void Compiler::Comp_JumpTo(Arm64Gen::ARM64Reg addr, bool switchThumb, bool resto
     }
 }
 
+#ifdef LITEV_JIT_RAS
+// Guest call: push this call site's own ICACHE site (its return lands on one address,
+// so the entry is monomorphic). Guest return (a non-linking branch through LR or a
+// load via SP, not an exception return): pop into ARM::RasSite, which the block exit
+// hands to the dispatcher as W9. Emitted on the taken path only; W16/W17 are scratch
+// (never allocated, and the branch target register is never one of them).
+void Compiler::Comp_RasCallRet(bool regTarget, bool restoreCPSR)
+{
+    if (!RasOn || restoreCPSR)
+        return;
+    u16 src = CurInstr.Info.SrcRegs, dst = CurInstr.Info.DstRegs;
+    bool call = (dst & (1 << 14)) && !(src & (1 << 13));
+    bool ret = regTarget && !call && (src & ((1 << 13) | (1 << 14)));
+    if (call)
+    {
+        u32 site = ICacheAssignSite();
+        if (!site)
+            return;
+        LDR(INDEX_UNSIGNED, W16, RCPU, offsetof(ARM, RasTop));
+        ADD(W16, W16, 1);
+        ANDI2R(W16, W16, ARM::RasMask);
+        STR(INDEX_UNSIGNED, W16, RCPU, offsetof(ARM, RasTop));
+        ADD(X16, RCPU, X16, ArithOption(X16, ST_LSL, 2));
+        MOVI2R(W17, site);
+        STR(INDEX_UNSIGNED, W17, X16, offsetof(ARM, RasRing));
+    }
+    else if (ret)
+    {
+        LDR(INDEX_UNSIGNED, W16, RCPU, offsetof(ARM, RasTop));
+        ADD(X17, RCPU, X16, ArithOption(X16, ST_LSL, 2));
+        LDR(INDEX_UNSIGNED, W17, X17, offsetof(ARM, RasRing));
+        STR(INDEX_UNSIGNED, W17, RCPU, offsetof(ARM, RasSite));
+        SUB(W16, W16, 1);
+        ANDI2R(W16, W16, ARM::RasMask);
+        STR(INDEX_UNSIGNED, W16, RCPU, offsetof(ARM, RasTop));
+        RasRetBlock = true;
+    }
+}
+#endif
+
 void Compiler::A_Comp_BranchImm()
 {
     int op = (CurInstr.Instr >> 24) & 1;
@@ -441,6 +490,31 @@ void Compiler::A_Comp_BranchXchangeReg()
 void Compiler::T_Comp_BCOND()
 {
     u32 cond = (CurInstr.Instr >> 8) & 0xF;
+#ifdef LITEV_JIT_COLD_EXITS
+    if (ColdExitOK())
+    {
+        // see Compiler::ColdExit; mirrors the in-place sequence below edge by edge
+        if (CurInstr.BranchFlags & branch_FollowCondNotTaken)
+        {
+            DeferColdExit(CheckCondition(cond ^ 1), 2);
+            IrregularCycles = true;   // what the deferred Comp_JumpTo sets
+            Comp_AddCycles_C(true);
+        }
+        else
+        {
+            FixupBranch notTaken = CheckCondition(cond);
+            s32 offset = (s32)(CurInstr.Instr << 24) >> 23;
+            Comp_JumpTo(R15 + offset + 1, true);
+            Comp_BranchSpecialBehaviour(true);
+            Comp_AddCycles_C(true);
+            DeferColdExit(notTaken, 1);
+  #ifdef LITEV_EXIT_PROTO_PC
+            PCElided = false;
+  #endif
+        }
+        return;
+    }
+#endif
     FixupBranch skipExecute = CheckCondition(cond);
 
     s32 offset = (s32)(CurInstr.Instr << 24) >> 23;

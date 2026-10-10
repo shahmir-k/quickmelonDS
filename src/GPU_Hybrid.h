@@ -82,21 +82,25 @@ private:
 
     int Scale = 0;
     GLuint MergeShader = 0;
-    GLint ScaleULoc = -1, SingleULoc = -1, OriginULoc = -1;
+    GLint ScaleULoc = -1, SingleULoc = -1, OriginULoc = -1, FastULoc = -1, FastEvyULoc = -1, EdgeULoc = -1;
     GLuint PresentFB = 0;
     void Merge(GLuint fbo, int single, int bottomY);
     // fb: framebuffer slot, tag: its 3D colour ring index, vao: this context's VAO,
     // sync: wait (GPU-side) for that 3D render first (not needed on the GL thread)
     void MergeSlot(GLuint fbo, int single, int bottomY, int fb, int tag, GLuint vao, bool sync);
     GLuint EmptyVAO = 0;
+#ifdef LITEV_HYB_MERGE_1X_2D
+    // a screen without 3D merges at 1x here, then is blitted up to Nx (made by the merging context)
+    GLuint Merge1xFB = 0, Merge1xTex = 0;
+#endif
     std::unique_ptr<GLWorker> Present;        // async present thread (shared EGL context)
     GLuint GLThreadFB = 0, GLThreadVAO = 0;   // its objects
-    u64 MergeSeq = 0, SlotMergeSeq[3] {};
+    u64 MergeSeq = 0, SlotMergeSeq[NFB] {};
     std::atomic<u64> MergeDone { 0 };
     // 513x192x2 RGBA8UI + staging buffer per framebuffer slot (a slot is reused 3 frames
     // later, so an upload never targets a texture an earlier merge may still be reading)
-    GLuint DescTex[3] {};
-    GLuint DescPBO[3] {};
+    GLuint DescTex[NFB] {};
+    GLuint DescPBO[NFB] {};
     GLuint OutTex[2] {};           // Nx, 2 layers (top, bottom), like GLRenderer's FPOutputTex
     GLuint OutFB[2] {};
     int OutIdx = 0;
@@ -105,10 +109,23 @@ private:
 #ifdef LITEV_HYB_CAPTURE_ASYNC
     // capture readback without a GPU stall: each capture frame starts its 3D's read into a
     // PBO and uses the one started on the previous frame (capture 3D one frame late)
-    GLuint CapPBO[2] {};
-    GLsync CapFence[2] {};
+    // a ring of reads: a capture uses the one started debug.litev.caplag (default 2) frames ago
+    GLuint CapPBO[4] {};   // [3]: LITEV_FF_CAP_PREFETCH
+    GLsync CapFence[4] {};
+    u32 CapFrameOf[4] {};            // NumFrames each read was started on
+#ifdef LITEV_HYB_CAPTURE_OFFTHREAD
+    std::atomic<bool> CapBusy[4] {}; // its read is still being finished on the GL 3D thread
+    u32 CapOut[4][256 * 192];        // the finished reads, converted
+    int CapPrevSlot = -1;            // read started by the last capture job, not finished yet
+    GLuint CapGLReadFB = 0, CapGLDownFB = 0;   // the GL 3D thread's own (FBOs aren't shared)
+    void CapKickGL(int k, int color);
+#ifdef LITEV_FF_CAP_PREFETCH
+    int PrefColor = -1;        // the 3D colour buffer read into slot 3 (-1: none valid)
+    u32 LastCapFrame = 0;      // NumFrames of the last capture readback
+#endif
+    void CapFinishGL(int k);
+#endif
     int CapNext = 0;
-    u32 CapPendFrame = ~0u;          // NumFrames of the read pending in CapPBO[CapNext ^ 1]
     void CapKick(int pbo);
     void CapConvert(const u8* src, u32* dst);
 #endif

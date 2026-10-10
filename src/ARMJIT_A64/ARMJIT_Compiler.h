@@ -29,6 +29,8 @@
 #include "../ARMJIT_RegisterCache.h"
 
 #include <unordered_map>
+#include <vector>
+#include <algorithm>
 
 namespace melonDS
 {
@@ -95,6 +97,105 @@ struct LoadStorePatch
     s32 PatchOffset;
     u32 PatchSize;
 };
+
+#ifdef LITEV_JIT_PATCHLOG
+// Code offset -> LoadStorePatch as a vector sorted by offset. The compiler emits code in
+// increasing offsets, so a new entry is an append (sequential writes); lookups (fault handler,
+// rare) binary-search. The hash maps it replaces scattered one random write per compiled memory
+// access over a table that grew to megabytes (entries are kept for store re-promotion): a cache +
+// TLB miss each on the A55, ~8% of a compile on the RG DS. Same contents and results.
+class PatchLog
+{
+public:
+    struct Slot { ptrdiff_t first; LoadStorePatch second; bool dead; };
+    Slot* end() const { return nullptr; }
+    Slot* find(ptrdiff_t key)
+    {
+        Slot* s = lower(key);
+        return s != Slots.data() + Slots.size() && s->first == key && !s->dead ? s : nullptr;
+    }
+    void erase(Slot* s) { s->dead = true; }
+    LoadStorePatch& operator[](ptrdiff_t key)
+    {
+        if (Slots.empty() || Slots.back().first < key)
+        {
+            Slots.push_back({key, {}, false});
+            return Slots.back().second;
+        }
+        Slot* s = lower(key);   // not in emission order (never seen, kept exact anyway)
+        if (s != Slots.data() + Slots.size() && s->first == key)
+        {
+            if (s->dead) { s->dead = false; s->second = {}; }
+            return s->second;
+        }
+        return Slots.insert(Slots.begin() + (s - Slots.data()), Slot{key, {}, false})->second;
+    }
+    void clear() { Slots.clear(); }
+    void reserve(size_t n) { Slots.reserve(n); }
+private:
+    std::vector<Slot> Slots;
+    Slot* lower(ptrdiff_t key)
+    {
+        return std::lower_bound(Slots.data(), Slots.data() + Slots.size(), key,
+                                [](const Slot& a, ptrdiff_t k) { return a.first < k; });
+    }
+};
+#endif
+
+#ifdef LITEV_JIT_PATCHMAP_FLAT
+// Open-addressing map code offset -> LoadStorePatch for the few operations the compiler needs
+// (assign, find, erase, clear). std::unordered_map allocated a node per compiled memory access:
+// ~6% of a JIT compile burst on the RG DS was malloc + its page faults.
+class FlatPatchMap
+{
+public:
+    struct Slot { ptrdiff_t first; LoadStorePatch second; };
+    FlatPatchMap() { Grow(1 << 15); }
+    Slot* end() const { return nullptr; }
+    Slot* find(ptrdiff_t key)
+    {
+        for (size_t i = Hash(key);; i = (i + 1) & Mask)
+        {
+            if (Slots[i].first == key) return &Slots[i];
+            if (Slots[i].first == Empty) return nullptr;
+        }
+    }
+    void erase(Slot* s) { s->first = Tomb; Live--; }
+    LoadStorePatch& operator[](ptrdiff_t key)
+    {
+        if ((Used + 1) * 2 > Slots.size()) Grow(Live * 4 > Slots.size() ? Slots.size() * 2 : Slots.size());
+        Slot* tomb = nullptr;
+        for (size_t i = Hash(key);; i = (i + 1) & Mask)
+        {
+            if (Slots[i].first == key) return Slots[i].second;
+            if (Slots[i].first == Tomb) { if (!tomb) tomb = &Slots[i]; continue; }
+            if (Slots[i].first == Empty)
+            {
+                Slot* s = tomb ? tomb : &Slots[i];
+                if (!tomb) Used++;
+                Live++;
+                s->first = key; s->second = {};
+                return s->second;
+            }
+        }
+    }
+    void clear() { for (Slot& s : Slots) s.first = Empty; Used = Live = 0; }
+    void reserve(size_t) {}
+private:
+    static constexpr ptrdiff_t Empty = -1, Tomb = -2;
+    std::vector<Slot> Slots;
+    size_t Mask = 0, Used = 0, Live = 0;   // Used counts tombstones too (they lengthen probes)
+    size_t Hash(ptrdiff_t k) const { return (size_t)(((u64)k >> 2) * 0x9E3779B97F4A7C15ull >> 20) & Mask; }
+    void Grow(size_t n)
+    {
+        std::vector<Slot> old;
+        old.swap(Slots);
+        Slots.assign(n, Slot{Empty, {}});
+        Mask = n - 1; Used = Live = 0;
+        for (const Slot& s : old) if (s.first >= 0) (*this)[s.first] = s.second;
+    }
+};
+#endif
 
 class Compiler : public Arm64Gen::ARM64XEmitter
 {
@@ -163,6 +264,12 @@ public:
 
     void A_Comp_MRS();
     void A_Comp_MSR();
+#ifdef LITEV_JIT_CP15_INLINE
+    bool Cp15InlineOn = false;   // debug.litev.cp15inline, latched at Reset()
+    bool CP15InlineOK();
+    void A_Comp_MCR_CacheOp();
+    void A_Comp_MRC_DTCM();
+#endif
 
     void T_Comp_ShiftImm();
     void T_Comp_AddSub_();
@@ -308,6 +415,7 @@ public:
     // eager shifter-C writes now that RCPSR[29] is gone (the interim memory RMW the design
     // flags as the L4 lazy-shifter-C target).
     void Comp_CPSRInsertBitToMem(Arm64Gen::ARM64Reg word, Arm64Gen::ARM64Reg src, int pos);
+    bool Comp_FlagsPrefixMerge(u8 m);
 #endif
 #endif
 
@@ -322,6 +430,9 @@ public:
     void Comp_RegShiftReg(int op, bool S, Op2& op2, Arm64Gen::ARM64Reg rs);
 
     bool Comp_MemLoadLiteral(int size, bool signExtend, int rd, u32 addr);
+#ifdef LITEV_JIT_R15_ELIDE
+    bool R15LiteralLoadFolds(CompileFunc comp);
+#endif
 
     enum
     {
@@ -389,6 +500,12 @@ public:
     u32 ICacheAssignSite() { return (ICacheNextSite < ICacheSites) ? ICacheNextSite++ : 0; }
 #endif
 
+#ifdef LITEV_JIT_RAS
+    bool RasOn = false;          // debug.litev.jitras, latched at Reset()
+    bool RasRetBlock = false;    // this block popped the RAS (its exits read ARM::RasSite)
+    void Comp_RasCallRet(bool regTarget, bool restoreCPSR);
+#endif
+
 #ifdef LITEV_JIT_DIRECTPATCH
     // Rewrite the 4-byte unconditional B at RX offset rxOffset to target targetRxOffset
     // + flush that word (same encoding/discipline as PatchLinkSite, but independent of
@@ -406,6 +523,12 @@ public:
     // invalidation): RX is append-only within an epoch, so this is the sound backstop
     // against a patched direct edge outliving its target block.
     void DirectPatchRevertAll();
+#ifdef LITEV_JIT_DP_REVERTLIST
+    // Sites promoted since the last RevertAll (each listed once, ICacheEntry::_dp0 = listed).
+    // RevertAll walks only these instead of every site slot: with the slots full (16383 per
+    // CPU x 64 B = 2 MB) a code overwrite of ~100 invalidations/frame scanned ~200 MB.
+    std::vector<u32> DirectPatchListed[2];
+#endif
 #endif
 #endif
 
@@ -445,7 +568,7 @@ public:
 
     // Populated during CompileBlock; copied into the JitBlock by ARMJIT::CompileBlock.
     u8 NumLinkExits = 0;
-    OutgoingLink LinkExits[2];
+    OutgoingLink LinkExits[MaxOutgoingLinks];
 
     // Threaded from Comp_JumpTo(u32) to the exit tail: does the last-compiled branch
     // have a compile-time-constant same-mode target, and was it conditional?
@@ -460,6 +583,97 @@ public:
 
     void Comp_BranchSpecialBehaviour(bool taken);
 
+    // JIT code-quality levers (debug.litev.jitq bitmask, latched at Reset(); default all on).
+    // Each is exact: same guest state and cycles, only the host code changes.
+    enum
+    {
+        jitq_ExitTail = 1 << 0,      // LITEV_JIT_EXIT_TAIL
+        jitq_MemBasePin = 1 << 1,    // LITEV_JIT_MEMBASE_PIN
+        jitq_FlagsBfxil = 1 << 2,    // LITEV_JIT_FLAGS_BFXIL
+        jitq_R15Elide = 1 << 3,      // LITEV_JIT_R15_ELIDE
+        jitq_LdrAlignChk = 1 << 4,   // LITEV_JIT_LDR_ALIGNCHK
+        jitq_CodeCyclesDead = 1 << 5,// LITEV_JIT_CODECYCLES_DEAD
+        jitq_ColdExits = 1 << 6,     // LITEV_JIT_COLD_EXITS
+        jitq_NZBranch = 1 << 7,      // LITEV_JIT_NZ_BRANCH
+        jitq_MovElide = 1 << 8,      // LITEV_JIT_MOV_ELIDE
+    };
+    u32 JitQ = 0;
+    bool JitQOn(u32 bit) const { return (JitQ & bit) != 0; }
+
+#if defined(LITEV_JIT_EXIT_TAIL) || defined(LITEV_JIT_LDR_ALIGNCHK) || defined(LITEV_JIT_COLD_EXITS)
+    // Cold code of the block being compiled, emitted after its last exit (EmitTailStubs) so
+    // the executed path is contiguous: fewer instruction-cache lines per block on the A55.
+    // Branches into the tail are conditional (+-1 MB) or TBNZ (+-32 KB); a block is < 16 KB.
+    struct TailStub
+    {
+        u8 Kind;                  // 0 = link exit stub, 1 = slow load, 2 = cold exit (ColdExits[Index])
+        u32 Index;
+        Arm64Gen::FixupBranch A;  // link: budget-expired branch (B.LE); load: misaligned branch
+        Arm64Gen::FixupBranch B;  // link: the unlinked target trampoline (B)
+        bool PCElided;            // link: store NewPC to R[15]
+        u32 NewPC;
+        void* Func;               // load: patched slow-path thunk
+        const u8* Back;           // load: where to continue
+    };
+    std::vector<TailStub> TailStubs;
+    void EmitTailStubs();
+#endif
+
+#ifdef LITEV_JIT_COLD_EXITS
+    // LITEV_JIT_COLD_EXITS: the exit edge of a followed conditional branch (its taken edge for
+    // branch_FollowCondNotTaken, its not-taken edge for branch_FollowCondTaken) is compiled at
+    // the block tail with the compiler state it had in place, so the path the block follows
+    // runs straight on (no taken branch over the exit, no exit code in its cache lines).
+    struct CompState
+    {
+        RegisterCache<Compiler, Arm64Gen::ARM64Reg> RegCache;
+        FetchedInstr CurInstr;
+        u32 R15, CodeRegion, ConstantCycles;
+        bool Exit, IrregularCycles, CPSRDirty;
+#ifdef LITEV_JIT_CYCLE_BATCH
+        u32 PendingCycles;
+        bool DeferCycles;
+#endif
+#ifdef LITEV_JIT_FIXEDREG
+        u8 NZCVDeferred;
+        bool NZCVCondValid;
+#endif
+#ifdef LITEV_JIT_LAZYFLAGS
+        u8 FlagsLiveInCur;
+        bool CarryInHostResident;
+#ifdef LITEV_EXIT_PROTO_NZCV
+        bool NZCVHostSynced, LastFlushFull;
+#endif
+#endif
+#ifdef LITEV_JIT_LINK
+        bool HasStaticExit, StaticExitCond;
+        u32 StaticExitTarget, StaticExitNewPC;
+#endif
+#ifdef LITEV_EXIT_PROTO_PC
+        bool PCElided;
+#endif
+#ifdef LITEV_JIT_RAS
+        bool RasRetBlock;
+#endif
+    };
+    void SaveCompState(CompState& s);
+    void LoadCompState(const CompState& s);
+    struct ColdExit
+    {
+        CompState State;
+        u8 Kind;   // 0 = ARM taken exit (body + exit), 1 = not-taken exit, 2 = Thumb BCOND taken exit
+    };
+    std::vector<ColdExit> ColdExits;
+    // CPU fields Comp_JumpTo(u32) changes at compile time (C++ reads them after the compile:
+    // e.g. the ARM7 compile pass takes CodeCycles as the next block's code timing)
+    struct CpuJumpFields { u32 CodeRegion; s32 CodeCycles, RegionCodeCycles; MemRegion CodeMem; u32 R15; };
+    void SaveCpuJumpFields(CpuJumpFields& f);
+    void LoadCpuJumpFields(const CpuJumpFields& f);
+    bool ColdExitOK() const;
+    void DeferColdExit(Arm64Gen::FixupBranch from, u8 kind);
+    void EmitColdExit(const ColdExit& e);
+#endif
+
     JitBlockEntry AddEntryOffset(u32 offset)
     {
         return (JitBlockEntry)(GetRXBase() + offset);
@@ -472,6 +686,18 @@ public:
 
     bool IsJITFault(const u8* pc);
     u8* RewriteMemAccess(u8* pc);
+    bool CondMemGuess(bool addrIsStatic);
+#ifdef LITEV_JIT_STORE_REPROMOTE
+    // A store that faulted on a code-protected page is rewritten to the slow path for good.
+    // Remember its original fast-path bytes and put them back at a later frame boundary
+    // (no JIT code is running there), so a memcpy that once hit a code page stores at full
+    // speed again. Faulting again just rewrites it again; the retry period doubles per fault.
+    struct SlowStoreSite { std::vector<u32> Orig; u32 Faults, RetryFrame, RestoredFrame; bool Slow; };
+    std::unordered_map<ptrdiff_t, SlowStoreSite> SlowStoreSites;   // key: patch region offset
+    u32 SlowStoreNextRetry = ~0u;
+    void NoteProtectFault(u8* pc);
+    void RepromoteStores();
+#endif
 
     void SwapCodeRegion()
     {
@@ -514,7 +740,13 @@ public:
     u32 JitMemSecondarySize;
     u32 JitMemMainSize;
 
-    std::unordered_map<ptrdiff_t, LoadStorePatch> LoadStorePatches; 
+#if defined(LITEV_JIT_PATCHLOG)
+    PatchLog LoadStorePatches;
+#elif defined(LITEV_JIT_PATCHMAP_FLAT)
+    FlatPatchMap LoadStorePatches;
+#else
+    std::unordered_map<ptrdiff_t, LoadStorePatch> LoadStorePatches;
+#endif
 
     RegisterCache<Compiler, Arm64Gen::ARM64Reg> RegCache;
 
