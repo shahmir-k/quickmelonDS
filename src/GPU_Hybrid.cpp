@@ -141,6 +141,8 @@ bool HybridRenderer::Init()
     glUseProgram(MergeShader);
     glUniform1i(glGetUniformLocation(MergeShader, "DescTex"), 0);
     glUniform1i(glGetUniformLocation(MergeShader, "Tex3D"), 1);
+    glUniform1i(glGetUniformLocation(MergeShader, "EdgeTex"), 2);
+    EdgeULoc = glGetUniformLocation(MergeShader, "uEdge");
     ScaleULoc = glGetUniformLocation(MergeShader, "uScale");
     SingleULoc = glGetUniformLocation(MergeShader, "uSingle");
     OriginULoc = glGetUniformLocation(MergeShader, "uOrigin");
@@ -634,6 +636,11 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
     const double ts = HybNowMs();
     if (sync) Sync3D(tag);
     glActiveTexture(GL_TEXTURE1);
+    {
+        const GLuint edge = GL3D()->GetEdgeTex(tag);   // LITEV_GL_EDGE_MARK
+        glUniform1i(EdgeULoc, edge != 0);
+        if (edge) { glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, edge); glActiveTexture(GL_TEXTURE1); }
+    }
     glBindTexture(GL_TEXTURE_2D, GL3D()->GetColorTex(tag));
     glBindVertexArray(vao);
     const double td = HybNowMs();

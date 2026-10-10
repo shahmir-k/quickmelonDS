@@ -82,7 +82,7 @@ private:
 
     int Scale = 0;
     GLuint MergeShader = 0;
-    GLint ScaleULoc = -1, SingleULoc = -1, OriginULoc = -1, FastULoc = -1, FastEvyULoc = -1;
+    GLint ScaleULoc = -1, SingleULoc = -1, OriginULoc = -1, FastULoc = -1, FastEvyULoc = -1, EdgeULoc = -1;
     GLuint PresentFB = 0;
     void Merge(GLuint fbo, int single, int bottomY);
     // fb: framebuffer slot, tag: its 3D colour ring index, vao: this context's VAO,
