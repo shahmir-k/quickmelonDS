@@ -773,7 +773,9 @@ SPUChannel::ADPCMMemo* SPU::GetMemo(u32 src, u32 loop, u32 total)
 
 static bool SPUMemoOn()
 {
-    static const bool on = SPUProp("debug.litev.spumemo", "LITEV_SPUMEMO", 1) != 0;
+    // default OFF: on the RG DS (in-order A55) the memo measured slower than decoding (overworld audio
+    // share 9.98% -> 11.08%: its table misses the caches); debug.litev.spumemo=1 turns it on
+    static const bool on = SPUProp("debug.litev.spumemo", "LITEV_SPUMEMO", 0) != 0;
 #ifdef LITEV_SPU_BENCH
     if (BenchMemo >= 0) return BenchMemo;
 #endif
