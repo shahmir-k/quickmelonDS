@@ -207,7 +207,18 @@ constexpr Variant kW2 = {
     0x0214C1B8, 0x0214C26C, 0x0214C250, 0x0214C0EC, 0x0209DA98,
     0x0207ABE4, 0x0207A49F, 0x0207A8BB, 0x02079C38, 0x0207A4C7,
     0x0207C81C, 0x0207AADF, 1, 0x14, 417, 25, 13,     // check mode: set 417, get 302 at bit 21 (~13/bit, Thumb loop)
-    0, {}, 0, {}, 0, 0, {}, 0, &kW2Mat,
+    0x02078454,     // 10. (Thumb): MI_SendGXCommandAsync and its callees (TWL SDK build)
+    {
+        {0x02078454, 0x020784FC},   // MI_SendGXCommandAsync with its literal pool
+        {0x0207840C, 0x02078454},   // (DMA range check)
+        {0x020782C8, 0x02078300},   // MI_WaitDma
+        {0x02079E10, 0x02079F00},   // OSi_EnterDmaCallback, OS_EnableIrqMask, OS_DisableIrqMask, OS_ResetRequestIrqMask
+        {0x01FF8BF0, 0x01FF8C88},   // MIi_DmaSetParams (ITCM, Thumb)
+        {0x0207C110, 0x0207C13C},   // OS_DisableInterrupts, OS_RestoreInterrupts
+        {0, 0},
+    },
+    0x6d62f51b28952570ull,
+    {}, 0, 0, {}, 0, &kW2Mat,
 };
 constexpr const Variant* kVariants[] = {&kPW, &kPB, &kW2};
 constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
@@ -217,7 +228,8 @@ inline int Kind(const Variant& v, u32 addr, u32 instr, bool thumb = false)
     if (!thumb && v.async && addr == v.async && instr == kGxInstr) return 10;
     if (!thumb && v.shp && addr == v.shp && instr == 0xE92D4010) return 13;
     if (thumb) return !v.twl ? -1 : addr == v.set && instr == kSetInstrT ? 1 : addr == v.get && instr == kGetInstrT ? 2
-                    : v.gx && addr == v.gx && instr == kGxInstrT ? 5 : v.matT && addr == v.matT->sbc && instr == 0xB570 ? 8 : -1;
+                    : v.gx && addr == v.gx && instr == kGxInstrT ? 5 : v.matT && addr == v.matT->sbc && instr == 0xB570 ? 8
+                    : v.async && addr == v.async && instr == 0xB5F8 ? 10 : -1;
     return addr == v.wake && instr == kWakeInstr ? 0 : !v.twl && addr == v.set && instr == kSetInstr ? 1
          : !v.twl && addr == v.get && instr == kGetInstr ? 2 : v.gx && addr == v.gx && instr == kGxInstr ? 5 : -1;
 }
@@ -2189,11 +2201,11 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     if (v.matT && addr == v.matT->sbc) { r = v.matT->code; return 4; }
     if (addr == v.async)
     {
-        static thread_local Range as[9];
+        static thread_local Range as[10];
         for (int i = 0; i < 7; i++) as[i] = v.asyncCode[i];
-        as[7] = v.gxCode; as[8] = v.code[3];
+        as[7] = v.gxCode; as[8] = v.code[3]; as[9] = v.code[10];
         r = as;
-        return 9;
+        return 10;
     }
     r = &v.code[3];             // OS_SetIrqFunction / OS_GetIrqFunction
     return 1;
@@ -2211,8 +2223,9 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         if (k == 5) return !s.gxOk ? 0 : GxIntact(&nds.ARM9, s) ? 1 : 2;
 #ifdef LITEV_GX_BULK
         if (k == 8) return !s.matTOk ? 0 : MatTIntact(&nds.ARM9, s) ? 1 : 2;
+        if (k == 10) return !s.gxOk || !s.asyncOk ? 0 : AsyncIntact(&nds.ARM9, s) && GxIntact(&nds.ARM9, s) && CodeIntact(&nds.ARM9, s, 0) ? 1 : 2;
 #else
-        if (k == 8) return 0;
+        if (k == 8 || k == 10) return 0;
 #endif
         return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
     }
@@ -2313,14 +2326,17 @@ __attribute__((noinline)) bool RunGx(melonDS::ARMv5* c, State& s, bool jit)
 // longer empty), the state is the guest's at MIi_FIFOCallback's entry and the guest continues there.
 // ponytail: fixed estimate (single-chunk lists, check mode without IRQs, entry to OS_RestoreInterrupts)
 constexpr s32 kAsyncCyc = 1500;   // (guest: 1510 + 4 per DMA word, exact over 4.7k lists; the DMA charges its own)
+constexpr s32 kAsyncCycT = 1351;  // TWL SDK build (W2): guest 1351 + 4 per DMA word (check mode, 6.6k lists, within 0.2%)
 
 // The synchronous part from the register file R / cpsr at MI_SendGXCommandAsync's entry (arg: its 5th argument, the
 // word at [sp]). 0: guest path (nothing done); 1: done, e = the state at its return (IO written, memory queued in m;
 // check / dry (ck): nothing written, ck = the compare point at the OS_RestoreInterrupts call); 2: handed over at
 // MIi_FIFOCallback's entry (registers set, memory flushed, c jumps there).
-struct AsyncChk { Expect e2; std::vector<std::pair<u32, u32>> io; u32 words = 0; };
+struct AsyncChk { Expect e2; std::vector<std::pair<u32, u32>> io; u32 words = 0; bool fin = false; };
+int AsyncCoreT(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 arg, bool jit, Expect& e, AsyncChk* ck);
 int AsyncCore(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 arg, bool jit, Expect& e, AsyncChk* ck)
 {
+    if (s.v->twl) return AsyncCoreT(c, s, m, R, cpsr, arg, jit, e, ck);
     melonDS::NDS& nds = c->NDS;
     const Variant& v = *s.v;
     const u32 pc = v.async;
@@ -2410,6 +2426,115 @@ int AsyncCore(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 a
     return 1;
 }
 
+// 10. for the TWL SDK build (W2): MI_SendGXCommandAsync and its callees in Thumb (MIi_DmaSetParams in ITCM, with its own
+// OS_Disable/RestoreInterrupts): the same IO writes in the same order as 10., this build's frames and registers.
+// Stage 1 compares at its OS_RestoreInterrupts call (r1 = the IF value read, not modelled), stage 2 the registers at
+// its return. No hand-over path: a list whose bulk send stops early runs the guest code.
+int AsyncCoreT(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 arg, bool jit, Expect& e, AsyncChk* ck)
+{
+    melonDS::NDS& nds = c->NDS;
+    const Variant& v = *s.v;
+    const u32 pc = v.async;
+    const u32 dma = R[0], src = R[1], len = R[2], cb = R[3], S = R[13];
+    Obj P, st;
+    u32 gxstat = 0, n = 0;
+    bool ok = s.gxOk && s.asyncOk && (jit || (AsyncIntact(c, s) && GxIntact(c, s) && CodeIntact(c, s, 0)))
+              && dma >= 1 && dma <= 3 && len && Fixed(c, s, m) && s.ftab && s.ftab2;
+    if (ok)
+    {
+        P = m.O(v.gxParams, 0x20); st = m.O(S - 80, 80);
+        ok = P && !P.dtcm && st && !P.r(0) && !(nds.A9HLEDmaCnt(dma) & 0x80000000);
+        if (ok) { gxstat = nds.ARM9Read32(0x04000600); ok = gxstat & (1u << 25); }
+    }
+    if (ok && len > kGxChunk)
+    {
+        // what 5. sends at once at MIi_FIFOCallback's entry (80% of the W2 town's lists)
+        melonDS::GPU3D& gx = nds.GPU.GPU3D;
+        ok = (s.mask & 16) && !ck && len <= 0x100000 && !(len & 3) && !(src & 3) && (src >> 24) == 0x02
+             && ((src + len - 1) >> 24) == 0x02 && gx.GeometryEnabled && gx.BulkReady();
+        n = ((len - 1) / kGxChunk) * (kGxChunk / 4);
+    }
+    if (!ok) return 0;
+    const u32 params = v.gxParams, oldI = cpsr & 0x80, ie0 = nds.IE[0], ie1 = ie0 | 0x200000, dbit = 1u << (8 + dma);
+    const u32 fifoCb = R32(CodePtr(c, pc + 0xA4)), dmaCb = R32(CodePtr(c, v.gx + 0x70));     // literals 0x020784FD, 0x0207857D
+    const Obj tab{s.ftab, kIrqTable, s.ftabD}, tab2{s.ftab2, v.irqTable2, s.ftab2D};
+    const u32 gxw = (gxstat & 0x3FFFFFFFu) | 0x40000000u;
+    u32 done = 0;
+    if (!ck)
+    {
+        nds.ARM9Write32(0x04000600, gxw);
+        nds.ARM9Write32(0x04000210, ie1);
+        if (n) done = GxSend(c, s, src, len, n);    // (writes MIi_GXDmaParams.src / length)
+    }
+    const u32 chunk = len - n * 4, srcL = src + n * 4, words = chunk >> 2, ctrl = 0xC4400000u | words;
+    // MIi_GXDmaParams {busy, dma, src, length, callback, arg, GXFIFO IRQ mode, GXFIFO IRQ handler}, OS_IRQTable[GXFIFO]
+    m.W(P, 0, 1); m.W(P, 4, dma); m.W(P, 0x10, cb); m.W(P, 0x14, arg);
+    m.W(P, 0x18, gxstat >> 30); m.W(P, 0x1C, R32(s.ftab + 21 * 4));
+    m.W(tab, 21 * 4, fifoCb);
+    m.W(tab2, dma * 12, dmaCb); m.W(tab2, dma * 12 + 8, 0); m.W(tab2, dma * 12 + 4, ie1 & dbit);
+    // stack (st = S-80), in write order: async push {r3-r7, lr} (S-24); the DMA range check push {r4, lr} (S-32);
+    // MI_WaitDma push {r3-r5, lr} (S-40); OS_GetIrqFunction push {r3, r4} (S-32); OS_SetIrqFunction push {r4-r7} (S-40);
+    // OS_EnableIrqMask push {r3, r4} (S-32); MIi_FIFOCallback push {r3-r7, lr} (S-48); OSi_EnterDmaCallback push
+    // {r3-r5, lr} (S-64); OS_EnableIrqMask push {r3, r4} (S-72); MIi_FIFOCallback str r7, [sp] (S-48);
+    // MIi_DmaSetParams push {r3-r7, lr} (S-72) + locals {r2, r3} (S-80); OS_ResetRequestIrqMask push {r3, r4} (S-56)
+    struct { u32 o, v; } w[] = {
+        {56, R[3]}, {60, R[4]}, {64, R[5]}, {68, R[6]}, {72, R[7]}, {76, R[14]},
+        {48, 0x04000600}, {52, pc + 0x4D},
+        {40, 0}, {44, 0x04000600}, {48, dma}, {52, pc + 0x53},
+        {48, 0}, {52, 0x04000600},
+        {40, 0x04000600}, {44, 0x200000}, {48, params}, {52, oldI},
+        {48, 0x20}, {52, 0x04000600},
+        {32, 0x20}, {36, 0x04000600}, {40, 0x200000}, {44, params}, {48, oldI}, {52, pc + 0x8F},
+        {16, 0x20}, {20, srcL}, {24, chunk}, {28, v.gx + 0x33},
+        {8, 12}, {12, dbit},
+        {32, 0},
+        {8, ctrl}, {12, 0x04000400}, {16, words}, {20, params}, {24, 0}, {28, v.gx + 0x47}, {0, 0x04000400}, {4, ctrl},
+        {24, ctrl}, {28, 0x04000400},
+    };
+    if (done < n)
+    {
+        // the FIFO stopped being empty (a SWAP_BUFFERS in the list): hand over at MIi_FIFOCallback's (Thumb) entry with
+        // the frames written so far (up to OS_EnableIrqMask's) and the guest's registers there; 5. finds it busy
+        for (u32 i = 0; i < 20; i++) m.W(st, w[i].o, w[i].v);
+        m.Flush();
+        for (int i = 0; i < 16; i++) c->R[i] = R[i];
+        c->R[0] = c->R[1] = ie0; c->R[2] = 0x04000210; c->R[3] = 0x20; c->R[4] = 0x04000600; c->R[5] = 0x200000; c->R[6] = params; c->R[7] = oldI;
+        c->R[13] = S - 24; c->R[14] = pc + 0x8F;
+        c->CPSR = (cpsr & 0x0FFFFFFF) | (ie0 & 0x80000000) | (ie0 ? 0 : 0x40000000u) | 0x80;    // adds r0, r1, #0 (old IE)
+        c->Cycles += 700;
+        c->JumpTo(v.gx | 1);
+        return 2;
+    }
+    m.W(P, 8, src + len); m.W(P, 0xC, 0);
+    for (auto& x : w) m.W(st, x.o, x.v);
+    const u32 sad = 0x040000B0 + dma * 12;
+    for (int i = 0; i < 16; i++) e.R[i] = R[i];
+    // flags at the end: MIi_FIFOCallback's caller does adds r0, r7, #0 (r7 = the old I bit) before OS_RestoreInterrupts
+    // (OS_RestoreInterrupts is ARM code: the CPSR it reads has T clear)
+    const u32 fl = oldI ? 0 : 0x40000000u, cpsrI = (cpsr & 0x0FFFFFDF) | fl | 0x80;
+    e.R[0] = 0x80; e.R[1] = cpsrI; e.R[2] = (cpsrI & ~0x80u) | oldI; e.R[3] = R[3]; e.R[12] = 0x80;
+    e.R[14] = pc + 0x95;     // lr: the blx OS_RestoreInterrupts
+    e.retPc = R[14];
+    e.CPSR = (cpsr & 0x0FFFFFDF) | fl | ((e.retPc & 1) << 5);
+    if (ck)
+    {
+        Expect& e2 = ck->e2;
+        e2 = e;
+        e2.R[0] = oldI; e2.R[2] = 0x04000214; e2.R[3] = 0; e2.R[4] = 0x04000600; e2.R[5] = 0x200000; e2.R[6] = params; e2.R[7] = oldI;
+        e2.R[13] = S - 24; e2.R[14] = v.gx + 0x4D;     // lr: MIi_FIFOCallback's bl OS_ResetRequestIrqMask
+        e2.retPc = pc + 0x90; e2.CPSR = cpsrI | 0x20;
+        ck->words = words;
+        ck->io = {{0x04000600, gxw & 0xC0008000u}, {0x04000210, ie1}, {0x04000210, ie1 | dbit}, {sad, srcL}, {sad + 4, 0x04000400},
+                  {sad + 8, ctrl}, {0x04000214, 0x200000}};
+        ck->fin = true;
+        return 1;
+    }
+    nds.ARM9Write32(0x04000210, ie1 | dbit);
+    nds.ARM9Write32(sad, srcL); nds.ARM9Write32(sad + 4, 0x04000400); nds.ARM9Write32(sad + 8, ctrl);
+    nds.ARM9Write32(0x04000214, 0x200000);
+    return 1;
+}
+
 __attribute__((noinline)) bool RunAsync(melonDS::ARMv5* c, State& s, bool jit)
 {
     const bool chk = g_Check || g_Dry;
@@ -2423,7 +2548,12 @@ __attribute__((noinline)) bool RunAsync(melonDS::ARMv5* c, State& s, bool jit)
     {
 #ifdef LITEV_HLE_DIAG
         m.Flush();      // logs only
-        if (g_Check) { ArmCheck(c, 10, m, ck.e2); g_P.fit[0] = ck.words; g_P.io = ck.io; }
+        if (g_Check)
+        {
+            ArmCheck(c, 10, m, ck.e2); g_P.fit[0] = ck.words; g_P.io = ck.io;
+            g_P.small = !ck.fin;        // stage 2 (registers at the return, the DMA number word) for the Thumb build
+            g_P.fin = e; g_P.finA = s.v->gxParams + 4; g_P.finV = c->R[0];
+        }
 #endif
         s.checks[10]++;
         GuestFallback(c);
@@ -2437,7 +2567,7 @@ __attribute__((noinline)) bool RunAsync(melonDS::ARMv5* c, State& s, bool jit)
     }
     m.Flush();
     s.native[10]++;
-    Return(c, e, kAsyncCyc);
+    Return(c, e, s.v->twl ? kAsyncCycT : kAsyncCyc);
     return true;
 }
 
@@ -2673,6 +2803,7 @@ __attribute__((noinline)) bool RunThumb(melonDS::ARMv5* c, bool jit)
 #ifdef LITEV_GX_BULK
     if (k == 5) return RunGx(c, s, jit);
     if (k == 8) return RunMatT(c, s, jit);
+    if (k == 10) return RunAsync(c, s, jit);
 #endif
     return RunOs(c, s, k, jit);
 }
@@ -2731,7 +2862,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         const Expect& f = g_P.fin;
         if (pc != (f.retPc & ~1u) || (cpu->CPSR & 0x3F) != (f.CPSR & 0x3F) || cpu->R[13] != f.R[13])
         {
-            if (++g_P.steps > 2000000) { fprintf(stderr, "A9HLE CHECK g3dshp: guest never returned\n"); g_P.stage2 = CheckPending = false; c->Idle2Log = nullptr; }
+            if (++g_P.steps > 2000000) { fprintf(stderr, "A9HLE CHECK %s: guest never returned\n", kName[g_P.kind]); g_P.stage2 = CheckPending = false; c->Idle2Log = nullptr; }
             return;
         }
         g_P.stage2 = CheckPending = false;
@@ -2744,7 +2875,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         Mem m(c, false);
         const u8* q = m.P(g_P.finA);
         if (!q || R32(q) != g_P.finV) { bl += snprintf(b + bl, sizeof(b) - bl, " sbc guest %08x native %08x;", q ? R32(q) : 0, g_P.finV); nd++; }
-        if (nd) { if (s.diffs[13] < 10) fprintf(stderr, "A9HLE CHECK g3dshp final %d diffs:%s\n", nd, b); s.diffs[13]++; }
+        if (nd) { if (s.diffs[g_P.kind] < 10) fprintf(stderr, "A9HLE CHECK %s final %d diffs:%s\n", kName[g_P.kind], nd, b); s.diffs[g_P.kind]++; }
         return;
     }
     const Expect& e = g_P.e;
@@ -2904,7 +3035,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         s.diffs[k]++;
     }
     if (g_P.irq) s.irqDuring[k]++;
-    else if (k == 13 && !g_P.small) { g_P.stage2 = true; g_P.steps = 0; CheckPending = true; c->Idle2Log = nullptr; }
+    else if ((k == 13 || k == 10) && !g_P.small) { g_P.stage2 = true; g_P.steps = 0; CheckPending = true; c->Idle2Log = nullptr; }
 }
 #endif
 }

@@ -60,7 +60,7 @@
 //    W2 (TWL SDK build, Thumb NNS): the same at SBC MAT's Thumb entry (variant code, exact bytes).
 // 9. _ll_sdiv (64-bit signed divide of the compiler runtime): native quotient with the guest's exact
 //    registers / flags / stack bytes (position independent).
-// 10. MI_SendGXCommandAsync's synchronous part (PW, PB): the same IO writes in the same order, every memory
+// 10. MI_SendGXCommandAsync's synchronous part (PW, PB; W2: Thumb, TWL SDK build): the same IO writes in the same order, every memory
 //    byte and register up to its return; the display list's DMA-end IRQ stays guest code.
 // 11. That DMA-end IRQ (PW, PB) natively at delivery like 3.: OS_IrqHandler -> OSi_IrqCallback -> MIi_DMACallback
 //    (OS_DisableIrqMask, GXSTAT, OS_SetIrqFunction, busy = 0, NNS G3D's "[arg] = 0" callback) with the same IO writes
