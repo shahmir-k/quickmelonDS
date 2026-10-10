@@ -10,6 +10,7 @@
 #include "GPU3D.h"
 #include "GPU3D_OpenGL.h"
 #include "GLWorker.h"
+#include "LitevSoftProf.h"
 #if defined(LITEV_GL_NOSNAPCOPY) && defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
@@ -91,6 +92,7 @@ public:
         if (Parent && Threaded) { inFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0); glFlush(); }
         const double tq = NowMs();
         Run([this, tq, seq, c, slot, inFence] {
+            LSP_EV(EV_GL3D_BEG);
             const double t0 = NowMs(), c0 = CpuMs();
             JobQueued += t0 - tq;
             if (inFence) { glWaitSync(inFence, 0, GL_TIMEOUT_IGNORED); glDeleteSync(inFence); }
@@ -105,6 +107,7 @@ public:
             JobTail += NowMs() - t0;
             JobEndFromKick += NowMs() - tq;
             DoneSeq.store(seq, std::memory_order_release);
+            LSP_EV(EV_GL3D_END);
         }, false);
     }
     // The render state is snapshotted in PrepareFrame. The polygons/vertices too, except under

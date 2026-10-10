@@ -95,12 +95,12 @@ private:
 #endif
     std::unique_ptr<GLWorker> Present;        // async present thread (shared EGL context)
     GLuint GLThreadFB = 0, GLThreadVAO = 0;   // its objects
-    u64 MergeSeq = 0, SlotMergeSeq[3] {};
+    u64 MergeSeq = 0, SlotMergeSeq[NFB] {};
     std::atomic<u64> MergeDone { 0 };
     // 513x192x2 RGBA8UI + staging buffer per framebuffer slot (a slot is reused 3 frames
     // later, so an upload never targets a texture an earlier merge may still be reading)
-    GLuint DescTex[3] {};
-    GLuint DescPBO[3] {};
+    GLuint DescTex[NFB] {};
+    GLuint DescPBO[NFB] {};
     GLuint OutTex[2] {};           // Nx, 2 layers (top, bottom), like GLRenderer's FPOutputTex
     GLuint OutFB[2] {};
     int OutIdx = 0;

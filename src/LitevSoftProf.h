@@ -82,18 +82,28 @@ void Tick();
 
 void NameThread(const char* n);
 
+// Per-frame pipeline event ring (debug.litev.pipering=N: record N events, then write them once
+// to /sdcard/Android/data/com.sereneds.app/files/pipering.csv). Each event: wall ms, the calling
+// thread's CPU ms, event id. ~100 ns per event; off unless the prop is set.
+enum PipeEv { EV_VBL_IN, EV_VBL_BAR, EV_KICK, EV_S2D_BEG, EV_S2D_END, EV_PRES_BEG, EV_PRES_END,
+              EV_KWAIT_BEG, EV_KWAIT_END, EV_HELP_BEG, EV_HELP_END, EV_GL3D_BEG, EV_GL3D_END,
+              EV_PRES_Q };
+void Ev(int ev);
+
 } // namespace LitevSP
 } // namespace melonDS
 
 #define LSP_NOW()          ::melonDS::LitevSP::NowMs()
 #define LSP_ADD(f, d)      ::melonDS::LitevSP::S.f.Add(d)
 #define LSP_NAME(n)        ::melonDS::LitevSP::NameThread(n)
+#define LSP_EV(e)          ::melonDS::LitevSP::Ev(::melonDS::LitevSP::e)
 
 #else   // !LITEV_SOFTPROF
 
 #define LSP_NOW()          0.0
 #define LSP_ADD(f, d)      ((void)0)
 #define LSP_NAME(n)        ((void)0)
+#define LSP_EV(e)          ((void)0)
 
 #endif  // LITEV_SOFTPROF
 #endif  // LITEV_SOFTPROF_H

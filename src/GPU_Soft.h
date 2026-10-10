@@ -74,8 +74,16 @@ protected:
     // Part 3: THREE framebuffers for the depth-2 flip (one rendering, one queued, one
     // presenting). Depth-1 (pipedepth==1) uses only [0]/[1] exactly as before -> byte-
     // identical. Allocated/freed/cleared in the ctor/dtor/Reset/Stop under the flag.
-    u32* Framebuffer[3][2];
+#ifdef LITEV_HYB_SLOTS4
+    // hybrid only: a 4th framebuffer/descriptor slot (round robin over 4; the software 3D
+    // backends keep 3)
+    static constexpr int NFB = 4;
 #else
+    static constexpr int NFB = 3;
+#endif
+    u32* Framebuffer[NFB][2];
+#else
+    static constexpr int NFB = 3;
     u32* Framebuffer[2][2];
 #endif
 
@@ -140,7 +148,21 @@ protected:
     // therefore STEALS a core from the 3D bands during the raster phase — and the old
     // NBANDS=2 path also spawned+joined a std::thread EVERY frame.
     // NBANDS=1: one persistent thread, no per-frame spawn, 3 full cores for the 3D.
+#ifdef LITEV_SOFT2D_HYB_BANDS
+    // Hybrid only: the 3D is on the GPU, so the cores 0-2 have room and the 2D thread is the
+    // pipeline's slowest stage (PW overworld 3x: ~10 ms/frame = the frame period). Split its lines
+    // over S2DBandsN persistent threads (debug.litev.s2dbands, 1..S2D_NBANDS).
+    static constexpr int S2D_NBANDS = 3;
+    int S2DBandsN = 1;
+    Platform::Thread* S2DHelper[S2D_NBANDS] {};
+    Platform::Semaphore* S2DHelpStart[S2D_NBANDS] {};
+    Platform::Semaphore* S2DHelpDone[S2D_NBANDS] {};
+    u32 S2DHelpY0[S2D_NBANDS] {}, S2DHelpY1[S2D_NBANDS] {};
+    std::atomic<bool> S2DHelpQuit { false };
+    void S2DHelperFunc(int b);
+#else
     static constexpr int S2D_NBANDS = 1;
+#endif
     struct S2DBand
     {
         std::unique_ptr<GPU2D> unit[2];
@@ -222,10 +244,10 @@ protected:
     // in bits 24-31 and 23). HybHas3D[b][screen]: some line of that screen has descriptors
     // (else only plane 1 + the control column need uploading).
     static constexpr int HybStride = 256*2 + 1;
-    bool HybHas3D[3][2] {};
+    bool HybHas3D[NFB][2] {};
     bool Hybrid = false;
-    u32* HybFB[3] {};
-    int HybTag[3] {};              // 3D colour-ring index the slot's frame pairs with
+    u32* HybFB[NFB] {};
+    int HybTag[NFB] {};              // 3D colour-ring index the slot's frame pairs with
     u32* Hyb3D[2] {};              // capture frames: the 1x 3D read back (per snap slot)
     bool Hyb3DValid[2] {};
     virtual int HybridCurrentTag() { return 0; }
@@ -233,7 +255,7 @@ protected:
     // into HybMap[b]; the 2D thread copies the finished frame's descriptors into it, so
     // the emu thread's upload is just a GPU-side copy
     virtual void HybridKick(int b) {}
-    u8* HybMap[3] {};
+    u8* HybMap[NFB] {};
     void HybridStage(int b);
     virtual void HybridReadback3D(u32* dst) {}
     void HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32* descB, const u32* l3d, bool has3D);

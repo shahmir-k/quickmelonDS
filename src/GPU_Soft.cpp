@@ -17,6 +17,10 @@
 */
 
 #include <thread>
+#include <algorithm>
+#if defined(LITEV_SOFT2D_HYB_BANDS) && !defined(LITEV_SOFT2D_DEPTH2)
+#error "LITEV_SOFT2D_HYB_BANDS needs LITEV_SOFT2D_DEPTH2"
+#endif
 #include "NDS.h"
 #include "GPU_Soft.h"
 #include "GPU_ColorOp.h"
@@ -86,6 +90,15 @@ static int litevReadPipeTrace()
     return 0;
 #endif
 }
+static int litevPropInt(const char* name, int def)
+{
+#ifdef __ANDROID__
+    char b[PROP_VALUE_MAX] = {0};
+    if (__system_property_get(name, b) > 0) return atoi(b);
+#endif
+    return def;
+}
+
 static inline u64 litevPipeFnv1a(const void* p, size_t n, u64 h = 1469598103934665603ULL)
 {
     const u8* d = (const u8*)p;
@@ -105,6 +118,10 @@ SoftRenderer::SoftRenderer(melonDS::NDS& nds)
 #ifdef LITEV_SOFT2D_DEPTH2
     Framebuffer[2][0] = new u32[len];   // Part 3: 3rd framebuffer for depth-2
     Framebuffer[2][1] = new u32[len];
+#endif
+#ifdef LITEV_HYB_SLOTS4
+    Framebuffer[3][0] = new u32[len];
+    Framebuffer[3][1] = new u32[len];
 #endif
     BackBuffer = 0;
 
@@ -136,7 +153,7 @@ SoftRenderer::~SoftRenderer()
     if (HybridCheck)
         fprintf(stderr, "hybrid_check: lines=%llu bad_px=%llu\n",
                 (unsigned long long)HybCheckLines.load(), (unsigned long long)HybCheckBad.load());
-    for (int i = 0; i < 3; i++) delete[] HybFB[i];
+    for (int i = 0; i < NFB; i++) delete[] HybFB[i];
     for (int i = 0; i < 2; i++) delete[] Hyb3D[i];
     Platform::Semaphore_Free(AsyncStart);
     Platform::Semaphore_Free(AsyncDone);
@@ -148,6 +165,10 @@ SoftRenderer::~SoftRenderer()
 #ifdef LITEV_SOFT2D_DEPTH2
     delete[] Framebuffer[2][0];
     delete[] Framebuffer[2][1];
+#endif
+#ifdef LITEV_HYB_SLOTS4
+    delete[] Framebuffer[3][0];
+    delete[] Framebuffer[3][1];
 #endif
 }
 
@@ -166,6 +187,10 @@ void SoftRenderer::Reset()
 #ifdef LITEV_SOFT2D_DEPTH2
     memset(Framebuffer[2][0], 0, len);
     memset(Framebuffer[2][1], 0, len);
+#endif
+#ifdef LITEV_HYB_SLOTS4
+    memset(Framebuffer[3][0], 0, len);
+    memset(Framebuffer[3][1], 0, len);
 #endif
 
     Rend2D_A->Reset();
@@ -188,6 +213,10 @@ void SoftRenderer::Stop()
 #ifdef LITEV_SOFT2D_DEPTH2
     memset(Framebuffer[2][0], 0, len);
     memset(Framebuffer[2][1], 0, len);
+#endif
+#ifdef LITEV_HYB_SLOTS4
+    memset(Framebuffer[3][0], 0, len);
+    memset(Framebuffer[3][1], 0, len);
 #endif
 }
 
@@ -411,6 +440,13 @@ void SoftRenderer::InitBands()
     }
 #endif
     S2DBandsInit = true;
+#ifdef LITEV_SOFT2D_HYB_BANDS
+    {
+        const int n = litevPropInt("debug.litev.s2dbands", 3);   // 3: PW overworld uncapped 104-106 vs 102-103 (2), 89-92 (off)
+        S2DBandsN = std::clamp(n, 1, S2D_NBANDS);
+        Platform::Log(Platform::Info, "LITEV_S2DBANDS resolved=%d\n", S2DBandsN);
+    }
+#endif
 }
 
 // Render a disjoint line range [y0,y1) for BOTH engines into BandOut2D, using this
@@ -447,7 +483,9 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
     u64 pipeSpriteTopHash = 1469598103934665603ULL;
     u64 pipe2dTopHash = 1469598103934665603ULL;
 #endif
+#ifndef LITEV_SOFT2D_HYB_BANDS
     if (Hybrid && y0 == 0) HybHas3D[AsyncTargetBuf][0] = HybHas3D[AsyncTargetBuf][1] = false;
+#endif
     for (u32 line = y0; line < y1; line++)
     {
         // DraStic model: consume the 3D line HERE, on the async render thread, paced by
@@ -609,7 +647,9 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         PipeTrace2DTopHash = pipe2dTopHash;
     }
 #endif
+#ifndef LITEV_SOFT2D_HYB_BANDS
     if (Hybrid && y1 == 192) HybridStage(AsyncTargetBuf);
+#endif
     LSP_ADD(S2DBand[bi], LSP_NOW() - _lspB0);
 }
 
@@ -617,6 +657,61 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
 // persistent async render thread (spawning short-lived band helpers for the other
 // cores), reading ONLY the render-owned snapshots the emu thread published at the
 // signalling VBlank. The emu thread is emulating frame N+1 concurrently.
+#ifdef LITEV_SOFT2D_HYB_BANDS
+static void litevPinRenderThread();
+void SoftRenderer::S2DHelperFunc(int b)
+{
+    litevPinRenderThread();
+    LSP_NAME("s2d-band");
+    for (;;)
+    {
+        Platform::Semaphore_Wait(S2DHelpStart[b]);
+        if (S2DHelpQuit.load(std::memory_order_acquire)) break;
+        LSP_EV(EV_HELP_BEG);
+        RenderBand(b, S2DHelpY0[b], S2DHelpY1[b]);
+        LSP_EV(EV_HELP_END);
+        Platform::Semaphore_Post(S2DHelpDone[b]);
+    }
+}
+
+void SoftRenderer::AsyncRenderFrame()
+{
+    if (Hybrid) HybHas3D[AsyncTargetBuf][0] = HybHas3D[AsyncTargetBuf][1] = false;
+    int n = Hybrid ? S2DBandsN : 1;
+    if (n > 1)
+    {
+        // display capture writes emulated VRAM line by line: keep those frames on one thread
+#ifdef LITEV_SOFT2D_DEPTH2
+        const FrameLineSnap* fs = FrameSnapR[AsyncSnapSlot];
+#else
+        const FrameLineSnap* fs = FrameSnapR;
+#endif
+        for (int y = 0; y < 192 && n > 1; y++)
+            if (fs[y].Valid && fs[y].CaptureEnable) n = 1;
+    }
+    if (n == 1)
+        RenderBand(0, 0, 192);
+    else
+    {
+        // equal line ranges (both engines per line, so the cost per line is roughly even)
+        for (int b = 1; b < n; b++)
+        {
+            if (!S2DHelper[b])
+            {
+                S2DHelpStart[b] = Platform::Semaphore_Create();
+                S2DHelpDone[b] = Platform::Semaphore_Create();
+                S2DHelper[b] = Platform::Thread_Create([this, b]() { S2DHelperFunc(b); });
+            }
+            S2DHelpY0[b] = 192 * b / n;
+            S2DHelpY1[b] = 192 * (b + 1) / n;
+            Platform::Semaphore_Post(S2DHelpStart[b]);
+        }
+        RenderBand(0, 0, 192 / n);
+        for (int b = 1; b < n; b++) Platform::Semaphore_Wait(S2DHelpDone[b]);
+    }
+    if (Hybrid) HybridStage(AsyncTargetBuf);
+}
+#else
 void SoftRenderer::AsyncRenderFrame()
 {
     if (S2D_NBANDS == 1)
@@ -638,6 +733,7 @@ void SoftRenderer::AsyncRenderFrame()
     RenderBand(0, 0, rows);
     for (int b = 0; b < S2D_NBANDS - 1; b++) helpers[b].join();
 }
+#endif
 
 #if defined(__ANDROID__) && defined(LITEV_PIN_RENDER) && defined(LITEV_TOPO_PIN)
 #include "LitevCores.h"
@@ -729,9 +825,22 @@ void SoftRenderer::AsyncRenderThreadFunc()
             PipeTraceTopInputHash = h;
         }
 #endif
+        LSP_EV(EV_S2D_BEG);
         const double _t0 = LSP_NOW();
         AsyncRenderFrame();
         const double _t1 = LSP_NOW();
+        LSP_EV(EV_S2D_END);
+#ifdef LITEV_SOFT2D_HYB_BANDS
+        // debug.litev.s2dhash=1: per-frame hash of the hybrid descriptors (bands=1 vs N must match)
+        {
+            static const bool hashOn = litevPropInt("debug.litev.s2dhash", 0) != 0;
+            static int hashFrame = 0;
+            if (hashOn && Hybrid)
+                Platform::Log(Platform::Info, "LITEV_S2DHASH %d %016llx %d%d\n", hashFrame++,
+                    (unsigned long long)litevPipeFnv1a(HybFB[AsyncTargetBuf], (size_t)2 * 192 * HybStride * 4),
+                    (int)HybHas3D[AsyncTargetBuf][0], (int)HybHas3D[AsyncTargetBuf][1]);
+        }
+#endif
         LSP_ADD(S2DWall, _t1 - _t0);
 #ifdef LITEV_SOFT2D_DEPTH2
         // RENDER-OUTPUT trace (see litevReadPipeTrace): hash the just-rastered framebuffer BEFORE
@@ -788,6 +897,20 @@ void SoftRenderer::StopAsyncThread()
         Platform::Thread_Free(AsyncThread);
         AsyncThread = nullptr;
     }
+#ifdef LITEV_SOFT2D_HYB_BANDS
+    S2DHelpQuit.store(true, std::memory_order_release);
+    for (int b = 1; b < S2D_NBANDS; b++)
+    {
+        if (!S2DHelper[b]) continue;
+        Platform::Semaphore_Post(S2DHelpStart[b]);
+        Platform::Thread_Wait(S2DHelper[b]);
+        Platform::Thread_Free(S2DHelper[b]);
+        Platform::Semaphore_Free(S2DHelpStart[b]);
+        Platform::Semaphore_Free(S2DHelpDone[b]);
+        S2DHelper[b] = nullptr;
+    }
+    S2DHelpQuit.store(false, std::memory_order_relaxed);
+#endif
 #ifdef LITEV_SOFT2D_DEPTH2
     GPU.SetBGOBJReadShadow(false, 0);   // back to the live mirrors (e.g. a GL renderer next)
 #endif
@@ -829,6 +952,7 @@ void SoftRenderer::VBlank()
 {
     if (!S2DDeferActive)
         return;   // nothing was snapshotted this frame (e.g. frameskip)
+    LSP_EV(EV_VBL_IN);
 
 #ifdef LITEV_SOFT2D_DEPTH2
     // (a) BARRIER. pipedepth cached here (per-VBlank read, cheap). Depth-1: wait the single
@@ -864,6 +988,7 @@ void SoftRenderer::VBlank()
     FlushAsyncRender();
 #endif
 
+    LSP_EV(EV_VBL_BAR);
     const double _lspSnap0 = LSP_NOW();
 
     StartAsyncThread();
@@ -909,7 +1034,11 @@ void SoftRenderer::VBlank()
     // *Read pointers redirected on the async thread (SetBGOBJReadShadow, keyed on AsyncSnapSlot).
     GPU.SnapshotBGOBJShadow(SnapParity);
 #endif
+#ifdef LITEV_SOFT2D_HYB_BANDS
+    for (int b = 0; b < S2DBandsN; b++)
+#else
     for (int b = 0; b < S2D_NBANDS; b++)
+#endif
     {
 #ifdef LITEV_SOFT2D_DEPTH2
         // Seed THIS frame's parity band-unit set (the render uses S2DBands[AsyncSnapSlot]).
@@ -951,7 +1080,13 @@ void SoftRenderer::VBlank()
         // ORDERING per frame: [barrier drains N-2] -> parity toggles + snapshot writes (b) ->
         // ring capture -> AsyncStart post -> (2D thread) ring pop + set keys + reads.
         int freshBuf = P2FrameBufRR;
+#ifdef LITEV_HYB_SLOTS4
+        // hybrid: 4 slots, so the slot kicked here was presented 2 frames ago, not on the frame
+        // just finished (whose async present the kick used to wait for)
+        P2FrameBufRR = (P2FrameBufRR + 1) % (Hybrid ? NFB : 3);
+#else
         P2FrameBufRR = (P2FrameBufRR + 1) % 3;
+#endif
         HybTag[freshBuf] = HybridCurrentTag();
         if (Hybrid) HybridKick(freshBuf);
         // consume3DParity = the P2 bank the 2D-N consumer must read = the parity 3D-N was
@@ -965,6 +1100,7 @@ void SoftRenderer::VBlank()
         P2InFlight++;
         S2DDeferActive = false;
         LSP_ADD(EmuSnap, LSP_NOW() - _lspSnap0);
+        LSP_EV(EV_KICK);
         Platform::Semaphore_Post(AsyncStart);
 #ifdef LITEV_SOFTPROF
         LitevSP::Tick();
@@ -1055,7 +1191,8 @@ void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32*
     if (has3D)
     {
         ctlA |= 1u << 18;
-        HybHas3D[AsyncTargetBuf][f.ScreenSwap ? 0 : 1] = true;
+        // relaxed atomic: two 2D bands may set the same screen's flag (LITEV_SOFT2D_HYB_BANDS)
+        __atomic_store_n(&HybHas3D[AsyncTargetBuf][f.ScreenSwap ? 0 : 1], true, __ATOMIC_RELAXED);
     }
     descA[512] = ctlA;
     descB[512] = ctlB;

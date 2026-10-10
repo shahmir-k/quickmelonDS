@@ -22,6 +22,7 @@
 #include "GPU_Hybrid.h"
 #include "GLWorker.h"
 #include "GLThread3D.h"
+#include "LitevSoftProf.h"
 #include <chrono>
 #include <condition_variable>
 #include <atomic>
@@ -87,7 +88,7 @@ HybridRenderer::HybridRenderer(melonDS::NDS& nds)
     Rend3D = std::make_unique<GLThread3D>(GPU.GPU3D);
     Hybrid = true;
     HybridCheck = false;
-    for (int i = 0; i < 3; i++) HybFB[i] = new u32[2 * 192 * HybStride]();
+    for (int i = 0; i < NFB; i++) HybFB[i] = new u32[2 * 192 * HybStride]();
     for (int i = 0; i < 2; i++) Hyb3D[i] = new u32[256 * 192]();
 }
 
@@ -99,8 +100,8 @@ HybridRenderer::~HybridRenderer()
     StopAsyncThread();   // the 2D thread reads HybFB; stop it before GL teardown below
     glDeleteProgram(MergeShader);
     glDeleteVertexArrays(1, &EmptyVAO);
-    glDeleteTextures(3, DescTex);
-    glDeleteBuffers(3, DescPBO);
+    glDeleteTextures(NFB, DescTex);
+    glDeleteBuffers(NFB, DescPBO);
     glDeleteTextures(2, OutTex);
     glDeleteFramebuffers(2, OutFB);
     if (PresentFB) glDeleteFramebuffers(1, &PresentFB);
@@ -156,14 +157,14 @@ bool HybridRenderer::Init()
         glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     };
 
-    glGenBuffers(3, DescPBO);
+    glGenBuffers(NFB, DescPBO);
     for (GLuint b : DescPBO)
     {
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, b);
         glBufferData(GL_PIXEL_UNPACK_BUFFER, 2 * 192 * HybStride * 4, nullptr, GL_STREAM_DRAW);
     }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    glGenTextures(3, DescTex);
+    glGenTextures(NFB, DescTex);
     for (GLuint t : DescTex)
     {
         glBindTexture(GL_TEXTURE_2D_ARRAY, t);
@@ -197,7 +198,7 @@ bool HybridRenderer::Init()
 void HybridRenderer::Reset()
 {
     SoftRenderer::Reset();   // drains the 2D, resets the 2D renderers and the GL 3D
-    for (int i = 0; i < 3; i++) memset(HybFB[i], 0, 2 * 192 * HybStride * sizeof(u32));
+    for (int i = 0; i < NFB; i++) memset(HybFB[i], 0, 2 * 192 * HybStride * sizeof(u32));
 }
 
 void HybridRenderer::PreSavestate()
@@ -258,7 +259,7 @@ void HybridRenderer::Restart3DRendering()
 void HybridRenderer::HybridKick(int b)
 {
     // an async present may still be reading this slot on the GL thread
-    if (Present && MergeDone.load(std::memory_order_acquire) < SlotMergeSeq[b]) Present->Wait();
+    if (Present && MergeDone.load(std::memory_order_acquire) < SlotMergeSeq[b]) { LSP_EV(EV_KWAIT_BEG); Present->Wait(); LSP_EV(EV_KWAIT_END); }
     if (HybDirect()) return;
     if (HybMap[b]) return;   // still mapped (that frame was never presented): reuse
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, DescPBO[b]);
@@ -520,7 +521,9 @@ void HybridRenderer::PresentIntoAsync(GLuint dstTex, int bottomY, std::function<
     const u64 seq = ++MergeSeq;
     SlotMergeSeq[fb] = seq;   // HybridKick(fb) waits for this before the 2D thread rewrites the slot
     glFlush();                // the frame texture may have just been (re)allocated on this context
+    LSP_EV(EV_PRES_Q);
     Present->Run([this, fb, tag, dstTex, bottomY, seq, pre = std::move(pre), post = std::move(post)] {
+        LSP_EV(EV_PRES_BEG);
         pre();
         if (!GLThreadFB) { glGenFramebuffers(1, &GLThreadFB); glGenVertexArrays(1, &GLThreadVAO); }
         glBindFramebuffer(GL_FRAMEBUFFER, GLThreadFB);
@@ -530,6 +533,7 @@ void HybridRenderer::PresentIntoAsync(GLuint dstTex, int bottomY, std::function<
         MergeSlot(GLThreadFB, 0, bottomY, fb, tag, GLThreadVAO, true);
         post();
         MergeDone.store(seq, std::memory_order_release);
+        LSP_EV(EV_PRES_END);
     }, false);
 }
 
