@@ -940,6 +940,21 @@ endif()
 
 # Hybrid renderer: lines showing the 3D straight through merge with a copy shader, the rest with
 # the full merge (scissored runs of lines; same pixels). Runtime: debug.litev.hybfastlines=0 off.
+# Hybrid renderer: the async software 2D is split into line bands on persistent threads (it was
+# the slowest pipeline stage once the 3D moved to the GPU). Same pixels. Runtime:
+# debug.litev.s2dbands=N (1 = off).
+option(LITEV_SOFT2D_HYB_BANDS "Hybrid: software 2D in parallel line bands" OFF)
+if (LITEV_SOFT2D_HYB_BANDS)
+    add_compile_definitions(LITEV_SOFT2D_HYB_BANDS=1)
+endif()
+
+# Hybrid renderer: 4 descriptor/framebuffer slots instead of 3, so the 2D kick no longer waits for
+# the async present of the frame that was just finished (it reuses the slot presented 2 frames ago).
+option(LITEV_HYB_SLOTS4 "Hybrid: 4 framebuffer slots" OFF)
+if (LITEV_HYB_SLOTS4)
+    add_compile_definitions(LITEV_HYB_SLOTS4=1)
+endif()
+
 option(LITEV_HYB_MERGE_FASTLINES "Hybrid: fast merge for plain-3D lines" OFF)
 if (LITEV_HYB_MERGE_FASTLINES)
     add_compile_definitions(LITEV_HYB_MERGE_FASTLINES=1)
