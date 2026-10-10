@@ -133,7 +133,15 @@ private:
     GLuint ClearShaderPlain {};
     GLuint ClearShaderBitmap {};
 
-    GLuint RenderShader[4] {};
+    GLuint RenderShader[8] {};
+#ifdef LITEV_GL_ALPHATEST_2PASS
+    static bool AlphaTest2Pass();
+    // drawn in the two alpha-test passes: an opaque polygon that needs the alpha test, not depth-equal
+    bool TwoPassPoly(const RendererPolygon* rp) const
+    {
+        return !(rp->RenderKey & RenderKey_NoDiscard) && !(rp->PolyData->Attr & (1<<14));
+    }
+#endif
     GLint RenderModeULoc = 0;
     GLuint CurShaderID = -1;
     // LITEV_GL_WBUF_EARLYZ: this frame's W-buffer depth mapping, window depth = 1 - WZ0/w

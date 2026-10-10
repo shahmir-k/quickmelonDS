@@ -54,7 +54,7 @@ bool GLRenderer3D::BuildRenderShader(int flags)
 #endif
 
     char shadername[32];
-    snprintf(shadername, sizeof(shadername), "RenderShader%c%s", wbuffer?'W':'Z', (flags & 2) ? "N" : "");
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s", wbuffer?'W':'Z', (flags & 2) ? "N" : "", (flags & 4) ? "A" : "");
 
     std::string vsbuf = k3DRenderVS;
     if (wbuffer)
@@ -76,6 +76,20 @@ bool GLRenderer3D::BuildRenderShader(int flags)
         auto pos = fsbuf.find('\n') + 1;
         fsbuf = fsbuf.substr(0, pos) + "#define NoDiscard\n" + fsbuf.substr(pos);
     }
+#ifdef LITEV_GL_ALPHATEST_2PASS
+    if ((flags & 4) && AlphaTest2Pass())
+    {
+        auto pos = fsbuf.find('\n') + 1;
+        fsbuf = fsbuf.substr(0, pos) + "#define AlphaTestOnly\n" + fsbuf.substr(pos);
+    }
+#endif
+#ifdef LITEV_GL_TEX_UNORM
+    if (TexUnorm())
+    {
+        auto pos = fsbuf.find('\n') + 1;
+        fsbuf = fsbuf.substr(0, pos) + "#define TexUnorm\n" + fsbuf.substr(pos);
+    }
+#endif
 
     GLuint prog;
     bool ret = OpenGL::CompileVertexFragmentProgram(prog,
@@ -118,6 +132,23 @@ void GLRenderer3D::UseRenderShader(int flags)
 bool GLRenderer3D::NoDiscard()
 {
     static const bool on = OpenGL::Prop("glnodiscard", 1) != 0;
+    return on;
+}
+#endif
+
+#ifdef LITEV_GL_ALPHATEST_2PASS
+// Alpha-tested opaque polygons (textures with transparent texels: foliage, fences, sprites) need
+// the discard shader, so the Mali tests and writes depth only after running the whole shader for
+// every fragment, hidden or not (~7 ms of a 20 ms GPU frame in the PW town at 400 MHz). Instead:
+// pass A runs a shader that only does the alpha test and writes depth + stencil (polygon ID with
+// bit 7 set); pass B draws them with the full shader without discard where the depth is equal and
+// bit 7 + polygon ID match (early depth test: only visible pixels are shaded), clearing bit 7.
+// Depth-equal (decal) polygons keep the one-pass discard. Same pixels, except coplanar overlapping
+// alpha-tested polygons with the same polygon ID (the later one wins instead of the first).
+// debug.litev.glat2pass=0 turns it off.
+bool GLRenderer3D::AlphaTest2Pass()
+{
+    static const bool on = NoDiscard() && OpenGL::Prop("glat2pass", 1) != 0;
     return on;
 }
 #endif
@@ -208,6 +239,10 @@ bool GLRenderer3D::Init()
 
     if (!BuildRenderShader(true))
         return false;
+#ifdef LITEV_GL_ALPHATEST_2PASS
+    if (AlphaTest2Pass() && !(BuildRenderShader(4) && BuildRenderShader(5)))
+        return false;
+#endif
 #ifdef LITEV_GL_OPAQUE_NODISCARD
     if (NoDiscard() && (!BuildRenderShader(2) || !BuildRenderShader(3)))
         return false;
@@ -524,20 +559,24 @@ void GLRenderer3D::WarmVariants()
     glDepthFunc(GL_LESS);
     glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
     int n = 0;
-    auto draw = [&](bool blend, bool cm0, GLboolean a, GLboolean b, GLboolean fog) {
+    auto draw = [&](bool blend, bool cm0, GLboolean a, GLboolean b, GLboolean fog, GLboolean alpha = GL_FALSE) {
         if (blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
         glColorMaski(0, cm0, cm0, cm0, cm0);
-        glColorMaski(1, a, b, fog, GL_FALSE);
+        glColorMaski(1, a, b, fog, alpha);
         glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, nullptr);
         n++;
     };
-    for (int prog = 0; prog < 4; prog++)
+    for (int prog = 0; prog < 8; prog++)
     {
         if (!RenderShader[prog]) continue;
         glUseProgram(RenderShader[prog]);
+        if (prog & 4) { draw(false, false, GL_FALSE, GL_FALSE, GL_FALSE); continue; }   // LITEV_GL_ALPHATEST_2PASS pass A
         for (GLboolean fog : {GL_FALSE, GL_TRUE})
         {
             draw(false, true, GL_TRUE, GL_TRUE, fog);         // opaque (also needopaque, pass 2)
+#ifdef LITEV_GL_OPAQUE_FULLMASK
+            if (fog) draw(false, true, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);   // opaque pass, full mask
+#endif
             if (prog & 2) continue;                           // no-discard: opaque pass only
             draw(false, true, GL_FALSE, GL_FALSE, fog);       // translucent against the clear plane
             for (int f = 0; f < 2; f++)
@@ -1255,6 +1294,14 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
         if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[3], "uWZ0"), WZ0);
     }
 #endif
+#ifdef LITEV_GL_ALPHATEST_2PASS
+    bool twoPassAny = false;
+    if (AlphaTest2Pass())
+    {
+        UseRenderShader(flags | 4);
+        if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[5], "uWZ0"), WZ0);
+    }
+#endif
     UseRenderShader(flags);
     if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[1], "uWZ0"), WZ0);
 
@@ -1286,6 +1333,15 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
     glLineWidth(1.0);
 
     glColorMaski(1, GL_TRUE, GL_TRUE, fogenable, GL_FALSE);
+#ifdef LITEV_GL_OPAQUE_FULLMASK
+    // Opaque pass: write every channel of the attribute target. A masked channel means the
+    // fragment doesn't fully replace the pixel, which turns off the Mali's hidden-surface removal
+    // (forward pixel kill) for every opaque polygon. Nothing reads attr.a, and attr.b (fog flag)
+    // is read only by the fog pass, which runs only when fog is on (when the mask had it anyway).
+    // debug.litev.glfullmask=0 turns it off.
+    static const bool fullMask = OpenGL::Prop("glfullmask", 1) != 0;
+    if (fullMask) glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+#endif
 
     glDepthFunc(GL_LESS);
     glDepthMask(GL_TRUE);
@@ -1309,6 +1365,9 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
 
         if (rp->PolyData->IsShadowMask) { i++; continue; }
         if (rp->PolyData->Translucent) { i++; continue; }
+#ifdef LITEV_GL_ALPHATEST_2PASS
+        if (AlphaTest2Pass() && TwoPassPoly(rp)) { twoPassAny = true; i++; continue; }   // below
+#endif
 
         if (rp->PolyData->Attr & (1<<14))
             glDepthFunc(GL_LEQUAL);
@@ -1327,6 +1386,44 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
 #endif
         i += RenderPolygonBatch(i);
     }
+#ifdef LITEV_GL_ALPHATEST_2PASS
+    if (twoPassAny)
+    {
+        // pass A: alpha test only; depth + stencil (0x80 | polygon ID), no colour
+        UseRenderShader(flags | 4);
+        GLboolean cm1[4];
+        glGetBooleani_v(GL_COLOR_WRITEMASK, 1, cm1);
+        glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glDepthFunc(GL_LESS);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        glStencilMask(0xFF);
+        for (int i = 0; i < NumFinalPolys; )
+        {
+            const RendererPolygon* rp = &PolygonList[i];
+            if (rp->PolyData->IsShadowMask || rp->PolyData->Translucent || !TwoPassPoly(rp)) { i++; continue; }
+            glStencilFunc(GL_ALWAYS, 0x80 | ((rp->PolyData->Attr >> 24) & 0x3F), 0xFF);
+            i += RenderPolygonBatch(i);
+        }
+        // pass B: full shader, no discard, where pass A left this polygon's depth and stencil
+        UseRenderShader(flags | 2);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glColorMaski(1, cm1[0], cm1[1], cm1[2], cm1[3]);
+        glDepthFunc(GL_EQUAL);
+        glDepthMask(GL_FALSE);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
+        glStencilMask(0x80);
+        for (int i = 0; i < NumFinalPolys; )
+        {
+            const RendererPolygon* rp = &PolygonList[i];
+            if (rp->PolyData->IsShadowMask || rp->PolyData->Translucent || !TwoPassPoly(rp)) { i++; continue; }
+            glStencilFunc(GL_EQUAL, 0x80 | ((rp->PolyData->Attr >> 24) & 0x3F), 0xFF);
+            i += RenderPolygonBatch(i);
+        }
+        glDepthMask(GL_TRUE);
+        glStencilMask(0xFF);
+    }
+#endif
 #ifdef LITEV_GL_OPAQUE_NODISCARD
     UseRenderShader(flags);   // the passes below set uRenderMode on this program
 #endif
