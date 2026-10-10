@@ -107,7 +107,7 @@ HybridRenderer::~HybridRenderer()
     if (PresentFB) glDeleteFramebuffers(1, &PresentFB);
     glDeleteFramebuffers(1, &ReadFB);
 #ifdef LITEV_HYB_CAPTURE_ASYNC
-    glDeleteBuffers(3, CapPBO);
+    glDeleteBuffers(4, CapPBO);
     for (GLsync& f : CapFence) if (f) { glDeleteSync(f); f = nullptr; }
 #endif
     glDeleteFramebuffers(1, &DownFB);
@@ -242,6 +242,27 @@ void HybridRenderer::Start3DRendering()
 {
     double t0 = HybNowMs();
     Rend3D->RenderFrame();   // emu: VRAM coherence + post the job
+#ifdef LITEV_FF_CAP_PREFETCH
+    // Frameskip (fast-forward) on a screen that uses display capture: the next drawn frame's
+    // capture follows skipped frames (no reads in flight), so it read this 3D render back
+    // synchronously on the emu thread (~8% of the PW title's fast-forward time). Read it now on
+    // the GL 3D thread; HybridReadback3D takes it while it is still the current 3D (same colour
+    // buffer, same conversion: same pixels). Not in a recording (KeepCaptures: every frame drawn,
+    // reads are already in flight). debug.litev.capprefetch=0 turns it off.
+    {
+        static const bool on = OpenGL::Prop("capprefetch", 1) != 0;
+        PrefColor = -1;
+        if (on && GPU.FrameskipTarget > 0 && !GPU.KeepCapturesSeen && Thread3D()->Threaded
+            && GPU.NDS.NumFrames - LastCapFrame < 16)
+        {
+            const int color = GL3D()->GetCurColor();
+            LSP_WAIT("cap-pref-reuse", GPU.NDS.NumFrames, while (CapBusy[3].load(std::memory_order_acquire)) std::this_thread::yield());
+            CapBusy[3].store(true, std::memory_order_relaxed);
+            Thread3D()->Run([this, color] { CapKickGL(3, color); CapFinishGL(3); }, false);
+            PrefColor = color;
+        }
+    }
+#endif
     ProfGL3D += HybNowMs() - t0;
 }
 
@@ -386,6 +407,17 @@ void HybridRenderer::HybridReadback3D(u32* dst)
             CapFrameOf[k] = frame;
             Thread3D()->Run([this, k, color, prev] { CapKickGL(k, color); if (prev >= 0) CapFinishGL(prev); }, false);
             CapPrevSlot = k;
+#ifdef LITEV_FF_CAP_PREFETCH
+            LastCapFrame = frame;
+            if (use < 0 && PrefColor >= 0 && PrefColor == color)   // read ahead at VCount 215
+            {
+                LSP_WAIT("cap-pref", frame, while (CapBusy[3].load(std::memory_order_acquire)) std::this_thread::yield());
+                memcpy(dst, CapOut[3], sizeof(CapOut[3]));
+                CapNext = (k + 1) % 3;
+                ProfReadback += HybNowMs() - t0;
+                return;
+            }
+#endif
             if (use < 0)   // a capture run starts: this frame's own read, now
             {
                 LSP_WAIT("cap-start", frame, Thread3D()->Run([this, k] { CapFinishGL(k); }, true));

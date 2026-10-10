@@ -1191,6 +1191,9 @@ void GPU::StartFrame() noexcept
     {
         SkipThisFrame = false;
     }
+#ifdef LITEV_FF_SKIP_PRESENT
+    SkipDisplay = SkipThisFrame;
+#endif
     if (KeepCaptures)
     {
         KeepCapturesSeen |= (CaptureCnt & (1u << 31)) != 0;

@@ -629,6 +629,11 @@ public:
     int FrameskipTarget = 0;
     int FrameskipCounter = 0;
     bool SkipThisFrame = false;
+#ifdef LITEV_FF_SKIP_PRESENT
+    // the frameskip schedule skips this frame's display: no present (the frontend), even when it is
+    // drawn anyway because a recording keeps every capture (KeepCaptures)
+    bool SkipDisplay = false;
+#endif
     static constexpr int LITEV_FRAMESKIP_MAX = 9;
 
     // Netplay: a console nobody looks at (another player's) draws nothing. Rendering does not
