@@ -135,13 +135,14 @@ struct State
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
-    u32 mask = 31;                  // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send
+    bool init = false, on = true;   // prop read; prop on
+    u32 mask = 31 | 64;             // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 64 LZ (32: card, not shipped)
     std::vector<u8> code, irqCode, gxCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool irqOk = false;             // IRQ path code matches the variant (3.)
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
-    u64 calls[6] = {}, native[6] = {}, fallback[6] = {}, checks[6] = {}, diffs[6] = {}, irqDuring[6] = {};
-    u64 guestCyc[6] = {}, guestN[6] = {}, getBits = 0, gxWords = 0;
+    u64 calls[7] = {}, native[7] = {}, fallback[7] = {}, checks[7] = {}, diffs[7] = {}, irqDuring[7] = {};
+    u64 guestCyc[7] = {}, guestN[7] = {}, getBits = 0, gxWords = 0, lzBytes = 0, lzEst = 0;
     u32 biosOk = 0;                 // BIOS IRQ epilogue address verified once
     u64 ns = 0;                     // stats: host time inside Run (native calls)
     // host pointers of the fixed-address OS objects, valid for fkey (DTCM base/mask, ITCM size)
@@ -164,9 +165,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[6] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend"};
+const char* kName[7] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -275,18 +276,25 @@ bool GxIntact(melonDS::ARMv5* c, const State& s)
 
 // The game's variant is found when the JIT (or the interpreter) first reaches a hook entry of one:
 // that variant's code signature is checked then (the OS code is in place by the time it runs).
-__attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 instr)
+// the console's state with the runtime switch read (no variant probing)
+__attribute__((noinline, cold)) State& Init(melonDS::ARMv5* c)
 {
     State& s = g_State[&c->NDS];         // map nodes are stable
     c->A9HLEState = &s;
+    if (s.init) return s;
+    s.init = true;
+    const u32 on = ReadOn();
+    if (!on) { s.on = false; s.status = -1; return s; }
+    if (on != 1) s.mask = on;
+    if (const char* m = getenv("LITEV_A9HLE_ONLY")) s.mask = (u32)strtoul(m, nullptr, 0);
+    return s;
+}
+inline State& St(melonDS::ARMv5* c) { return c->A9HLEState ? *(State*)c->A9HLEState : Init(c); }
+
+__attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 instr)
+{
+    State& s = St(c);
     if (s.status != 0) return s;
-    if (!s.tried)
-    {
-        const u32 on = ReadOn();
-        if (!on) { s.status = -1; return s; }
-        if (on != 1) s.mask = on;
-        if (const char* m = getenv("LITEV_A9HLE_ONLY")) s.mask = (u32)strtoul(m, nullptr, 0);
-    }
     for (int i = 0; i < kNumVariants; i++)
     {
         const Variant& v = *kVariants[i];
@@ -430,6 +438,10 @@ struct Pending
     u64 t0 = 0, steps = 0;
     bool irq = false;
     bool vecSkip = false;   // native IRQ check: the guest's own entry through the IRQ vector
+    u32 lzn[4] = {};        // LZ check: token counts of the native chunk
+    u32 lzLo = 0, lzHi = 0; // LZ check: the window (an IRQ inside the guest chunk writes elsewhere)
+    u32 lzFn = 0;           // LZ check: function entry; cycles of the instructions inside it (no IRQs)
+    u64 lzOwn = 0, lzLastTs = 0; bool lzLastIn = false;
 } g_P;
 
 __attribute__((noinline, cold)) void ArmCheck(melonDS::ARMv5* c, int kind, const Mem& m, const Expect& e)
@@ -851,13 +863,182 @@ void GxCheckAt(State& s, melonDS::ARMv5* c)
 }
 #endif
 
+// ---- 6. MIi_UncompressBackward: backward LZ (overlay / data unpacking) ------------------------
+// NitroSDK's in-place backward LZ decompressor (ARM, position independent; PW/PB/W2 have it at
+// 0x02004DF4): 18% of the ARM9's guest instructions in PW loading frames. Hooked at its loop head
+// (`cmp r3, r1`); the native loop is the guest loop instruction by instruction (same byte reads
+// and writes in the same order, so overlapping in-place data behaves the same) and stops at a
+// token boundary, leaving exactly the guest's registers and flags for that point: when done (the
+// cache clean/invalidate tail at +0x8C then runs as guest code), after kLzBudget output bytes (the
+// guest loop head, where the hook runs again: IRQs and events run in between as they would between
+// JIT blocks), or before any token that would leave the checked main-RAM window (the guest
+// continues). Category B: a fixed cycle estimate per token / byte instead of the loop's own count.
+constexpr u32 kLzInstr = 0xE1530001;        // cmp r3, r1 (the loop head)
+constexpr u32 kLzHead = 0x24;               // loop head - function entry
+constexpr u32 kLzCode[45] = {
+    0xE3500000, 0x0A000029, 0xE92D01F0, 0xE9100006, 0xE0802002, 0xE0403C21, 0xE3C114FF, 0xE0401001, 0xE1A04002,
+    0xE1530001, 0xDA000017, 0xE5735001, 0xE3A06008, 0xE2566001, 0xBAFFFFF9, 0xE3150080, 0x1A000003, 0xE5730001,
+    0xE5528001, 0xE5620001, 0xEA00000A, 0xE573C001, 0xE5737001, 0xE187740C, 0xE3C77A0F, 0xE2877002, 0xE28CC020,
+    0xE7D20007, 0xE5528001, 0xE5620001, 0xE25CC010, 0xAAFFFFFA, 0xE1530001, 0xE1A05085, 0xCAFFFFE9, 0xE3A00000,
+    0xE3C1301F, 0xEE070F9A, 0xEE073F35, 0xEE073F3E, 0xE2833020, 0xE1530004, 0xBAFFFFF9, 0xE8BD01F0, 0xE12FFF1E};
+// output bytes per native call (~5.5k ARM9 cycles: an IRQ waits at most ~1.3 scanlines longer)
+constexpr u32 kLzBudget = 256;
+// ponytail: fixed cycle estimate, least-squares fit of the guest's own cycles (check mode, cycles of
+// the function's instructions only) over 779 chunks of f12000/f15780/f1300: per flag byte, literal,
+// back-reference, copied byte; total within ~1%, per chunk within ~2%
+constexpr s32 kLzCycFlag = 9, kLzCycLit = 25, kLzCycRef = 24, kLzCycByte = 14;
+
+bool LzCodeAt(melonDS::ARMv5* c, u32 head)
+{
+    const u32 a = head - kLzHead;
+    if (a & 3) return false;
+    for (u32 i = 0; i < 45; i++)
+    {
+        const u8* p = CodePtr(c, a + i * 4);
+        if (!p || R32(p) != kLzCode[i]) return false;
+    }
+    return true;
+}
+
+// guest state at the hook (pc = loop head) or a handoff point
+struct Lz { u32 r[13]; u32 pc; u32 cpsr; s32 cyc; u32 out; u32 n[4]; };   // n: flag bytes, literals, back-references, copied bytes
+
+// Runs the loop on the window [lo, hi) at host b (b[a - lo] = guest byte a), from the loop head.
+// Returns false if nothing could be done natively (the guest runs the loop head).
+bool LzRun(Lz& z, u8* b, u32 lo, u32 hi)
+{
+    u32 r0 = z.r[0], r1 = z.r[1], r2 = z.r[2], r3 = z.r[3], r5 = z.r[5], r6 = z.r[6], r7 = z.r[7], r8 = z.r[8], ip = z.r[12];
+    const u32 head = z.pc, done = head + 0x68, inner = head + 0x10;
+    u32 out = 0, nf = 0, nl = 0, nr = 0;
+    auto M = [&](u32 a) -> u32 { return b[a - lo]; };
+    u32 pc, fl;     // handoff point and NZCV there (fl: of the last flag-setting guest instruction)
+    for (;;)
+    {
+        // loop head (+0): cmp r3, r1; ble done; ldrb r5, [r3, #-1]!; mov r6, #8
+        fl = Flags(r3, r1);
+        if ((s32)r3 <= (s32)r1) { pc = done; break; }
+        r3--; r5 = M(r3); r6 = 8; nf++;
+        bool head2 = false;
+        for (;;)
+        {
+            // inner loop head (+0x10): the next token stays in the window and the budget, else hand over here
+            if (r6 != 0)
+            {
+                bool ok;
+                if (r5 & 0x80)
+                {
+                    ok = r3 - 2 >= lo;
+                    if (ok)
+                    {
+                        const u32 b1 = M(r3 - 1), d = ((M(r3 - 2) | b1 << 8) & ~0xF000u) + 2, n = (b1 >> 4) + 3;
+                        ok = r2 - n >= lo && r2 + d < hi;
+                    }
+                }
+                else ok = r3 - 1 >= lo && r2 - 1 >= lo;
+                if (!ok || out >= kLzBudget) { pc = inner; goto end; }
+            }
+            fl = Flags(r6, 1);      // subs r6, r6, #1; blt head
+            r6--;
+            if ((s32)r6 < 0) { head2 = true; break; }
+            if (r5 & 0x80)
+            {
+                ip = M(--r3); r7 = M(--r3);
+                r7 |= ip << 8; r7 &= ~0xF000u; r7 += 2; ip += 0x20;
+                nr++;
+                do { r0 = M(r2 + r7); r8 = M(r2 - 1); b[--r2 - lo] = (u8)r0; ip -= 0x10; out++; } while ((s32)ip >= 0);
+            }
+            else { r0 = M(--r3); r8 = M(r2 - 1); b[--r2 - lo] = (u8)r0; out++; nl++; }
+            fl = Flags(r3, r1);     // cmp r3, r1; lsl r5, r5, #1; bgt inner
+            r5 <<= 1;
+            if (!((s32)r3 > (s32)r1)) { pc = done; goto end; }
+        }
+        if (head2 && out >= kLzBudget && (s32)r3 > (s32)r1) { pc = head; break; }
+    }
+end:
+    if (!out && pc != done) return false;
+    z.r[0] = r0; z.r[2] = r2; z.r[3] = r3; z.r[5] = r5; z.r[6] = r6; z.r[7] = r7; z.r[8] = r8; z.r[12] = ip;
+    z.pc = pc; z.cpsr = (z.cpsr & 0x0FFFFFFF) | fl; z.out = out;
+    z.n[0] = nf; z.n[1] = nl; z.n[2] = nr; z.n[3] = out - nl;
+    z.cyc = kLzCycFlag * (s32)nf + kLzCycLit * (s32)nl + kLzCycRef * (s32)nr + kLzCycByte * (s32)(out - nl);
+    return true;
+}
+
+// [lo, hi) is one main-RAM block in host memory (no TCM, no mirror wrap), else nullptr
+u8* LzWindow(melonDS::ARMv5* c, u32 lo, u32 hi)
+{
+    melonDS::NDS& nds = c->NDS;
+    if (hi <= lo || lo < c->ITCMSize || (lo >> 24) != 0x02 || ((hi - 1) >> 24) != 0x02) return nullptr;
+    if ((lo & nds.MainRAMMask) > ((hi - 1) & nds.MainRAMMask)) return nullptr;
+    const u32 dsz = ~c->DTCMMask + 1;   // DTCM window [DTCMBase, DTCMBase + dsz)
+    if (c->DTCMBase < hi && lo < c->DTCMBase + dsz) return nullptr;
+    return &nds.MainRAM[lo & nds.MainRAMMask];
+}
+
+__attribute__((noinline)) bool RunLz(melonDS::ARMv5* c, State& s, bool jit)
+{
+    if (!jit && !LzCodeAt(c, c->R[15] - 8)) return false;
+    s.calls[6]++;
+    Lz z;
+    for (int i = 0; i < 13; i++) z.r[i] = c->R[i];
+    z.pc = c->R[15] - 8; z.cpsr = c->CPSR;
+    const u32 z0pc = z.pc;
+    (void)z0pc;
+    const u32 lo = z.r[1] - 2, hi = z.r[4];    // r1: source start, r4: destination end
+    u8* w = CheckPending ? nullptr : LzWindow(c, lo, hi);
+    bool ok = w != nullptr;
+#ifdef LITEV_HLE_DIAG
+    if (ok && (g_Check || g_Dry))
+    {
+        // on a copy; check: compare with the guest at the handoff point
+        std::vector<u8> cp(w, w + (hi - lo));
+        ok = LzRun(z, cp.data(), lo, hi);
+        if (ok && g_Check)
+        {
+            Mem m(c, true);
+            Expect e;
+            for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+            for (int i = 0; i < 13; i++) e.R[i] = z.r[i];
+            e.CPSR = z.cpsr; e.retPc = z.pc;
+            ArmCheck(c, 6, m, e);
+            for (u32 i = 0; i < hi - lo; i++) if (cp[i] != w[i]) g_P.log.push_back({lo + i, cp[i], 1});
+            s.lzBytes += z.out;
+            s.lzEst += (u64)z.cyc;
+            for (int i = 0; i < 4; i++) g_P.lzn[i] = z.n[i];
+            g_P.lzLo = lo; g_P.lzHi = hi;
+            g_P.lzFn = z0pc - kLzHead; g_P.lzOwn = 0; g_P.lzLastIn = false;
+        }
+        if (ok) s.checks[6]++;
+        ok = false;
+    }
+    else
+#endif
+    if (ok) ok = LzRun(z, w, lo, hi);
+    if (!ok)
+    {
+        s.fallback[6] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    // written: [z.r[2], old r2): JIT invalidation per 16-byte granule (what the guest's strb do)
+    melonDS::NDS& nds = c->NDS;
+    for (u32 a = z.r[2] & ~15u; a < c->R[2]; a += 16)
+        nds.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(a);
+    s.native[6]++;
+    s.lzBytes += z.out;
+    for (int i = 0; i < 13; i++) c->R[i] = z.r[i];
+    c->CPSR = z.cpsr;
+    c->Cycles += z.cyc;
+    c->JumpTo(z.pc);
+    return true;
+}
+
 struct StatsDump
 {
     ~StatsDump()
     {
         if (!g_Stats) return;
         for (auto& [k, s] : g_State)
-            for (int i = 0; i < 6; i++)
+            for (int i = 0; i < 7; i++)
                 fprintf(stderr, "A9HLE %s: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu irq_during=%llu guest_cyc_avg=%.0f\n",
                         kName[i], s.status, (unsigned long long)s.calls[i], (unsigned long long)s.native[i],
                         (unsigned long long)s.fallback[i], (unsigned long long)s.checks[i], (unsigned long long)s.diffs[i],
@@ -866,6 +1047,9 @@ struct StatsDump
         {
             u64 n = s.native[0] + s.native[1] + s.native[2] + s.native[3] + s.native[4] + s.native[5];
             if (s.native[5]) fprintf(stderr, "A9HLE gxsend: %.1f words per native call\n", (double)s.gxWords / s.native[5]);
+            if (s.native[6]) fprintf(stderr, "A9HLE lz: %.1f bytes per native call\n", (double)s.lzBytes / s.native[6]);
+            if (s.checks[6] && s.guestN[6]) fprintf(stderr, "A9HLE lz check: %.1f bytes per call, guest cycles %llu, estimate %llu\n",
+                                                   (double)s.lzBytes / s.checks[6], (unsigned long long)s.guestCyc[6], (unsigned long long)s.lzEst);
             if (n && g_Time) fprintf(stderr, "A9HLE: %.1f ns per native call (Run, timer pair %.1f ns subtracted)\n", (double)s.ns / n - TimerNs(), TimerNs());
         }
         for (auto& [k, s] : g_State)
@@ -938,8 +1122,15 @@ bool Irq(melonDS::ARMv5* c, bool halted)
     return true;
 }
 
-int Deps(melonDS::NDS& nds, u32 addr, const Range*& r)
+int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
 {
+    if (instr == kLzInstr)
+    {
+        static thread_local Range lz;
+        lz = {addr - kLzHead, addr - kLzHead + 45 * 4};
+        r = &lz;
+        return 1;
+    }
     const Variant& v = *Active(&nds.ARM9)->v;     // after IsHook != 0
     if (addr == v.wake) { r = v.code; return kNumCode; }
     if (addr == v.gx) { r = &v.gxCode; return 1; }
@@ -950,6 +1141,12 @@ int Deps(melonDS::NDS& nds, u32 addr, const Range*& r)
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 {
     if (!MaybeHook(instr)) return 0;
+    if (instr == kLzInstr)
+    {
+        // position independent: the code bytes around addr
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 64) && LzCodeAt(&nds.ARM9, addr) ? 1 : 0;
+    }
     State& s = Get(&nds.ARM9, addr, instr);
     if (s.status != 1) return 0;
     const int k = Kind(*s.v, addr, instr);
@@ -1049,6 +1246,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
     if (cpu->Num != 0 || (cpu->CPSR & 0x20)) return false;
     auto* c = (melonDS::ARMv5*)cpu;
     const u32 pc = cpu->R[15] - 8, in = cpu->CurInstr;
+    if (in == kLzInstr)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 64) && RunLz(c, s, jit);
+    }
     State& s = Get(c, pc, in);
     if (s.status != 1) return false;
     const int k = Kind(*s.v, pc, in);
@@ -1082,6 +1284,12 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         }
         else g_P.irq = true;
     }
+    if (g_P.kind == 6)
+    {
+        const u64 now = c->NDS.ARM9Timestamp + c->Cycles;
+        if (g_P.lzLastIn) g_P.lzOwn += now - g_P.lzLastTs;
+        g_P.lzLastTs = now; g_P.lzLastIn = pc - g_P.lzFn < 45 * 4;
+    }
     if (++g_P.steps > 2000000)
     {
         fprintf(stderr, "A9HLE CHECK %s: guest never returned to %08x\n", kName[g_P.kind], g_P.e.retPc);
@@ -1091,6 +1299,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         return;
     }
     if (!atVec && (pc != (e.retPc & ~1u) || cpu->CPSR != e.CPSR)) return;
+    if (g_P.kind == 6 && (cpu->R[2] != e.R[2] || cpu->R[3] != e.R[3] || cpu->R[6] != e.R[6])) return;   // LZ: same progress
     melonDS::NDS& nds = c->NDS;
     if ((g_P.kind == 0 || g_P.kind == 4) && R32(&nds.MainRAM[(g_State[&nds].v->info + 4) & nds.MainRAMMask]) != e.cur) return;
     CheckPending = false;
@@ -1104,6 +1313,8 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     }
     s.guestCyc[k] += nds.ARM9Timestamp + c->Cycles - g_P.t0;
     s.guestN[k]++;
+    if (k == 6 && getenv("LITEV_A9HLE_LZFIT"))
+        fprintf(stderr, "LZFIT %u %u %u %u %llu\n", g_P.lzn[0], g_P.lzn[1], g_P.lzn[2], g_P.lzn[3], (unsigned long long)g_P.lzOwn);
     // expected bytes: native log over the snapshot; compared at every byte either side wrote
     std::unordered_map<u32, u8> exp;
     Mem m(c, false);
@@ -1124,7 +1335,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     for (u32 a : addrs)
     {
         u8* p = m.P(a);
-        if (!p) continue;
+        if (!p || (k == 6 && (a < g_P.lzLo || a >= g_P.lzHi))) continue;
         auto it = exp.find(a);
         u8 want = it != exp.end() ? it->second : old(a);
         if (*p != want)
@@ -1148,7 +1359,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             if (gs[i] != e.SVC[i]) { if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " svc[%d] guest %08x native %08x;", i, gs[i], e.SVC[i]); nd++; }
         }
     }
-    if (k >= 3)
+    if (k == 3 || k == 4)
     {
         // IF: the guest acknowledged exactly HBlank (the native path does IF &= ~2)
         int acks = 0, other = 0;
@@ -1160,7 +1371,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             nd++;
         }
     }
-    if (nd && g_P.irq)
+    if (nd && g_P.irq && k != 6)
         nd = 0;   // an IRQ arrived inside the guest round trip: the native path takes it after; counted in irq_during
     if (nd)
     {

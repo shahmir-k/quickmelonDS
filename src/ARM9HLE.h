@@ -63,7 +63,7 @@ namespace melonDS { class ARM; class ARMv5; class NDS; }
 namespace melonDS::A9HLE
 {
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
-inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8; }
+inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001; }
 // JIT decode: is the ARM-mode instruction at addr a hooked entry?
 // 0 no, 1 yes (code signature verified: under the JIT this compile-time check is the code
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the
@@ -73,7 +73,7 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr);
 // so any write there invalidates the block (and the next compile re-verifies)
 struct Range { u32 a, b; };
 constexpr int kNumCode = 17;
-int Deps(melonDS::NDS& nds, u32 addr, const Range*& r);
+int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r);
 // Execute the hook at R15-8 (native, or the guest instruction on fallback). jit: reached from a
 // JIT-compiled hook (code already verified); else the code is compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).

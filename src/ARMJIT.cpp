@@ -1221,7 +1221,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
             // a write there invalidates it like a write to its own code, and recompiling
             // re-verifies (IsHook). That is what lets A9HLE::Run skip a per-call code compare.
             const A9HLE::Range* dep;
-            int nd = A9HLE::Deps(NDS, instrs[i].Addr, dep);
+            int nd = A9HLE::Deps(NDS, instrs[i].Addr, instrs[i].Instr, dep);
             for (int d = 0; d < nd; d++) addDeps(0, dep[d].a, dep[d].b);
             if (hook == 1)
             {
