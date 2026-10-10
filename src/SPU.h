@@ -260,6 +260,8 @@ public:
         if (FIFOLevel <= 16) FIFO_BufferTiming();
     }
     void RefillFIFO();      // main-RAM samples only (the paths above require it)
+    u32 FIFOOwed = 0;       // FIFO bytes the fast ADPCM path consumed and has not booked yet
+    void FIFOCatchUp() { for (; FIFOOwed; FIFOOwed--) FIFO_Skip(1); }   // (byte by byte = the same end state)
 #endif
 
 private:
