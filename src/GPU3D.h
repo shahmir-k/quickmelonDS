@@ -156,7 +156,16 @@ private:
     __attribute__((noinline))
 #endif
     void SubmitPolygon() noexcept;
+#ifdef LITEV_GX_CMD_SLIM
+    // one call site per executor (the vertex commands share it): inline it there
+    __attribute__((always_inline))
+#endif
     void SubmitVertex() noexcept;
+#ifdef LITEV_GX_CMD_SLIM
+    // the clip matrix rebuild (a 4x4 multiply on a local array = a stack-protector canary in
+    // whatever inlines it) stays out of the per-vertex path
+    __attribute__((noinline)) void UpdateClipMatrixOOL() noexcept;
+#endif
     void CalculateLighting() noexcept;
     void BoxTest(const u32* params) noexcept;
     void PosTest() noexcept;
