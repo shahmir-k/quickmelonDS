@@ -581,8 +581,8 @@ endif()
 
 # A7HLE: Pokemon Black/White's NitroSDK ARM7 sound driver SND_ExChannelMain (envelope/LFO/
 # sweep/volume/pitch/pan per channel, ~1/3 of the ARM7's guest instructions in the PW overworld)
-# runs as native C++ writing the same channel bytes; detected by code signature, falls back to
-# the guest code for channel callbacks. Category B: guest memory identical, ARM7 cycles of the
+# and SND_SeqMain (sequencer, ~1/5) run as native C++ writing the same bytes; detected by code
+# signature, fall back to the guest code for channel callbacks / notes needing a new channel. Category B: guest memory identical, ARM7 cycles of the
 # call are a fixed estimate. Runtime: debug.litev.a7hle (default on). See src/ARM7HLE.h.
 option(LITEV_A7HLE "ARM7 HLE of the NitroSDK SND_ExChannelMain (PW/PB, approximate cycles)" OFF)
 if (LITEV_A7HLE)
