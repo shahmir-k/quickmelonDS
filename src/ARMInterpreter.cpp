@@ -40,7 +40,7 @@ void A_UNK(ARM* cpu)
 {
 #ifdef LITEV_A7HLE
     // the JIT compiles a hooked ARM7 function entry as this fallback (see ARMJIT CompileBlock)
-    if (cpu->Num == 1 && A7HLE::Run(cpu))
+    if (cpu->Num == 1 && A7HLE::Run(cpu, true))
         return;
 #endif
 #ifdef LITEV_A9HLE

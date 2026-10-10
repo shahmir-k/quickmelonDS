@@ -1682,7 +1682,7 @@ void ARMv4::Execute()
 #endif
 #ifdef LITEV_A7HLE
                 if (A7HLE::CheckPending) A7HLE::CheckAt(this, R[15] - 8);
-                if ((CurInstr == 0xE92D4FF8 || CurInstr == 0xE92D47F0 || CurInstr == 0xE081C002) && A7HLE::Run(this)) {}
+                if ((CurInstr == 0xE92D4FF8 || CurInstr == 0xE92D47F0 || CurInstr == 0xE081C002) && A7HLE::Run(this, false)) {}
                 else
 #endif
                 if (CheckCondition(CurInstr >> 28))

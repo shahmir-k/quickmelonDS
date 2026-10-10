@@ -1028,17 +1028,47 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     int i = 0;
     u32 r15 = cpu->R[15];
 
-#ifdef LITEV_A9HLE
-    // + room for an A9HLE hook block's dependency ranges (see below)
+#if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
+    // + room for an A9HLE/A7HLE hook block's dependency ranges (see below)
     const int maxRanges = MaxBlockSize + 48;
-    u32 a9HookAt = 0;           // verified hook in this block (its address), see A9HLE::HookCompiled
 #else
     const int maxRanges = MaxBlockSize;
+#endif
+#ifdef LITEV_A9HLE
+    u32 a9HookAt = 0;           // verified hook in this block (its address), see A9HLE::HookCompiled
+#endif
+#ifdef LITEV_A7HLE
+    bool a7Hook = false;        // block compiled with a verified A7HLE hook
 #endif
     u32 addressRanges[maxRanges];
     u32 addressMasks[maxRanges];
     memset(addressMasks, 0, maxRanges * sizeof(u32));
     u32 numAddressRanges = 0;
+    // add [a, b) of guest code to this block's dependencies, keeping the last range last
+    // (a write there invalidates the block like a write to its own code)
+    auto addDeps = [&](u32 num, u32 a0, u32 b0)
+    {
+        u32 cur = numAddressRanges - 1;
+        for (u32 a = a0 & ~15u; a < b0; a += 16)
+        {
+            u32 ta = LocaliseCodeAddress(num, a);
+            u32 tr = ta & ~0x1FF, j = 0;
+            for (; j < numAddressRanges; j++)
+                if (addressRanges[j] == tr) break;
+            if (j == numAddressRanges)
+            {
+                assert(numAddressRanges < (u32)maxRanges);
+                addressRanges[numAddressRanges++] = tr;
+            }
+            addressMasks[j] |= 1 << ((ta & 0x1FF) / 16);
+        }
+        if (cur != numAddressRanges - 1)
+        {
+            std::swap(addressRanges[cur], addressRanges[numAddressRanges - 1]);
+            std::swap(addressMasks[cur], addressMasks[numAddressRanges - 1]);
+        }
+    };
+    (void)addDeps;
 
     u32 numLiterals = 0;
     u32 literalLoadAddrs[MaxBlockSize];
@@ -1128,8 +1158,18 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         // HLE'd ARM7 function entry: compile it as an interpreter fallback that ends the block
         // (decoded as an undefined instruction); A_UNK runs the native function or the original
         // instruction. Keeps Instr, so the code hash / invalidation still see the real bytes.
-        if (cpu->Num == 1 && !thumb && A7HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr))
-            instrs[i].Info = ARMInstrInfo::Decode(false, 1, 0xE7F000F0, false);
+        if (int hook = cpu->Num == 1 && !thumb ? A7HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr) : 0)
+        {
+            // verified now; the block depends on the hooked code (no per-call compare in Run)
+            A7HLE::Range dep[4];
+            int nd = A7HLE::Deps(instrs[i].Addr, instrs[i].Instr, dep);
+            for (int d = 0; d < nd; d++) addDeps(1, dep[d].a, dep[d].b);
+            if (hook == 1)
+            {
+                instrs[i].Info = ARMInstrInfo::Decode(false, 1, 0xE7F000F0, false);
+                a7Hook = true;
+            }
+        }
 #endif
 #ifdef LITEV_A9HLE
         if (int hook = cpu->Num == 0 && !thumb ? A9HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr) : 0)
@@ -1139,26 +1179,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
             // re-verifies (IsHook). That is what lets A9HLE::Run skip a per-call code compare.
             const A9HLE::Range* dep;
             int nd = A9HLE::Deps(instrs[i].Addr, dep);
-            u32 cur = numAddressRanges - 1;     // keep the instruction's own range last
-            for (int d = 0; d < nd; d++)
-                for (u32 a = dep[d].a & ~15u; a < dep[d].b; a += 16)
-                {
-                    u32 ta = LocaliseCodeAddress(0, a);
-                    u32 tr = ta & ~0x1FF, j = 0;
-                    for (; j < numAddressRanges; j++)
-                        if (addressRanges[j] == tr) break;
-                    if (j == numAddressRanges)
-                    {
-                        assert(numAddressRanges < (u32)maxRanges);
-                        addressRanges[numAddressRanges++] = tr;
-                    }
-                    addressMasks[j] |= 1 << ((ta & 0x1FF) / 16);
-                }
-            if (cur != numAddressRanges - 1)
-            {
-                std::swap(addressRanges[cur], addressRanges[numAddressRanges - 1]);
-                std::swap(addressMasks[cur], addressMasks[numAddressRanges - 1]);
-            }
+            for (int d = 0; d < nd; d++) addDeps(0, dep[d].a, dep[d].b);
             if (hook == 1)
             {
                 instrs[i].Info = ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
@@ -1395,6 +1416,9 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     // a block compiled with a native hook must never be restored for the same bytes compiled
     // without it (hook site whose dependencies changed): different restore key
     if (a9HookAt) instrHash ^= 0x5A9E1A9Eu;
+#endif
+#ifdef LITEV_A7HLE
+    if (a7Hook) instrHash ^= 0xA7E1A7E1u;
 #endif
 
     auto prevBlockIt = RestoreCandidates.find(instrHash);
