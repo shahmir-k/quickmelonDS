@@ -43,6 +43,10 @@ void A_UNK(ARM* cpu)
     if (cpu->Num == 1 && A7HLE::Run(cpu, true))
         return;
 #endif
+#ifdef LITEV_GX_CPUSEND
+    if (cpu->Num == 0 && GXSend::Run(cpu, true))
+        return;
+#endif
 #ifdef LITEV_A9HLE
     if (cpu->Num == 0 && A9HLE::Run(cpu, true))
         return;

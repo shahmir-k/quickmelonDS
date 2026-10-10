@@ -719,6 +719,34 @@ void DMA::Run9()
                 u32 words[64];
                 const u32 n = IterCount < 64 ? IterCount : 64;
                 u32 cycles = 0;
+#ifdef LITEV_GX_DMA_PREFETCH
+                // Same words and cycles; the loop state lives in registers (the MainRAM byte loads
+                // otherwise force member reloads) and the display list is prefetched one chunk
+                // ahead: the in-order A55 stalls on every source line miss otherwise.
+                {
+                    const u8* ram = NDS.MainRAM;
+                    const u32 mask = NDS.MainRAMMask, inc = SrcAddrInc << 2;
+                    u32 src = CurSrcAddr, bc = MRAMBurstCount;
+                    const u8* bt = MRAMBurstTable.data();
+                    const u8* reloaded = nullptr;
+                    for (u32 o = 0; o < 512; o += 64) __builtin_prefetch(ram + ((src + o) & mask));
+                    for (u32 i = 0; i < n; i++)
+                    {
+                        if (burststart || bt[bc] == 0)
+                        {
+                            bc = 0;
+                            const u32 dst_n = NDS.ARM9MemTimings[0x1000][6];
+                            bt = reloaded = (dst_n == 2) ? DMATiming::MRAMRead32Bursts[0].data() : DMATiming::MRAMRead32Bursts[1].data();
+                        }
+                        cycles += bt[bc++];
+                        burststart = false;
+                        words[i] = *(const u32*)&ram[src & mask];
+                        src += inc;
+                    }
+                    CurSrcAddr = src; MRAMBurstCount = bc;
+                    if (reloaded) memcpy(MRAMBurstTable.data(), reloaded, MRAMBurstTable.size());
+                }
+#else
                 for (u32 i = 0; i < n; i++)
                 {
                     if (burststart || MRAMBurstTable[MRAMBurstCount] == 0)
@@ -733,6 +761,7 @@ void DMA::Run9()
                     words[i] = *(u32*)&NDS.MainRAM[CurSrcAddr & NDS.MainRAMMask];
                     CurSrcAddr += SrcAddrInc<<2;
                 }
+#endif
                 NDS.ARM9Timestamp += (u64)cycles << NDS.ARM9ClockShift;
                 IterCount -= n;
                 RemCount -= n;

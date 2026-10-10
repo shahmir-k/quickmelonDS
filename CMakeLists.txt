@@ -743,6 +743,30 @@ option(LITEV_GX_BULK "Geometry DMA in bulk: a GXFIFO DMA with an empty FIFO deco
 if (LITEV_GX_BULK)
     add_compile_definitions(LITEV_GX_BULK=1)
 endif()
+
+# GX_CPUSEND: NitroSDK MI_CpuSend32 to GXFIFO (a display list sent by the CPU, one slow IO store
+# per word) runs through the bulk geometry path (LITEV_GX_BULK). Hooked by code signature at JIT
+# compile; category B (fixed cycle estimate, the FIFO never fills). Runtime off: debug.litev.gxsend=0.
+option(LITEV_GX_CPUSEND "MI_CpuSend32 to GXFIFO through the bulk geometry path (needs LITEV_GX_BULK; approximate timing)" OFF)
+if (LITEV_GX_CPUSEND)
+    add_compile_definitions(LITEV_GX_CPUSEND=1)
+endif()
+
+# GX_DMA_PREFETCH: the bulk geometry DMA loop (LITEV_GX_BULK) keeps its state in registers and
+# prefetches the display list a chunk ahead (the in-order A55 stalls on every source line miss).
+# Exact: same words, same cycles.
+option(LITEV_GX_DMA_PREFETCH "Bulk geometry DMA: register loop state + source prefetch (exact)" OFF)
+if (LITEV_GX_DMA_PREFETCH)
+    add_compile_definitions(LITEV_GX_DMA_PREFETCH=1)
+endif()
+
+# GX_POLY_LEAN: polygon setup for the in-order A55: SubmitPolygon out of line (vertices that close
+# no polygon skip its prologue), and one 32-bit divide per axis gives both the hi-res and the
+# 9/8-bit screen position (was two 32-bit + two 64-bit divides). Exact.
+option(LITEV_GX_POLY_LEAN "Lean polygon setup: SubmitPolygon out of line, merged viewport divides (exact)" OFF)
+if (LITEV_GX_POLY_LEAN)
+    add_compile_definitions(LITEV_GX_POLY_LEAN=1)
+endif()
 option(LITEV_JIT_CYCLE_BATCH "Batch the per-instruction cycle adds of unconditional non-branch instructions into one add before the next cycle read (AArch64, exact)" OFF)
 if (LITEV_JIT_CYCLE_BATCH)
     add_compile_definitions(LITEV_JIT_CYCLE_BATCH=1)
