@@ -2896,6 +2896,19 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         snprintf(nm, sizeof(nm), "jit_a%d_%x", Num == 0 ? 9 : 7, (unsigned)instrs[0].Addr);
         litev_perfmap::Add(nm, (void*)res, GetRXPtr());
     }
+    // LITEV_JIT_DUMP=<file> (with the perf map armed): every block's guest range and host code bytes,
+    // appended: u32 cpu, u32 guest addr, u32 guest instr count, u32 thumb, u32 host bytes, bytes
+    {
+        static FILE* df = [] { const char* f = getenv("LITEV_JIT_DUMP"); return f ? fopen(f, "ab") : nullptr; }();
+        if (df && litev_perfmap::g_state == 1)
+        {
+            static std::mutex dl;
+            std::lock_guard<std::mutex> lk(dl);
+            const u8* a = (const u8*)res; const u8* b = (const u8*)GetRXPtr();
+            u32 h[5] = { (u32)Num, (u32)instrs[0].Addr, (u32)instrsCount, (u32)thumb, (u32)(b - a) };
+            fwrite(h, 4, 5, df); fwrite(a, 1, b - a, df); fflush(df);
+        }
+    }
 #endif
 
     return res;

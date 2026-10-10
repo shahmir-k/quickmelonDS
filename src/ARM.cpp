@@ -1334,6 +1334,9 @@ void ARMv5::Execute()
 
             JitBlockEntry block = NDS.JIT.LookUpBlock(0, FastBlockLookup,
                 instrAddr - FastBlockLookupStart, instrAddr);
+#ifdef LITEV_A7PROF
+            const u64 a9t0 = NDS.ARM9Timestamp;
+#endif
 
             // liteDS-v2 Unit 2 (shadow): maintain the slice budget in the exact same
             // unit as Cycles. The loop guarantees ARM9Timestamp < ARM9Target here, so
@@ -1374,6 +1377,9 @@ void ARMv5::Execute()
             }
             else
                 NDS.JIT.CompileBlock(this);
+#ifdef LITEV_A7PROF
+            if (&NDS == A7Prof::Target) A7Prof::g9.Jit(block != nullptr, (NDS.ARM9Timestamp - a9t0) >> NDS.ARM9ClockShift);
+#endif
 
 #if defined(LITEV_SHADOW_ASSERT)
             LiteV_ShadowAssertBudget("ARM9", Cycles, CyclesBudget,
