@@ -27,6 +27,9 @@
 #include "../LiteProfile.h"
 
 #include <stdlib.h>
+#if defined(LITEV_JIT_RAS) && defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 #include <cstddef>
 
 using namespace Arm64Gen;
@@ -186,6 +189,9 @@ namespace litev_perfmap
 // independent, but the assert is kept under the A64 guard to mirror where the
 // offsets are consumed.
 #ifdef __aarch64__
+#ifdef LITEV_JIT_RAS
+static_assert(offsetof(ARM, RasRing) + sizeof(ARM::RasRing) < 16384, "RAS fields need a scaled 12-bit LDR/STR offset");
+#endif
 static_assert(offsetof(ARM, Cycles) == ARM_Cycles_offset,
     "ARM_Cycles_offset out of sync with ARM::Cycles");
 static_assert(offsetof(ARM, StopExecution) == ARM_StopExecution_offset,
@@ -1299,6 +1305,26 @@ void* Compiler::Gen_Dispatcher(u32 num)
     SetJumpTarget(icNoCache);
     // miss -> fall through to the region-bounds + tag lookup, which WRITES BACK below.
 #endif
+#ifdef LITEV_JIT_RAS
+    // (d.6-RAS) second chance: W10 = the caller's call-site slot popped by a guest
+    // return (0 = none). Same epoch + key check as above, 1-way (key0/ptr0).
+    FixupBranch rasHit;
+    if (RasOn)
+    {
+        FixupBranch rasNone = CBZ(W10);
+        MOVP2R(X2, (void*)ICacheTable[num]);
+        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICacheEntryShift));
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        LDR(INDEX_UNSIGNED, W4, RCPU, offsetof(ARM, ICacheEpoch));
+        CMP(W3, W4);
+        FixupBranch rasEpochMiss = B(CC_NEQ);
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key0));
+        CMP(W3, W0);
+        rasHit = B(CC_EQ);
+        SetJumpTarget(rasEpochMiss);
+        SetJumpTarget(rasNone);
+    }
+#endif
 
     // (e) region bounds: offset = instrAddr - FastBlockLookupStart, exit if >= Size (unsigned;
     //     a single compare also catches instrAddr < Start via wraparound)
@@ -1392,6 +1418,19 @@ void* Compiler::Gen_Dispatcher(u32 num)
         STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
         SetJumpTarget(wbSkip);
     }
+#ifdef LITEV_JIT_RAS
+    if (RasOn)
+    {
+        FixupBranch rasSkip = CBZ(W10);
+        MOVP2R(X2, (void*)ICacheTable[num]);
+        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICacheEntryShift));
+        STR(INDEX_UNSIGNED, W0, X2, offsetof(ICacheEntry, key0));
+        STR(INDEX_UNSIGNED, X6, X2, offsetof(ICacheEntry, ptr0));
+        LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, ICacheEpoch));
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        SetJumpTarget(rasSkip);
+    }
+#endif
   #if LITEV_PROFILE
     MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.DispatcherHits);
     LDR(INDEX_UNSIGNED, X5, X4, 0);
@@ -1434,6 +1473,24 @@ void* Compiler::Gen_Dispatcher(u32 num)
     BR(X0);
 #endif
 
+#ifdef LITEV_JIT_RAS
+    if (RasOn)
+    {
+        // RAS hit (X2 = the call-site entry). CPSR is canonical in memory (LAZYFLAGS).
+        SetJumpTarget(rasHit);
+  #ifndef LITEV_JIT_LAZYFLAGS
+        STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+  #endif
+        LDR(INDEX_UNSIGNED, X5, X2, offsetof(ICacheEntry, ptr0));
+  #if LITEV_PROFILE
+        MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.RasHits);
+        LDR(INDEX_UNSIGNED, X3, X4, 0);
+        ADD(X3, X3, 1);
+        STR(INDEX_UNSIGNED, X3, X4, 0);
+  #endif
+        BR(X5);
+    }
+#endif
 #ifdef LITEV_JIT_ICACHE
     // ICACHE hit tails (reached from (d.5-ICACHE); X2 still holds the entry pointer).
     // Under LAZYFLAGS ARM::CPSR is already canonical (as at step (g)); otherwise commit
@@ -1547,6 +1604,18 @@ void Compiler::EmitBlockExit()
 #ifdef LITEV_JIT_DIRECTPATCH
     u32 dpSite = ICacheAssignSite();
     MOVI2R(W9, dpSite);
+#ifdef LITEV_JIT_RAS
+    // W10 = the call-site slot this path's taken return popped (0 = none), the
+    // dispatcher's second chance after a W9 miss. Cleared so a not-taken path of a
+    // conditional return never sees a stale slot.
+    if (RasRetBlock)
+    {
+        LDR(INDEX_UNSIGNED, W10, RCPU, offsetof(ARM, RasSite));
+        STR(INDEX_UNSIGNED, WZR, RCPU, offsetof(ARM, RasSite));
+    }
+    else if (RasOn)
+        MOVI2R(W10, 0);
+#endif
     // Record the RX offset of the patchable exit `B` so DIRECTPATCH can later rewrite
     // it to a guard stub. Compile-time; survives until the next ICacheReset (which
     // zeroes the whole table, incl. patchOff/hitCount/promoted). Site 0 = no cache.
@@ -1609,6 +1678,10 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
   #ifdef LITEV_JIT_ICACHE
     MOVI2R(W9, 0);   // a linkable exit opts out of the per-site cache (0 = no cache)
   #endif
+  #ifdef LITEV_JIT_RAS
+    if (RasOn)
+        MOVI2R(W10, 0);
+  #endif
   #ifdef LITEV_EXIT_PROTO_PC
     if (PCElided)
     {
@@ -1664,6 +1737,10 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
     // LAZYFLAGS: ARM::CPSR already canonical in memory at the linkable exit; W27 = guest r7.
 #ifdef LITEV_JIT_ICACHE
     MOVI2R(W9, 0);   // a linkable exit opts out of the per-site cache (0 = no cache)
+#endif
+#ifdef LITEV_JIT_RAS
+    if (RasOn)
+        MOVI2R(W10, 0);
 #endif
     u32 patchOffset = (u32)((u8*)GetRXPtr() - GetRXBase());
     B(DispatcherEntry[Num]);   // the patch slot (unlinked state)
@@ -2043,6 +2120,9 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     HasStaticExit = false;
     LastInstrCompiledNonBranch = false;
 #endif
+#ifdef LITEV_JIT_RAS
+    RasRetBlock = false;
+#endif
 #ifdef LITEV_EXIT_PROTO_PC
     PCElided = false;
     BlockStartAddr = instrs[0].Addr;
@@ -2409,6 +2489,16 @@ void Compiler::Reset()
     // address, then clear them + bump the epoch for this new cache epoch.
     ICacheAllocOnce();
     ICacheReset();
+#endif
+#ifdef LITEV_JIT_RAS
+    {
+#if defined(__ANDROID__)
+        char b[8] = {0}; int n = __system_property_get("debug.litev.jitras", b);
+        RasOn = (n > 0) ? (atoi(b) != 0) : true;
+#else
+        const char* e = getenv("debug.litev.jitras"); RasOn = e ? (atoi(e) != 0) : true;
+#endif
+    }
 #endif
 
 #ifdef LITEV_JIT_PERFMAP
