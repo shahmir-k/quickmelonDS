@@ -1299,6 +1299,11 @@ u32 NDS::RunFrame()
     // Ensure the last audio samples produced for this frame are available to the frontend immediately
     SPU.BufferAudio();
 
+#if defined(LITEV_JIT_STORE_REPROMOTE) && defined(JIT_ENABLED) && defined(__aarch64__)
+    if constexpr (cpuMode == CPUExecuteMode::JIT)
+        JIT.JITCompiler.RepromoteStores();   // frame boundary: no JIT code is running
+#endif
+
     // In the context of TASes, frame count is traditionally the primary measure of emulated time,
     // so it needs to be tracked even if NDS is powered off.
     NumFrames++;

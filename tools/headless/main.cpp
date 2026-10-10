@@ -41,7 +41,7 @@
 #include "LiteProfile.h"
 #include "VerifyTrace.h"
 #include "InputScript.h"
-namespace melonDS { extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults; }
+namespace melonDS { extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults, JitStoreRepromotions; }
 #ifdef LITEV_ACCESS_STATS
 namespace melonDS { extern u64 LitevAccess[6][0x10000]; extern u64 LitevRomctrlPC[0x100000]; }
 static void DumpAccessStats()
@@ -727,6 +727,9 @@ int main(int argc, char** argv)
                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fms0).count(),
                    (unsigned long long)(melonDS::JitCompileCount - jit0),
                    (unsigned long long)(melonDS::JitProtectCalls - prot0), (unsigned long long)(melonDS::JitProtectFaults - flt0));
+#ifdef LITEV_JIT_STORE_REPROMOTE
+        if (frameMs) printf("REPROMOTED %d %llu\n", frame, (unsigned long long)melonDS::JitStoreRepromotions);
+#endif
         {   // LITEV_PRINT_REGS=<frame>: display registers after that frame (diagnosis)
             static const int regsAt = getenv("LITEV_PRINT_REGS") ? atoi(getenv("LITEV_PRINT_REGS")) : -1;
             if (frame == regsAt)

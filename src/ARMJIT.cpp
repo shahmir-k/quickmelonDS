@@ -1056,6 +1056,9 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                 && instrs[i].Instr & (1 << 16)))
             hasLink = false;
 
+#ifdef LITEV_JIT_COND_MEMGUESS
+        instrs[i].DataExecuted = 1;
+#endif
         if (thumb)
         {
             InterpretTHUMB[instrs[i].Info.Kind](cpu);
@@ -1076,7 +1079,12 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                 if (cpu->CheckCondition(instrs[i].Cond()))
                     InterpretARM[instrs[i].Info.Kind](cpu);
                 else
+                {
                     cpu->AddCycles_C();
+#ifdef LITEV_JIT_COND_MEMGUESS
+                    instrs[i].DataExecuted = 0;
+#endif
+                }
             }
         }
 

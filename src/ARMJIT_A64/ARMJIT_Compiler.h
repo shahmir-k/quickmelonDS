@@ -534,6 +534,18 @@ public:
 
     bool IsJITFault(const u8* pc);
     u8* RewriteMemAccess(u8* pc);
+    bool CondMemGuess(bool addrIsStatic);
+#ifdef LITEV_JIT_STORE_REPROMOTE
+    // A store that faulted on a code-protected page is rewritten to the slow path for good.
+    // Remember its original fast-path bytes and put them back at a later frame boundary
+    // (no JIT code is running there), so a memcpy that once hit a code page stores at full
+    // speed again. Faulting again just rewrites it again; the retry period doubles per fault.
+    struct SlowStoreSite { std::vector<u32> Orig; u32 Faults, RetryFrame, RestoredFrame; bool Slow; };
+    std::unordered_map<ptrdiff_t, SlowStoreSite> SlowStoreSites;   // key: patch region offset
+    u32 SlowStoreNextRetry = ~0u;
+    void NoteProtectFault(u8* pc);
+    void RepromoteStores();
+#endif
 
     void SwapCodeRegion()
     {
