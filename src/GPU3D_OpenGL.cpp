@@ -79,8 +79,9 @@ bool GLRenderer3D::BuildRenderShader(int flags)
 #ifdef LITEV_GL_ALPHATEST_2PASS
     if ((flags & 4) && AlphaTest2Pass())
     {
+        // 4: pass A (alpha test only); 6: pass B (full shader + the alpha test, no depth/stencil writes)
         auto pos = fsbuf.find('\n') + 1;
-        fsbuf = fsbuf.substr(0, pos) + "#define AlphaTestOnly\n" + fsbuf.substr(pos);
+        fsbuf = fsbuf.substr(0, pos) + ((flags & 2) ? "#define PassBDiscard\n" : "#define AlphaTestOnly\n") + fsbuf.substr(pos);
     }
 #endif
 #ifdef LITEV_GL_TEX_UNORM
@@ -144,7 +145,7 @@ bool GLRenderer3D::NoDiscard()
 // bit 7 set); pass B draws them with the full shader without discard where the depth is equal and
 // bit 7 + polygon ID match (early depth test: only visible pixels are shaded), clearing bit 7.
 // Depth-equal (decal) polygons keep the one-pass discard. Same pixels, except coplanar overlapping
-// alpha-tested polygons with the same polygon ID (the later one wins instead of the first).
+// alpha-tested polygons with the same polygon ID, both opaque on a pixel (the later one wins).
 // debug.litev.glat2pass=0 turns it off.
 bool GLRenderer3D::AlphaTest2Pass()
 {
@@ -240,7 +241,7 @@ bool GLRenderer3D::Init()
     if (!BuildRenderShader(true))
         return false;
 #ifdef LITEV_GL_ALPHATEST_2PASS
-    if (AlphaTest2Pass() && !(BuildRenderShader(4) && BuildRenderShader(5)))
+    if (AlphaTest2Pass() && !(BuildRenderShader(4) && BuildRenderShader(5) && BuildRenderShader(6) && BuildRenderShader(7)))
         return false;
 #endif
 #ifdef LITEV_GL_OPAQUE_NODISCARD
@@ -570,7 +571,7 @@ void GLRenderer3D::WarmVariants()
     {
         if (!RenderShader[prog]) continue;
         glUseProgram(RenderShader[prog]);
-        if (prog & 4) { draw(false, false, GL_FALSE, GL_FALSE, GL_FALSE); continue; }   // LITEV_GL_ALPHATEST_2PASS pass A
+        if ((prog & 6) == 4) { draw(false, false, GL_FALSE, GL_FALSE, GL_FALSE); continue; }   // LITEV_GL_ALPHATEST_2PASS pass A
         for (GLboolean fog : {GL_FALSE, GL_TRUE})
         {
             draw(false, true, GL_TRUE, GL_TRUE, fog);         // opaque (also needopaque, pass 2)
@@ -1300,6 +1301,8 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
     {
         UseRenderShader(flags | 4);
         if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[5], "uWZ0"), WZ0);
+        UseRenderShader(flags | 6);
+        if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[7], "uWZ0"), WZ0);
     }
 #endif
     UseRenderShader(flags);
@@ -1405,14 +1408,22 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
             glStencilFunc(GL_ALWAYS, 0x80 | ((rp->PolyData->Attr >> 24) & 0x3F), 0xFF);
             i += RenderPolygonBatch(i);
         }
-        // pass B: full shader, no discard, where pass A left this polygon's depth and stencil
-        UseRenderShader(flags | 2);
+        // pass B: full shader where pass A left this polygon's depth and stencil marker, with the
+        // alpha test but no depth/stencil writes (so the early depth/stencil test still culls
+        // hidden pixels). Coplanar polygons with the same ID (the PW player sprite is two) pass
+        // the test on each other's pixels: without the alpha test one transparent there drew its
+        // texel colour over the other (half the sprite white). Where both are opaque the later
+        // one wins. Clearing the marker per pixel instead (stencil write + discard) loses the
+        // early test: town 400 MHz 20.1 ms GPU/frame vs 17.0. Markers cleared after the pass.
+        // debug.litev.glat2passb=0: the old pass B (no alpha test, clears the marker).
+        static const bool passB = OpenGL::Prop("glat2passb", 1) != 0;
+        UseRenderShader(flags | (passB ? 6 : 2));
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glColorMaski(1, cm1[0], cm1[1], cm1[2], cm1[3]);
         glDepthFunc(GL_EQUAL);
         glDepthMask(GL_FALSE);
         glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
-        glStencilMask(0x80);
+        glStencilMask(passB ? 0x00 : 0x80);
         for (int i = 0; i < NumFinalPolys; )
         {
             const RendererPolygon* rp = &PolygonList[i];
@@ -1421,6 +1432,7 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
             i += RenderPolygonBatch(i);
         }
         glDepthMask(GL_TRUE);
+        if (passB) { glStencilMask(0x80); glClear(GL_STENCIL_BUFFER_BIT); }
         glStencilMask(0xFF);
     }
 #endif
