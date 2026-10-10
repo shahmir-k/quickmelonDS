@@ -780,6 +780,13 @@ option(LITEV_GX_CLIP_REJECT "Trivial reject before the polygon clipper (exact)" 
 if (LITEV_GX_CLIP_REJECT)
     add_compile_definitions(LITEV_GX_CLIP_REJECT=1)
 endif()
+
+# GX_CLIP_LEAN: the polygon clipper (ClipAgainstPlane) reads vertices in place instead of copying
+# each one, and skips a plane side with no vertex past it (that pass only copies). Exact.
+option(LITEV_GX_CLIP_LEAN "Polygon clipper without the per-vertex copies (exact)" OFF)
+if (LITEV_GX_CLIP_LEAN)
+    add_compile_definitions(LITEV_GX_CLIP_LEAN=1)
+endif()
 option(LITEV_JIT_CYCLE_BATCH "Batch the per-instruction cycle adds of unconditional non-branch instructions into one add before the next cycle read (AArch64, exact)" OFF)
 if (LITEV_JIT_CYCLE_BATCH)
     add_compile_definitions(LITEV_JIT_CYCLE_BATCH=1)
