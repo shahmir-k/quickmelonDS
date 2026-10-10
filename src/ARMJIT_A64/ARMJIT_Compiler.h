@@ -474,6 +474,12 @@ public:
     // invalidation): RX is append-only within an epoch, so this is the sound backstop
     // against a patched direct edge outliving its target block.
     void DirectPatchRevertAll();
+#ifdef LITEV_JIT_DP_REVERTLIST
+    // Sites promoted since the last RevertAll (each listed once, ICacheEntry::_dp0 = listed).
+    // RevertAll walks only these instead of every site slot: with the slots full (16383 per
+    // CPU x 64 B = 2 MB) a code overwrite of ~100 invalidations/frame scanned ~200 MB.
+    std::vector<u32> DirectPatchListed[2];
+#endif
 #endif
 #endif
 
