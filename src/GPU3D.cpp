@@ -1179,6 +1179,16 @@ bool ClipCoordsEqual(Vertex* a, Vertex* b)
 
 void GPU3D::SubmitPolygon() noexcept
 {
+#ifdef LITEV_GX_VTX_PREFETCH
+    // the polygon's vertices are stored at CurVertexRAM[NumVertices..] (a 384 KB bank, colder than
+    // the caches): start the write-allocate of the next lines now, while it clips (no state change)
+    if (NumVertices + 8 <= 6144)
+    {
+        const char* p = (const char*)&CurVertexRAM[NumVertices];
+        __builtin_prefetch(p + 64, 1, 3); __builtin_prefetch(p + 128, 1, 3);
+        __builtin_prefetch(p + 192, 1, 3); __builtin_prefetch(p + 256, 1, 3);
+    }
+#endif
     Vertex clippedvertices[10];
     Vertex* reusedvertices[2];
     int clipstart = 0;
@@ -2180,6 +2190,9 @@ gxfifo_threaded_top:
     // commands (presumably) run when all the needed parameters have been read
     // which is where we add the remaining cycles if any
 
+#ifdef LITEV_ACCESS_STATS
+    { extern u64 LitevAccess[6][0x10000]; LitevAccess[5][0xC000 | entry.Command]++; }   // GX FIFO entries by command
+#endif
     u32 paramsRequiredCount = CmdNumParams[entry.Command];
     if (paramsRequiredCount <= 1)
     {

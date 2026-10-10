@@ -819,6 +819,10 @@ endif()
 # stale (a 64-bit sqrt writes three registers, each ran the 32-step bit loop); it is
 # computed on the next read of SQRTCNT/SQRT_RESULT or at a savestate, from the FPU with an
 # exact integer correction. Same values as INSTANT_DIVSQRT wherever they can be read.
+option(LITEV_GX_VTX_PREFETCH "GPU3D: prefetch the vertex RAM lines a polygon will be stored to (exact)" OFF)
+if (LITEV_GX_VTX_PREFETCH)
+    add_compile_definitions(LITEV_GX_VTX_PREFETCH=1)
+endif()
 option(LITEV_LAZY_DIV "Compute the divider's result on read of DIVCNT/results or at a savestate (exact)" OFF)
 if (LITEV_LAZY_DIV)
     add_compile_definitions(LITEV_LAZY_DIV=1)

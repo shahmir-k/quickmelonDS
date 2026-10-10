@@ -54,9 +54,10 @@ static void DumpAccessStats()
     std::sort(v.rbegin(), v.rend());
     for (int a = 0; a < 0x100000; a++)
         if (melonDS::LitevRomctrlPC[a] > 1000) fprintf(stderr, "ROMCTRL-PC %05X %llu\n", a << 1, (unsigned long long)melonDS::LitevRomctrlPC[a]);
-    for (size_t i = 0; i < v.size() && i < 40; i++)
+    for (size_t i = 0; i < v.size() && i < 60; i++)
     {
         int a = v[i].second.second;
+        if (a >= 0xC000 && a < 0xD000) { fprintf(stderr, "GXCMD %02X entries %llu\n", a & 0xFF, (unsigned long long)v[i].first); continue; }
         if (a >= 0xD000 && a < 0xE000) { int step = (a & 0x3FF) << 6; fprintf(stderr, "SPUCH type %d rate ~%d Hz (timer step %d) channel-samples %llu\n", (a >> 10) & 3, step ? (int)(33513982.0 / 2 / step) : 0, step, (unsigned long long)v[i].first); continue; }
         if (a >= 0xE000 && a < 0xF000) { fprintf(stderr, "IRQ %s source %d %llu\n", v[i].second.first == 4 ? "ARM9" : "ARM7", a & 0xFF, (unsigned long long)v[i].first); continue; }
         if (a >= 0xF000) fprintf(stderr, "ACCESS %s region %02X:%X %llu\n", kinds[v[i].second.first], (a >> 4) & 0xFF, a & 0xF, (unsigned long long)v[i].first);
