@@ -1015,7 +1015,7 @@ void GPU3D::StallPolygonPipeline(s32 delay, s32 nonstalldelay) noexcept
 
 
 template<int comp, s32 plane, bool attribs>
-void ClipSegment(Vertex* outbuf, Vertex* vin, Vertex* vout)
+void ClipSegment(Vertex* outbuf, const Vertex* vin, const Vertex* vout)
 {
     s64 factor_num = vin->Position[3] - (plane*vin->Position[comp]);
     s32 factor_den = factor_num - (vout->Position[3] - (plane*vout->Position[comp]));
@@ -1067,6 +1067,70 @@ int ClipAgainstPlane(const GPU3D& gpu, Vertex* vertices, int nverts, int clipsta
             }
             return nverts;
         }
+    }
+#endif
+#ifdef LITEV_GX_CLIP_LEAN
+    // Same result with fewer 64-byte vertex copies: vertices are read in place (no local copy per
+    // vertex), and a side with no vertex past it skips its pass (the pass would copy them through
+    // unchanged); the result lands in temp or vertices, copied back only when it ends in temp.
+    {
+        Vertex temp[10];
+        const Vertex* in = vertices;
+        int n = nverts;
+        bool plus = false;
+        for (int i = clipstart; i < n; i++) plus |= vertices[i].Position[comp] > vertices[i].Position[3];
+        if (plus)
+        {
+            int c = clipstart;
+            if (clipstart == 2) { temp[0] = vertices[0]; temp[1] = vertices[1]; }
+            for (int i = clipstart; i < n; i++)
+            {
+                const Vertex* vtx = &vertices[i];
+                if (vtx->Position[comp] > vtx->Position[3])
+                {
+                    if ((comp == 2) && (!(gpu.CurPolygonAttr & (1<<12)))) return 0;
+                    const Vertex* vprev = &vertices[i == 0 ? n - 1 : i - 1];
+                    if (vprev->Position[comp] <= vprev->Position[3]) ClipSegment<comp, 1, attribs>(&temp[c++], vtx, vprev);
+                    const Vertex* vnext = &vertices[i + 1 >= n ? 0 : i + 1];
+                    if (vnext->Position[comp] <= vnext->Position[3]) ClipSegment<comp, 1, attribs>(&temp[c++], vtx, vnext);
+                }
+                else
+                    temp[c++] = *vtx;
+            }
+            in = temp; n = c;
+        }
+        bool minus = false;
+        for (int i = clipstart; i < n; i++) minus |= in[i].Position[comp] < -in[i].Position[3];
+        if (minus)
+        {
+            Vertex* out = in == vertices ? temp : vertices;
+            int c = clipstart;
+            if (clipstart == 2 && out == temp) { temp[0] = vertices[0]; temp[1] = vertices[1]; }
+            for (int i = clipstart; i < n; i++)
+            {
+                const Vertex* vtx = &in[i];
+                if (vtx->Position[comp] < -vtx->Position[3])
+                {
+                    const Vertex* vprev = &in[i == 0 ? n - 1 : i - 1];
+                    if (vprev->Position[comp] >= -vprev->Position[3]) ClipSegment<comp, -1, attribs>(&out[c++], vtx, vprev);
+                    const Vertex* vnext = &in[i + 1 >= n ? 0 : i + 1];
+                    if (vnext->Position[comp] >= -vnext->Position[3]) ClipSegment<comp, -1, attribs>(&out[c++], vtx, vnext);
+                }
+                else
+                    out[c++] = *vtx;
+            }
+            in = out; n = c;
+        }
+        if (in != vertices)
+            for (int i = 0; i < n; i++) vertices[i] = in[i];
+        for (int i = 0; i < n; i++)
+        {
+            Vertex* vtx = &vertices[i];
+            vtx->Color[0] &= ~0xFFF; vtx->Color[0] += 0xFFF;
+            vtx->Color[1] &= ~0xFFF; vtx->Color[1] += 0xFFF;
+            vtx->Color[2] &= ~0xFFF; vtx->Color[2] += 0xFFF;
+        }
+        return n;
     }
 #endif
     Vertex temp[10];
@@ -3438,6 +3502,9 @@ bool GPU3D::BulkReady() const noexcept
 void GPU3D::BulkWords(const u32* words, u32 n) noexcept
 {
     Run(); // bring the engine clock up to now (the FIFO is empty: only time passes)
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap) A9HLE::GxTap->insert(A9HLE::GxTap->end(), words, words + n);
+#endif
 
     CmdFIFOEntry q[4*64]; // a word holds at most 4 commands; Run9 passes <= 64 words
     u32 m = 0;
@@ -3993,6 +4060,9 @@ u32 GPU3D::Read32(u32 addr) noexcept
 
 void GPU3D::Write8(u32 addr, u8 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap && addr >= 0x04000400 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
+#endif
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 
@@ -4043,6 +4113,9 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
 
 void GPU3D::Write16(u32 addr, u16 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap && addr >= 0x04000400 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
+#endif
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 
@@ -4130,6 +4203,9 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
 
 void GPU3D::Write32(u32 addr, u32 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap && addr >= 0x04000440 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
+#endif
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 

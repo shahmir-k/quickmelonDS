@@ -598,6 +598,12 @@ option(LITEV_A9HLE "ARM9 HLE of NitroSDK OS IRQ wake-ups / IRQ table functions (
 if (LITEV_A9HLE)
     add_compile_definitions(LITEV_A9HLE=1)
 endif()
+# A9HLE_GXCHECK (diagnostic): records the words reaching GXFIFO so LITEV_A9HLE_CHECK=1 (interpreter)
+# can check the MI_SendGXCommandAsync hook (A9HLE 5.) against the guest. Never in a shipping build.
+option(LITEV_A9HLE_GXCHECK "Diagnostic: A9HLE GX send compare mode (GXFIFO word tap)" OFF)
+if (LITEV_A9HLE_GXCHECK)
+    add_compile_definitions(LITEV_A9HLE_GXCHECK=1)
+endif()
 
 # A7PROF (diagnostic): per-guest-function ARM7 (and ARM9: env LITEV_A9PROF) profile in the interpreter (--mode interp,
 # env LITEV_A7PROF=<out prefix>). See src/ARM7Prof.h. Never in a shipping build.
@@ -773,6 +779,13 @@ endif()
 option(LITEV_GX_CLIP_REJECT "Trivial reject before the polygon clipper (exact)" OFF)
 if (LITEV_GX_CLIP_REJECT)
     add_compile_definitions(LITEV_GX_CLIP_REJECT=1)
+endif()
+
+# GX_CLIP_LEAN: the polygon clipper (ClipAgainstPlane) reads vertices in place instead of copying
+# each one, and skips a plane side with no vertex past it (that pass only copies). Exact.
+option(LITEV_GX_CLIP_LEAN "Polygon clipper without the per-vertex copies (exact)" OFF)
+if (LITEV_GX_CLIP_LEAN)
+    add_compile_definitions(LITEV_GX_CLIP_LEAN=1)
 endif()
 option(LITEV_JIT_CYCLE_BATCH "Batch the per-instruction cycle adds of unconditional non-branch instructions into one add before the next cycle read (AArch64, exact)" OFF)
 if (LITEV_JIT_CYCLE_BATCH)
