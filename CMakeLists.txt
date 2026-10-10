@@ -579,6 +579,15 @@ if (LITEV_JIT_RAS)
     endif()
 endif()
 
+# CP15_INLINE: the JIT emits ARM9 data-cache maintenance MCRs (c7, no-ops in CP15Write) and
+# the DTCM-setting MRC (c9,c1,0) inline instead of an interpreter fallback (full register
+# spill + C++ call). Same cycles -> exact. Runtime: debug.litev.cp15inline (prop on
+# Android, env elsewhere; default on), latched at each block-cache reset.
+option(LITEV_JIT_CP15_INLINE "JIT: inline no-op cache-maintenance MCRs and the DTCM-setting MRC" OFF)
+if (LITEV_JIT_CP15_INLINE)
+    add_compile_definitions(LITEV_JIT_CP15_INLINE=1)
+endif()
+
 # Unit 5 (M2.1): event-true scheduler slices. When ON, each scheduler iteration
 # runs the CPUs to the TRUE next deadline (next scheduled event / frame end /
 # next timer overflow) instead of the fixed kMaxIterationCycles cap, so the CPUs
