@@ -4,6 +4,12 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <ctime>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#include <unistd.h>
+#endif
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <sys/prctl.h>
@@ -23,6 +29,48 @@ void NameThread(const char* n)
 #else
     (void)n;
 #endif
+}
+
+namespace
+{
+struct RingEnt { double t, cpu; int ev; int tid; };
+std::atomic<int> RingN { 0 };
+}
+
+void Ev(int ev)
+{
+    // magic statics: thread-safe one-time init
+    static const int RingCap = [] {
+        int cap = 0;
+#ifdef __ANDROID__
+        char b[PROP_VALUE_MAX] = {};
+        if (__system_property_get("debug.litev.pipering", b) > 0) cap = atoi(b);
+#endif
+        return cap > 0 ? cap : 0;
+    }();
+    static RingEnt* const Ring = RingCap ? (RingEnt*)calloc(RingCap, sizeof(RingEnt)) : nullptr;
+    if (!Ring) return;
+    const int i = RingN.fetch_add(1, std::memory_order_relaxed);
+    if (i >= RingCap) return;
+    timespec c; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c);
+    Ring[i] = { NowMs(), c.tv_sec * 1e3 + c.tv_nsec / 1e6, ev, 
+#ifdef __ANDROID__
+        (int)gettid()
+#else
+        0
+#endif
+    };
+    if (i == RingCap - 1)
+    {
+        if (FILE* f = fopen("/sdcard/Android/data/com.sereneds.app/files/pipering.csv", "w"))
+        {
+            fprintf(f, "t_ms,cpu_ms,ev,tid\n");
+            for (int k = 0; k < RingCap; k++)
+                fprintf(f, "%.3f,%.3f,%d,%d\n", Ring[k].t, Ring[k].cpu, Ring[k].ev, Ring[k].tid);
+            fclose(f);
+        }
+        Platform::Log(Platform::LogLevel::Info, "LITEV_PIPERING wrote %d events\n", RingCap);
+    }
 }
 
 void Tick()
