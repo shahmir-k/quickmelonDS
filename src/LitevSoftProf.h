@@ -90,6 +90,16 @@ enum PipeEv { EV_VBL_IN, EV_VBL_BAR, EV_KICK, EV_S2D_BEG, EV_S2D_END, EV_PRES_BE
               EV_PRES_Q };
 void Ev(int ev);
 
+// Stall log (debug.litev.stalllog=1): emu-thread waits over 3 ms and GL 3D jobs over 10 ms are
+// logged (LITEV_STALL lines) with the frame and where the GL job's time went, to classify
+// one-off slow frames. The GL counters are written by the GL 3D thread only.
+bool StallLogOn();
+struct GLJobStat { double TexNew, TexUp, Draw, DrawMax; int TexNewN, TexUpN, DrawN, DrawMaxKey; };
+extern GLJobStat GLJ;
+void StallWait(const char* site, double ms, unsigned frame);
+void StallGLJob(unsigned frame, double wall, double cpu);
+void StallFrame(unsigned frame);   // emu thread, each VBlank kick: logs gaps over 20 ms
+
 } // namespace LitevSP
 } // namespace melonDS
 
@@ -97,6 +107,16 @@ void Ev(int ev);
 #define LSP_ADD(f, d)      ::melonDS::LitevSP::S.f.Add(d)
 #define LSP_NAME(n)        ::melonDS::LitevSP::NameThread(n)
 #define LSP_EV(e)          ::melonDS::LitevSP::Ev(::melonDS::LitevSP::e)
+// time stmt into GLJ.<f> (+ count <f>N) when the stall log is on
+#define LSP_GLT(f, stmt)   do { if (::melonDS::LitevSP::StallLogOn()) { const double t_ = LSP_NOW(); stmt; \
+                               ::melonDS::LitevSP::GLJ.f += LSP_NOW() - t_; ::melonDS::LitevSP::GLJ.f##N++; } else { stmt; } } while (0)
+// a draw call: also keep the slowest one and its key
+#define LSP_GLDRAW(key, stmt) do { if (::melonDS::LitevSP::StallLogOn()) { const double t_ = LSP_NOW(); stmt; \
+                               const double d_ = LSP_NOW() - t_; auto& j_ = ::melonDS::LitevSP::GLJ; j_.Draw += d_; j_.DrawN++; \
+                               if (d_ > j_.DrawMax) { j_.DrawMax = d_; j_.DrawMaxKey = (int)(key); } } else { stmt; } } while (0)
+// an emu-thread wait
+#define LSP_WAIT(site, frame, stmt) do { if (::melonDS::LitevSP::StallLogOn()) { const double t_ = LSP_NOW(); stmt; \
+                               ::melonDS::LitevSP::StallWait(site, LSP_NOW() - t_, frame); } else { stmt; } } while (0)
 
 #else   // !LITEV_SOFTPROF
 
@@ -104,6 +124,9 @@ void Ev(int ev);
 #define LSP_ADD(f, d)      ((void)0)
 #define LSP_NAME(n)        ((void)0)
 #define LSP_EV(e)          ((void)0)
+#define LSP_GLT(f, stmt)   do { stmt; } while (0)
+#define LSP_GLDRAW(key, stmt) do { stmt; } while (0)
+#define LSP_WAIT(site, frame, stmt) do { stmt; } while (0)
 
 #endif  // LITEV_SOFTPROF
 #endif  // LITEV_SOFTPROF_H

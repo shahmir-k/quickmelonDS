@@ -73,6 +73,45 @@ void Ev(int ev)
     }
 }
 
+bool StallLogOn()
+{
+    static const bool on = [] {
+#ifdef __ANDROID__
+        char b[PROP_VALUE_MAX] = {};
+        return __system_property_get("debug.litev.stalllog", b) > 0 && atoi(b) != 0;
+#else
+        const char* e = getenv("LITEV_STALLLOG");
+        return e && atoi(e) != 0;
+#endif
+    }();
+    return on;
+}
+
+GLJobStat GLJ;
+
+void StallWait(const char* site, double ms, unsigned frame)
+{
+    if (ms >= 3.0) Platform::Log(Platform::LogLevel::Info, "LITEV_STALL wait %s %.1f ms frame %u t %.3f\n", site, ms, frame, NowMs());
+}
+
+void StallGLJob(unsigned frame, double wall, double cpu)
+{
+    GLJobStat& j = GLJ;
+    if (wall >= 10.0)
+        Platform::Log(Platform::LogLevel::Info, "LITEV_STALL gljob frame %u wall %.1f cpu %.1f texnew %d/%.1f texup %d/%.1f draws %d/%.1f max %.1f key %08x t %.3f\n",
+                      frame, wall, cpu, j.TexNewN, j.TexNew, j.TexUpN, j.TexUp, j.DrawN, j.Draw, j.DrawMax, j.DrawMaxKey, NowMs());
+    j = GLJobStat{};
+}
+
+void StallFrame(unsigned frame)
+{
+    static double last = 0;
+    const double t = NowMs();
+    if (last > 0 && t - last > 20.0)
+        Platform::Log(Platform::LogLevel::Info, "LITEV_STALL vbl frame %u gap %.1f t %.3f\n", frame, t - last, t);
+    last = t;
+}
+
 void Tick()
 {
     int f = S.Frames.fetch_add(1, std::memory_order_relaxed) + 1;

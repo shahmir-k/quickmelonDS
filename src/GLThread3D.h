@@ -63,7 +63,7 @@ public:
         const double tw = NowMs();
         if (LastKick > 0) KickGap += tw - LastKick;
         LastKick = tw;
-        WaitQueued();
+        LSP_WAIT("gl-queued", GPU3D.NDS.NumFrames, WaitQueued());
         const double tp = NowMs();
         const int slot = Slot;
         Slot ^= 1;
@@ -79,7 +79,7 @@ public:
 #endif
         const int bank = GL->PrepareFrame(slot, [this] {
             const double t = NowMs();
-            Wait();
+            LSP_WAIT("gl-prep", GPU3D.NDS.NumFrames, Wait());
             PrepWait += NowMs() - t;
         }, copy);
         PrepWait += tp - tw; PrepMs += NowMs() - tp;
@@ -91,13 +91,17 @@ public:
         GLsync inFence = nullptr;
         if (Parent && Threaded) { inFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0); glFlush(); }
         const double tq = NowMs();
-        Run([this, tq, seq, c, slot, inFence] {
+        const u32 frame = GPU3D.NDS.NumFrames; (void)frame;
+        Run([this, tq, seq, c, slot, inFence, frame] {
             LSP_EV(EV_GL3D_BEG);
             const double t0 = NowMs(), c0 = CpuMs();
             JobQueued += t0 - tq;
             if (inFence) { glWaitSync(inFence, 0, GL_TIMEOUT_IGNORED); glDeleteSync(inFence); }
             GL->RenderPreparedFrame(slot);
             JobWall += NowMs() - t0; JobCpu += CpuMs() - c0; JobN++;
+#ifdef LITEV_SOFTPROF
+            if (LitevSP::StallLogOn()) LitevSP::StallGLJob(frame, NowMs() - t0, CpuMs() - c0);
+#endif
             if (Threaded)
             {
                 if (Fence[c]) glDeleteSync(Fence[c]);
@@ -122,7 +126,7 @@ public:
         const u32 reused = GPU3D.CurRAMBank ^ 1;
         if (DoneSeq.load(std::memory_order_acquire) >= BankSeq[reused]) return;
         const double t = NowMs();
-        Wait();
+        LSP_WAIT("gl-finish", GPU3D.NDS.NumFrames, Wait());
         FinishWait += NowMs() - t;
         BankWaitN++;
         CopyHold = 60;   // the GL thread is behind: snapshot for a second before trying again
@@ -131,7 +135,7 @@ public:
     // block until the job that renders colour buffer c has been issued (its fence exists)
     void WaitColor(int c)
     {
-        if (DoneSeq.load(std::memory_order_acquire) < ColorSeq[c]) Wait();
+        if (DoneSeq.load(std::memory_order_acquire) < ColorSeq[c]) LSP_WAIT("gl-color", GPU3D.NDS.NumFrames, Wait());
     }
     // caller's context: wait (GPU-side) for colour buffer c's render, return its texture
     GLuint SyncColor(int c)
