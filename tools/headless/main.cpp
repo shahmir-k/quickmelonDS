@@ -681,6 +681,9 @@ int main(int argc, char** argv)
         video = popen(cmd.c_str(), "w");
     }
 
+#ifdef LITEV_FF_HEADLESS3D
+    if (getenv("LITEV_FFHEADLESS")) nds->GPU.FFHeadless3D = atoi(getenv("LITEV_FFHEADLESS")) != 0;   // the app's fast-forward mode
+#endif
     // LITEV_LOOP=<n>: run the --frames window n more times from --savestate (profile a short burst)
     int loopsLeft = getenv("LITEV_LOOP") ? atoi(getenv("LITEV_LOOP")) : 0;
     for (int frame = 0; frame < opt.frames; frame++)

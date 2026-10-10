@@ -35,6 +35,14 @@
 
 #define INTERNAL_SAMPLE_RATE 16756991.f
 
+// LITEV_SPU_INLINE: the per-sample decoders and FIFO reads are inlined into SPUChannel::Run, which
+// calls them once per sample per channel (~0.3M calls/s with PW's ADPCM music). Same code.
+#ifdef LITEV_SPU_INLINE
+#define LITEV_SPU_INL __attribute__((always_inline)) inline
+#else
+#define LITEV_SPU_INL
+#endif
+
 namespace melonDS
 {
 using Platform::Log;
@@ -435,6 +443,14 @@ void SPUChannel::FIFO_BufferData()
     {
         for (u32 i = 0; i < burstlen; i += 4)
         {
+#ifdef LITEV_SPU_FAST_FETCH
+            // sample data is almost always in main RAM: read it directly (what ARM7Read32 does
+            // for 0x02000000-0x02FFFFFF) instead of through the full ARM7 bus switch
+            const u32 a = (SrcAddr + FIFOReadOffset) & ~0x3;
+            if ((a & 0xFF000000) == 0x02000000)
+                FIFO[FIFOWritePos] = *(u32*)&NDS.MainRAM[a & NDS.MainRAMMask];
+            else
+#endif
             FIFO[FIFOWritePos] = NDS.ARM7Read32(SrcAddr + FIFOReadOffset);
             FIFOReadOffset += 4;
             FIFOWritePos++;
@@ -456,7 +472,7 @@ void SPUChannel::FIFO_BufferData()
 }
 
 template<typename T>
-T SPUChannel::FIFO_ReadData()
+LITEV_SPU_INL T SPUChannel::FIFO_ReadData()
 {
     T ret = *(T*)&((u8*)FIFO)[FIFOReadPos];
 
@@ -498,7 +514,7 @@ void SPUChannel::Start()
     }
 }
 
-void SPUChannel::NextSample_PCM8()
+LITEV_SPU_INL void SPUChannel::NextSample_PCM8()
 {
     Pos++;
     if (Pos < 0) return;
@@ -521,7 +537,7 @@ void SPUChannel::NextSample_PCM8()
     CurSample = val << 8;
 }
 
-void SPUChannel::NextSample_PCM16()
+LITEV_SPU_INL void SPUChannel::NextSample_PCM16()
 {
     Pos++;
     if (Pos < 0) return;
@@ -567,7 +583,7 @@ static const struct ADPCMTables
 } ADPCMTabs;
 #endif
 
-void SPUChannel::NextSample_ADPCM()
+LITEV_SPU_INL void SPUChannel::NextSample_ADPCM()
 {
     Pos++;
     if (Pos < 8)
@@ -663,13 +679,13 @@ void SPUChannel::NextSample_ADPCM()
     CurSample = ADPCMVal;
 }
 
-void SPUChannel::NextSample_PSG()
+LITEV_SPU_INL void SPUChannel::NextSample_PSG()
 {
     Pos++;
     CurSample = PSGTable[(Cnt >> 24) & 0x7][Pos & 0x7];
 }
 
-void SPUChannel::NextSample_Noise()
+LITEV_SPU_INL void SPUChannel::NextSample_Noise()
 {
     if (NoiseVal & 0x1)
     {
