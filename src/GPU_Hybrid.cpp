@@ -246,7 +246,7 @@ void HybridRenderer::Start3DRendering()
 
 void HybridRenderer::Finish3DRendering()
 {
-    Rend3D->FinishRendering();   // no-op: the GL thread renders from a snapshot
+    Rend3D->FinishRendering();   // LITEV_GL_NOSNAPCOPY: polygon-bank barrier; else a no-op
 }
 
 void HybridRenderer::Restart3DRendering()
@@ -715,14 +715,14 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
         ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0;
         GLThread3D* t = Thread3D();
         if (t->JobN)
-            Platform::Log(Platform::Info, "LITEV_HYB 3d-job: n=%d queued=%.2f wall=%.2f cpu=%.2f incl-flush=%.2f | emu: prev-job wait=%.2f prepare=%.2f kick-gap=%.2f job-end-from-kick=%.2f polyram-wait=%.2f ms/job\n",
-                          t->JobN, t->JobQueued / t->JobN, t->JobWall / t->JobN, t->JobCpu / t->JobN, t->JobTail / t->JobN, t->PrepWait / t->JobN, t->PrepMs / t->JobN, t->KickGap / t->JobN, t->JobEndFromKick / t->JobN, t->FinishWait / t->JobN);
+            Platform::Log(Platform::Info, "LITEV_HYB 3d-job: n=%d queued=%.2f wall=%.2f cpu=%.2f incl-flush=%.2f | emu: prev-job wait=%.2f prepare=%.2f kick-gap=%.2f job-end-from-kick=%.2f polyram-wait=%.2f ms/job (snapcopy %d, bank waits %d)\n",
+                          t->JobN, t->JobQueued / t->JobN, t->JobWall / t->JobN, t->JobCpu / t->JobN, t->JobTail / t->JobN, t->PrepWait / t->JobN, t->PrepMs / t->JobN, t->KickGap / t->JobN, t->JobEndFromKick / t->JobN, t->FinishWait / t->JobN, t->CopyN, t->BankWaitN);
         if (t->JobN)
             Platform::Log(Platform::Info, "LITEV_HYB 3d-draws: %.1f draws %.1f polys per job\n",
                           (double)GL3D()->StatDraws / t->JobN, (double)GL3D()->StatPolys / t->JobN);
         GL3D()->StatDraws = GL3D()->StatPolys = 0;
         OpenGL::GLStatLog(60);
-        t->JobQueued = t->JobWall = t->JobCpu = t->PrepWait = t->PrepMs = t->JobTail = t->KickGap = t->JobEndFromKick = t->FinishWait = 0; t->JobN = 0;
+        t->JobQueued = t->JobWall = t->JobCpu = t->PrepWait = t->PrepMs = t->JobTail = t->KickGap = t->JobEndFromKick = t->FinishWait = 0; t->JobN = t->CopyN = t->BankWaitN = 0;
     }
 }
 

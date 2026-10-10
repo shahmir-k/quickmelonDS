@@ -882,6 +882,11 @@ endif()
 # GL 3D, W-buffer frames: depth 1 - z0/w from the rasterizer instead of gl_FragDepth, so the GPU's
 # early depth test works (display only; same depth order, fog converts back to w).
 # Runtime: debug.litev.glwearlyz=0 off.
+option(LITEV_GL_NOSNAPCOPY "GL 3D (threaded): render from GPU3D's polygon/vertex bank in place, no per-frame copy (waits at VBlank if a job still reads a reused bank)" OFF)
+if (LITEV_GL_NOSNAPCOPY)
+    add_compile_definitions(LITEV_GL_NOSNAPCOPY=1)
+endif()
+
 option(LITEV_GL_WBUF_EARLYZ "GL 3D: W-buffer depth without gl_FragDepth (early-Z)" OFF)
 if (LITEV_GL_WBUF_EARLYZ)
     add_compile_definitions(LITEV_GL_WBUF_EARLYZ=1)

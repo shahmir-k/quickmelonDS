@@ -428,6 +428,12 @@ void GLRenderer::Stop()
     // TODO: do we even need this anymore?
 }
 
+// a loaded state rewrites GPU3D's polygon/vertex banks, which a 3D job may read in place
+void GLRenderer::PreSavestate()
+{
+    if (Thread3D) Thread3D->Wait();
+}
+
 void GLRenderer::PostSavestate()
 {
     Reset();

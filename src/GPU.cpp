@@ -1431,7 +1431,12 @@ void GPU::StartScanline(u32 line) noexcept
             // 215) and this barrier, so the emu stalled ~9 ms EVERY frame. The game
             // only flushes geometry every OTHER frame, so the raster genuinely has
             // two frames of headroom; this takes it.
-            if (GPU3D.NeedsRenderBarrier())
+            if (GPU3D.NeedsRenderBarrier()
+#ifdef LITEV_GL_NOSNAPCOPY
+                // the bank swap below also happens with rendering off: the GL 3D's bank barrier
+                || GPU3D.FlushRequest
+#endif
+               )
 #endif
             Rend->Finish3DRendering();
         }

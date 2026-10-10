@@ -1643,14 +1643,18 @@ polygons_done:
 
 void GLRenderer3D::RenderFrame()
 {
+#ifdef LITEV_GL_NOSNAPCOPY
+    PrepareFrame(0, {}, false);   // rendered right here: nothing rewrites the bank meanwhile
+#else
     PrepareFrame();
+#endif
     RenderPreparedFrame();
 }
 
 // Emu-thread half of RenderFrame: VRAM coherence for the texture cache (reads emu-side
 // dirty tracking, writes the flat texture VRAM). Everything else RenderPreparedFrame reads
 // (Render* registers, polygon RAM, flat VRAM) is stable until the next VBlank barrier.
-void GLRenderer3D::PrepareFrame(int slot, const std::function<void()>& beforeVRAMWrite)
+int GLRenderer3D::PrepareFrame(int slot, const std::function<void()>& beforeVRAMWrite, bool copyPolys)
 {
     Texcache.Prepare(slot, [&] { if (beforeVRAMWrite) beforeVRAMWrite(); });
 
@@ -1677,6 +1681,15 @@ void GLRenderer3D::PrepareFrame(int slot, const std::function<void()>& beforeVRA
     // the polygons and their vertices themselves (the job reads them through all its passes,
     // and GPU3D rewrites this bank once its VBlank after next swaps it back: a job running that
     // late, as in Pokemon White's town intro, drew half-rewritten polygons as wedges)
+    int bank = -1;
+    if (!copyPolys)
+    {
+        // LITEV_GL_NOSNAPCOPY: only the (sorted) pointer list; GLThread3D keeps the bank unwritten
+        const u32 np = n.RenderNumPolygons;
+        memcpy(n.RenderPolygonRAM, GPU3D.RenderPolygonRAM.data(), np * sizeof(Polygon*));
+        if (np) bank = n.RenderPolygonRAM[0] >= &GPU3D.PolygonRAM[2048];
+    }
+    else
     {
         std::vector<Polygon>& pc = PolyCopy[slot];
         std::vector<Vertex>& vc = VtxCopy[slot];
@@ -1714,6 +1727,7 @@ void GLRenderer3D::PrepareFrame(int slot, const std::function<void()>& beforeVRA
     if (!n.Skip && ColorRing > 1)
         CurColor = (CurColor + 1) % ColorRing;
     n.Color = CurColor;
+    return n.Skip ? -1 : bank;   // a skipped frame reads no polygons
 }
 
 void GLRenderer3D::RenderPreparedFrame(int slot)

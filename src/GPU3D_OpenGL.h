@@ -54,7 +54,9 @@ public:
     // slot: up to two prepared frames may be outstanding (one rendering, one queued);
     // beforeVRAMWrite runs before PrepareFrame modifies the flat texture VRAM a running
     // frame may still be reading (the caller waits for it there).
-    void PrepareFrame(int slot = 0, const std::function<void()>& beforeVRAMWrite = {});
+    // copyPolys=false (LITEV_GL_NOSNAPCOPY): the job reads GPU3D's polygon/vertex bank in place;
+    // returns that bank (0/1, -1: none read), which the caller must keep unwritten until the job ends.
+    int PrepareFrame(int slot = 0, const std::function<void()>& beforeVRAMWrite = {}, bool copyPolys = true);
 #ifdef LITEV_HYB_TEXSTAGE
     void EnableTexStaging() { Texcache.EnableStaging(); }
 #endif

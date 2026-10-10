@@ -4,11 +4,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <time.h>
 #include "GPU3D.h"
 #include "GPU3D_OpenGL.h"
 #include "GLWorker.h"
+#if defined(LITEV_GL_NOSNAPCOPY) && defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 namespace melonDS
 {
@@ -62,13 +66,24 @@ public:
         const double tp = NowMs();
         const int slot = Slot;
         Slot ^= 1;
-        GL->PrepareFrame(slot, [this] {
+#ifdef LITEV_GL_NOSNAPCOPY
+        // read the polygons in place unless this job will likely still run when its bank is
+        // reused (GL thread still busy with the previous job, or a recent in-place job made
+        // FinishRendering wait): then snapshot them as before
+        const bool copy = !NoSnapCopy() || DoneSeq.load(std::memory_order_acquire) < Seq || CopyHold > 0;
+        if (CopyHold > 0) CopyHold--;
+        CopyN += copy;
+#else
+        const bool copy = true;
+#endif
+        const int bank = GL->PrepareFrame(slot, [this] {
             const double t = NowMs();
             Wait();
             PrepWait += NowMs() - t;
-        });
+        }, copy);
         PrepWait += tp - tw; PrepMs += NowMs() - tp;
         const u64 seq = ++Seq;
+        if (!copy && bank >= 0) BankSeq[bank] = seq;
         const int c = GL->GetCurColor();
         ColorSeq[c] = seq;   // (unchanged colour if the frame is skipped: still waits right)
         // GLRenderer: its capture textures were written on the caller's context this frame
@@ -92,9 +107,24 @@ public:
             DoneSeq.store(seq, std::memory_order_release);
         }, false);
     }
-    // The render state AND the polygons/vertices are snapshotted in PrepareFrame (copies the
-    // job owns), so VBlank never has to wait for the job.
-    void FinishRendering() override {}
+    // The render state is snapshotted in PrepareFrame. The polygons/vertices too, except under
+    // LITEV_GL_NOSNAPCOPY: a job may then read GPU3D's polygon/vertex bank in place. GPU::VBlank
+    // calls this right before GPU3D::VBlank, whose swap makes the other bank the one the next
+    // geometry overwrites (nothing writes a bank before that: geometry stalls on the flush), so
+    // wait here for a job still reading that bank.
+    void FinishRendering() override
+    {
+#ifdef LITEV_GL_NOSNAPCOPY
+        if (!GPU3D.FlushRequest) return;
+        const u32 reused = GPU3D.CurRAMBank ^ 1;
+        if (DoneSeq.load(std::memory_order_acquire) >= BankSeq[reused]) return;
+        const double t = NowMs();
+        Wait();
+        FinishWait += NowMs() - t;
+        BankWaitN++;
+        CopyHold = 60;   // the GL thread is behind: snapshot for a second before trying again
+#endif
+    }
     // block until the job that renders colour buffer c has been issued (its fence exists)
     void WaitColor(int c)
     {
@@ -119,6 +149,24 @@ public:
     u64 Seq = 0, ColorSeq[GLRenderer3D::MaxColorRing] {};
     int Slot = 0;
     std::atomic<u64> DoneSeq { 0 };
+    // LITEV_GL_NOSNAPCOPY: last job reading polygon/vertex bank b in place (emu thread only)
+    u64 BankSeq[2] {};
+    int CopyHold = 0, CopyN = 0, BankWaitN = 0;
+#ifdef LITEV_GL_NOSNAPCOPY
+    static bool NoSnapCopy()   // debug.litev.glnosnapcopy=0 (env LITEV_GL_NOSNAPCOPY=0): always snapshot
+    {
+        static const bool on = [] {
+#ifdef __ANDROID__
+            char b[PROP_VALUE_MAX] = {};
+            return !(__system_property_get("debug.litev.glnosnapcopy", b) > 0 && atoi(b) == 0);
+#else
+            const char* e = getenv("LITEV_GL_NOSNAPCOPY");
+            return !(e && atoi(e) == 0);
+#endif
+        }();
+        return on;
+    }
+#endif
     // job timing (GL thread), read/reset by HybridRenderer's log while the job is idle
     double JobQueued = 0, JobWall = 0, JobCpu = 0, PrepWait = 0, PrepMs = 0, JobTail = 0, KickGap = 0, LastKick = 0, JobEndFromKick = 0, FinishWait = 0; int JobN = 0;
     static double NowMs() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
