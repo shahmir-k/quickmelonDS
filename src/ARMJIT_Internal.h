@@ -85,6 +85,40 @@ struct __attribute__((packed)) AddressRange
 };
 
 
+#ifdef LITEV_JIT_COMPILE_STATS
+// JIT diagnosis: where ARMJIT::CompileBlock spends its time (ticks of JitTicks())
+enum JitPhase
+{
+    JitPhase_Lookup,    // existing-block lookup, set-up
+    JitPhase_Decode,    // fetch + decode + interpret the block once (+ HLE hook checks)
+    JitPhase_Hash,      // literal checks, code hashes, restore-candidate lookup
+    JitPhase_Alloc,     // JitBlock allocation + fill, flag flood fill
+    JitPhase_Emit,      // Compiler::CompileBlock (includes JitPhase_Flush)
+    JitPhase_Protect,   // code-page protection (mprotect) + per-512-byte range block lists
+    JitPhase_Insert,    // block map + fast lookup entry
+    JitPhase_Link,      // LinkBlock
+    JitPhase_Flush,     // instruction-cache flush of the new block (part of JitPhase_Emit)
+    JitPhase_Count
+};
+extern u64 JitCompileTicks[JitPhase_Count];
+inline u64 JitTicks()
+{
+#if defined(__aarch64__)
+    u64 t; asm volatile("mrs %0, cntvct_el0" : "=r"(t)); return t;
+#else
+    return 0;
+#endif
+}
+inline u64 JitTicksPerSec()
+{
+#if defined(__aarch64__)
+    u64 f; asm volatile("mrs %0, cntfrq_el0" : "=r"(f)); return f;
+#else
+    return 1;
+#endif
+}
+#endif
+
 typedef void (*InterpreterFunc)(ARM* cpu);
 extern InterpreterFunc InterpretARM[];
 extern InterpreterFunc InterpretTHUMB[];

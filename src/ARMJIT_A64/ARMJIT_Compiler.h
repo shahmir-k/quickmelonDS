@@ -30,6 +30,7 @@
 
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
 
 namespace melonDS
 {
@@ -96,6 +97,50 @@ struct LoadStorePatch
     s32 PatchOffset;
     u32 PatchSize;
 };
+
+#ifdef LITEV_JIT_PATCHLOG
+// Code offset -> LoadStorePatch as a vector sorted by offset. The compiler emits code in
+// increasing offsets, so a new entry is an append (sequential writes); lookups (fault handler,
+// rare) binary-search. The hash maps it replaces scattered one random write per compiled memory
+// access over a table that grew to megabytes (entries are kept for store re-promotion): a cache +
+// TLB miss each on the A55, ~8% of a compile on the RG DS. Same contents and results.
+class PatchLog
+{
+public:
+    struct Slot { ptrdiff_t first; LoadStorePatch second; bool dead; };
+    Slot* end() const { return nullptr; }
+    Slot* find(ptrdiff_t key)
+    {
+        Slot* s = lower(key);
+        return s != Slots.data() + Slots.size() && s->first == key && !s->dead ? s : nullptr;
+    }
+    void erase(Slot* s) { s->dead = true; }
+    LoadStorePatch& operator[](ptrdiff_t key)
+    {
+        if (Slots.empty() || Slots.back().first < key)
+        {
+            Slots.push_back({key, {}, false});
+            return Slots.back().second;
+        }
+        Slot* s = lower(key);   // not in emission order (never seen, kept exact anyway)
+        if (s != Slots.data() + Slots.size() && s->first == key)
+        {
+            if (s->dead) { s->dead = false; s->second = {}; }
+            return s->second;
+        }
+        return Slots.insert(Slots.begin() + (s - Slots.data()), Slot{key, {}, false})->second;
+    }
+    void clear() { Slots.clear(); }
+    void reserve(size_t n) { Slots.reserve(n); }
+private:
+    std::vector<Slot> Slots;
+    Slot* lower(ptrdiff_t key)
+    {
+        return std::lower_bound(Slots.data(), Slots.data() + Slots.size(), key,
+                                [](const Slot& a, ptrdiff_t k) { return a.first < k; });
+    }
+};
+#endif
 
 #ifdef LITEV_JIT_PATCHMAP_FLAT
 // Open-addressing map code offset -> LoadStorePatch for the few operations the compiler needs
@@ -600,7 +645,9 @@ public:
     u32 JitMemSecondarySize;
     u32 JitMemMainSize;
 
-#ifdef LITEV_JIT_PATCHMAP_FLAT
+#if defined(LITEV_JIT_PATCHLOG)
+    PatchLog LoadStorePatches;
+#elif defined(LITEV_JIT_PATCHMAP_FLAT)
     FlatPatchMap LoadStorePatches;
 #else
     std::unordered_map<ptrdiff_t, LoadStorePatch> LoadStorePatches;

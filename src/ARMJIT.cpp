@@ -800,12 +800,24 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
         }
         else
         {
+#ifdef LITEV_JIT_FLATMAPS
+            pending.insert(link.TargetAddr, LinkSite{block->StartAddr, link.PatchOffset});
+#else
             pending.insert({link.TargetAddr, LinkSite{block->StartAddr, link.PatchOffset}});
+#endif
         }
     }
 
     // (b) drain pending links waiting on THIS block's start address.
     u32 entryOff = JITCompiler.SubEntryOffset(block->EntryPoint);
+#ifdef LITEV_JIT_FLATMAPS
+    pending.drain(block->StartAddr, [&](const LinkSite& site)
+    {
+        JITCompiler.PatchLinkSite(site.PatchOffset, entryOff);
+        block->Incoming.Add(site);
+        LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
+    });
+#else
     auto range = pending.equal_range(block->StartAddr);
     for (auto it = range.first; it != range.second; ++it)
     {
@@ -815,6 +827,7 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
         LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
     }
     pending.erase(range.first, range.second);
+#endif
 
     JitEnableExecute();
 
@@ -835,7 +848,11 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
     {
         LinkSite site = block->Incoming[i];
         JITCompiler.PatchLinkSite(site.PatchOffset, JITCompiler.UnlinkedSiteTarget(block->Num, site.PatchOffset));
+#ifdef LITEV_JIT_FLATMAPS
+        pending.insert(block->StartAddr, site);
+#else
         pending.insert({block->StartAddr, site});
+#endif
         LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksUnlinked);
     }
     block->Incoming.Clear();
@@ -847,6 +864,10 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
     {
         const OutgoingLink& link = block->Outgoing[i];
 
+#ifdef LITEV_JIT_FLATMAPS
+        bool found = pending.remove_one(link.TargetAddr, [&](const LinkSite& s)
+            { return s.PatchOffset == link.PatchOffset && s.SourceBlockAddr == block->StartAddr; });
+#else
         bool found = false;
         auto range = pending.equal_range(link.TargetAddr);
         for (auto pit = range.first; pit != range.second; ++pit)
@@ -859,6 +880,7 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
                 break;
             }
         }
+#endif
         if (!found)
         {
             auto it = blocks.find(link.TargetAddr);
@@ -923,7 +945,7 @@ void ARMJIT::ValidateLinkSites() noexcept
         }
     };
 
-    auto walk = [&](std::unordered_map<u32, JitBlock*>& map)
+    auto walk = [&](auto& map)
     {
         for (auto& kv : map)
         {
@@ -981,10 +1003,20 @@ void ARMJIT::SetFastMemory(bool enabled) noexcept
 }
 
 u64 JitCompileCount = 0;   // blocks compiled so far (headless LITEV_FRAME_MS)
+#ifdef LITEV_JIT_COMPILE_STATS
+// time per compile phase in timer ticks (JitTicks(); JitTicksPerSec), see JitPhase
+u64 JitCompileTicks[JitPhase_Count] = {};
+#define JIT_PHASE(p) do { u64 t_ = JitTicks(); JitCompileTicks[p] += t_ - jitT; jitT = t_; } while (0)
+#else
+#define JIT_PHASE(p) do {} while (0)
+#endif
 
 void ARMJIT::CompileBlock(ARM* cpu) noexcept
 {
     JitCompileCount++;
+#ifdef LITEV_JIT_COMPILE_STATS
+    u64 jitT = JitTicks();
+#endif
     bool thumb = cpu->CPSR & 0x20;
 
     u32 blockAddr = cpu->R[15] - (thumb ? 2 : 4);
@@ -1027,6 +1059,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     FetchedInstr instrs[MaxBlockSize];
     int i = 0;
     u32 r15 = cpu->R[15];
+    JIT_PHASE(JitPhase_Lookup);
 
 #if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
     // + room for an A9HLE/A7HLE hook block's dependency ranges (see below)
@@ -1400,6 +1433,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
             FloodFillSetFlags(instrs, i - 2, !secondaryFlagReadCond ? instrs[i - 1].Info.ReadFlags : 0xF);
     } while(!instrs[i - 1].Info.EndBlock && i < MaxBlockSize && !cpu->Halted && (!cpu->IRQ || (cpu->CPSR & 0x80)));
 
+    JIT_PHASE(JitPhase_Decode);
     if (numLiterals)
     {
         for (u32 j = 0; j < numWriteAddrs; j++)
@@ -1461,6 +1495,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         mayRestore = false;
     }
 
+    JIT_PHASE(JitPhase_Hash);
     JitBlock* block;
     if (!mayRestore)
     {
@@ -1481,10 +1516,12 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         block->StartAddrLocal = localAddr;
 
         FloodFillSetFlags(instrs, i - 1, 0xF);
+        JIT_PHASE(JitPhase_Alloc);
 
         JitEnableWrite();
         block->EntryPoint = JITCompiler.CompileBlock(cpu, thumb, instrs, i, hasMemoryInstr);
         JitEnableExecute();
+        JIT_PHASE(JitPhase_Emit);
 
 #ifdef LITEV_JIT_LINK
         // Carry the compiler's recorded outgoing link sites onto the block (a
@@ -1503,6 +1540,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         block = prevBlock;
     }
 
+    JIT_PHASE(JitPhase_Alloc);
     assert((localAddr & 1) == 0);
     for (u32 j = 0; j < numAddressRanges; j++)
     {
@@ -1520,6 +1558,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         range->Blocks.Add(block);
     }
 
+    JIT_PHASE(JitPhase_Protect);
     if (cpu->Num == 0)
     {
         JitBlocks9[blockAddr] = block;
@@ -1534,11 +1573,13 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     *entry = ((u64)blockAddr | cpu->Num) << 32;
     *entry |= JITCompiler.SubEntryOffset(block->EntryPoint);
 
+    JIT_PHASE(JitPhase_Insert);
 #ifdef LITEV_JIT_LINK
     // Block is now in JitBlocks + FastBlockLookup: resolve its outgoing links and
     // drain any pending links that were waiting for a block at this StartAddr.
     LinkBlock(block);
 #endif
+    JIT_PHASE(JitPhase_Link);
 }
 
 void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept

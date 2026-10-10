@@ -22,6 +22,9 @@
 #include <assert.h>
 #include <string.h>
 #include "types.h"
+#ifdef LITEV_JIT_POOL_ALLOC
+#include "JitPool.h"
+#endif
 
 namespace melonDS
 {
@@ -43,23 +46,31 @@ struct __attribute__((packed)) TinyVector
     u16 Capacity = 0;
     u16 Length = 0;
 
+#ifdef LITEV_JIT_POOL_ALLOC
+    static T* NewData(u32 n) { return (T*)JitPool::Alloc(n * sizeof(T)); }
+    static void DeleteData(T* p, u32 n) { JitPool::Free(p, n * sizeof(T)); }
+#else
+    static T* NewData(u32 n) { return new T[n]; }
+    static void DeleteData(T* p, u32) { delete[] p; }
+#endif
+
     ~TinyVector()
     {
-        delete[] Data;
+        DeleteData(Data, Capacity);
     }
 
     void MakeCapacity(u32 capacity)
     {
         assert(capacity <= UINT16_MAX);
         assert(capacity > Capacity);
-        T* newMem = new T[capacity];
+        T* newMem = NewData(capacity);
         if (Data != NULL)
             memcpy(newMem, Data, sizeof(T) * Length);
 
         T* oldData = Data;
         Data = newMem;
         if (oldData != NULL)
-            delete[] oldData;
+            DeleteData(oldData, Capacity);
 
         Capacity = capacity;
     }
