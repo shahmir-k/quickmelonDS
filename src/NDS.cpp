@@ -1334,6 +1334,17 @@ u32 NDS::RunFrame()
             fclose(f);
         }
     }
+    if (A7Prof::g9.EndFrame())
+    {
+        // ARM9 view: main RAM (4 MB, bus) + ITCM (32 KB, at 0x01FF8000 in NitroSDK games)
+        std::string o = std::string(A7Prof::g9.out) + ".mem";
+        if (FILE* f = fopen(o.c_str(), "wb"))
+        {
+            for (u32 a = 0x02000000; a < 0x02400000; a += 4) { u32 v = ARM9Read32(a); fwrite(&v, 4, 1, f); }
+            fwrite(ARM9.ITCM, 1, sizeof(ARM9.ITCM), f);
+            fclose(f);
+        }
+    }
 #endif
 #ifdef JIT_ENABLED
     if (EnableJIT)
@@ -3180,6 +3191,9 @@ bool NDS::ARM7GetMemRegion(u32 addr, bool write, MemRegion* region)
 
 LITEV_MEM_SPLIT_NOINLINE u8 NDS::ARM9IORead8(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0);
+#endif
 #ifdef LITEV_LAZY_DIV
     if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
 #endif
@@ -3277,6 +3291,9 @@ LITEV_MEM_SPLIT_NOINLINE u8 NDS::ARM9IORead8(u32 addr)
 
 LITEV_MEM_SPLIT_NOINLINE u16 NDS::ARM9IORead16(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0);
+#endif
 #ifdef LITEV_LAZY_DIV
     if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
 #endif
@@ -3409,6 +3426,9 @@ LITEV_MEM_SPLIT_NOINLINE u16 NDS::ARM9IORead16(u32 addr)
 
 LITEV_MEM_SPLIT_NOINLINE u32 NDS::ARM9IORead32(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0);
+#endif
 #ifdef LITEV_LAZY_DIV
     if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
 #endif
@@ -3642,6 +3662,9 @@ LITEV_MEM_SPLIT_NOINLINE u32 NDS::ARM9IORead32(u32 addr)
 
 LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite8(u32 addr, u8 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(0, val, 0x00FF); return;
@@ -3761,6 +3784,9 @@ LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite8(u32 addr, u8 val)
 
 LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite16(u32 addr, u16 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(0, val, 0xFFFF); return;
@@ -3938,6 +3964,9 @@ LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite16(u32 addr, u16 val)
 
 LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite32(u32 addr, u32 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g9.IO(addr | 0x80000000);
+#endif
 #ifdef LITEV_IO_DISPATCH_TABLE
     // Fast O(1) dispatch for word-aligned accesses in the primary 8 KB I/O window
     // (see NDS::ARM9IORead32 for the full rationale). Every case is a verbatim copy of

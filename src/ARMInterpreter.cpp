@@ -20,6 +20,7 @@
 #include "NDS.h"
 #include "ARMInterpreter.h"
 #include "ARM7HLE.h"
+#include "ARM9HLE.h"
 #include "ARMInterpreter_ALU.h"
 #include "ARMInterpreter_Branch.h"
 #include "ARMInterpreter_LoadStore.h"
@@ -40,6 +41,10 @@ void A_UNK(ARM* cpu)
 #ifdef LITEV_A7HLE
     // the JIT compiles a hooked ARM7 function entry as this fallback (see ARMJIT CompileBlock)
     if (cpu->Num == 1 && A7HLE::Run(cpu))
+        return;
+#endif
+#ifdef LITEV_A9HLE
+    if (cpu->Num == 0 && A9HLE::Run(cpu))
         return;
 #endif
     Log(LogLevel::Warn, "undefined ARM%d instruction %08X @ %08X\n", cpu->Num?7:9, cpu->CurInstr, cpu->R[15]-8);

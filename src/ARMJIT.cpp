@@ -18,6 +18,7 @@
 
 #include "ARMJIT.h"
 #include "ARM7HLE.h"
+#include "ARM9HLE.h"
 #include "ARMJIT_Memory.h"
 #include <string.h>
 #include <assert.h>
@@ -1119,6 +1120,10 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         // instruction. Keeps Instr, so the code hash / invalidation still see the real bytes.
         if (cpu->Num == 1 && !thumb && A7HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr))
             instrs[i].Info = ARMInstrInfo::Decode(false, 1, 0xE7F000F0, false);
+#endif
+#ifdef LITEV_A9HLE
+        if (cpu->Num == 0 && !thumb && A9HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr))
+            instrs[i].Info = ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
 #endif
 
         hasMemoryInstr |= thumb
