@@ -381,6 +381,43 @@ void Compiler::A_Comp_MRS()
     }
 }
 
+#ifdef LITEV_JIT_CP15_INLINE
+// ARM9 coprocessor ops the JIT used to hand to the interpreter (spill every register,
+// call A_MCR/A_MRC, reload) although they do nothing to emulated state. PW's overworld
+// runs ~830 data-cache maintenance MCRs (c7: 761/7A4/7E1) and ~280 DTCM-setting reads
+// (MRC c9,c1,0, in the IRQ path) per frame. Same cycles as A_MCR/A_MRC (CodeCycles + 2 / + 3).
+// A block compiled in user mode keeps the fallback (there both ops are undefined instructions).
+bool Compiler::CP15InlineOK()
+{
+    if (!Cp15InlineOn || Num != 0 || Thumb || NDS.ConsoleType != 0)
+        return false;
+    if ((CurCPU->CPSR & 0x1F) == 0x10)
+        return false;
+    u32 instr = CurInstr.Instr;
+    if (((instr >> 8) & 0xF) != 15)
+        return false;
+    u32 id = (((instr >> 16) & 0xF) << 8) | ((instr & 0xF) << 4) | ((instr >> 5) & 0x7);
+    if (CurInstr.Info.Kind == ARMInstrInfo::ak_MCR)
+        // every c7 write but wait-for-interrupt and the icache invalidates is a no-op in CP15Write
+        return (id & 0xF00) == 0x700 && id != 0x704 && id != 0x782
+            && id != 0x750 && id != 0x751 && id != 0x752;
+    // CP15Read(0x910) == DTCMSetting
+    return id == 0x910 && ((instr >> 12) & 0xF) != 15;
+}
+
+void Compiler::A_Comp_MCR_CacheOp()
+{
+    Comp_AddCycles_CI(1 + 1);
+}
+
+void Compiler::A_Comp_MRC_DTCM()
+{
+    Comp_AddCycles_CI(2 + 1);
+    ARM64Reg rd = MapReg(CurInstr.A_Reg(12));
+    LDR(INDEX_UNSIGNED, rd, RCPU, offsetof(ARMv5, DTCMSetting));
+}
+#endif
+
 void UpdateModeTrampoline(ARM* arm, u32 oldmode, u32 newmode)
 {
     arm->UpdateMode(oldmode, newmode);
@@ -2153,6 +2190,12 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         CompileFunc comp = Thumb
             ? T_Comp[CurInstr.Info.Kind]
             : A_Comp[CurInstr.Info.Kind];
+#ifdef LITEV_JIT_CP15_INLINE
+        if (!comp && !Thumb && (CurInstr.Info.Kind == ARMInstrInfo::ak_MCR
+                || CurInstr.Info.Kind == ARMInstrInfo::ak_MRC) && CP15InlineOK())
+            comp = CurInstr.Info.Kind == ARMInstrInfo::ak_MCR
+                ? &Compiler::A_Comp_MCR_CacheOp : &Compiler::A_Comp_MRC_DTCM;
+#endif
 
         Exit = i == (instrsCount - 1) || (CurInstr.BranchFlags & branch_FollowCondNotTaken);
 
@@ -2493,6 +2536,16 @@ void Compiler::Reset()
     // address, then clear them + bump the epoch for this new cache epoch.
     ICacheAllocOnce();
     ICacheReset();
+#endif
+#ifdef LITEV_JIT_CP15_INLINE
+    {
+#if defined(__ANDROID__)
+        char b[8] = {0}; int n = __system_property_get("debug.litev.cp15inline", b);
+        Cp15InlineOn = (n > 0) ? (atoi(b) != 0) : true;
+#else
+        const char* e = getenv("debug.litev.cp15inline"); Cp15InlineOn = e ? (atoi(e) != 0) : true;
+#endif
+    }
 #endif
 #ifdef LITEV_JIT_RAS
     {

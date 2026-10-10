@@ -219,6 +219,12 @@ public:
 
     void A_Comp_MRS();
     void A_Comp_MSR();
+#ifdef LITEV_JIT_CP15_INLINE
+    bool Cp15InlineOn = false;   // debug.litev.cp15inline, latched at Reset()
+    bool CP15InlineOK();
+    void A_Comp_MCR_CacheOp();
+    void A_Comp_MRC_DTCM();
+#endif
 
     void T_Comp_ShiftImm();
     void T_Comp_AddSub_();
