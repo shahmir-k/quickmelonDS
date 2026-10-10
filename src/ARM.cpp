@@ -1472,12 +1472,14 @@ void ARMv5::Execute()
                 A7Prof::g9.Pre(R[15] - 8, 4, CPSR, R[14]);
                 const u32 a9pc = R[15] - 8;
 #endif
+#ifdef LITEV_A9HLE
+                if (A9HLE::CheckPending) A9HLE::CheckAt(this, R[15] - 8);   // before any hook runs this instruction
+#endif
 #ifdef LITEV_GX_CPUSEND
                 if (GXSend::MaybeHook(CurInstr) && GXSend::Run(this, false)) {}
                 else
 #endif
 #ifdef LITEV_A9HLE
-                if (A9HLE::CheckPending) A9HLE::CheckAt(this, R[15] - 8);
                 if (A9HLE::MaybeHook(CurInstr) && A9HLE::Run(this, false)) {}
                 else
 #endif

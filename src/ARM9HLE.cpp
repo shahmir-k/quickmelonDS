@@ -4,6 +4,10 @@
 #include "ARM.h"
 #include "NDS.h"
 #include "ARMInterpreter.h"
+#ifdef LITEV_GX_BULK
+#include "GPU.h"
+#include "DMA_Timings.h"
+#endif
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -18,12 +22,17 @@
 namespace melonDS::A9HLE
 {
 bool CheckPending = false;
+#ifdef LITEV_A9HLE_GXCHECK
+std::vector<u32>* GxTap = nullptr;
+bool GxOtherSeen = false;
+#endif
 namespace
 {
 // ---- Pokemon Black/White (USA/EU), NitroSDK ARM9 OS --------------------------------------
 constexpr u32 kWake = 0x01FF8160, kWakeInstr = 0xE58C2064;    // OS_IrqHandler_ThreadSwitch wake loop (queue not empty): str r2, [ip, #0x64]
 constexpr u32 kSet = 0x0208478C, kSetInstr = 0xE92D47F0;      // OS_SetIrqFunction: push {r4-r10, lr}
 constexpr u32 kGet = 0x02084830, kGetInstr = 0xE59F207C;      // OS_GetIrqFunction: ldr r2, =OS_IRQTable
+constexpr u32 kGx = 0x02082864, kGxInstr = 0xE92D40F8;        // MIi_FIFOCallback: push {r3-r7, lr}
 
 constexpr u32 kIrqQueue = 0x02FE00A0;   // OS_IrqThreadQueue {head, tail} (DTCM)
 constexpr u32 kIrqCheck = 0x02FE3FF8;   // OS_IRQ check flags (DTCM)
@@ -62,6 +71,11 @@ constexpr Range kCode[kNumCode] = {
 constexpr int kNumWake = 12;    // ranges of 1. and 2. (signature kSig); the rest: 3. (kIrqSig)
 constexpr u64 kSig = 0xc03b33186e018603ull;
 constexpr u64 kIrqSig = 0xba271beda6c559d8ull;
+// 5.: MIi_FIFOCallback with its literal pool (MIi_GXDmaParams, MIi_DMACallback, GXFIFO, DMA control)
+constexpr Range kGxCode = {0x02082864, 0x02082918};
+constexpr u64 kGxSig = 0x907c24457e1359d8ull;
+constexpr u32 kGxParams = 0x02150E8C;       // MIi_GXDmaParams {busy, dmaNo, src, length, callback, arg, ...}
+constexpr u32 kGxChunk = 0x1D8;             // bytes per DMA (118 words)
 constexpr u32 kIrqHandler = 0x01FF80F0;     // OS_IrqHandler (BIOS jumps to [DTCM+0x3FFC])
 constexpr u32 kHbFn = 0x02005205;           // OS_IRQTable[1] (HBlank)
 constexpr u32 kHbObjPtr = 0x020AA1B4;       // callback object = [[kHbObjPtr + 0x10] + 0x18]
@@ -76,12 +90,13 @@ constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 struct State
 {
     int status = 0;                 // 0 unprobed, 1 active, -1 off
-    u32 mask = 15;                  // 1 wake, 2 set, 4 get, 8 HBlank IRQ
-    std::vector<u8> code, irqCode;
+    u32 mask = 31;                  // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send
+    std::vector<u8> code, irqCode, gxCode;
+    bool gxOk = false;              // MIi_FIFOCallback matches PW (5.)
     bool irqOk = false;             // IRQ path code matches PW (3.)
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
-    u64 calls[5] = {}, native[5] = {}, fallback[5] = {}, checks[5] = {}, diffs[5] = {}, irqDuring[5] = {};
-    u64 guestCyc[5] = {}, guestN[5] = {}, getBits = 0;
+    u64 calls[6] = {}, native[6] = {}, fallback[6] = {}, checks[6] = {}, diffs[6] = {}, irqDuring[6] = {};
+    u64 guestCyc[6] = {}, guestN[6] = {}, getBits = 0, gxWords = 0;
     u32 biosOk = 0;                 // BIOS IRQ epilogue address verified once
     u64 ns = 0;                     // stats: host time inside Run (native calls)
     // host pointers of the fixed-address OS objects, valid for fkey (DTCM base/mask, ITCM size)
@@ -95,7 +110,9 @@ bool g_Stats = getenv("LITEV_A9HLE_STATS") && atoi(getenv("LITEV_A9HLE_STATS"));
 bool g_Dry = getenv("LITEV_A9HLE_DRY") && atoi(getenv("LITEV_A9HLE_DRY"));
 // same, IRQ path (3.) only
 bool g_DryIrq = g_Dry || (getenv("LITEV_A9HLE_DRYIRQ") && atoi(getenv("LITEV_A9HLE_DRYIRQ")));
-const char* kName[5] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake"};
+const char* kName[6] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend"};
+// kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
+inline u32 Bit(int k) { return k == 5 ? 16 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -109,14 +126,16 @@ double TimerNs()   // cost of one Now() pair, subtracted from the per-call figur
 inline u32 R32(const u8* p) { u32 v; memcpy(&v, p, 4); return v; }
 inline u16 R16(const u8* p) { u16 v; memcpy(&v, p, 2); return v; }
 
-bool ReadOn()
+// 0 off, 1 (or unset) all hooks, else the mask of hooks (as LITEV_A9HLE_ONLY)
+u32 ReadOn()
 {
 #if defined(__ANDROID__)
-    char b[8] = {0}; int n = __system_property_get("debug.litev.a9hle", b);
-    return (n > 0) ? (atoi(b) != 0) : true;
+    char b[16] = {0}; int n = __system_property_get("debug.litev.a9hle", b);
+    const char* e = n > 0 ? b : nullptr;
 #else
-    const char* e = getenv("debug.litev.a9hle"); return e ? (atoi(e) != 0) : true;
+    const char* e = getenv("debug.litev.a9hle");
 #endif
+    return e ? (u32)strtoul(e, nullptr, 0) : 1;
 }
 
 // code bytes as the ARM9 sees them (ITCM or main RAM), no timing / side effects
@@ -192,6 +211,12 @@ bool CodeIntact(melonDS::ARMv5* c, const State& s, int k)
     return true;
 }
 
+bool GxIntact(melonDS::ARMv5* c, const State& s)
+{
+    const u8* p = CodePtr(c, kGxCode.a);
+    return p && memcmp(p, s.gxCode.data(), kGxCode.b - kGxCode.a) == 0;
+}
+
 State& Get(melonDS::ARMv5* c)
 {
     if (c->A9HLEState) return *(State*)c->A9HLEState;
@@ -199,7 +224,9 @@ State& Get(melonDS::ARMv5* c)
     c->A9HLEState = &s;
     if (s.status != 0) return s;
     s.status = -1;
-    if (!ReadOn()) return s;
+    const u32 on = ReadOn();
+    if (!on) return s;
+    if (on != 1) s.mask = on;
     if (const char* m = getenv("LITEV_A9HLE_ONLY")) s.mask = (u32)strtoul(m, nullptr, 0);
     std::vector<u8> code;
     CodeBytes(c, code, 0, kNumWake);
@@ -215,6 +242,9 @@ State& Get(melonDS::ARMv5* c)
     s.biosRet = BiosIrqRet(c->NDS);
     s.irqOk = Fnv(s.irqCode) == kIrqSig && s.biosRet;
     if (g_Stats) fprintf(stderr, "A9HLE: IRQ path signature %016llx, BIOS IRQ return %08x -> %s\n", (unsigned long long)Fnv(s.irqCode), s.biosRet, s.irqOk ? "on" : "off");
+    for (u32 a = kGxCode.a; a < kGxCode.b; a++) { const u8* p = CodePtr(c, a); s.gxCode.push_back(p ? *p : 0); }
+    s.gxOk = Fnv(s.gxCode) == kGxSig;
+    if (g_Stats) fprintf(stderr, "A9HLE: GX send signature %016llx -> %s\n", (unsigned long long)Fnv(s.gxCode), s.gxOk ? "on" : "off");
     return s;
 }
 
@@ -607,24 +637,131 @@ bool IrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, int&
     return true;
 }
 
+#ifdef LITEV_GX_BULK
+// ---- 5. MI_SendGXCommandAsync: the display list at once ----------------------------------------
+// MIi_FIFOCallback sends the list in 118-word immediate DMAs to GXFIFO, the next one from the
+// GXFIFO "less than half full" IRQ. Under LITEV_GX_BULK each DMA finds the FIFO empty and runs
+// in bulk, so the FIFO is empty again at once and the IRQ that follows only starts the next DMA:
+// ~2 IRQs per list, 100-200 a frame in PW's 3D scenes. At MIi_FIFOCallback's entry, with the
+// FIFO empty: every chunk but the last goes through GPU3D::BulkWords now (what those DMAs do)
+// and MIi_GXDmaParams.src/length move past them; the guest code then sends the last chunk
+// (DMA with IRQ -> MIi_DMACallback) as before. Category B: the elided IRQs take a fixed estimate
+// (the DMA cycles themselves are the DMA's own burst timing).
+// ponytail: fixed estimate per elided GXFIFO IRQ (BIOS, OS_IrqHandler, MIi_FIFOCallback, DMA
+// setup): check mode measures ~850 guest cycles per chunk on 7 PW segments, ~488 of them the DMA
+constexpr s32 kGxIrqCycles = 360;
+
+// the words the guest would send before its last chunk (n), from src; false: guest path
+bool GxPlan(melonDS::ARMv5* c, u32& src, u32& len, u32& n)
+{
+    melonDS::NDS& nds = c->NDS;
+    if ((kGxParams & c->DTCMMask) == c->DTCMBase || ((kGxParams + 0xF) & c->DTCMMask) == c->DTCMBase) return false;
+    const u8* p = &nds.MainRAM[kGxParams & nds.MainRAMMask];
+    len = R32(p + 0xC); src = R32(p + 8);
+    const u32 dma = R32(p + 4);
+    // DMA reads the bus (main RAM, never TCM), like the guest's
+    if (len <= kGxChunk || len > 0x100000 || (len & 3) || (src & 3) || dma > 3 || (src >> 24) != 0x02 || ((src + len - 1) >> 24) != 0x02)
+        return false;
+    if (nds.A9HLEDmaCnt(dma) & 0x80000000) return false;
+    melonDS::GPU3D& gx = nds.GPU.GPU3D;
+    if (!gx.GeometryEnabled || !gx.BulkReady()) return false;
+    n = ((len - 1) / kGxChunk) * (kGxChunk / 4);
+    return true;
+}
+
+// sends them (stops early if the FIFO stops being empty: a SWAP_BUFFERS); returns the count
+u32 GxSend(melonDS::ARMv5* c, u32 src, u32 len, u32 n)
+{
+    melonDS::NDS& nds = c->NDS;
+    melonDS::GPU3D& gx = nds.GPU.GPU3D;
+    const u8* ram = nds.MainRAM;
+    const u32 mask = nds.MainRAMMask, per = kGxChunk / 4;
+    // the bulk DMA loop's timing (DMA::Run9): burst table restarted at each DMA
+    const u8* bt = (nds.ARM9MemTimings[0x1000][6] == 2) ? DMATiming::MRAMRead32Bursts[0].data() : DMATiming::MRAMRead32Bursts[1].data();
+    u32 done = 0, cyc = 0, bc = 0;
+    for (u32 o = 0; o < 512; o += 64) __builtin_prefetch(ram + ((src + o) & mask));
+    while (done < n && gx.BulkReady())
+    {
+        u32 w[64];
+        const u32 m = n - done < 64 ? n - done : 64;
+        for (u32 i = 0; i < m; i++)
+        {
+            if ((done + i) % per == 0 || bt[bc] == 0) bc = 0;
+            cyc += bt[bc++];
+            w[i] = R32(ram + ((src + (done + i) * 4) & mask));
+        }
+        __builtin_prefetch(ram + ((src + (done + m) * 4 + 512) & mask));
+        gx.BulkWords(w, m);
+        done += m;
+    }
+    nds.ARM9Write32(kGxParams + 8, src + done * 4);
+    nds.ARM9Write32(kGxParams + 0xC, len - done * 4);
+    c->Cycles += (s32)(cyc << nds.ARM9ClockShift) + kGxIrqCycles * (s32)(done / per);
+    return done;
+}
+#endif
+
+#ifdef LITEV_A9HLE_GXCHECK
+// check mode for 5. (interpreter, env LITEV_A9HLE_CHECK): the guest sends the list; every word
+// reaching GXFIFO (and any other geometry command write) is recorded; when the guest's
+// MIi_FIFOCallback reaches the point the native path would leave, the words, src and length
+// must be what the native path computed.
+std::vector<u32> g_GxTapBuf;
+struct GxPending { bool on = false; u32 src = 0, len = 0, n = 0; u64 t0 = 0; std::vector<u32> w; } g_Gx;
+u64 g_GxDmaCyc = 0;     // the DMA part of the guest cycles (same burst timing as GxSend)
+void GxCheckAt(State& s, melonDS::ARMv5* c)
+{
+    melonDS::NDS& nds = c->NDS;
+    if (!g_Gx.on) return;
+    const u8* p = &nds.MainRAM[kGxParams & nds.MainRAMMask];
+    const u32 src = R32(p + 8), len = R32(p + 0xC), want = g_Gx.len - g_Gx.n * 4;
+    if (len > want) return;     // guest not there yet
+    g_Gx.on = false;
+    GxTap = nullptr;
+    bool bad = len != want || src != g_Gx.src + g_Gx.n * 4 || g_GxTapBuf != g_Gx.w;
+    if (GxOtherSeen) bad = true;
+    if (bad)
+    {
+        if (s.diffs[5] < 10)
+            fprintf(stderr, "A9HLE CHECK gxsend: src %08x len %x (native %08x %x), words guest %zu native %zu%s\n", src, len,
+                    g_Gx.src + g_Gx.n * 4, want, g_GxTapBuf.size(), g_Gx.w.size(), GxOtherSeen ? ", other GX writes" : "");
+        s.diffs[5]++;
+    }
+    GxOtherSeen = false;
+    // resolved checks; guest cycles per elided chunk (for kGxIrqCycles: minus the DMA's own)
+    s.guestN[5] += g_Gx.n / (kGxChunk / 4);
+    s.guestCyc[5] += nds.ARM9Timestamp + c->Cycles - g_Gx.t0;
+    const u8* bt = (nds.ARM9MemTimings[0x1000][6] == 2) ? DMATiming::MRAMRead32Bursts[0].data() : DMATiming::MRAMRead32Bursts[1].data();
+    for (u32 i = 0, bc = 0; i < g_Gx.n; i++) { if (i % (kGxChunk / 4) == 0 || bt[bc] == 0) bc = 0; g_GxDmaCyc += (u64)bt[bc++] << nds.ARM9ClockShift; }
+    s.irqDuring[5]++;
+}
+#endif
+
 struct StatsDump
 {
     ~StatsDump()
     {
         if (!g_Stats) return;
         for (auto& [k, s] : g_State)
-            for (int i = 0; i < 5; i++)
+            for (int i = 0; i < 6; i++)
                 fprintf(stderr, "A9HLE %s: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu irq_during=%llu guest_cyc_avg=%.0f\n",
                         kName[i], s.status, (unsigned long long)s.calls[i], (unsigned long long)s.native[i],
                         (unsigned long long)s.fallback[i], (unsigned long long)s.checks[i], (unsigned long long)s.diffs[i],
                         (unsigned long long)s.irqDuring[i], s.guestN[i] ? (double)s.guestCyc[i] / s.guestN[i] : 0.0);
         for (auto& [k, s] : g_State)
         {
-            u64 n = s.native[0] + s.native[1] + s.native[2] + s.native[3] + s.native[4];
+            u64 n = s.native[0] + s.native[1] + s.native[2] + s.native[3] + s.native[4] + s.native[5];
+            if (s.native[5]) fprintf(stderr, "A9HLE gxsend: %.1f words per native call\n", (double)s.gxWords / s.native[5]);
             if (n) fprintf(stderr, "A9HLE: %.1f ns per native call (Run, timer pair %.1f ns subtracted)\n", (double)s.ns / n - TimerNs(), TimerNs());
         }
         for (auto& [k, s] : g_State)
             if (s.checks[2]) fprintf(stderr, "A9HLE getirqfn: avg lowest set bit %.2f\n", (double)s.getBits / s.checks[2]);
+#ifdef LITEV_A9HLE_GXCHECK
+        for (auto& [k, s] : g_State)
+            if (s.checks[5]) fprintf(stderr, "A9HLE gxsend check: %llu resolved (irq_during above), %.0f guest cycles per elided chunk, of them DMA %.0f\n",
+                                     (unsigned long long)s.irqDuring[5], s.guestN[5] ? (double)s.guestCyc[5] / s.guestN[5] : 0.0,
+                                     s.guestN[5] ? (double)g_GxDmaCyc / s.guestN[5] : 0.0);
+#endif
     }
 } g_StatsDump;
 }
@@ -684,16 +821,19 @@ bool Irq(melonDS::ARMv5* c, bool halted)
 int Deps(u32 addr, const Range*& r)
 {
     if (addr == kWake) { r = kCode; return kNumCode; }
+    if (addr == kGx) { r = &kGxCode; return 1; }
     r = &kCode[3];              // OS_SetIrqFunction / OS_GetIrqFunction
     return 1;
 }
 
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 {
-    int k = addr == kWake && instr == kWakeInstr ? 0 : addr == kSet && instr == kSetInstr ? 1 : addr == kGet && instr == kGetInstr ? 2 : -1;
+    int k = addr == kWake && instr == kWakeInstr ? 0 : addr == kSet && instr == kSetInstr ? 1 : addr == kGet && instr == kGetInstr ? 2
+          : addr == kGx && instr == kGxInstr ? 5 : -1;
     if (k < 0) return 0;
     State& s = Get(&nds.ARM9);
-    if (s.status != 1 || !(s.mask >> k & 1)) return 0;
+    if (s.status != 1 || !(s.mask & Bit(k))) return 0;
+    if (k == 5) return !s.gxOk ? 0 : GxIntact(&nds.ARM9, s) ? 1 : 2;
     return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
 }
 
@@ -703,11 +843,49 @@ bool Run(melonDS::ARM* cpu, bool jit)
     auto* c = (melonDS::ARMv5*)cpu;
     const u32 pc = cpu->R[15] - 8;
     int k = pc == kWake && cpu->CurInstr == kWakeInstr ? 0 : pc == kSet && cpu->CurInstr == kSetInstr ? 1
-          : pc == kGet && cpu->CurInstr == kGetInstr ? 2 : -1;
+          : pc == kGet && cpu->CurInstr == kGetInstr ? 2 : pc == kGx && cpu->CurInstr == kGxInstr ? 5 : -1;
     if (k < 0) return false;
     State& s = Get(c);
-    if (s.status != 1 || !(s.mask >> k & 1)) return false;
+    if (s.status != 1 || !(s.mask & Bit(k))) return false;
     s.calls[k]++;
+#ifdef LITEV_GX_BULK
+    if (k == 5)
+    {
+        // a prefix: the native part, then the guest function from its first instruction
+        if (!s.gxOk) return false;
+#ifdef LITEV_A9HLE_GXCHECK
+        if (g_Check) GxCheckAt(s, c);
+#endif
+        u32 src, len, n;
+        if ((jit || GxIntact(c, s)) && GxPlan(c, src, len, n))
+        {
+            if (g_Check)
+            {
+#ifdef LITEV_A9HLE_GXCHECK
+                if (!g_Gx.on)
+                {
+                    g_Gx.on = true; g_Gx.src = src; g_Gx.len = len; g_Gx.n = n; g_Gx.w.resize(n);
+                    g_Gx.t0 = c->NDS.ARM9Timestamp + c->Cycles;
+                    for (u32 i = 0; i < n; i++) g_Gx.w[i] = R32(&c->NDS.MainRAM[(src + i * 4) & c->NDS.MainRAMMask]);
+                    g_GxTapBuf.clear(); GxOtherSeen = false; GxTap = &g_GxTapBuf;
+                    s.checks[5]++;
+                }
+#endif
+            }
+            else if (g_Dry) s.checks[5]++;
+            else
+            {
+                const u64 t0 = __builtin_expect(g_Stats, 0) ? Now() : 0;
+                s.gxWords += GxSend(c, src, len, n);
+                s.native[5]++;
+                if (__builtin_expect(g_Stats, 0)) s.ns += Now() - t0;
+            }
+        }
+        else s.fallback[5]++;
+        GuestFallback(cpu);
+        return true;
+    }
+#endif
     const u64 t0 = __builtin_expect(g_Stats, 0) ? Now() : 0;
     Mem m(c, g_Check || g_Dry);
     Expect e;

@@ -362,6 +362,7 @@ public: // TODO: Encapsulate the rest of these members
         out[0] = DivNumerator[0]; out[1] = DivNumerator[1]; out[2] = DivDenominator[0]; out[3] = DivDenominator[1];
         out[4] = SqrtVal[0]; out[5] = SqrtVal[1]; out[6] = (u32)(DivCnt & 3) | ((u32)(SqrtCnt & 1) << 16);
     }
+    u32 A9HLEDmaCnt(u32 n) const noexcept { return DMAs[n].Cnt; }   // ARM9 DMA n control
 #endif
     void SetARM9BIOS(const std::array<u8, ARM9BIOSSize>& bios) noexcept;
 

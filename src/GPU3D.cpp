@@ -3438,6 +3438,9 @@ bool GPU3D::BulkReady() const noexcept
 void GPU3D::BulkWords(const u32* words, u32 n) noexcept
 {
     Run(); // bring the engine clock up to now (the FIFO is empty: only time passes)
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap) A9HLE::GxTap->insert(A9HLE::GxTap->end(), words, words + n);
+#endif
 
     CmdFIFOEntry q[4*64]; // a word holds at most 4 commands; Run9 passes <= 64 words
     u32 m = 0;
@@ -3993,6 +3996,9 @@ u32 GPU3D::Read32(u32 addr) noexcept
 
 void GPU3D::Write8(u32 addr, u8 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap && addr >= 0x04000400 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
+#endif
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 
@@ -4043,6 +4049,9 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
 
 void GPU3D::Write16(u32 addr, u16 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap && addr >= 0x04000400 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
+#endif
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 
@@ -4130,6 +4139,9 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
 
 void GPU3D::Write32(u32 addr, u32 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap && addr >= 0x04000440 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
+#endif
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 

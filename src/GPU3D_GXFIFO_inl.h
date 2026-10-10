@@ -23,6 +23,9 @@
 
 #include "GPU3D.h"
 #include "NDS.h"
+#ifdef LITEV_A9HLE_GXCHECK
+#include "ARM9HLE.h"
+#endif
 
 namespace melonDS
 {
@@ -97,6 +100,9 @@ __attribute__((always_inline)) inline void GPU3D::CmdFIFOWrite_Inline(const CmdF
 
 __attribute__((always_inline)) inline void GPU3D::WriteToGXFIFO_Inline(u32 val) noexcept
 {
+#ifdef LITEV_A9HLE_GXCHECK
+    if (A9HLE::GxTap) A9HLE::GxTap->push_back(val);
+#endif
     if (NumCommands == 0)
     {
         NumCommands = 4;

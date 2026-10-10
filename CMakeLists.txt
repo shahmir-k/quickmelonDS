@@ -598,6 +598,12 @@ option(LITEV_A9HLE "ARM9 HLE of NitroSDK OS IRQ wake-ups / IRQ table functions (
 if (LITEV_A9HLE)
     add_compile_definitions(LITEV_A9HLE=1)
 endif()
+# A9HLE_GXCHECK (diagnostic): records the words reaching GXFIFO so LITEV_A9HLE_CHECK=1 (interpreter)
+# can check the MI_SendGXCommandAsync hook (A9HLE 5.) against the guest. Never in a shipping build.
+option(LITEV_A9HLE_GXCHECK "Diagnostic: A9HLE GX send compare mode (GXFIFO word tap)" OFF)
+if (LITEV_A9HLE_GXCHECK)
+    add_compile_definitions(LITEV_A9HLE_GXCHECK=1)
+endif()
 
 # A7PROF (diagnostic): per-guest-function ARM7 (and ARM9: env LITEV_A9PROF) profile in the interpreter (--mode interp,
 # env LITEV_A7PROF=<out prefix>). See src/ARM7Prof.h. Never in a shipping build.

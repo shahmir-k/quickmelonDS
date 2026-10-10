@@ -22,8 +22,9 @@
 // Category B: guest memory and registers are what the guest code would leave; the call takes
 // a fixed estimated number of ARM9 cycles instead of the real count (and an IRQ that would
 // have arrived inside the elided round trip is taken right after it). Deterministic.
-// Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS.
-// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ; 8 needs 1) for A/B of single hooks.
+// Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS:
+// 0 off, 1 all, other values = the mask below.
+// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send; 8 needs 1) for A/B of single hooks.
 //
 // 3. Whole HBlank IRQs (~265 a frame on PW, ~3.8k Mac host instructions each through the JIT
 //    even with 1. native; ~1.7k native): when the only pending enabled IRQ is HBlank and the game's HBlank callback
@@ -34,6 +35,15 @@
 //    OS idle loop it stays halted. Code verified at JIT compile of the wake hook block (which
 //    depends on all of it: ARMv5::A9HLEGuard), BIOS once; anything else runs the guest path.
 //
+// 5. MI_SendGXCommandAsync display lists (with LITEV_GX_BULK): MIi_FIFOCallback sends a list in
+//    118-word immediate DMAs, the next one from the GXFIFO "less than half" IRQ; with the bulk
+//    geometry path the FIFO is empty again at once, so every chunk costs an IRQ (100-200 a frame
+//    in PW's 3D scenes). At MIi_FIFOCallback's entry with the FIFO empty, all chunks but the last
+//    go through GPU3D::BulkWords at once and MIi_GXDmaParams.src/length move past them; the guest
+//    code then sends the last chunk as before. Category B: DMA cycles as the DMA's, plus a fixed
+//    estimate per elided IRQ. Check mode (build with LITEV_A9HLE_GXCHECK) compares the words
+//    the guest sends to GXFIFO, and src/length where the native path would leave them.
+//
 // LITEV_A9HLE_CHECK=1 (env, interpreter mode): compute the native result, run the guest code
 // instead, and at the guest's return compare all of main RAM, ITCM, DTCM and the registers
 // with the native prediction. LITEV_A9HLE_STATS=1: counts, host ns per native call (and measured
@@ -43,13 +53,16 @@
 #pragma once
 #ifdef LITEV_A9HLE
 #include "types.h"
+#ifdef LITEV_A9HLE_GXCHECK
+#include <vector>
+#endif
 
 namespace melonDS { class ARM; class ARMv5; class NDS; }
 
 namespace melonDS::A9HLE
 {
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
-inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C; }
+inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8; }
 // JIT decode: is the ARM-mode instruction at addr a hooked entry?
 // 0 no, 1 yes (code signature verified: under the JIT this compile-time check is the code
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the
@@ -74,6 +87,11 @@ void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
 void BlockGone(melonDS::NDS& nds, const void* block);
 // interpreter check mode: called before every ARM9 instruction while a check is pending
 extern bool CheckPending;
+#ifdef LITEV_A9HLE_GXCHECK
+// check mode of 5. (diagnostic build): words written to GXFIFO / other geometry command writes
+extern std::vector<u32>* GxTap;
+extern bool GxOtherSeen;
+#endif
 void CheckAt(melonDS::ARM* cpu, u32 pc);
 }
 #endif
