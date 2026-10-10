@@ -151,6 +151,10 @@ private:
     void AddCycles(s32 num) noexcept;
     void NextVertexSlot() noexcept;
     void StallPolygonPipeline(s32 delay, s32 nonstalldelay) noexcept;
+#ifdef LITEV_GX_POLY_LEAN
+    // out of line: most vertices don't close a polygon and skip its big prologue/epilogue
+    __attribute__((noinline))
+#endif
     void SubmitPolygon() noexcept;
     void SubmitVertex() noexcept;
     void CalculateLighting() noexcept;
@@ -447,5 +451,23 @@ protected:
 };
 
 }
+
+#ifdef LITEV_GX_CPUSEND
+// LITEV_GX_CPUSEND: NitroSDK MI_CpuSend32(src, dst, size) (ARM, position independent:
+//   add ip,r0,r2 / cmp r0,ip / ldmlt r0!,{r2} / strlt r2,[r1] / blt -> cmp / bx lr)
+// sending a display list from main RAM to GXFIFO (PW: ~1600 words a frame, one slow IO store and
+// one non-bulk geometry command each) goes through GPU3D::BulkWords like a bulk geometry DMA.
+// Hooked at JIT compile by the exact code bytes (the hook block depends on them), guest fallback
+// otherwise. Category B (like LITEV_GX_BULK): same words and registers, fixed cycle estimate, the
+// FIFO never fills. Runtime off: debug.litev.gxsend=0 (headless: env LITEV_GXSEND=0).
+namespace melonDS { class ARM; class NDS; }
+namespace melonDS::GXSend
+{
+inline bool MaybeHook(u32 instr) { return instr == 0xE080C002; }
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr);    // 1: hook (code verified), 0: not
+inline void Deps(u32 addr, u32& a, u32& b) { a = addr; b = addr + 24; }
+bool Run(melonDS::ARM* cpu, bool jit);                 // false: not at a hook
+}
+#endif
 
 #endif

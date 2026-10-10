@@ -30,6 +30,9 @@
 // so the public WriteToGXFIFO/CmdFIFOWrite delegate to the SAME code DMA.cpp inlines (no duplication).
 // The extern decl inside also gives CmdNumParams (defined below) external linkage for other TUs.
 #include "GPU3D_GXFIFO_inl.h"
+#ifdef LITEV_GX_CPUSEND
+#include "ARMInterpreter.h"
+#endif
 
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
@@ -1177,6 +1180,30 @@ bool ClipCoordsEqual(Vertex* a, Vertex* b)
            a->Position[3] == b->Position[3];
 }
 
+#ifdef LITEV_GX_CLIP_REJECT
+// ClipPolygon returns 0 for these without the copy passes (clipstart 0 only: kept strip vertices
+// make the clipper return at least 2). Planes in its order (Z, Y, X); the first one with a vertex
+// outside decides: every vertex past the same side -> 0 (the + pass, or the - pass after the +
+// pass copied them all), a vertex past the far plane without attr bit 12 -> 0; anything else clips.
+// Planes with no vertex outside leave the positions as they are.
+static bool ClipTrivialReject(const Vertex* v, int n, u32 attr)
+{
+    for (int comp = 2; comp >= 0; comp--)
+    {
+        bool anyOut = false, allPlus = true, allMinus = true;
+        for (int i = 0; i < n; i++)
+        {
+            const s32 p = v[i].Position[comp], w = v[i].Position[3];
+            const bool plus = p > w, minus = !plus && p < -w;
+            if (comp == 2 && plus && !(attr & (1<<12))) return true;
+            anyOut |= plus | minus; allPlus &= plus; allMinus &= minus;
+        }
+        if (anyOut) return allPlus || allMinus;
+    }
+    return false;
+}
+#endif
+
 void GPU3D::SubmitPolygon() noexcept
 {
 #ifdef LITEV_GX_VTX_PREFETCH
@@ -1384,6 +1411,10 @@ void GPU3D::SubmitPolygon() noexcept
     }
     else
 #endif
+#ifdef LITEV_GX_CLIP_REJECT
+    if (clipstart == 0 && ClipTrivialReject(clippedvertices, nverts, CurPolygonAttr)) nverts = 0;
+    else
+#endif
     nverts = ClipPolygon<true>(*this, clippedvertices, nverts, clipstart);
     if (nverts == 0)
     {
@@ -1421,6 +1452,23 @@ void GPU3D::SubmitPolygon() noexcept
             posX = 0;
             posY = 0;
         }
+#ifdef LITEV_GX_POLY_LEAN
+        // common case (w <= 0xFFFF, vertex inside the clip volume): one 32-bit divide gives the
+        // hi-res position, and the 9/8-bit position is it >> 4 (floor(floor(16n/d)/16) =
+        // floor(n/d); 16 * 2w * 511 < 2^32, so nothing wraps). Same values as below.
+        else if (w <= 0xFFFF && (u32)(vtx->Position[0] + (s32)w) <= 2 * w && (u32)(-vtx->Position[1] + (s32)w) <= 2 * w
+                 && !LITEV_HEADLESS(Headless))
+        {
+            const u32 den = w << 1;
+            const u32 hx = (((u32)(vtx->Position[0] + (s32)w) * Viewport[4]) << 4) / den;
+            const u32 hy = (((u32)(-vtx->Position[1] + (s32)w) * Viewport[5]) << 4) / den;
+            vtx->FinalPosition[0] = ((hx >> 4) + Viewport[0]) & 0x1FF;
+            vtx->FinalPosition[1] = ((hy >> 4) + Viewport[3]) & 0xFF;
+            vtx->HiresPosition[0] = (hx + (Viewport[0] << 4)) & 0x1FFF;
+            vtx->HiresPosition[1] = (hy + (Viewport[3] << 4)) & 0xFFF;
+            continue;
+        }
+#endif
         else
         {
             posX = vtx->Position[0] + w;
@@ -3446,6 +3494,93 @@ void GPU3D::BulkWords(const u32* words, u32 n) noexcept
     if (NumTestCommands == 0)    GXStat &= ~(1<<0);
     CheckFIFODMA();
     CheckFIFOIRQ();
+}
+#endif
+
+
+#ifdef LITEV_GX_CPUSEND
+namespace GXSend
+{
+namespace
+{
+constexpr u32 kSend32[6] = {0xE080C002, 0xE150000C, 0xB8B00004, 0xB5812000, 0xBAFFFFFB, 0xE12FFF1E};
+// ponytail: fixed estimate of the guest loop (cmp + ldm main RAM + str IO + branch per word)
+constexpr s32 kCyclesBase = 6, kCyclesPerWord = 12;
+
+bool On()
+{
+#if defined(__ANDROID__)
+    static const bool on = litevGxPropDefault("debug.litev.gxsend", 1) != 0;
+#else
+    static const bool on = !getenv("LITEV_GXSEND") || atoi(getenv("LITEV_GXSEND")) != 0;
+#endif
+    return on;
+}
+
+bool IsSend32(melonDS::NDS& nds, u32 addr)
+{
+    for (u32 i = 1; i < 6; i++)
+        if (nds.ARM9Read32(addr + i * 4) != kSend32[i]) return false;
+    return true;
+}
+}
+
+int IsHook(NDS& nds, u32 addr, u32 instr)
+{
+    return instr == kSend32[0] && On() && IsSend32(nds, addr) ? 1 : 0;
+}
+
+bool Run(melonDS::ARM* cpu, bool jit)
+{
+    if (cpu->Num != 0 || (cpu->CPSR & 0x20) || cpu->CurInstr != kSend32[0] || !On()) return false;
+    const u32 pc = cpu->R[15] - 8;
+    melonDS::NDS& nds = cpu->NDS;
+    if (!jit && !IsSend32(nds, pc)) return false;
+    GPU3D& gx = nds.GPU.GPU3D;
+    const u32 src = cpu->R[0], dst = cpu->R[1], size = cpu->R[2];
+    // main RAM or DTCM (all of the range in one, no wrap) -> GXFIFO, whole words, FIFO empty:
+    // else the guest loop runs
+    auto* c9 = (melonDS::ARMv5*)cpu;
+    const u32* w = nullptr;
+    if ((dst & ~0x3Fu) == 0x04000400 && !(src & 3) && !(size & 3) && (s32)size > 0 && size <= 0x4000
+        && gx.GeometryEnabled && gx.BulkReady())
+    {
+        const u32 last = src + size - 4;
+        const bool d0 = (src & c9->DTCMMask) == c9->DTCMBase, d1 = (last & c9->DTCMMask) == c9->DTCMBase;
+        if (d0 && d1 && (src & (DTCMPhysicalSize - 1)) <= (last & (DTCMPhysicalSize - 1)))
+            w = (const u32*)&c9->DTCM[src & (DTCMPhysicalSize - 1)];
+        else if (!d0 && !d1 && src >= c9->ITCMSize && (src >> 24) == 0x02 && (last >> 24) == 0x02
+                 && (src & nds.MainRAMMask) <= (last & nds.MainRAMMask))
+            w = (const u32*)&nds.MainRAM[src & nds.MainRAMMask];
+    }
+    if (!w)
+    {
+        u32 icode = ((cpu->CurInstr >> 4) & 0xF) | ((cpu->CurInstr >> 16) & 0xFF0);
+        ARMInterpreter::ARMInstrTable[icode](cpu);   // the add; the guest loop follows
+        return true;
+    }
+    const u32 n = size >> 2;
+    u32 done = 0;
+    while (done < n && gx.BulkReady())
+    {
+        const u32 m = n - done < 64 ? n - done : 64;
+        gx.BulkWords(w + done, m);
+        done += m;
+    }
+    const u32 end = src + size;
+    cpu->R[2] = w[done - 1];
+    cpu->R[0] = src + done * 4;
+    cpu->R[12] = end;
+    cpu->Cycles += kCyclesBase + kCyclesPerWord * (s32)done;
+    if (done < n)
+    {
+        cpu->JumpTo(pc + 4);        // FIFO no longer empty (a SWAP_BUFFERS queued): the guest loop goes on
+        return true;
+    }
+    cpu->CPSR = (cpu->CPSR & 0x0FFFFFFF) | 0x60000000;   // cmp r0, ip: equal
+    cpu->JumpTo(cpu->R[14]);
+    return true;
+}
 }
 #endif
 

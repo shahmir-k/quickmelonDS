@@ -1171,6 +1171,16 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
             }
         }
 #endif
+#ifdef LITEV_GX_CPUSEND
+        if (cpu->Num == 0 && !thumb && GXSend::MaybeHook(instrs[i].Instr) && GXSend::IsHook(NDS, instrs[i].Addr, instrs[i].Instr))
+        {
+            // the hook block depends on the whole MI_CpuSend32 body (verified now)
+            u32 da, db;
+            GXSend::Deps(instrs[i].Addr, da, db);
+            addDeps(0, da, db);
+            instrs[i].Info = ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
+        }
+#endif
 #ifdef LITEV_A9HLE
         if (int hook = cpu->Num == 0 && !thumb ? A9HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr) : 0)
         {
