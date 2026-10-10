@@ -71,6 +71,10 @@ public:
 
     LockstepMP() noexcept
     {
+#ifdef LITEV_MP_FASTPOLL
+        TraceOn = TraceDir() != nullptr;
+        TLOn = getenv("LITEV_MP_TL") != nullptr;
+#endif
 #ifdef LITEV_MP_CLOCKWAKE
         for (auto& w : WakeAt) w.store(UINT64_MAX, std::memory_order_relaxed);
 #endif
@@ -121,7 +125,14 @@ private:
     void TxNote(int inst, u32 type, const u8* data, int len, u64 timestamp);
     // LITEV_MP_TL=<dir>: timeline, one line per blocking event: wall ns, event, own clock, host clock
     FILE* TL[kMaxInst] {};
-    void TLog(int inst, const char* ev);
+#ifdef LITEV_MP_FASTPOLL
+    // the poll path calls these ~2000 times a frame per client: inline no-ops unless tracing
+    bool TLOn = false;
+    void TLog(int inst, const char* ev) { if (TLOn) TLogImpl(inst, ev); }
+#else
+    void TLog(int inst, const char* ev) { TLogImpl(inst, ev); }
+#endif
+    void TLogImpl(int inst, const char* ev);
     static constexpr u64 kDelay = 33514 * 4; // 4 ms in system clock cycles (33.514 MHz)
     // host frames (CMD/ACK) reach the clients this much later; < kDelay, or a reply sent on time
     // would land past the host's deadline
@@ -150,7 +161,14 @@ private:
     bool Stopped = false;
     std::function<u64()> Clock[kMaxInst];
     FILE* Trace[kMaxInst] {};   // LITEV_MP_TRACE=<dir>: one line per link call, per instance
-    void Log(int inst, const char* call, int result, u64 extra);
+#ifdef LITEV_MP_FASTPOLL
+    bool TraceOn = false;
+    void Log(int inst, const char* call, int result, u64 extra) { if (TraceOn) LogImpl(inst, call, result, extra); }
+#else
+    void Log(int inst, const char* call, int result, u64 extra) { LogImpl(inst, call, result, extra); }
+#endif
+    void LogImpl(int inst, const char* call, int result, u64 extra);
+    static const char* TraceDir();
     // LITEV_MP_STATS / debug.litev.mpstats=1: per CMD, where the host's wait for the replies goes
     struct
     {

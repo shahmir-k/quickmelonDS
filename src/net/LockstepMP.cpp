@@ -70,12 +70,10 @@ void LockstepMP::End(int inst)
     NotifyAll();
 }
 
-void LockstepMP::Log(int inst, const char* call, int result, u64 extra)
+const char* LockstepMP::TraceDir()
 {
-    if (!Trace[inst])
-    {
-        // resolved once: this runs on every link call
-        static const char* dir = [] {
+    // resolved once
+    static const char* dir = [] {
             const char* d = getenv("LITEV_MP_TRACE");
 #ifdef __ANDROID__
             // apps get no environment: debug.litev.mptrace=<dir the app can write>
@@ -83,7 +81,15 @@ void LockstepMP::Log(int inst, const char* call, int result, u64 extra)
             if (!d && __system_property_get("debug.litev.mptrace", propDir) > 0 && propDir[0]) d = propDir;
 #endif
             return d;
-        }();
+    }();
+    return dir;
+}
+
+void LockstepMP::LogImpl(int inst, const char* call, int result, u64 extra)
+{
+    if (!Trace[inst])
+    {
+        const char* dir = TraceDir();
         if (!dir) return;
         char path[512];
         snprintf(path, sizeof(path), "%s/inst%d.txt", dir, inst);
@@ -110,7 +116,7 @@ bool LockstepMP::StatsOn()
     return St.On > 0;
 }
 
-void LockstepMP::TLog(int inst, const char* ev)
+void LockstepMP::TLogImpl(int inst, const char* ev)
 {
     static const char* dir = getenv("LITEV_MP_TL");
     if (!dir) return;
