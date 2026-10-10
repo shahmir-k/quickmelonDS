@@ -35,6 +35,10 @@ typedef void (*JitBlockEntry)();
 // jumps straight into TargetAddr's block. Persisted in the JitBlock so a restored
 // block (same RX, same offsets) can re-establish its links without recompiling.
 struct OutgoingLink { u32 PatchOffset; u32 TargetAddr; };
+// A block that follows conditional branches (branch_FollowCond*) has one link exit per
+// followed branch plus its end; an exit past this cap stays unlinked (always pays a full
+// dispatcher lookup, no inline cache), so it must cover the common case.
+constexpr int MaxOutgoingLinks = 8;
 // LinkSite: a patch slot in SOURCE block's code that currently points at (an entry
 // of) the block that owns this Incoming record. Rewritten back to the dispatcher
 // when that block dies.
@@ -62,9 +66,9 @@ public:
     JitBlockEntry EntryPoint;
 
 #ifdef LITEV_JIT_LINK
-    // Up to two outgoing static exits (a conditional block has taken + fall-through).
+    // Outgoing static exits (taken + fall-through of each followed conditional branch).
     u8 NumOutgoing = 0;
-    OutgoingLink Outgoing[2];
+    OutgoingLink Outgoing[MaxOutgoingLinks];
     // Sites in other (or this) block(s) currently linked INTO this block.
     TinyVector<LinkSite> Incoming;
 #endif

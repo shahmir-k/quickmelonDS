@@ -1225,7 +1225,10 @@ void* Compiler::Gen_Dispatcher(u32 num)
   #else
     FixupBranch exitStopUnmasked = TBZ(RCPSR, 7);
   #endif
-  #ifdef LITEV_JIT_ICACHE
+  #if defined(LITEV_JIT_ICACHE) && !defined(LITEV_JIT_EXIT_PROTO)
+    // Without EXIT_PROTO a linked exit's stop path reaches here with W9 unset. Under
+    // EXIT_PROTO every way in sets W9 (block exit: its site; link stub: 0; guard stub:
+    // its site), so the hop keeps its site's inline cache.
     MOVI2R(W9, 0);
   #endif
     SetJumpTarget(noStop);
@@ -1676,7 +1679,7 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
     B(DispatcherEntry[Num]);
 #endif  // LITEV_JIT_EXIT_PROTO
 
-    if (NumLinkExits < 2)
+    if (NumLinkExits < MaxOutgoingLinks)
     {
         LinkExits[NumLinkExits].PatchOffset = patchOffset;
         LinkExits[NumLinkExits].TargetAddr = targetAddr;

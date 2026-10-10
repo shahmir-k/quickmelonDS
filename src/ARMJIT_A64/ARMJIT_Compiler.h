@@ -501,7 +501,7 @@ public:
 
     // Populated during CompileBlock; copied into the JitBlock by ARMJIT::CompileBlock.
     u8 NumLinkExits = 0;
-    OutgoingLink LinkExits[2];
+    OutgoingLink LinkExits[MaxOutgoingLinks];
 
     // Threaded from Comp_JumpTo(u32) to the exit tail: does the last-compiled branch
     // have a compile-time-constant same-mode target, and was it conditional?
