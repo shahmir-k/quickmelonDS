@@ -178,14 +178,14 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 8;     // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read
+constexpr int kKinds = 10;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = 127;                 // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ
+    u32 mask = 511;                 // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv
     std::vector<u8> code, irqCode, gxCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool irqOk = false;             // IRQ path code matches the variant (3.)
@@ -214,9 +214,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -491,7 +491,13 @@ struct Pending
     u32 lzLo = 0, lzHi = 0; // LZ check: the window (an IRQ inside the guest chunk writes elsewhere)
     u32 lzFn = 0;           // LZ check: function entry; cycles of the instructions inside it (no IRQs)
     u64 lzOwn = 0, lzLastTs = 0; bool lzLastIn = false;
+    std::vector<u32> gx;    // G3D material check: the GXFIFO words of the native path
+    bool gxOn = false;      // ... captured from BulkWords (GxTap) + the guest's GXFIFO stores
+    u32 fit[4] = {};        // _ll_sdiv check: normalization shifts, dividend shifts, nonzero, estimate
 } g_P;
+#ifdef LITEV_A9HLE_GXCHECK
+std::vector<u32> g_GxMatTap;
+#endif
 
 __attribute__((noinline, cold)) void ArmCheck(melonDS::ARMv5* c, int kind, const Mem& m, const Expect& e)
 {
@@ -1325,6 +1331,322 @@ __attribute__((noinline)) bool RunCard(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
+#ifdef LITEV_GX_BULK
+// ---- 8. NNS G3D material: NNSi_G3dFuncSbc_MAT with the default material function -----------------
+// NitroSystem G3D's SBC MAT command (PW 0x0206BEB8) calls NNSi_G3dFuncSbc_MAT_InternalDefault
+// (MAT - 0x488) through its function table, which builds the material result (diffuse/ambient,
+// specular/emission, polygon attr, texture image / palette) and sends it with one
+// NNS_G3dGeBufferOP_N (no GE buffer: the packed command word to GXFIFO, then MI_CpuSend32 of the 6
+// parameters). 81 calls a frame in the PW town, ~190 guest instructions each (16% of the ARM9's guest
+// instructions; MAT_InternalDefault alone compiles to ~34 KB of JIT blocks). Natively at MAT's entry
+// for the common case: no render callback at any timing of this command, no model material cache, no
+// cached result (opt 0x20/0x40 with the material's bit set), no texture matrix, no material animation
+// callback for this material, a visible material, render state flag 0x100 clear, no GE buffer, the
+// geometry FIFO empty: the 7 words go through GPU3D::BulkWords (as GX_CPUSEND sends the parameters),
+// every guest-memory byte (render state, material result, the stack frames of the 4 functions) and
+// every register / flag as the guest leaves them. Anything else runs the guest code.
+// Position independent: the exact code words (literal-pool globals and calls the native path never
+// makes are masked), the globals read from the literal pools.
+// Category B: a fixed cycle estimate (guest average in check mode).
+constexpr u32 kMatInstr = 0xE92D4010;   // push {r4, lr}
+constexpr u32 kMatOff = 0x488;          // MAT - MAT_InternalDefault (kMatCode[0])
+// MAT_InternalDefault + MAT (from kMatCode[290]) with their literal pools
+constexpr u32 kMatCode[334] = {
+    0xE92D41F8, 0xE24DD01C, 0xE1A07000, 0xE1A05003, 0xE5C750AD, 0xE5973008, 0xE28700F4, 0xE3833008, 0xE5873008,
+    0xE58700B0, 0xE597001C, 0xE1A08001, 0xE3500000, 0x15D74090, 0xE1A06002, 0x03A04000, 0xE3540001, 0x1A00000C,
+    0xE5971008, 0xE1A00007, 0xE3C11040, 0xE5871008, 0xE597101C, 0xE12FFF31, 0xE597001C, 0xE3500000, 0x15D74090,
+    0xE5970008, 0x03A04000, 0xE2000040, 0xEA000000, 0xE3A00000, 0xE3500000, 0x1A0000B5, 0xE5970004, 0xE5900038,
+    0xE3500000, 0x0A000004, 0xE5971008, 0xE3110080, 0x03A01038, 0x00280195, 0x0A0000AB, 0xE3580020, 0x13580040,
+    0x1A00000E, 0xE1A012A5, 0xE0871101, 0xE59110BC, 0xE205201F, 0xE3A03001, 0xE1110213, 0x0A000007, 0xE3500000,
+    0x13A01038, 0x10280195, 0x1A00009D, 0xE59F1388, 0xE3A00038, 0xE0281095, 0xEA000099, 0xE3500000, 0x0A00000B,
+    0xE28780BC, 0xE1A032A5, 0xE7982103, 0xE205001F, 0xE3A01001, 0xE1820011, 0xE7880103, 0xE5971004, 0xE3A00038,
+    0xE5911038, 0xE0281095, 0xEA00000C, 0xE3580040, 0x128780F4, 0x1A000009, 0xE287E0BC, 0xE1A0C2A5, 0xE59F132C,
+    0xE79E810C, 0xE3A00038, 0xE205201F, 0xE3A03001, 0xE1882213, 0xE0281095, 0xE78E210C, 0xE3A00000, 0xE5880000,
+    0xE59730D8, 0xE3530000, 0x0A00000F, 0xE2932004, 0x0A000008, 0xE5D30005, 0xE1550000, 0x2A000005, 0xE1D310BA,
+    0xE19200B1, 0xE0821001, 0xE2811004, 0xE0211590, 0xEA000000, 0xE3A01000, 0xE3510000, 0x15910000, 0x10830000,
+    0x1A000000, 0xE3A00000, 0xE1D001BE, 0xE59F12B4, 0xE3100020, 0x15980000, 0x13800020, 0x15880000, 0xE1D621BE,
+    0xE59F02A0, 0xE591C094, 0xE1A02342, 0xE2022007, 0xE790E102, 0xE5962004, 0xE1E0300E, 0xE00C3003, 0xE002200E,
+    0xE1832002, 0xE5882004, 0xE1D6C1BE, 0xE5913098, 0xE5962008, 0xE1A0C4CC, 0xE20CC007, 0xE790C10C, 0xE1E0000C,
+    0xE0033000, 0xE002000C, 0xE1830000, 0xE5880008, 0xE5963010, 0xE596000C, 0xE591209C, 0xE1E01003, 0xE0021001,
+    0xE0000003, 0xE1810000, 0xE588000C, 0xE5960014, 0xE5880010, 0xE1D601BC, 0xE5880014, 0xE1D601BE, 0xE3100001,
+    0x0A000022, 0xE3100002, 0x15981000, 0xE286002C, 0x13811001, 0x15881000, 0x1A000004, 0xE5901000, 0xE5881018,
+    0xE5901004, 0xE2800008, 0xE588101C, 0xE1D611BE, 0xE3110004, 0x15981000, 0x13811002, 0x15881000, 0x1A000004,
+    0xE1D010F0, 0xE1C812B0, 0xE1D010F2, 0xE2800004, 0xE1C812B2, 0xE1D611BE, 0xE3110008, 0x15980000, 0x13800004,
+    0x15880000, 0x1A000003, 0xE5901000, 0xE5881024, 0xE5900004, 0xE5880028, 0xE5980000, 0xE3800008, 0xE5880000,
+    0xE597C004, 0xE59C1008, 0xE3510000, 0x0A00000A, 0xE1A002A5, 0xE08C0100, 0xE590003C, 0xE205201F, 0xE3A03001,
+    0xE1100213, 0x0A000003, 0xE59C300C, 0xE1A00008, 0xE1A02005, 0xE12FFF33, 0xE5980000, 0xE3100018, 0x0A000007,
+    0xE1D602B0, 0xE1C802BC, 0xE1D602B2, 0xE1C802BE, 0xE5960024, 0xE5880030, 0xE5960028, 0xE5880034, 0xE58780B0,
+    0xE3540002, 0x1A00000C, 0xE5971008, 0xE1A00007, 0xE3C11040, 0xE5871008, 0xE597101C, 0xE12FFF31, 0xE597001C,
+    0xE3500000, 0x15D74090, 0xE5970008, 0x03A04000, 0xE2000040, 0xEA000000, 0xE3A00000, 0xE3500000, 0x1A000027,
+    0xE59750B0, 0xE595100C, 0xE311081F, 0x0A000020, 0xE5950000, 0xE3100020, 0x13C1081F, 0x1585000C, 0xE5970008,
+    0xE3C00002, 0xE5870008, 0xE3100C01, 0x1A00001A, 0xE59F009C, 0xE59F309C, 0xE58D0000, 0xE5952004, 0xE28D1004,
+    0xE58D2004, 0xE5956008, 0xE3A02006, 0xE58D6008, 0xE595600C, 0xE58D600C, 0xE58D3010, 0xE5953010, 0xE58D3014,
+    0xE5953014, 0xE58D3018, 0xEB0007DA, 0xE5950000, 0xE3100018, 0x0A000006, 0xE59710F0, 0xE1A00005, 0xE12FFF31,
+    0xEA000002, 0xE5970008, 0xE3800002, 0xE5870008, 0xE3540003, 0x128DD01C, 0x18BD81F8, 0xE5971008, 0xE1A00007,
+    0xE3C11040, 0xE5871008, 0xE597101C, 0xE12FFF31, 0xE28DD01C, 0xE8BD81F8, 0x02148DD4, 0x02148B6C, 0x020A196C,
+    0x00293130, 0x00002B2A, 0xE92D4010, 0xE1A04000, 0xE5942008, 0xE3120C02, 0x1A000021, 0xE5940000, 0xE3120001,
+    0xE5D03001, 0x1A000004, 0xE3120008, 0x0A000002, 0xE5D400AD, 0xE1530000, 0x0A000018, 0xE594E0D8, 0xE35E0000,
+    0x0A00000F, 0xE29EC004, 0x0A000008, 0xE5DE0005, 0xE1530000, 0x2A000005, 0xE1DE20BA, 0xE19C00B2, 0xE08C2002,
+    0xE2822004, 0xE0222390, 0xEA000000, 0xE3A02000, 0xE3520000, 0x15920000, 0x108E2000, 0x1A000000, 0xE3A02000,
+    0xE1D2E0B0, 0xE59FC018, 0xE1A00004, 0xE79CC10E, 0xE12FFF3C, 0xE5940000, 0xE2800002, 0xE5840000, 0xE8BD8010,
+    0x020A82E8,
+};
+constexpr u16 kMatSkip[] = {285, 286, 287, 333};    // literals: material cache, NNS_G3dGlb, mask table, MAT function table
+// NNS_G3dGeBufferOP_N (MAT_InternalDefault's bl at word 263)
+constexpr u32 kOpnCode[57] = {
+    0xE92D4070, 0xE59F30D0, 0xE1A06000, 0xE593C000, 0xE1A05001, 0xE1A04002, 0xE35C0000, 0x0A000024, 0xE5930004,
+    0xE3500000, 0x0A000016, 0xE59C2000, 0xE2820001, 0xE0801004, 0xE35100C0, 0x8A000011, 0xE58C0000, 0xE5930000,
+    0xE3540000, 0xE0800102, 0xE5806004, 0x08BD8070, 0xE5932000, 0xE1A00005, 0xE4921004, 0xE0821101, 0xE1A02104,
+    0xEB00533D, 0xE59F0064, 0xE5901000, 0xE5910000, 0xE0800004, 0xE5810000, 0xE8BD8070, 0xE59C0000, 0xE3500000,
+    0x0A000001, 0xEBFFFF50, 0xEA000009, 0xE59F0038, 0xE5900004, 0xE3500000, 0x0A000005, 0xEBFFFF61, 0xEA000003,
+    0xE5930004, 0xE3500000, 0x0A000000, 0xEBFFFF5C, 0xE59F1014, 0xE1A00005, 0xE1A02104, 0xE5816000, 0xEB00530A,
+    0xE8BD8070, 0x0214BAD4, 0x04000400,
+};
+constexpr u16 kOpnSkip[] = {27, 37, 43, 48, 55};    // calls on the buffered / flush paths, the GE buffer literal
+constexpr u32 kSend32Code[6] = {0xE080C002, 0xE150000C, 0xB8B00004, 0xB5812000, 0xBAFFFFFB, 0xE12FFF1E};   // MI_CpuSend32 (OP_N's bl at word 53)
+// ponytail: fixed estimate (guest average in check mode, PW town / gift box / overworld / title)
+constexpr s32 kMatCyc = 512, kMatCycNoSend = 325;
+
+bool CodeEq(melonDS::ARMv5* c, u32 a, const u32* w, u32 n, const u16* sk, u32 ns)
+{
+    for (u32 i = 0, j = 0; i < n; i++)
+    {
+        if (j < ns && sk[j] == i) { j++; continue; }
+        const u8* p = CodePtr(c, a + i * 4);
+        if (!p || R32(p) != w[i]) return false;
+    }
+    return true;
+}
+u32 BlTarget(melonDS::ARMv5* c, u32 a)
+{
+    const u8* p = CodePtr(c, a);
+    if (!p) return 0;
+    const u32 w = R32(p);
+    return (w >> 24) == 0xEB ? a + 8 + (u32)(((s32)(w << 8)) >> 6) : 0;
+}
+// entry: MAT's address; out: MAT_InternalDefault, OP_N, MI_CpuSend32. 0: not MAT, 1: MAT (code verified),
+// 2: MAT's entry but the code differs somewhere (the JIT still depends on it: restoring it re-enables the hook)
+int MatAt(melonDS::ARMv5* c, u32 entry, u32& def, u32& opn, u32& snd)
+{
+    def = entry - kMatOff;
+    // cheap reject first (push {r4, lr} starts many functions): MAT's next two words
+    const u8* p = (entry & 3) ? nullptr : CodePtr(c, entry + 4);
+    const u8* q = p ? CodePtr(c, entry + 8) : nullptr;
+    if (!q || R32(p) != kMatCode[291] || R32(q) != kMatCode[292]) return 0;
+    opn = BlTarget(c, def + 263 * 4);
+    snd = opn ? BlTarget(c, opn + 53 * 4) : 0;
+    return CodeEq(c, def, kMatCode, 334, kMatSkip, 4) && opn && CodeEq(c, opn, kOpnCode, 57, kOpnSkip, 5)
+           && snd && CodeEq(c, snd, kSend32Code, 6, nullptr, 0) ? 1 : 2;
+}
+
+bool MatNative(melonDS::ARMv5* c, Mem& m, Expect& e, u32 pc, u32 def, u32 opn, u32* gw, bool& send)
+{
+    bool bad = false;
+    auto rd = [&](u32 a, u32 n) -> u32 {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    };
+    auto lit = [&](u32 a) { return R32(CodePtr(c, a)); };
+    const u32 rs = c->R[0], opt = c->R[1], sp = c->R[13];
+    // NNSi_G3dFuncSbc_MAT: skip conditions, the material's resource entry, the function table
+    Obj RS = m.O(rs, 0x100);
+    if (!RS) return false;
+    const u32 flag = RS.r(8);
+    if (flag & 0x200) return false;
+    const u32 sbc = RS.r(0), idx = rd(sbc + 1, 1);
+    if (bad || (!(flag & 1) && (flag & 8) && idx == RS.p[0xAD])) return false;
+    const u32 res = RS.r(0xD8);
+    if (!res) return false;
+    const u32 nEnt = rd(res + 5, 1), ofs = rd(res + 0xA, 2);
+    if (bad || idx >= nEnt) return false;
+    const u32 dict = res + 4, ent = dict + ofs + 4 + rd(dict + ofs, 2) * idx;
+    const u32 md = res + rd(ent, 4);
+    if (bad || !ent || rd(lit(def + 333 * 4) + rd(md, 2) * 4, 4) != def || bad) return false;
+    // MAT_InternalDefault(rs, opt, md, idx)
+    const u32 cb = RS.r(0x1C), cbT = cb ? RS.p[0x90] : 0;
+    if (cbT >= 1 && cbT <= 3) return false;
+    const u32 ro = RS.r(4);
+    if (rd(ro + 0x38, 4) || bad) return false;
+    const u32 bo = 0xBC + (idx >> 5) * 4, bit = 1u << (idx & 31), bits = RS.r(bo);
+    if ((opt == 0x20 || opt == 0x40) && (bits & bit)) return false;
+    const u32 r8 = opt == 0x40 ? lit(def + 285 * 4) + idx * 0x38 : rs + 0xF4;
+    Obj R8 = m.O(r8, 0x38);
+    const u32 h = rd(md + 0x1E, 2);
+    if (!R8 || bad || (h & 1)) return false;
+    const u32 anm = rd(ro + 8, 4);
+    if (anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit)) return false;    // material animation callback
+    const u32 glb = lit(def + 286 * 4), mt = lit(def + 287 * 4);
+    const u32 t1 = rd(mt + ((h >> 6) & 7) * 4, 4), t2 = rd(mt + ((h >> 9) & 7) * 4, 4);
+    const u32 v0 = h & 0x20;
+    const u32 v4 = (rd(glb + 0x94, 4) & ~t1) | (rd(md + 4, 4) & t1);
+    const u32 v8 = (rd(glb + 0x98, 4) & ~t2) | (rd(md + 8, 4) & t2);
+    const u32 m10 = rd(md + 0x10, 4);
+    const u32 g9c = rd(glb + 0x9C, 4);
+    u32 vc = (g9c & ~m10) | (rd(md + 0xC, 4) & m10);
+    const u32 v10 = rd(md + 0x14, 4), v14 = rd(md + 0x1C, 2);
+    send = vc & 0x1F0000;   // else an invisible material: [rs + 8] |= 2, no send
+    const u32 fl = send ? (flag | 8) & ~2u : flag | 0xA;
+    if (bad || (send && (fl & 0x100))) return false;     // (send path) the no-send flag
+    if (send && v0) vc &= ~0x1F0000u;
+    Obj st = m.O(sp - 80, 80);
+    if (!st) return false;
+    const u32 cmd0 = kMatCode[288], cmd1 = kMatCode[289];
+    // stack: MAT push {r4, lr}; MAT_InternalDefault push {r3-r8, lr} + locals (the OP_N arguments); OP_N push {r4-r6, lr}
+    m.W(st, 72, c->R[4]); m.W(st, 76, c->R[14]);
+    m.W(st, 44, idx); m.W(st, 48, rs); m.W(st, 52, c->R[5]); m.W(st, 56, c->R[6]); m.W(st, 60, c->R[7]); m.W(st, 64, c->R[8]);
+    m.W(st, 68, pc + 0x9C);
+    if (send)
+    {
+        // NNS_G3dGeBufferOP_N: no buffering ([ge + 4] clear) and no GE buffer or an empty one: straight to GXFIFO
+        const u32 ge = lit(opn + 55 * 4), gb = rd(ge, 4);
+        if (rd(ge + 4, 4) || (gb && rd(gb, 4)) || bad) return false;
+        m.W(st, 16, cmd0); m.W(st, 20, v4); m.W(st, 24, v8); m.W(st, 28, vc); m.W(st, 32, cmd1); m.W(st, 36, v10); m.W(st, 40, v14);
+        m.W(st, 0, cbT); m.W(st, 4, r8); m.W(st, 8, vc); m.W(st, 12, def + 0x420);
+    }
+    // render state, material result
+    m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFF00u) | idx << 8);
+    m.W(RS, 8, fl);
+    m.W(RS, 0xB0, r8);
+    if (opt == 0x40) m.W(RS, bo, bits | bit);
+    m.W(RS, 0, sbc + 2);
+    m.W(R8, 0, v0); m.W(R8, 4, v4); m.W(R8, 8, v8); m.W(R8, 0xC, vc); m.W(R8, 0x10, v10); m.W(R8, 0x14, v14);
+    gw[0] = cmd0; gw[1] = v4; gw[2] = v8; gw[3] = vc; gw[4] = cmd1; gw[5] = v10; gw[6] = v14;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = sbc + 2; e.R[3] = idx;
+    if (send) { e.R[1] = kOpnCode[56]; e.R[2] = v14; e.R[12] = sp - 36; e.R[14] = opn + 0xD8; }
+    else { e.R[1] = vc; e.R[2] = anm ? idx & 31 : g9c; e.R[12] = ro; e.R[14] = t1; }
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFDF) | Flags(cbT, 3) | ((e.retPc & 1) << 5);
+    return true;
+}
+
+__attribute__((noinline)) bool RunMat(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    u32 def, opn, snd;
+    if (jit)
+    {
+        def = pc - kMatOff; opn = BlTarget(c, def + 263 * 4);
+        (void)snd;
+    }
+    else if (MatAt(c, pc, def, opn, snd) != 1) return false;
+    s.calls[8]++;
+    melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
+    Mem m(c, g_Check || g_Dry);
+    Expect e;
+    u32 gw[7];
+    bool send = false;
+    bool ok = !CheckPending && opn && MatNative(c, m, e, pc, def, opn, gw, send) && (!send || (gx.GeometryEnabled && gx.BulkReady()));
+#ifdef LITEV_HLE_DIAG
+    if (ok && (g_Check || g_Dry))
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 8, m, e);
+            g_P.gx.assign(gw, gw + (send ? 7 : 0));
+            g_P.fit[0] = send;
+#ifdef LITEV_A9HLE_GXCHECK
+            if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
+#endif
+        }
+        s.checks[8]++;
+        ok = false;
+    }
+#endif
+    if (!ok)
+    {
+        s.fallback[8] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    m.Flush();
+    if (send) gx.BulkWords(gw, 7);
+    s.native[8]++;
+    Return(c, e, send ? kMatCyc : kMatCycNoSend);
+    return true;
+}
+#endif
+
+// ---- 9. _ll_sdiv: 64-bit signed divide of the compiler runtime -----------------------------------
+// r1:r0 / r3:r2 by shift-and-subtract (~750 guest instructions a call; PW: 2-3 calls a frame from one
+// caller in 3D scenes). Natively: the quotient, r3:r2 = |divisor| normalized (shifted left until bit
+// 63 is set), the flags of the final cmp / rsbs, the 7 pushed words below sp; r4-r7, fp, ip, lr as on
+// entry (popped). Divide by zero, the 32-bit fast path (both operands sign-extended 32-bit: the guest
+// calls the 32-bit divide) and INT64_MIN operands run the guest code. Position independent (exact
+// code words; the 32-bit path's call masked). Category B: cycles from a fit of the guest's own count.
+constexpr u32 kSdivInstr = 0xE92D58F0;  // push {r4-r7, fp, ip, lr}
+constexpr u32 kSdivCode[108] = {
+    0xE92D58F0, 0xE0214003, 0xE1A040C4, 0xE1A04084, 0xE1935002, 0x1A000001, 0xE8BD58F0, 0xE12FFF1E, 0xE1A05FA0,
+    0xE0855001, 0xE1A06FA2, 0xE0866003, 0xE1956006, 0x1A000006, 0xE1A01002, 0xEB000081, 0xE2144001, 0x11A00001,
+    0xE1A01FC0, 0xE8BD58F0, 0xE12FFF1E, 0xE3510000, 0xAA000001, 0xE2700000, 0xE2E11000, 0xE3530000, 0xAA000001,
+    0xE2722000, 0xE2E33000, 0xE1915000, 0x0A000046, 0xE3A05000, 0xE3A06001, 0xE3530000, 0x4A000004, 0xE2855001,
+    0xE0922002, 0xE0B33003, 0x5AFFFFFB, 0xE0866005, 0xE3510000, 0xBA000005, 0xE3560001, 0x0A000003, 0xE2466001,
+    0xE0900000, 0xE0B11001, 0x5AFFFFF9, 0xE3A07000, 0xE3A0C000, 0xE3A0B000, 0xEA000005, 0xE38CC001, 0xE2566001,
+    0x0A000018, 0xE0900000, 0xE0B11001, 0xE0B77007, 0xE0500002, 0xE0D11003, 0xE2D77000, 0xE09CC00C, 0xE0ABB00B,
+    0xE3570000, 0xAAFFFFF2, 0xE2566001, 0x0A00000A, 0xE0900000, 0xE0B11001, 0xE0A77007, 0xE0900002, 0xE0B11003,
+    0xE2A77000, 0xE09CC00C, 0xE0ABB00B, 0xE3570000, 0xAAFFFFE6, 0xEAFFFFF2, 0xE0900002, 0xE0A11003, 0xE2147001,
+    0x01A0000C, 0x01A0100B, 0x0A000009, 0xE2557020, 0xA1A00731, 0xAA00000F, 0xE2657020, 0xE1A00530, 0xE1800711,
+    0xE1A01531, 0xEA000001, 0xE1A00731, 0xE3A01000, 0xE3540000, 0xBA000001, 0xE8BD58F0, 0xE12FFF1E, 0xE2700000,
+    0xE2E11000, 0xE8BD58F0, 0xE12FFF1E, 0xE3A00000, 0xE3A01000, 0xE3540000, 0xBAFFFFF7, 0xE8BD58F0, 0xE12FFF1E,
+};
+constexpr u16 kSdivSkip[] = {15};
+// ponytail: fit of the guest's own count (check mode without IRQs, PW town/title: 1190-1241 cycles a call, within
+// ~1%): base + per normalization shift + per quotient bit + per dividend shift; zero dividend: a short path
+constexpr s32 kSdivCyc0 = 631, kSdivCycNorm = 6, kSdivCycBit = 7, kSdivCycSh = 3, kSdivCycZero = 40;
+
+__attribute__((noinline)) bool RunSdiv(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && !CodeEq(c, pc, kSdivCode, 108, kSdivSkip, 1)) return false;
+    s.calls[9]++;
+    const u32 r0 = c->R[0], r1 = c->R[1], r2 = c->R[2], r3 = c->R[3], sp = c->R[13];
+    const u64 n = (u64)r1 << 32 | r0, d = (u64)r3 << 32 | r2, kMin = 1ull << 63;
+    Mem m(c, g_Check || g_Dry);
+    Obj st = m.O(sp - 28, 28);
+    bool ok = !CheckPending && st && d && (((r0 >> 31) + r1) | ((r2 >> 31) + r3)) && n != kMin && d != kMin;
+    if (ok)
+    {
+        const u32 r4 = (r1 ^ r3) & ~1u;
+        const u64 an = (s64)n < 0 ? -n : n, ad = (s64)d < 0 ? -d : d;
+        const int k = __builtin_clzll(ad);
+        const u64 q = an / ad, dd = an ? ad << k : ad;
+        const int sh = an ? (__builtin_clzll(an) < k ? __builtin_clzll(an) : k) : 0;
+        Expect e;
+        for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+        u32 fl;
+        u64 res = q;
+        if ((s32)r4 >= 0) fl = Flags(r4, 0);
+        else { fl = Flags(0, (u32)q); res = -q; }
+        e.R[0] = (u32)res; e.R[1] = (u32)(res >> 32); e.R[2] = (u32)dd; e.R[3] = (u32)(dd >> 32);
+        e.retPc = c->R[14];
+        e.CPSR = (c->CPSR & 0x0FFFFFDF) | fl | ((e.retPc & 1) << 5);
+        for (int i = 0; i < 4; i++) m.W(st, i * 4, c->R[4 + i]);
+        m.W(st, 16, c->R[11]); m.W(st, 20, c->R[12]); m.W(st, 24, c->R[14]);
+        const s32 cyc = an ? kSdivCyc0 + kSdivCycNorm * k + kSdivCycBit * (1 + k - sh) + kSdivCycSh * sh : kSdivCycZero;
+#ifdef LITEV_HLE_DIAG
+        if (g_Check || g_Dry)
+        {
+            m.Flush();      // logs only
+            if (g_Check) { ArmCheck(c, 9, m, e); g_P.fit[0] = k; g_P.fit[1] = sh; g_P.fit[2] = an != 0; g_P.fit[3] = cyc; }
+            s.checks[9]++;
+            ok = false;
+        }
+#endif
+        if (ok)
+        {
+            m.Flush();
+            s.native[9]++;
+            Return(c, e, cyc);
+            return true;
+        }
+    }
+    s.fallback[9] += !g_Check;
+    GuestFallback(c);
+    return true;
+}
+
 struct StatsDump
 {
     ~StatsDump()
@@ -1425,6 +1747,24 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         r = &card;
         return 1;
     }
+#ifdef LITEV_GX_BULK
+    if (instr == kMatInstr)
+    {
+        static thread_local Range mat[3];
+        u32 def, opn, snd;
+        MatAt(&nds.ARM9, addr, def, opn, snd);      // (after IsHook != 0) a missing call target: an empty range
+        mat[0] = {def, addr + 0xB0}; mat[1] = {opn, opn ? opn + 57 * 4 : 0}; mat[2] = {snd, snd ? snd + 24 : 0};
+        r = mat;
+        return 3;
+    }
+#endif
+    if (instr == kSdivInstr)
+    {
+        static thread_local Range sd;
+        sd = {addr, addr + 108 * 4};
+        r = &sd;
+        return 1;
+    }
     if (instr == kLzInstr)
     {
         static thread_local Range lz;
@@ -1456,6 +1796,20 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
     {
         State& s = St(&nds.ARM9);
         return s.on && (s.mask & 32) && CardCodeAt(&nds.ARM9, addr) ? 1 : 0;
+    }
+#ifdef LITEV_GX_BULK
+    if (instr == kMatInstr)
+    {
+        State& s = St(&nds.ARM9);
+        u32 def, opn, snd;
+        return s.on && (s.mask & 128) ? MatAt(&nds.ARM9, addr, def, opn, snd) : 0;
+    }
+#endif
+    if (instr == kSdivInstr)
+    {
+        State& s = St(&nds.ARM9);
+        if (!s.on || !(s.mask & 256) || !CodeEq(&nds.ARM9, addr, kSdivCode, 2, nullptr, 0)) return 0;
+        return CodeEq(&nds.ARM9, addr, kSdivCode, 108, kSdivSkip, 1) ? 1 : 2;
     }
     if (instr == kLzInstr)
     {
@@ -1589,6 +1943,18 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 32) && RunCard(c, s, jit);
     }
+#ifdef LITEV_GX_BULK
+    if (in == kMatInstr)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 128) && RunMat(c, s, jit);
+    }
+#endif
+    if (in == kSdivInstr)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 256) && RunSdiv(c, s, jit);
+    }
     State& s = Get(c, pc, in);
     if (s.status != 1) return false;
     const int k = Kind(*s.v, pc, in);
@@ -1632,6 +1998,9 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     if (++g_P.steps > 2000000)
     {
         fprintf(stderr, "A9HLE CHECK %s: guest never returned to %08x\n", kName[g_P.kind], g_P.e.retPc);
+#ifdef LITEV_A9HLE_GXCHECK
+        if (g_P.gxOn) { GxTap = nullptr; g_P.gxOn = false; }
+#endif
         CheckPending = false;
         c->Idle2Log = nullptr;
         g_State[&c->NDS].diffs[g_P.kind]++;
@@ -1650,8 +2019,12 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         s.irqDuring[k]++;   // an IRQ handler ran inside the function: its writes would show as diffs
         return;
     }
-    s.guestCyc[k] += nds.ARM9Timestamp + c->Cycles - g_P.t0;
-    s.guestN[k]++;
+    if (k < 8 || !g_P.irq) { s.guestCyc[k] += nds.ARM9Timestamp + c->Cycles - g_P.t0; s.guestN[k]++; }   // 8, 9: without IRQs
+    if (k == 8 && getenv("LITEV_A9HLE_MATFIT") && !g_P.irq)
+        fprintf(stderr, "MATFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 9 && getenv("LITEV_A9HLE_LLFIT") && !g_P.irq)
+        fprintf(stderr, "LLFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3],
+                (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 6 && getenv("LITEV_A9HLE_LZFIT"))
         fprintf(stderr, "LZFIT %u %u %u %u %llu\n", g_P.lzn[0], g_P.lzn[1], g_P.lzn[2], g_P.lzn[3], (unsigned long long)g_P.lzOwn);
     // expected bytes: native log over the snapshot; compared at every byte either side wrote
@@ -1696,6 +2069,22 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         {
             if (gi[i] != e.IRQ[i]) { if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " irq[%d] guest %08x native %08x;", i, gi[i], e.IRQ[i]); nd++; }
             if (gs[i] != e.SVC[i]) { if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " svc[%d] guest %08x native %08x;", i, gs[i], e.SVC[i]); nd++; }
+        }
+    }
+    if (k == 8)
+    {
+        // GXFIFO words: the guest's stores to GXFIFO, then what reached BulkWords (MI_CpuSend32 under GX_CPUSEND)
+        std::vector<u32> gw;
+#ifdef LITEV_A9HLE_GXCHECK
+        if (g_P.gxOn) { gw = g_GxMatTap; GxTap = nullptr; g_P.gxOn = false; }     // every GXFIFO word (stores and BulkWords)
+        else
+#endif
+        for (auto& a : g_P.acc)
+            if (a.Write && a.Addr >= 0x04000400 && a.Addr < 0x04000440) gw.push_back(a.Val);
+        if (gw != g_P.gx)
+        {
+            if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " GX words: guest %zu (first %08x), native %zu;", gw.size(), gw.empty() ? 0 : gw[0], g_P.gx.size());
+            nd++;
         }
     }
     if (k == 3 || k == 4)
