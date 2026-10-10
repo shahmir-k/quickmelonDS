@@ -79,6 +79,10 @@ struct Variant
     u8 twl;
     u8 hbObjOff;
     s32 setCyc, getCyc, getCycPerBit;   // ponytail: fixed cycle estimates (guest averages in check mode)
+    // 10.: MI_SendGXCommandAsync and the functions its synchronous part runs (besides MIi_FIFOCallback, Set/Get)
+    u32 async;
+    Range asyncCode[7];
+    u64 asyncSig;
 };
 constexpr Variant kPW = {
     "PW", 0x01FF8160, 0x0208478C, 0x02084830, 0x02082864,
@@ -107,6 +111,17 @@ constexpr Variant kPW = {
     0x02150F58, 0x0215100C, 0x02150FF0, 0x02150E8C, 0x020AA1B4,
     0x02085C68, 0x02085224, 0x02085808, 0x02084610, 0x02085270,
     0x020882F0, 0x02085B44, 0, 0x10, 500, 27, 17,
+    0x02082778,
+    {
+        {0x020825AC, 0x02082608},   // MI_WaitDma
+        {0x02082724, 0x02082864},   // (DMA range check), MI_SendGXCommandAsync with its literal pool
+        {0x020848BC, 0x02084904},   // OSi_EnterDmaCallback (DMA IRQ table entry + IE)
+        {0x02084980, 0x020849B0},   // OS_EnableIrqMask
+        {0x020849E0, 0x02084A0C},   // OS_ResetRequestIrqMask
+        {0x01FF8020, 0x01FF80F0},   // MIi_DmaSetParams (ITCM)
+        {0x020879A0, 0x020879CC},   // OS_DisableInterrupts, OS_RestoreInterrupts
+    },
+    0xb26c62ca8cd70cfeull,
 };
 // Pokemon Black: the same code; main-binary OS code 0x18 bytes lower, its data 0x20 lower
 // (located by masked code match against PW + the literal pools; tools/hle/xmap.py)
@@ -126,6 +141,12 @@ constexpr Variant kPB = {
     0x02150F38, 0x02150FEC, 0x02150FD0, 0x02150E6C, 0x020AA194,
     B(0x02085C68), B(0x02085224), B(0x02085808), B(0x02084610), B(0x02085270),
     B(0x020882F0), B(0x02085B44), 0, 0x10, 500, 27, 17,
+    B(0x02082778),
+    {
+        {B(0x020825AC), B(0x02082608)}, {B(0x02082724), B(0x02082864)}, {B(0x020848BC), B(0x02084904)},
+        {B(0x02084980), B(0x020849B0)}, {B(0x020849E0), B(0x02084A0C)}, {0x01FF8020, 0x01FF80F0}, {B(0x020879A0), B(0x020879CC)},
+    },
+    0x3f2c017ca1395eceull,
 };
 // Pokemon White 2 (USA/EU), TWL SDK build: OS_IrqHandler and the ARM context switch code are PW's
 // (ITCM +0xB98), OS_WaitIrq, CP and OS_Save/LoadContext ARM as in PW; OS_SleepThread,
@@ -167,6 +188,7 @@ constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
 // hook kind of (addr, instr) in variant v: 0 wake, 1 set, 2 get, 5 GX send, -1 none (thumb: a Thumb entry, instr the halfword)
 inline int Kind(const Variant& v, u32 addr, u32 instr, bool thumb = false)
 {
+    if (!thumb && v.async && addr == v.async && instr == kGxInstr) return 10;
     if (thumb) return !v.twl ? -1 : addr == v.set && instr == kSetInstrT ? 1 : addr == v.get && instr == kGetInstrT ? 2
                     : v.gx && addr == v.gx && instr == kGxInstrT ? 5 : -1;
     return addr == v.wake && instr == kWakeInstr ? 0 : !v.twl && addr == v.set && instr == kSetInstr ? 1
@@ -178,16 +200,17 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 10;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv
+constexpr int kKinds = 11;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = 511;                 // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv
-    std::vector<u8> code, irqCode, gxCode;
+    u32 mask = 1023;                // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start
+    std::vector<u8> code, irqCode, gxCode, asyncCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
+    bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
     bool irqOk = false;             // IRQ path code matches the variant (3.)
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
     u64 calls[kKinds] = {}, native[kKinds] = {}, fallback[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, irqDuring[kKinds] = {};
@@ -214,9 +237,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -316,6 +339,18 @@ bool CodeIntact(melonDS::ARMv5* c, const State& s, int k)
     return true;
 }
 
+bool AsyncIntact(melonDS::ARMv5* c, const State& s)
+{
+    size_t o = 0;
+    for (const Range& r : s.v->asyncCode)
+    {
+        const u8* p = CodePtr(c, r.a);
+        if (!p || memcmp(p, s.asyncCode.data() + o, r.b - r.a) != 0) return false;
+        o += r.b - r.a;
+    }
+    return true;
+}
+
 bool GxIntact(melonDS::ARMv5* c, const State& s)
 {
     const Range& r = s.v->gxCode;
@@ -364,6 +399,12 @@ __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 in
         for (u32 a = v.gxCode.a; a < v.gxCode.b; a++) { const u8* p = CodePtr(c, a); s.gxCode.push_back(p ? *p : 0); }
         s.gxOk = Fnv(s.gxCode) == v.gxSig;
         if (g_Stats) fprintf(stderr, "A9HLE: GX send signature %016llx -> %s\n", (unsigned long long)Fnv(s.gxCode), s.gxOk ? "on" : "off");
+        if (v.async)
+        {
+            CodeBytes(c, s.asyncCode, v.asyncCode, 0, 7);
+            s.asyncOk = Fnv(s.asyncCode) == v.asyncSig;
+            if (g_Stats) fprintf(stderr, "A9HLE: GX async start signature %016llx -> %s\n", (unsigned long long)Fnv(s.asyncCode), s.asyncOk ? "on" : "off");
+        }
         break;
     }
     if (!s.status && s.tried == (1u << kNumVariants) - 1) s.status = -1;    // no variant matches
@@ -494,6 +535,7 @@ struct Pending
     std::vector<u32> gx;    // G3D material check: the GXFIFO words of the native path
     bool gxOn = false;      // ... captured from BulkWords (GxTap) + the guest's GXFIFO stores
     u32 fit[4] = {};        // _ll_sdiv check: normalization shifts, dividend shifts, nonzero, estimate
+    std::vector<std::pair<u32, u32>> io;    // GX async check: the IO writes of the native plan (IME toggles left out)
 } g_P;
 #ifdef LITEV_A9HLE_GXCHECK
 std::vector<u32> g_GxMatTap;
@@ -1775,6 +1817,14 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     const Variant& v = *Active(&nds.ARM9)->v;     // after IsHook != 0
     if (addr == v.wake) { r = v.code; return kNumCode; }
     if (addr == v.gx) { r = &v.gxCode; return 1; }
+    if (addr == v.async)
+    {
+        static thread_local Range as[9];
+        for (int i = 0; i < 7; i++) as[i] = v.asyncCode[i];
+        as[7] = v.gxCode; as[8] = v.code[3];
+        r = as;
+        return 9;
+    }
     r = &v.code[3];             // OS_SetIrqFunction / OS_GetIrqFunction
     return 1;
 }
@@ -1822,6 +1872,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
     const int k = Kind(*s.v, addr, instr);
     if (k < 0 || !(s.mask & Bit(k))) return 0;
     if (k == 5) return !s.gxOk ? 0 : GxIntact(&nds.ARM9, s) ? 1 : 2;
+#ifdef LITEV_GX_BULK
+    if (k == 10) return !s.gxOk || !s.asyncOk ? 0 : AsyncIntact(&nds.ARM9, s) && GxIntact(&nds.ARM9, s) && CodeIntact(&nds.ARM9, s, 1) ? 1 : 2;
+#else
+    if (k == 10) return 0;
+#endif
     return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
 }
 
@@ -1862,6 +1917,132 @@ __attribute__((noinline)) bool RunGx(melonDS::ARMv5* c, State& s, bool jit)
     }
     else s.fallback[5]++;
     GuestFallback(c);
+    return true;
+}
+// ---- 10. MI_SendGXCommandAsync: its synchronous part natively -------------------------------------
+// NNS G3D sends every shape's display list with MI_SendGXCommandAsync (55 lists a frame in the PW town):
+// wait for the previous list and the DMA, save the GXFIFO IRQ mode / handler, GXFIFO IRQ mode "less
+// than half", OS_SetIrqFunction(GXFIFO, MIi_FIFOCallback), OS_EnableIrqMask(GXFIFO), MIi_FIFOCallback
+// (with 5.: every chunk but the last at once; the last one as a DMA with its IRQ handler
+// MIi_DMACallback: OSi_EnterDmaCallback, MIi_DmaSetParams), OS_ResetRequestIrqMask(GXFIFO), IRQs
+// restored: ~210 guest instructions and 3 hook exits (Get, Set, 5.) a list. Natively at its entry
+// when the previous list is done, the FIFO empty and the DMA idle: the same IO writes in the same
+// order (GXSTAT, IE, the bulk chunks, IE, the DMA registers, IF; the IME toggles around them are
+// left out: IRQs are off and IME ends unchanged), every memory byte (MIi_GXDmaParams, OS_IRQTable,
+// the DMA IRQ table, the stack frames) and register / flag the guest leaves. The DMA completion
+// (IRQ -> MIi_DMACallback) stays guest code. Category B: a fixed cycle estimate (guest average in
+// check mode) plus 5.'s. If the bulk send stops early (a SWAP_BUFFERS in the list: the FIFO is no
+// longer empty), the state is the guest's at MIi_FIFOCallback's entry and the guest continues there.
+// ponytail: fixed estimate (single-chunk lists, check mode without IRQs, entry to OS_RestoreInterrupts)
+constexpr s32 kAsyncCyc = 1500;   // (guest: 1510 + 4 per DMA word, exact over 4.7k lists; the DMA charges its own)
+
+__attribute__((noinline)) bool RunAsync(melonDS::ARMv5* c, State& s, bool jit)
+{
+    melonDS::NDS& nds = c->NDS;
+    const Variant& v = *s.v;
+    const u32 pc = c->R[15] - 8;
+    const u32 dma = c->R[0], src = c->R[1], len = c->R[2], cb = c->R[3], sp = c->R[13];
+    Mem m(c, g_Check || g_Dry);
+    Obj P, st;
+    u32 gxstat = 0, n = 0;
+    bool ok = !CheckPending && s.gxOk && s.asyncOk && (jit || (AsyncIntact(c, s) && GxIntact(c, s) && CodeIntact(c, s, 1)))
+              && dma >= 1 && dma <= 3 && len && Fixed(c, s, m) && s.ftab && s.ftab2;
+    if (ok)
+    {
+        // the guest waits for the previous list (MIi_GXDmaParams.busy), the DMA (MI_WaitDma) and an empty FIFO
+        P = m.O(v.gxParams, 0x20); st = m.O(sp - 80, 84);
+        ok = P && !P.dtcm && st && !P.r(0) && !(nds.A9HLEDmaCnt(dma) & 0x80000000);
+        if (ok) { gxstat = nds.ARM9Read32(0x04000600); ok = gxstat & (1u << 25); }
+    }
+    if (ok && len > kGxChunk)
+    {
+        // what 5. sends at once at MIi_FIFOCallback's entry
+        melonDS::GPU3D& gx = nds.GPU.GPU3D;
+        ok = (s.mask & 16) && !g_Check && len <= 0x100000 && !(len & 3) && !(src & 3) && (src >> 24) == 0x02
+             && ((src + len - 1) >> 24) == 0x02 && gx.GeometryEnabled && gx.BulkReady();
+        n = ((len - 1) / kGxChunk) * (kGxChunk / 4);
+    }
+    if (!ok)
+    {
+        s.fallback[10] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    const u64 t0 = g_Time ? Now() : 0;
+    const u32 params = v.gxParams, arg = st.r(80), oldI = c->CPSR & 0x80, ie0 = nds.IE[0], ie1 = ie0 | 0x200000, dbit = 1u << (8 + dma);
+    const u32 fifoCb = R32(CodePtr(c, v.async + 0xE8)), dmaCb = R32(CodePtr(c, v.gx + 0xA8));
+    const Obj tab{s.ftab, kIrqTable, s.ftabD}, tab2{s.ftab2, v.irqTable2, s.ftab2D};
+    const u32 gxw = (gxstat & ~0xC0000000u) | 0x40000000u;
+    u32 done = 0;
+    if (!m.logOnly)
+    {
+        nds.ARM9Write32(0x04000600, gxw);
+        nds.ARM9Write32(0x04000210, ie1);
+        if (n) done = GxSend(c, s, src, len, n);
+    }
+    // MIi_GXDmaParams {busy, dma, src, length, callback, arg, GXFIFO IRQ mode, GXFIFO IRQ handler}, OS_IRQTable[GXFIFO]
+    m.W(P, 0, 1); m.W(P, 4, dma); m.W(P, 0x10, cb); m.W(P, 0x14, arg); m.W(P, 0x18, gxstat >> 30); m.W(P, 0x1C, R32(s.ftab + 21 * 4));
+    m.W(tab, 21 * 4, fifoCb);
+    m.W(st, 56, c->R[3]); m.W(st, 60, c->R[4]); m.W(st, 64, c->R[5]); m.W(st, 68, c->R[6]); m.W(st, 72, c->R[7]); m.W(st, 76, c->R[14]);
+    if (done < n)
+    {
+        // the FIFO stopped being empty: hand over at MIi_FIFOCallback's entry (5. found it busy: the guest goes on)
+        const u32 set[8] = {oldI, 0x04000600, params, 0x200000, c->R[8], c->R[9], c->R[10], pc + 0xC8};   // OS_SetIrqFunction's push
+        for (int i = 0; i < 8; i++) m.W(st, 24 + i * 4, set[i]);
+        m.Flush();
+        c->R[0] = c->R[1] = ie0; c->R[2] = nds.IME[0] & 0xFFFF; c->R[3] = 0x04000208; c->R[4] = oldI; c->R[5] = 0x04000600; c->R[6] = params; c->R[7] = 0x200000;
+        c->R[12] = 0x20; c->R[13] = sp - 24; c->R[14] = pc + 0xD4;
+        c->CPSR = (c->CPSR & 0x0FFFFFFF) | 0x60000000 | 0x80;
+        c->Cycles += 700;
+        s.native[10]++;
+        c->JumpTo(v.gx);
+        return true;
+    }
+    const u32 chunk = len - n * 4, srcL = src + n * 4, ctrl = 0xC4400000u | (chunk >> 2);
+    m.W(P, 8, src + len); m.W(P, 0xC, 0);
+    m.W(tab2, dma * 12, dmaCb); m.W(tab2, dma * 12 + 8, 0); m.W(tab2, dma * 12 + 4, ie1 & dbit);
+    m.W(st, 32, 0);     // MIi_FIFOCallback: str r7, [sp] over its push of r3
+    const u32 fc[5] = {oldI, 0x04000600, params, 0x200000, pc + 0xD4};
+    for (int i = 0; i < 5; i++) m.W(st, 36 + i * 4, fc[i]);
+    const u32 ds[8] = {ctrl, srcL, chunk, params, 0, c->R[8], c->R[9], v.gx + 0x6C};   // MIi_DmaSetParams' push
+    for (int i = 0; i < 8; i++) m.W(st, i * 4, ds[i]);
+    const u32 sad = 0x040000B0 + dma * 12;
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    const u32 cpsrI = (c->CPSR & 0x0FFFFFFF) | 0x60000000 | 0x80;
+    e.R[0] = 0x80; e.R[1] = cpsrI; e.R[2] = (cpsrI & ~0x80u) | oldI; e.R[3] = 0; e.R[12] = v.irqTable2;   // r3: MIi_FIFOCallback pops the 0 it stored over its r3 e.R[14] = pc + 0xDC;
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFDF) | 0x60000000 | ((e.retPc & 1) << 5);
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            // compared where the guest calls OS_RestoreInterrupts at the end (the DMA's IRQ is taken right after it;
+            // natively at the return instead): MI_SendGXCommandAsync's frame and registers, IRQs still off,
+            // r1 = the IF value OS_ResetRequestIrqMask read (not compared)
+            Expect e2 = e;
+            e2.R[0] = oldI; e2.R[2] = nds.IME[0] & 0xFFFF; e2.R[4] = oldI; e2.R[5] = 0x04000600; e2.R[6] = params; e2.R[7] = 0x200000;
+            e2.R[13] = sp - 24; e2.R[14] = v.gx + 0x74;
+            e2.retPc = pc + 0xD8; e2.CPSR = cpsrI & ~0x20u;
+            ArmCheck(c, 10, m, e2);
+            g_P.fit[0] = chunk >> 2;
+            g_P.io = {{0x04000600, gxw & 0xC0008000u}, {0x04000210, ie1}, {0x04000210, ie1 | dbit}, {sad, srcL}, {sad + 4, 0x04000400},
+                      {sad + 8, ctrl}, {0x04000214, 0x200000}};
+        }
+        s.checks[10]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    nds.ARM9Write32(0x04000210, ie1 | dbit);
+    nds.ARM9Write32(sad, srcL); nds.ARM9Write32(sad + 4, 0x04000400); nds.ARM9Write32(sad + 8, ctrl);
+    nds.ARM9Write32(0x04000214, 0x200000);
+    m.Flush();
+    s.native[10]++;
+    Return(c, e, kAsyncCyc);
+    if (g_Time) s.ns += Now() - t0;
     return true;
 }
 #endif
@@ -1962,6 +2143,7 @@ bool Run(melonDS::ARM* cpu, bool jit)
     s.calls[k]++;
 #ifdef LITEV_GX_BULK
     if (k == 5) return RunGx(c, s, jit);
+    if (k == 10) return RunAsync(c, s, jit);
 #endif
     return RunOs(c, s, k, jit);
 }
@@ -2007,6 +2189,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         return;
     }
     if (!atVec && (pc != (e.retPc & ~1u) || cpu->CPSR != e.CPSR)) return;
+    if (g_P.kind == 10) gR[1] = e.R[1];     // GX async: r1 = the IF value read (not modelled)
     if (g_P.kind == 6 && (cpu->R[2] != e.R[2] || cpu->R[3] != e.R[3] || cpu->R[6] != e.R[6])) return;   // LZ: same progress
     melonDS::NDS& nds = c->NDS;
     if ((g_P.kind == 0 || g_P.kind == 4) && R32(&nds.MainRAM[(g_State[&nds].v->info + 4) & nds.MainRAMMask]) != e.cur) return;
@@ -2020,6 +2203,8 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         return;
     }
     if (k < 8 || !g_P.irq) { s.guestCyc[k] += nds.ARM9Timestamp + c->Cycles - g_P.t0; s.guestN[k]++; }   // 8, 9: without IRQs
+    if (k == 10 && getenv("LITEV_A9HLE_ASYNCFIT") && !g_P.irq)
+        fprintf(stderr, "ASYNCFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 8 && getenv("LITEV_A9HLE_MATFIT") && !g_P.irq)
         fprintf(stderr, "MATFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 9 && getenv("LITEV_A9HLE_LLFIT") && !g_P.irq)
@@ -2069,6 +2254,19 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         {
             if (gi[i] != e.IRQ[i]) { if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " irq[%d] guest %08x native %08x;", i, gi[i], e.IRQ[i]); nd++; }
             if (gs[i] != e.SVC[i]) { if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " svc[%d] guest %08x native %08x;", i, gs[i], e.SVC[i]); nd++; }
+        }
+    }
+    if (k == 10)
+    {
+        std::vector<std::pair<u32, u32>> io;
+        for (auto& a : g_P.acc)
+            if (a.Write && (a.Addr >> 24) == 0x04 && a.Addr != 0x04000208)
+                io.push_back({a.Addr, a.Addr == 0x04000600 ? a.Val & 0xC0008000u : a.Val});
+        if (io != g_P.io)
+        {
+            if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " IO writes: guest %zu, native %zu;", io.size(), g_P.io.size());
+            if (getenv("LITEV_A9HLE_IODUMP") && !g_P.irq) { for (auto& x : io) fprintf(stderr, " %08x=%08x", x.first, x.second); fprintf(stderr, " |"); for (auto& x : g_P.io) fprintf(stderr, " %08x=%08x", x.first, x.second); fprintf(stderr, "\n"); }
+            nd++;
         }
     }
     if (k == 8)
