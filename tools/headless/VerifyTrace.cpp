@@ -1189,6 +1189,12 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                         lastCode = code;
                     }
                     float m = NetplaySpeed::Multiplier(code);
+#ifdef LITEV_AGGRESSIVE_SKIP
+                    // LITEV_NP_FFSKIP=N: while the session runs faster than 1x the local console draws
+                    // 1 of N+1 frames, never skipping once the game captured (the app's Netplay fast-forward)
+                    static const int ffSkip = getenv("LITEV_NP_FFSKIP") ? atoi(getenv("LITEV_NP_FFSKIP")) : 0;
+                    if (ffSkip) { bi.nds->GPU.KeepCaptures = true; bi.nds->GPU.SetFrameskipTarget(code ? ffSkip : 0); }
+#endif
                     workEma = workEma * 0.9 + runNow * 0.1;
                     auto now = std::chrono::steady_clock::now();
                     if (pace > 0 && m > 0)
