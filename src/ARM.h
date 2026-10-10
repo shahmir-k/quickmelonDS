@@ -486,6 +486,9 @@ public:
     u8 MemTimings[0x100000][4];
 
     u8* CurICacheLine;
+#ifdef LITEV_A9HLE
+    void* A9HLEState = nullptr;   // A9HLE per-console state (owned by ARM9HLE.cpp)
+#endif
 
     bool (*GetMemRegion)(u32 addr, bool write, MemRegion* region);
 

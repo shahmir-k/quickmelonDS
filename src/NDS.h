@@ -355,6 +355,14 @@ public: // TODO: Encapsulate the rest of these members
     /// of a native DS-compatible ARM9 BIOS.
     [[nodiscard]] bool IsLoadedARM9BIOSKnownNative() const noexcept { return ARM9BIOSNative; }
     [[nodiscard]] const std::array<u8, ARM9BIOSSize>& GetARM9BIOS() const noexcept { return ARM9BIOS; }
+#ifdef LITEV_A9HLE
+    // NitroSDK CP_SaveContext's view of the divider/sqrt unit (no lazy-result materialisation)
+    void A9HLECpContext(u32 out[7]) const noexcept
+    {
+        out[0] = DivNumerator[0]; out[1] = DivNumerator[1]; out[2] = DivDenominator[0]; out[3] = DivDenominator[1];
+        out[4] = SqrtVal[0]; out[5] = SqrtVal[1]; out[6] = (u32)(DivCnt & 3) | ((u32)(SqrtCnt & 1) << 16);
+    }
+#endif
     void SetARM9BIOS(const std::array<u8, ARM9BIOSSize>& bios) noexcept;
 
     [[nodiscard]] const std::array<u8, ARM7BIOSSize>& GetARM7BIOS() const noexcept { return ARM7BIOS; }

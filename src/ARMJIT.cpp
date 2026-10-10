@@ -1025,9 +1025,15 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     int i = 0;
     u32 r15 = cpu->R[15];
 
-    u32 addressRanges[MaxBlockSize];
-    u32 addressMasks[MaxBlockSize];
-    memset(addressMasks, 0, MaxBlockSize * sizeof(u32));
+#ifdef LITEV_A9HLE
+    // + room for an A9HLE hook block's dependency ranges (see below)
+    const int maxRanges = MaxBlockSize + 32;
+#else
+    const int maxRanges = MaxBlockSize;
+#endif
+    u32 addressRanges[maxRanges];
+    u32 addressMasks[maxRanges];
+    memset(addressMasks, 0, maxRanges * sizeof(u32));
     u32 numAddressRanges = 0;
 
     u32 numLiterals = 0;
@@ -1122,8 +1128,36 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
             instrs[i].Info = ARMInstrInfo::Decode(false, 1, 0xE7F000F0, false);
 #endif
 #ifdef LITEV_A9HLE
-        if (cpu->Num == 0 && !thumb && A9HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr))
-            instrs[i].Info = ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
+        if (int hook = cpu->Num == 0 && !thumb ? A9HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr) : 0)
+        {
+            // The hook block also covers every byte of guest code the native version replaces:
+            // a write there invalidates it like a write to its own code, and recompiling
+            // re-verifies (IsHook). That is what lets A9HLE::Run skip a per-call code compare.
+            const A9HLE::Range* dep;
+            int nd = A9HLE::Deps(instrs[i].Addr, dep);
+            u32 cur = numAddressRanges - 1;     // keep the instruction's own range last
+            for (int d = 0; d < nd; d++)
+                for (u32 a = dep[d].a & ~15u; a < dep[d].b; a += 16)
+                {
+                    u32 ta = LocaliseCodeAddress(0, a);
+                    u32 tr = ta & ~0x1FF, j = 0;
+                    for (; j < numAddressRanges; j++)
+                        if (addressRanges[j] == tr) break;
+                    if (j == numAddressRanges)
+                    {
+                        assert(numAddressRanges < (u32)maxRanges);
+                        addressRanges[numAddressRanges++] = tr;
+                    }
+                    addressMasks[j] |= 1 << ((ta & 0x1FF) / 16);
+                }
+            if (cur != numAddressRanges - 1)
+            {
+                std::swap(addressRanges[cur], addressRanges[numAddressRanges - 1]);
+                std::swap(addressMasks[cur], addressMasks[numAddressRanges - 1]);
+            }
+            if (hook == 1)
+                instrs[i].Info = ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
+        }
 #endif
 
         hasMemoryInstr |= thumb

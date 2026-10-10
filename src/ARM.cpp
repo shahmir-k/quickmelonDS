@@ -1453,7 +1453,7 @@ void ARMv5::Execute()
 #endif
 #ifdef LITEV_A9HLE
                 if (A9HLE::CheckPending) A9HLE::CheckAt(this, R[15] - 8);
-                if (A9HLE::MaybeHook(CurInstr) && A9HLE::Run(this)) {}
+                if (A9HLE::MaybeHook(CurInstr) && A9HLE::Run(this, false)) {}
                 else
 #endif
                 if (CheckCondition(CurInstr >> 28))

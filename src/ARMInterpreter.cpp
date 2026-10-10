@@ -44,7 +44,7 @@ void A_UNK(ARM* cpu)
         return;
 #endif
 #ifdef LITEV_A9HLE
-    if (cpu->Num == 0 && A9HLE::Run(cpu))
+    if (cpu->Num == 0 && A9HLE::Run(cpu, true))
         return;
 #endif
     Log(LogLevel::Warn, "undefined ARM%d instruction %08X @ %08X\n", cpu->Num?7:9, cpu->CurInstr, cpu->R[15]-8);

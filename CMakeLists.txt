@@ -592,7 +592,7 @@ endif()
 # A9HLE: Pokemon Black/White's NitroSDK ARM9 OS: spurious OS_WaitIrq wake-ups (the IRQ handler
 # switching to the VBlank-waiting main thread and back on every HBlank, 25-50% of ARM9 guest
 # instructions) are skipped with the exact memory/register result, and OS_SetIrqFunction /
-# OS_GetIrqFunction run natively. Signature-detected, code re-checked per call, guest fallback;
+# OS_GetIrqFunction run natively. Signature-detected (JIT: hook block depends on the code bytes), guest fallback;
 # cycles are a fixed estimate. Runtime: debug.litev.a9hle (default on). See src/ARM9HLE.h.
 option(LITEV_A9HLE "ARM9 HLE of NitroSDK OS IRQ wake-ups / IRQ table functions (PW/PB, approximate cycles)" OFF)
 if (LITEV_A9HLE)

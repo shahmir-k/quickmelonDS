@@ -10,6 +10,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <chrono>
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
@@ -37,9 +38,8 @@ constexpr u32 kOsi = 0x02150FF0;        // +0 switchCallback, +4 (nonzero: no re
 constexpr u32 kCtxPc = 0x02085C68, kCtxLr = 0x02085224, kRetSleep = 0x02085808, kRetWait = 0x02084610, kRetLoad = 0x02085270;
 constexpr u32 kBiosLdm = 0xE8BD500F, kBiosSubs = 0xE25EF004;  // BIOS IRQ epilogue: ldmia sp!, {r0-r3,r12,lr}; subs pc, lr, #4
 
-struct Range { u32 a, b; };
 // every function the round trip / hooks execute, with literal pools
-constexpr Range kCode[] = {
+constexpr Range kCode[kNumCode] = {
     {0x01FF80F0, 0x01FF82A8},   // OS_IrqHandler + OS_IrqHandler_ThreadSwitch (ITCM)
     {0x020775D0, 0x0207764C},   // CP_SaveContext, CP_RestoreContext
     {0x020845B4, 0x02084628},   // OS_WaitIrq
@@ -65,12 +65,25 @@ struct State
     std::vector<u8> code;
     u64 calls[3] = {}, native[3] = {}, fallback[3] = {}, checks[3] = {}, diffs[3] = {}, irqDuring[3] = {};
     u64 guestCyc[3] = {}, guestN[3] = {}, getBits = 0;
+    u32 biosOk = 0;                 // BIOS IRQ epilogue address verified once
+    u64 ns = 0;                     // stats: host time inside Run (native calls)
 };
 std::unordered_map<const melonDS::NDS*, State> g_State;
 bool g_Check = getenv("LITEV_A9HLE_CHECK") && atoi(getenv("LITEV_A9HLE_CHECK"));
 bool g_Stats = getenv("LITEV_A9HLE_STATS") && atoi(getenv("LITEV_A9HLE_STATS"));
+// cost measurement: compute the native result (nothing written) and run the guest code anyway
+bool g_Dry = getenv("LITEV_A9HLE_DRY") && atoi(getenv("LITEV_A9HLE_DRY"));
 const char* kName[3] = {"irqwake", "setirqfn", "getirqfn"};
 
+// stats only
+u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+double TimerNs()   // cost of one Now() pair, subtracted from the per-call figure
+{
+    u64 t = Now(), z = 0;
+    for (int i = 0; i < 100000; i++) { u64 a = Now(); z += Now() - a; }
+    (void)t;
+    return (double)z / 100000;
+}
 inline u32 R32(const u8* p) { u32 v; memcpy(&v, p, 4); return v; }
 inline u16 R16(const u8* p) { u16 v; memcpy(&v, p, 2); return v; }
 
@@ -116,10 +129,9 @@ bool CodeIntact(melonDS::ARMv5* c, const State& s, int k)
 
 State& Get(melonDS::ARMv5* c)
 {
-    static thread_local const melonDS::NDS* lastNds = nullptr;
-    static thread_local State* last = nullptr;
-    if (lastNds != &c->NDS) { last = &g_State[&c->NDS]; lastNds = &c->NDS; }   // map nodes are stable
-    State& s = *last;
+    if (c->A9HLEState) return *(State*)c->A9HLEState;
+    State& s = g_State[&c->NDS];         // map nodes are stable
+    c->A9HLEState = &s;
     if (s.status != 0) return s;
     s.status = -1;
     if (!ReadOn()) return s;
@@ -139,16 +151,27 @@ State& Get(melonDS::ARMv5* c)
 }
 
 // ---- guest memory view with a write log --------------------------------------------------
+// Reads are host loads from main RAM / DTCM. Writes (only after every address was validated)
+// go straight to memory and only when the word changes; in check mode they are logged instead.
 struct Wr { u32 a, v; u8 sz; };
+// a validated, contiguous guest object in host memory
+struct Obj
+{
+    u8* p = nullptr; u32 a = 0; bool dtcm = false;
+    explicit operator bool() const { return p != nullptr; }
+    u32 r(u32 o) const { return R32(p + o); }
+    u16 r16(u32 o) const { return R16(p + o); }
+};
 struct Mem
 {
     melonDS::ARMv5* c;
-    Wr log[64];
+    bool logOnly;
     u32 n = 0;
     bool bad = false;
-    explicit Mem(melonDS::ARMv5* cpu) : c(cpu) {}
+    Wr log[64];
+    Mem(melonDS::ARMv5* cpu, bool check) : c(cpu), logOnly(check) {}
     // DTCM or main RAM (the only places the hooked code writes), else nullptr
-    u8* P(u32 a)
+    __attribute__((always_inline)) u8* P(u32 a)
     {
         if (a < c->ITCMSize) return nullptr;
         if ((a & c->DTCMMask) == c->DTCMBase) return &c->DTCM[a & (DTCMPhysicalSize - 1)];
@@ -157,16 +180,42 @@ struct Mem
     }
     u32 r32(u32 a) { a &= ~3u; if (u8* p = P(a)) return R32(p); bad = true; return 0; }
     u16 r16(u32 a) { a &= ~1u; if (u8* p = P(a)) return R16(p); bad = true; return 0; }
-    void w32(u32 a, u32 v) { a &= ~3u; if (!P(a) || n == 64) { bad = true; return; } log[n++] = {a, v, 4}; }
-    void Apply()
+    bool ok(u32 a) { return P(a) != nullptr; }
+    // [a, a+len) in one host block (main RAM or DTCM, no mirror wrap), else empty
+    __attribute__((always_inline)) Obj O(u32 a, u32 len)
     {
-        melonDS::NDS& nds = c->NDS;
-        for (u32 i = 0; i < n; i++)
+        Obj x;
+        u8* p = P(a);
+        if (!p || (a & 3) || P(a + len - 1) != p + len - 1) return x;
+        x.p = p; x.a = a; x.dtcm = (a & c->DTCMMask) == c->DTCMBase;
+        return x;
+    }
+    // queue a word write (applied by Flush, after every check passed)
+    struct Pw { u8* p; u32 a, v; bool d; } pw[48];
+    u32 np = 0;
+    __attribute__((always_inline)) void W(const Obj& x, u32 o, u32 v) { pw[np++] = {x.p + o, x.a + o, v, x.dtcm}; }
+    // only changed words are written: DTCM directly (never holds JIT code), main RAM through the
+    // bus (JIT invalidation); in check mode they are logged instead
+    void Flush()
+    {
+        for (u32 i = 0; i < np; i++)
         {
-            const Wr& w = log[i];
-            if ((w.a & c->DTCMMask) == c->DTCMBase) memcpy(&c->DTCM[w.a & (DTCMPhysicalSize - 1)], &w.v, 4);
-            else nds.ARM9Write32(w.a, w.v);     // main RAM through the bus (JIT invalidation)
+            const Pw& w = pw[i];
+            if (__builtin_expect(logOnly, 0)) { if (n < 64) log[n++] = {w.a, w.v, 4}; else bad = true; continue; }
+            if (R32(w.p) == w.v) continue;
+            if (w.d) memcpy(w.p, &w.v, 4);
+            else c->NDS.ARM9Write32(w.a, w.v);
         }
+        np = 0;
+    }
+    // a must be valid (checked with ok() before the first write)
+    void w32(u32 a, u32 v)
+    {
+        if (__builtin_expect(logOnly, 0)) { if (n < 64) log[n++] = {a, v, 4}; else bad = true; return; }
+        u8* p = P(a);
+        if (R32(p) == v) return;
+        if ((a & c->DTCMMask) == c->DTCMBase) memcpy(p, &v, 4);   // DTCM never holds JIT code
+        else c->NDS.ARM9Write32(a, v);                            // main RAM: JIT invalidation
     }
 };
 
@@ -187,7 +236,7 @@ struct Pending
     bool irq = false;
 } g_P;
 
-void ArmCheck(melonDS::ARMv5* c, int kind, const Mem& m, const Expect& e)
+__attribute__((noinline, cold)) void ArmCheck(melonDS::ARMv5* c, int kind, const Mem& m, const Expect& e)
 {
     melonDS::NDS& nds = c->NDS;
     g_P.kind = kind; g_P.e = e; g_P.log.assign(m.log, m.log + m.n); g_P.irq = false; g_P.steps = 0;
@@ -218,105 +267,115 @@ u32 Flags(u32 a, u32 b)   // NZCV of cmp a, b
 // the switch would pick, and the interrupted thread is the one picked once it sleeps again.
 // An IRQ that is already pending (or arrives during the guest's round trip) would be taken in
 // the woken thread's short IRQs-on window; here it is taken right after the return instead.
-bool Wake(melonDS::ARMv5* c, Mem& m, Expect& e, u32& tpc, u32& tcpsr)
+bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, u32& tpc, u32& tcpsr)
 {
     melonDS::NDS& nds = c->NDS;
     if ((c->CPSR & 0x3F) != 0x12) return false;
     const u32 spsr = c->R_IRQ[2];
     if ((spsr & 0x1F) != 0x1F && (spsr & 0x1F) != 0x10) return false;
-    const u32 t = m.r32(kIrqQueue);
-    if (!t || c->R[12] != t || m.r32(kIrqQueue + 4) != t || m.r32(t + 0x80) || m.r32(t + 0x7C)) return false;
-    if (m.r16(kInfo) || m.r32(kInfo + 0xC) || m.r32(kOsi) || m.r32(kOsi + 4) || m.r16(kOsi + 0x1E)
-        || m.r32(kOsi + 8) != kInfo + 4)
-        return false;
-    const u32 cur = m.r32(kInfo + 4);
+    const u32 F = c->R[13], svcsp = c->R_SVC[0];
+    // host views of every guest object touched (validated once; contiguous)
+    Obj q = m.O(kIrqQueue, 8), chk = m.O(kIrqCheck, 4), osi = m.O(kOsi, kInfo + 0x10 - kOsi);
+    Obj fr = m.O(F - 12, 40), sv = m.O(svcsp - 24, 24);
+    if (!q || !chk || !osi || !fr || !sv) return false;
+    // in-order cores: start the independent cold loads together
+    __builtin_prefetch(osi.p); __builtin_prefetch(osi.p + 32); __builtin_prefetch(fr.p); __builtin_prefetch(sv.p);
+    const u32 t = q.r(0);
+    if (!t || c->R[12] != t || q.r(4) != t) return false;
+    const u32 info = kInfo - kOsi;
+    if (osi.r16(info) || osi.r(info + 0xC) || osi.r(0) || osi.r(4) || osi.r16(0x1E) || osi.r(8) != kInfo + 4) return false;
+    const u32 cur = osi.r(info + 4);
     if (!cur || cur == t) return false;
+    Obj tp = m.O(t, 0x84), cp = m.O(cur, 0x64);
+    if (!tp || !cp) return false;
+    __builtin_prefetch(tp.p); __builtin_prefetch(tp.p + 64); __builtin_prefetch(cp.p); __builtin_prefetch(cp.p + 64);
     // t asleep in OS_WaitIrq on this queue, flags not satisfied
-    if (m.r32(t + 0x64) != 0 || m.r32(t + 0x78) != kIrqQueue || m.r32(t + 0x40) != kCtxPc || m.r32(t + 0x3C) != kCtxLr)
+    if (tp.r(0x80) || tp.r(0x7C) || tp.r(0x64) != 0 || tp.r(0x78) != kIrqQueue || tp.r(0x40) != kCtxPc || tp.r(0x3C) != kCtxLr)
         return false;
-    const u32 tsp = m.r32(t + 0x38);
-    if (m.r32(tsp + 12) != kRetSleep || m.r32(tsp + 28) != kRetWait || m.r32(tsp + 20) != kIrqQueue || m.r32(tsp + 24) != kIrqCheck)
-        return false;
-    if (m.r32(tsp + 16) & m.r32(kIrqCheck)) return false;        // real wake-up
-    tcpsr = m.r32(t + 0);
+    const u32 tsp = tp.r(0x38);
+    Obj ts = m.O(tsp - 12, 44);
+    if (!ts) return false;
+    if (ts.r(24) != kRetSleep || ts.r(40) != kRetWait || ts.r(32) != kIrqQueue || ts.r(36) != kIrqCheck) return false;
+    if (ts.r(28) & chk.r(0)) return false;                        // real wake-up
+    tcpsr = tp.r(0);
     tpc = kCtxPc;
     if ((tcpsr & 0xFF) != 0x9F) return false;                     // SYS mode, ARM, IRQs off
     // the switch picks t (first thread that is ready or t), and with t asleep again the first
     // ready thread is cur
     u32 first = 0, firstReady = 0;
-    u32 x = m.r32(kInfo + 8);
+    u32 x = osi.r(info + 8);
     for (int i = 0; x && i < 64; i++)
     {
-        u32 st = m.r32(x + 0x64);
+        Obj xp = m.O(x + 0x64, 8);
+        if (!xp) return false;
+        u32 st = xp.r(0);
         if (st > 0xFFFF) return false;
         if (!first && (st == 1 || x == t)) first = x;
         if (!firstReady && st == 1 && x != t) firstReady = x;
         if (first && firstReady) break;
-        x = m.r32(x + 0x68);
+        x = xp.r(4);
     }
     if (first != t || firstReady != cur) return false;
-    // BIOS IRQ frame: [F] = return into the BIOS, [F+4..F+28) = r0-r3, r12, lr
-    const u32 F = c->R[13];
-    const u32 lrb = m.r32(F);
-    if ((lrb >> 12) != 0xFFFF0 || nds.ARM9Read32(lrb) != kBiosLdm || nds.ARM9Read32(lrb + 4) != kBiosSubs) return false;
-    u32 fr[6];
-    for (int i = 0; i < 6; i++) fr[i] = m.r32(F + 4 + i * 4);
-    const u32 svcsp = c->R_SVC[0];
-    if (m.bad) return false;
+    // BIOS IRQ frame: [F] = return into the BIOS, [F+4..F+28) = r0-r3, r12, lr  (fr: F-12..F+28)
+    const u32 lrb = fr.r(12);
+    if (lrb != s.biosOk)
+    {
+        if ((lrb >> 12) != 0xFFFF0 || (lrb & 0xFFF) > ARM9BIOSSize - 8) return false;
+        const u8* bios = nds.GetARM9BIOS().data() + (lrb & 0xFFF);
+        if (R32(bios) != kBiosLdm || R32(bios + 4) != kBiosSubs) return false;
+        s.biosOk = lrb;
+    }
+    u32 f[6];
+    for (int i = 0; i < 6; i++) f[i] = fr.r(16 + i * 4);
+    const u32 tf[6] = {tp.r(4), tp.r(8), tp.r(0xC), tp.r(0x10), tp.r(0x34), kCtxPc};
 
     // interrupted thread's context, as the IRQ path saves it
-    const u32 C = cur;
-    m.w32(C + 0x00, spsr);
-    for (int i = 0; i < 4; i++) m.w32(C + 4 + i * 4, fr[i]);
-    for (int i = 4; i < 12; i++) m.w32(C + 4 + i * 4, c->R[i]);
-    m.w32(C + 0x34, fr[4]);
-    m.w32(C + 0x38, c->R_IRQ[0]);                                // user/sys r13, r14 (banked out in IRQ mode)
-    m.w32(C + 0x3C, c->R_IRQ[1]);
-    m.w32(C + 0x40, fr[5]);
-    m.w32(C + 0x44, svcsp);
+    m.W(cp, 0x00, spsr);
+    for (int i = 0; i < 4; i++) m.W(cp, 4 + i * 4, f[i]);
+    for (int i = 4; i < 12; i++) m.W(cp, 4 + i * 4, c->R[i]);
+    m.W(cp, 0x34, f[4]);
+    m.W(cp, 0x38, c->R_IRQ[0]);                                  // user/sys r13, r14 (banked out in IRQ mode)
+    m.W(cp, 0x3C, c->R_IRQ[1]);
+    m.W(cp, 0x40, f[5]);
+    m.W(cp, 0x44, svcsp);
     // CP_SaveContext: divider numerator/denominator, sqrt param, DIVCNT&3, SQRTCNT&1
-    u32 cp[7];
-    for (int i = 0; i < 4; i++) cp[i] = nds.ARM9Read32(0x04000290 + i * 4);
-    cp[4] = nds.ARM9Read32(0x040002B8);
-    cp[5] = nds.ARM9Read32(0x040002BC);
-    cp[6] = (nds.ARM9Read16(0x04000280) & 3) | ((nds.ARM9Read16(0x040002B0) & 1) << 16);
-    for (int i = 0; i < 7; i++) m.w32(C + 0x48 + i * 4, cp[i]);
-    // IRQ stack below the frame: push {r0 = C, r1 = t}, CP_SaveContext's push {r4}
-    m.w32(F - 8, C);
-    m.w32(F - 4, t);
-    m.w32(F - 12, c->R[4]);
+    // (the register values themselves: no lazy-divider materialisation needed for these bits)
+    u32 cpx[7];
+    nds.A9HLECpContext(cpx);
+    for (int i = 0; i < 7; i++) m.W(cp, 0x48 + i * 4, cpx[i]);
+    // IRQ stack below the frame: CP_SaveContext's push {r4}, push {r0 = C, r1 = t}
+    m.W(fr, 0, c->R[4]);
+    m.W(fr, 4, cur);
+    m.W(fr, 8, t);
     // the IRQ frame rewritten with t's registers (the BIOS returned into t with them)
-    const u32 tf[6] = {m.r32(t + 4), m.r32(t + 8), m.r32(t + 0xC), m.r32(t + 0x10), m.r32(t + 0x34), kCtxPc};
-    for (int i = 0; i < 6; i++) m.w32(F + 4 + i * 4, tf[i]);
+    for (int i = 0; i < 6; i++) m.W(fr, 16 + i * 4, tf[i]);
     // t slept again: its context holds r5 = the thread it switched to; its stack holds
     // OS_LoadContext's push {r0 = cur, lr} and CP_RestoreContext's push {r4 = OSThreadInfo}
-    m.w32(t + 0x18, cur);
-    m.w32(tsp - 12, kInfo);
-    m.w32(tsp - 8, cur);
-    m.w32(tsp - 4, kRetLoad);
+    m.W(tp, 0x18, cur);
+    m.W(ts, 0, kInfo);
+    m.W(ts, 4, cur);
+    m.W(ts, 8, kRetLoad);
     // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack
-    for (int i = 0; i < 5; i++) m.w32(svcsp - 24 + i * 4, fr[i]);
-    m.w32(svcsp - 4, fr[5]);
-    if (m.bad) return false;
+    for (int i = 0; i < 6; i++) m.W(sv, i * 4, f[i]);
+    m.Flush();
 
     // registers after the guest's return into cur
     for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
-    for (int i = 0; i < 4; i++) e.R[i] = fr[i];
-    e.R[12] = fr[4];
+    for (int i = 0; i < 4; i++) e.R[i] = f[i];
+    e.R[12] = f[4];
     e.R[13] = c->R_IRQ[0];
     e.R[14] = c->R_IRQ[1];
     e.CPSR = spsr;
     e.IRQ[0] = F + 28; e.IRQ[1] = tpc; e.IRQ[2] = tcpsr;
-    e.SVC[0] = svcsp; e.SVC[1] = fr[5]; e.SVC[2] = spsr;
+    e.SVC[0] = svcsp; e.SVC[1] = f[5]; e.SVC[2] = spsr;
     e.banks = true;
-    e.retPc = (fr[5] - 4) & ((spsr & 0x20) ? ~1u : ~3u);
+    e.retPc = (f[5] - 4) & ((spsr & 0x20) ? ~1u : ~3u);
     e.cur = cur;
     return true;
 }
 
-void WakeCommit(melonDS::ARMv5* c, Mem& m, const Expect& e)
+void WakeCommit(melonDS::ARMv5* c, const Expect& e)
 {
-    m.Apply();
     c->R_SVC[1] = e.SVC[1];
     c->R_SVC[2] = e.SVC[2];
     for (int i = 0; i < 4; i++) c->R[i] = e.R[i];
@@ -334,6 +393,7 @@ bool SetIrq(melonDS::ARMv5* c, Mem& m, Expect& e)
 {
     u32 mask = c->R[0], fn = c->R[1], sp = c->R[13];
     u32 lr = c->R[14];
+    if (!m.ok(sp - 32) || !m.ok(sp - 4) || !m.ok(kIrqTable) || !m.ok(kIrqTable + 127) || !m.ok(kIrqTable2)) return false;
     for (u32 i = 0; i < 32; i++)
     {
         if (!(mask >> i & 1)) continue;
@@ -397,20 +457,33 @@ struct StatsDump
                         (unsigned long long)s.fallback[i], (unsigned long long)s.checks[i], (unsigned long long)s.diffs[i],
                         (unsigned long long)s.irqDuring[i], s.guestN[i] ? (double)s.guestCyc[i] / s.guestN[i] : 0.0);
         for (auto& [k, s] : g_State)
+        {
+            u64 n = s.native[0] + s.native[1] + s.native[2];
+            if (n) fprintf(stderr, "A9HLE: %.1f ns per native call (Run, timer pair %.1f ns subtracted)\n", (double)s.ns / n - TimerNs(), TimerNs());
+        }
+        for (auto& [k, s] : g_State)
             if (s.checks[2]) fprintf(stderr, "A9HLE getirqfn: avg lowest set bit %.2f\n", (double)s.getBits / s.checks[2]);
     }
 } g_StatsDump;
 }
 
-bool IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
+int Deps(u32 addr, const Range*& r)
 {
-    int k = addr == kWake && instr == kWakeInstr ? 0 : addr == kSet && instr == kSetInstr ? 1 : addr == kGet && instr == kGetInstr ? 2 : -1;
-    if (k < 0) return false;
-    State& s = Get(&nds.ARM9);
-    return s.status == 1 && (s.mask >> k & 1);
+    if (addr == kWake) { r = kCode; return kNumCode; }
+    r = &kCode[3];              // OS_SetIrqFunction / OS_GetIrqFunction
+    return 1;
 }
 
-bool Run(melonDS::ARM* cpu)
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
+{
+    int k = addr == kWake && instr == kWakeInstr ? 0 : addr == kSet && instr == kSetInstr ? 1 : addr == kGet && instr == kGetInstr ? 2 : -1;
+    if (k < 0) return 0;
+    State& s = Get(&nds.ARM9);
+    if (s.status != 1 || !(s.mask >> k & 1)) return 0;
+    return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
+}
+
+bool Run(melonDS::ARM* cpu, bool jit)
 {
     if (cpu->Num != 0 || (cpu->CPSR & 0x20)) return false;
     auto* c = (melonDS::ARMv5*)cpu;
@@ -421,12 +494,16 @@ bool Run(melonDS::ARM* cpu)
     State& s = Get(c);
     if (s.status != 1 || !(s.mask >> k & 1)) return false;
     s.calls[k]++;
-    Mem m(c);
+    const u64 t0 = __builtin_expect(g_Stats, 0) ? Now() : 0;
+    Mem m(c, g_Check || g_Dry);
     Expect e;
     u32 tpc = 0, tcpsr = 0, bits = 0;
-    bool ok = !CheckPending && CodeIntact(c, s, k);
+    // JIT: the hook block was compiled after IsHook verified the code, and it depends on every
+    // checked byte (ARMJIT adds the Deps() ranges to the block), so a write there invalidates it.
+    // Interpreter: compare per call.
+    bool ok = !CheckPending && (jit || CodeIntact(c, s, k));
     if (ok)
-        ok = k == 0 ? Wake(c, m, e, tpc, tcpsr) : k == 1 ? SetIrq(c, m, e) : GetIrq(c, m, e, bits);
+        ok = k == 0 ? Wake(c, s, m, e, tpc, tcpsr) : k == 1 ? SetIrq(c, m, e) : GetIrq(c, m, e, bits);
     if (ok && g_Check)
     {
         if (k == 2) s.getBits += bits;
@@ -434,6 +511,7 @@ bool Run(melonDS::ARM* cpu)
         s.checks[k]++;
         ok = false;
     }
+    if (__builtin_expect(g_Dry, 0) && ok) { s.checks[k]++; ok = false; }
     if (!ok)
     {
         s.fallback[k] += !g_Check;
@@ -441,12 +519,9 @@ bool Run(melonDS::ARM* cpu)
         return true;
     }
     s.native[k]++;
-    if (k == 0) WakeCommit(c, m, e);
-    else
-    {
-        m.Apply();
-        Return(c, e, k == 1 ? kSetCycles : kGetCyclesBase + kGetCyclesPerBit * (s32)bits);
-    }
+    if (k == 0) WakeCommit(c, e);
+    else Return(c, e, k == 1 ? kSetCycles : kGetCyclesBase + kGetCyclesPerBit * (s32)bits);
+    if (__builtin_expect(g_Stats, 0)) s.ns += Now() - t0;
     return true;
 }
 
@@ -479,7 +554,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     s.guestN[k]++;
     // expected bytes: native log over the snapshot; compared at every byte either side wrote
     std::unordered_map<u32, u8> exp;
-    Mem m(c);
+    Mem m(c, false);
     auto old = [&](u32 a) -> u8 {
         if ((a & c->DTCMMask) == c->DTCMBase) return g_P.dtcm[a & (DTCMPhysicalSize - 1)];
         return g_P.ram[a & nds.MainRAMMask];
