@@ -40,6 +40,9 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsy
 #include "xxhash/xxhash.h"
 
 #include "PlatformHeadless.h"
+#ifdef __linux__
+#include <sched.h>
+#endif
 #ifdef LITEV_A7PROF
 #include "ARM7Prof.h"
 #endif
@@ -1125,6 +1128,21 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     auto runInstance = [&](int inst)
     {
         BuiltNDS& bi = b[inst];
+#ifdef __linux__
+        // LITEV_MP_PIN=c0,c1,...: console k's thread on core ck (list shorter than the consoles: round robin
+        // over the entries after the first, which is console 0's)
+        if (const char* pv = getenv("LITEV_MP_PIN"))
+        {
+            std::vector<int> cores;
+            for (const char* q = pv; *q; ) { cores.push_back(atoi(q)); while (*q && *q != ',') q++; if (*q) q++; }
+            if (!cores.empty())
+            {
+                int c = inst == 0 || cores.size() == 1 ? cores[0] : cores[1 + (inst - 1) % (cores.size() - 1)];
+                cpu_set_t set; CPU_ZERO(&set); CPU_SET(c, &set);
+                if (sched_setaffinity(0, sizeof(set), &set) != 0) fprintf(stderr, "inst%d: pin to core %d failed\n", inst, c);
+            }
+        }
+#endif
         // LITEV_MP_NICE0 / LITEV_MP_NICE1: nice of console 0's thread / every other console's (the
         // app: EmulatorThread -10, NetplayRemote -16)
         if (const char* nv = getenv(inst ? "LITEV_MP_NICE1" : "LITEV_MP_NICE0"))
