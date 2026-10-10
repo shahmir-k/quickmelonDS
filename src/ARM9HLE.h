@@ -26,8 +26,10 @@
 // 0 off, 1 all, other values = the mask below.
 // Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 64 LZ; 8 needs 1; 32 is
 // reserved for the unshipped card loop) for A/B of single hooks.
-// Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black), probed when a
-// hook entry of that variant is first reached; hook 6 is position independent (any game).
+// Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
+// probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
+// W2 (TWL SDK build) has the same IRQ handler / context switch code but its thread functions and
+// OS_Set/GetIrqFunction are Thumb: hooks 1, 2, 4 (2/4 are Thumb entries); 3 and 5 are PW/PB only.
 //
 // 3. Whole HBlank IRQs (~265 a frame on PW, ~3.8k Mac host instructions each through the JIT
 //    even with 1. native; ~1.7k native): when the only pending enabled IRQ is HBlank and the game's HBlank callback
@@ -70,17 +72,19 @@ namespace melonDS::A9HLE
 {
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
 inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001; }
-// JIT decode: is the ARM-mode instruction at addr a hooked entry?
+// Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4}); instr: the halfword
+inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418; }
+// JIT decode: is the instruction at addr (ARM, or Thumb with thumb set) a hooked entry?
 // 0 no, 1 yes (code signature verified: under the JIT this compile-time check is the code
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the
 // ranges so restoring the code re-enables the hook)
-int IsHook(melonDS::NDS& nds, u32 addr, u32 instr);
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb = false);
 // guest code the hook at addr depends on (the wake hook: also all of 3.): ARMJIT adds these to the hook block's code ranges,
 // so any write there invalidates the block (and the next compile re-verifies)
 struct Range { u32 a, b; };
 constexpr int kNumCode = 17;
 int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r);
-// Execute the hook at R15-8 (native, or the guest instruction on fallback). jit: reached from a
+// Execute the hook at R15-8 (R15-4 in Thumb) (native, or the guest instruction on fallback). jit: reached from a
 // JIT-compiled hook (code already verified); else the code is compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).
 bool Run(melonDS::ARM* cpu, bool jit);

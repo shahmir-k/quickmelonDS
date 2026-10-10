@@ -37,6 +37,8 @@ constexpr u32 kWakeInstr = 0xE58C2064;    // OS_IrqHandler_ThreadSwitch wake loo
 constexpr u32 kSetInstr = 0xE92D47F0;     // OS_SetIrqFunction: push {r4-r10, lr}
 constexpr u32 kGetInstr = 0xE59F207C;     // OS_GetIrqFunction: ldr r2, =OS_IRQTable
 constexpr u32 kGxInstr = 0xE92D40F8;      // MIi_FIFOCallback: push {r3-r7, lr}
+constexpr u32 kSetInstrT = 0xB4F0;        // TWL SDK (W2), Thumb OS_SetIrqFunction: push {r4-r7}
+constexpr u32 kGetInstrT = 0xB418;        // TWL SDK (W2), Thumb OS_GetIrqFunction: push {r3, r4}
 
 // DTCM / ITCM objects (the same in every variant)
 constexpr u32 kIrqQueue = 0x02FE00A0;   // OS_IrqThreadQueue {head, tail} (DTCM)
@@ -68,6 +70,10 @@ struct Variant
     // call chain OS_RescheduleThread <- OS_SleepThread <- OS_WaitIrq loop
     u32 ctxPc, ctxLr, retSleep, retWait, retLoad;
     u32 idlePc, idleLr;         // halted in OS_Halt, called from the idle loop
+    // 1: TWL SDK build (W2): thread functions and OS_Set/GetIrqFunction are Thumb (other register use:
+    // OS_RescheduleThread holds the current thread, not OSThreadInfo, in r4), no hooks 3 and 5
+    u8 twl;
+    s32 setCyc, getCyc, getCycPerBit;   // ponytail: fixed cycle estimates (guest averages in check mode)
 };
 constexpr Variant kPW = {
     "PW", 0x01FF8160, 0x0208478C, 0x02084830, 0x02082864,
@@ -95,7 +101,7 @@ constexpr Variant kPW = {
     0xc03b33186e018603ull, 0xba271beda6c559d8ull, 0x907c24457e1359d8ull,
     0x02150F58, 0x0215100C, 0x02150FF0, 0x02150E8C, 0x020AA1B4,
     0x02085C68, 0x02085224, 0x02085808, 0x02084610, 0x02085270,
-    0x020882F0, 0x02085B44,
+    0x020882F0, 0x02085B44, 0, 500, 27, 17,
 };
 // Pokemon Black: the same code; main-binary OS code 0x18 bytes lower, its data 0x20 lower
 // (located by masked code match against PW + the literal pools; tools/hle/xmap.py)
@@ -114,19 +120,49 @@ constexpr Variant kPB = {
     0x2334bee5ccee4f77ull, 0x6d63379d6bebab20ull, 0x39d10b67f1dc9b7cull,
     0x02150F38, 0x02150FEC, 0x02150FD0, 0x02150E6C, 0x020AA194,
     B(0x02085C68), B(0x02085224), B(0x02085808), B(0x02084610), B(0x02085270),
-    B(0x020882F0), B(0x02085B44),
+    B(0x020882F0), B(0x02085B44), 0, 500, 27, 17,
 };
-constexpr const Variant* kVariants[] = {&kPW, &kPB};
+// Pokemon White 2 (USA/EU), TWL SDK build: OS_IrqHandler and the ARM context switch code are PW's
+// (ITCM +0xB98), OS_WaitIrq, CP and OS_Save/LoadContext ARM as in PW; OS_SleepThread,
+// OS_RescheduleThread, the queue insert, the thread select, the divider check and
+// OS_Set/GetIrqFunction are Thumb. 97 spurious wake round trips/frame in the overworld (the
+// HBlank IRQ programs a DMA: not the PW HBlank case), OS_SetIrqFunction 186 + OS_GetIrqFunction 93
+// calls/frame (every MI_SendGXCommandAsync: 22% of the town's ARM9 guest instructions).
+constexpr Variant kW2 = {
+    "W2", 0x01FF8CF8, 0x02079D4C, 0x02079DB4, 0,
+    {
+        {0x01FF8C88, 0x01FF8E40},   // OS_IrqHandler + OS_IrqHandler_ThreadSwitch (ITCM)
+        {0x02070058, 0x020700D4},   // CP_SaveContext, CP_RestoreContext
+        {0x02079BDC, 0x02079C50},   // OS_WaitIrq
+        {0x02079D4C, 0x02079E10},   // OS_SetIrqFunction, OS_GetIrqFunction (Thumb)
+        {0x0207A320, 0x0207A37C},   // thread queue insert (Thumb)
+        {0x0207A460, 0x0207A4D0},   // OS_RescheduleThread (Thumb)
+        {0x0207A894, 0x0207A8C8},   // OS_SleepThread (Thumb)
+        {0x0207A92C, 0x0207A944},   // select runnable thread (Thumb)
+        {0x0207AB9C, 0x0207AC50},   // OS_SaveContext, OS_LoadContext
+        {0x0207ACB8, 0x0207ACE8},   // (TWL divider check, Thumb)
+        {0x0207C110, 0x0207C13C},   // OS_DisableInterrupts, OS_RestoreInterrupts
+        {0x0207C174, 0x0207C180},   // OS_GetProcMode
+        {}, {}, {}, {}, {},         // no native HBlank IRQ (3.)
+    },
+    {},
+    0x60444b04a2da8f6full, 0, 0,
+    0x0214C1B8, 0x0214C26C, 0x0214C250, 0, 0,
+    0x0207ABE4, 0x0207A49F, 0x0207A8BB, 0x02079C38, 0x0207A4C7,
+    0, 0, 1, 417, 25, 13,     // check mode: set 417, get 302 at bit 21 (~13/bit, Thumb loop)
+};
+constexpr const Variant* kVariants[] = {&kPW, &kPB, &kW2};
 constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
-// hook kind of (addr, instr) in variant v: 0 wake, 1 set, 2 get, 5 GX send, -1 none
-inline int Kind(const Variant& v, u32 addr, u32 instr)
+// hook kind of (addr, instr) in variant v: 0 wake, 1 set, 2 get, 5 GX send, -1 none (thumb: a Thumb entry, instr the halfword)
+inline int Kind(const Variant& v, u32 addr, u32 instr, bool thumb = false)
 {
-    return addr == v.wake && instr == kWakeInstr ? 0 : addr == v.set && instr == kSetInstr ? 1
-         : addr == v.get && instr == kGetInstr ? 2 : addr == v.gx && instr == kGxInstr ? 5 : -1;
+    if (thumb) return !v.twl ? -1 : addr == v.set && instr == kSetInstrT ? 1 : addr == v.get && instr == kGetInstrT ? 2 : -1;
+    return addr == v.wake && instr == kWakeInstr ? 0 : !v.twl && addr == v.set && instr == kSetInstr ? 1
+         : !v.twl && addr == v.get && instr == kGetInstr ? 2 : v.gx && addr == v.gx && instr == kGxInstr ? 5 : -1;
 }
 
-// ponytail: fixed cycle estimates (guest averages measured in check mode on PW)
-constexpr s32 kWakeCycles = 900, kSetCycles = 500, kGetCyclesBase = 27, kGetCyclesPerBit = 17;
+// ponytail: fixed cycle estimate of the wake round trip (guest average measured in check mode on PW)
+constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
@@ -291,14 +327,14 @@ __attribute__((noinline, cold)) State& Init(melonDS::ARMv5* c)
 }
 inline State& St(melonDS::ARMv5* c) { return c->A9HLEState ? *(State*)c->A9HLEState : Init(c); }
 
-__attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 instr)
+__attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 instr, bool thumb)
 {
     State& s = St(c);
     if (s.status != 0) return s;
     for (int i = 0; i < kNumVariants; i++)
     {
         const Variant& v = *kVariants[i];
-        if ((s.tried >> i & 1) || Kind(v, addr, instr) < 0) continue;
+        if ((s.tried >> i & 1) || Kind(v, addr, instr, thumb) < 0) continue;
         s.tried |= 1u << i;
         std::vector<u8> code;
         CodeBytes(c, code, v.code, 0, kNumWake);
@@ -321,10 +357,10 @@ __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 in
     return s;
 }
 // the console's state for a hook entry (addr, instr): probes the variants with a hook there
-inline State& Get(melonDS::ARMv5* c, u32 addr, u32 instr)
+inline State& Get(melonDS::ARMv5* c, u32 addr, u32 instr, bool thumb = false)
 {
     State* s = (State*)c->A9HLEState;
-    return s && s->status != 0 ? *s : Probe(c, addr, instr);
+    return s && s->status != 0 ? *s : Probe(c, addr, instr, thumb);
 }
 // the console's state once a variant is active, else nullptr (no probing)
 inline State* Active(melonDS::ARMv5* c)
@@ -459,6 +495,7 @@ __attribute__((noinline, cold)) void ArmCheck(melonDS::ARMv5* c, int kind, const
 
 void GuestFallback(melonDS::ARM* cpu)
 {
+    if (cpu->CPSR & 0x20) { ARMInterpreter::THUMBInstrTable[(cpu->CurInstr >> 6) & 0x3FF](cpu); return; }
     u32 icode = ((cpu->CurInstr >> 4) & 0xF) | ((cpu->CurInstr >> 16) & 0xFF0);
     ARMInterpreter::ARMInstrTable[icode](cpu);
 }
@@ -569,9 +606,10 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     // the IRQ frame rewritten with t's registers (the BIOS returned into t with them)
     for (int i = 0; i < 6; i++) m.W(fr, 16 + i * 4, tf[i]);
     // t slept again: its context holds r5 = the thread it switched to; its stack holds
-    // OS_LoadContext's push {r0 = cur, lr} and CP_RestoreContext's push {r4 = OSThreadInfo}
+    // OS_LoadContext's push {r0 = cur, lr} and CP_RestoreContext's push {r4 = OS_RescheduleThread's
+    // r4: OSThreadInfo, TWL build: the current thread t}
     m.W(tp, 0x18, cur);
-    m.W(ts, 0, v.info);
+    m.W(ts, 0, v.twl ? t : v.info);
     m.W(ts, 4, cur);
     m.W(ts, 8, v.retLoad);
     // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack
@@ -655,6 +693,68 @@ bool GetIrq(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, u32& bits)
     e.CPSR = (c->CPSR & 0x0FFFFFFF) | fl;
     e.retPc = c->R[14];
     if (e.retPc & 1) e.CPSR |= 0x20;
+    return true;
+}
+
+// ---- 2./4. TWL SDK build (W2): Thumb OS_SetIrqFunction / OS_GetIrqFunction -------------------
+// Set: push {r4-r7}; the same 32-bit loop and table writes as 2.; leaves r0 = 0, r1 = OS_IRQTable,
+// r2 = the DMA/timer table, r3 = 32, flags of cmp r3, #32; bx lr.
+__attribute__((noinline)) bool SetIrqT(melonDS::ARMv5* c, State& s, Mem& m, Expect& e)
+{
+    const u32 mask = c->R[0], fn = c->R[1], sp = c->R[13];
+    Fixed(c, s, m);
+    Obj st = m.O(sp - 16, 16);
+    if (!st || !s.ftab || !s.ftab2) return false;
+    const u32 t2 = s.v->irqTable2;
+    const Obj tab{s.ftab, kIrqTable, s.ftabD}, tab2{s.ftab2, t2, s.ftab2D};
+    for (u32 b = mask; b; b &= b - 1)
+    {
+        const u32 i = __builtin_ctz(b);
+        const int o = Ent2(i);
+        if (o >= 0) { m.W(tab2, o, fn); m.W(tab2, o + 8, 0); m.W(tab2, o + 4, 1); }
+        else m.W(tab, i * 4, fn);
+    }
+    for (int i = 0; i < 4; i++) m.W(st, i * 4, c->R[4 + i]);
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = 0; e.R[1] = kIrqTable; e.R[2] = t2; e.R[3] = 0x20;
+    e.CPSR = (c->CPSR & 0x0FFFFFFF) | Flags(0x20, 0x20);
+    e.retPc = c->R[14];
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+    return true;
+}
+
+// Get: push {r3, r4}; walks the mask bit by bit like 4. (registers and flags of the path taken; r3, r4 popped)
+__attribute__((noinline)) bool GetIrqT(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, u32& bits)
+{
+    const u32 mask = c->R[0], sp = c->R[13];
+    Fixed(c, s, m);
+    Obj st = m.O(sp - 8, 8);
+    if (!st || !s.ftab || !s.ftab2) return false;
+    m.W(st, 0, c->R[3]); m.W(st, 4, c->R[4]);
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    const u32 i = mask ? __builtin_ctz(mask) : 32;
+    bits = i;
+    u32 fl;
+    auto NZ = [](u32 r) { return (r & 0x80000000) | ((r == 0) << 30); };
+    if (i == 32) { e.R[0] = 0; e.R[1] = 1; e.R[2] = 0; fl = (1u << 30) | (1u << 29); }   // movs r0, #0 after cmp r3, #32
+    else
+    {
+        e.R[2] = mask >> i;
+        if (i >= 8 && i <= 11)
+        {
+            // subs r3, #8 (C=1, V=0); adds r1, r3, #0 (C=0, V=0); muls r1, r0, r1 (NZ)
+            e.R[1] = 12 * (i - 8); e.R[0] = R32(s.ftab2 + e.R[1]); fl = NZ(e.R[1]);
+        }
+        else if (i >= 3 && i <= 6)
+        {
+            // adds r1, r3, #5; adds r2, r1, #0 (C=0, V=0); muls r2, r0, r2 (NZ)
+            e.R[1] = i + 5; e.R[2] = 12 * (i + 5); e.R[0] = R32(s.ftab2 + e.R[2]); fl = NZ(e.R[2]);
+        }
+        else { e.R[1] = 1; e.R[0] = R32(s.ftab + 4 * i); fl = i < 3 ? Flags(i, 3) : Flags(i, 6); }
+    }
+    e.CPSR = (c->CPSR & 0x0FFFFFFF) | fl;
+    e.retPc = c->R[14];
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
     return true;
 }
 
@@ -1138,8 +1238,16 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     return 1;
 }
 
-int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
 {
+    if (thumb)
+    {
+        if (!MaybeHookT(instr)) return 0;
+        State& s = Get(&nds.ARM9, addr, instr & 0xFFFF, true);
+        if (s.status != 1) return 0;
+        const int k = Kind(*s.v, addr, instr & 0xFFFF, true);
+        return k < 0 || !(s.mask & Bit(k)) ? 0 : CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
+    }
     if (!MaybeHook(instr)) return 0;
     if (instr == kLzInstr)
     {
@@ -1214,6 +1322,7 @@ __attribute__((noinline)) bool RunOs(melonDS::ARMv5* c, State& s, int k, bool ji
             IrqIn in{c->R_IRQ[2], c->R[13], c->R_SVC[0], c->R_IRQ[0], c->R_IRQ[1], c->R[12], false, 0, {}};
             ok = (c->CPSR & 0x3F) == 0x12 && Wake(c, s, m, e, in, tpc, tcpsr);
         }
+        else if (s.v->twl) ok = k == 1 ? SetIrqT(c, s, m, e) : GetIrqT(c, s, m, e, bits);
         else ok = k == 1 ? SetIrq(c, s, m, e) : GetIrq(c, s, m, e, bits);
         if (ok) m.Flush();                              // check / dry: logs only
     }
@@ -1235,16 +1344,29 @@ __attribute__((noinline)) bool RunOs(melonDS::ARMv5* c, State& s, int k, bool ji
     }
     s.native[k]++;
     if (k == 0) WakeCommit(c, e);
-    else Return(c, e, k == 1 ? kSetCycles : kGetCyclesBase + kGetCyclesPerBit * (s32)bits);
+    else Return(c, e, k == 1 ? s.v->setCyc : s.v->getCyc + s.v->getCycPerBit * (s32)bits);
     if (g_Time) s.ns += Now() - t0;
     return true;
+}
+
+// Thumb entries (TWL SDK build: OS_Set/GetIrqFunction)
+__attribute__((noinline)) bool RunThumb(melonDS::ARMv5* c, bool jit)
+{
+    const u32 pc = c->R[15] - 4, in = c->CurInstr & 0xFFFF;
+    State& s = Get(c, pc, in, true);
+    if (s.status != 1) return false;
+    const int k = Kind(*s.v, pc, in, true);
+    if (k < 0 || !(s.mask & Bit(k))) return false;
+    s.calls[k]++;
+    return RunOs(c, s, k, jit);
 }
 }
 
 bool Run(melonDS::ARM* cpu, bool jit)
 {
-    if (cpu->Num != 0 || (cpu->CPSR & 0x20)) return false;
+    if (cpu->Num != 0) return false;
     auto* c = (melonDS::ARMv5*)cpu;
+    if (cpu->CPSR & 0x20) return RunThumb(c, jit);
     const u32 pc = cpu->R[15] - 8, in = cpu->CurInstr;
     if (in == kLzInstr)
     {
