@@ -43,6 +43,7 @@ constexpr u32 kGetInstr = 0xE59F207C;     // OS_GetIrqFunction: ldr r2, =OS_IRQT
 constexpr u32 kGxInstr = 0xE92D40F8;      // MIi_FIFOCallback: push {r3-r7, lr}
 constexpr u32 kSetInstrT = 0xB4F0;        // TWL SDK (W2), Thumb OS_SetIrqFunction: push {r4-r7}
 constexpr u32 kGetInstrT = 0xB418;        // TWL SDK (W2), Thumb OS_GetIrqFunction: push {r3, r4}
+constexpr u32 kGxInstrT = 0xB5F8;         // TWL SDK (W2), Thumb MIi_FIFOCallback: push {r3-r7, lr}
 
 // DTCM / ITCM objects (the same in every variant)
 constexpr u32 kIrqQueue = 0x02FE00A0;   // OS_IrqThreadQueue {head, tail} (DTCM)
@@ -50,9 +51,8 @@ constexpr u32 kIrqCheck = 0x02FE3FF8;   // OS_IRQ check flags (DTCM)
 constexpr u32 kIrqTable = 0x02FE0020;   // OS_IRQTable[32] (DTCM)
 constexpr u32 kBiosLdm = 0xE8BD500F, kBiosSubs = 0xE25EF004;  // BIOS IRQ epilogue: ldmia sp!, {r0-r3,r12,lr}; subs pc, lr, #4
 constexpr u32 kGxChunk = 0x1D8;             // bytes per DMA (118 words)
-constexpr u32 kIrqHandler = 0x01FF80F0;     // OS_IrqHandler (BIOS jumps to [DTCM+0x3FFC])
-constexpr u32 kHbFn = 0x02005205;           // OS_IRQTable[1] (HBlank)
-constexpr u32 kHbRet = 0x01FF8148;          // OS_IrqHandler after the table call
+// (per variant, from its code ranges: OS_IrqHandler = code[0].a (the BIOS jumps to [DTCM+0x3FFC]),
+// OS_IRQTable[1] (HBlank) = the Thumb stub code[12].a | 1, OS_IrqHandler after the table call = code[0].a + 0x58)
 constexpr int kNumWake = 12;    // code ranges of 1. and 2. (signature sig); the rest: 3. (irqSig)
 
 // OSThread: +0 context {cpsr, r0-r14, pc, sp_svc, CP context (+0x48, 0x1C bytes)}, +0x64 state,
@@ -69,7 +69,7 @@ struct Variant
     u32 info;                   // OSThreadInfo: +0 u16 isNeedRescheduling, +4 current, +8 list, +C switchCallback
     u32 osi;                    // +0 switchCallback, +4 (nonzero: no reschedule), +8 &current, +1E u16 reschedule lock
     u32 gxParams;               // MIi_GXDmaParams {busy, dmaNo, src, length, callback, arg, ...}
-    u32 hbObjPtr;               // HBlank callback object = [[hbObjPtr + 0x10] + 0x18]
+    u32 hbObjPtr;               // HBlank callback object = [[hbObjPtr + hbObjOff] + 0x18]
     // return addresses of a thread asleep in OS_WaitIrq: OS_SaveContext's resume point and the
     // call chain OS_RescheduleThread <- OS_SleepThread <- OS_WaitIrq loop
     u32 ctxPc, ctxLr, retSleep, retWait, retLoad;
@@ -77,6 +77,7 @@ struct Variant
     // 1: TWL SDK build (W2): thread functions and OS_Set/GetIrqFunction are Thumb (other register use:
     // OS_RescheduleThread holds the current thread, not OSThreadInfo, in r4), no hooks 3 and 5
     u8 twl;
+    u8 hbObjOff;
     s32 setCyc, getCyc, getCycPerBit;   // ponytail: fixed cycle estimates (guest averages in check mode)
 };
 constexpr Variant kPW = {
@@ -105,7 +106,7 @@ constexpr Variant kPW = {
     0xc03b33186e018603ull, 0xba271beda6c559d8ull, 0x907c24457e1359d8ull,
     0x02150F58, 0x0215100C, 0x02150FF0, 0x02150E8C, 0x020AA1B4,
     0x02085C68, 0x02085224, 0x02085808, 0x02084610, 0x02085270,
-    0x020882F0, 0x02085B44, 0, 500, 27, 17,
+    0x020882F0, 0x02085B44, 0, 0x10, 500, 27, 17,
 };
 // Pokemon Black: the same code; main-binary OS code 0x18 bytes lower, its data 0x20 lower
 // (located by masked code match against PW + the literal pools; tools/hle/xmap.py)
@@ -124,16 +125,17 @@ constexpr Variant kPB = {
     0x2334bee5ccee4f77ull, 0x6d63379d6bebab20ull, 0x39d10b67f1dc9b7cull,
     0x02150F38, 0x02150FEC, 0x02150FD0, 0x02150E6C, 0x020AA194,
     B(0x02085C68), B(0x02085224), B(0x02085808), B(0x02084610), B(0x02085270),
-    B(0x020882F0), B(0x02085B44), 0, 500, 27, 17,
+    B(0x020882F0), B(0x02085B44), 0, 0x10, 500, 27, 17,
 };
 // Pokemon White 2 (USA/EU), TWL SDK build: OS_IrqHandler and the ARM context switch code are PW's
 // (ITCM +0xB98), OS_WaitIrq, CP and OS_Save/LoadContext ARM as in PW; OS_SleepThread,
 // OS_RescheduleThread, the queue insert, the thread select, the divider check and
 // OS_Set/GetIrqFunction are Thumb. 97 spurious wake round trips/frame in the overworld (the
-// HBlank IRQ programs a DMA: not the PW HBlank case), OS_SetIrqFunction 186 + OS_GetIrqFunction 93
-// calls/frame (every MI_SendGXCommandAsync: 22% of the town's ARM9 guest instructions).
+// HBlank IRQ is PW's empty-callback-list case, 263/frame), OS_SetIrqFunction 186 + OS_GetIrqFunction 93
+// calls/frame (every MI_SendGXCommandAsync: 22% of the town's ARM9 guest instructions), MIi_FIFOCallback
+// (Thumb, same chunking as PW's) 287 GXFIFO IRQs/frame.
 constexpr Variant kW2 = {
-    "W2", 0x01FF8CF8, 0x02079D4C, 0x02079DB4, 0,
+    "W2", 0x01FF8CF8, 0x02079D4C, 0x02079DB4, 0x020784FC,
     {
         {0x01FF8C88, 0x01FF8E40},   // OS_IrqHandler + OS_IrqHandler_ThreadSwitch (ITCM)
         {0x02070058, 0x020700D4},   // CP_SaveContext, CP_RestoreContext
@@ -147,20 +149,26 @@ constexpr Variant kW2 = {
         {0x0207ACB8, 0x0207ACE8},   // (TWL divider check, Thumb)
         {0x0207C110, 0x0207C13C},   // OS_DisableInterrupts, OS_RestoreInterrupts
         {0x0207C174, 0x0207C180},   // OS_GetProcMode
-        {}, {}, {}, {}, {},         // no native HBlank IRQ (3.)
+        // native HBlank IRQ (3.): the same empty-callback-list case as PW, the stub chain and callback Thumb
+        {0x0200522C, 0x02005234},   // OS_IRQTable[HBlank] stub (Thumb, literal)
+        {0x0200566C, 0x02005680},   // -> HBlank callback with its object (Thumb, literals)
+        {0x0203A5FC, 0x0203A63C},   // HBlank callback (callback list walk, Thumb)
+        {0x0207AAD4, 0x0207AAE0},   // OS idle thread loop (Thumb)
+        {0x0207C814, 0x0207C820},   // OS_Halt
     },
-    {},
-    0x60444b04a2da8f6full, 0, 0,
-    0x0214C1B8, 0x0214C26C, 0x0214C250, 0, 0,
+    {0x020784FC, 0x02078578},       // MIi_FIFOCallback (Thumb) with its literal pool
+    0x60444b04a2da8f6full, 0x47569f144546b503ull, 0x8b5e996183dc6c58ull,
+    0x0214C1B8, 0x0214C26C, 0x0214C250, 0x0214C0EC, 0x0209DA98,
     0x0207ABE4, 0x0207A49F, 0x0207A8BB, 0x02079C38, 0x0207A4C7,
-    0, 0, 1, 417, 25, 13,     // check mode: set 417, get 302 at bit 21 (~13/bit, Thumb loop)
+    0x0207C81C, 0x0207AADF, 1, 0x14, 417, 25, 13,     // check mode: set 417, get 302 at bit 21 (~13/bit, Thumb loop)
 };
 constexpr const Variant* kVariants[] = {&kPW, &kPB, &kW2};
 constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
 // hook kind of (addr, instr) in variant v: 0 wake, 1 set, 2 get, 5 GX send, -1 none (thumb: a Thumb entry, instr the halfword)
 inline int Kind(const Variant& v, u32 addr, u32 instr, bool thumb = false)
 {
-    if (thumb) return !v.twl ? -1 : addr == v.set && instr == kSetInstrT ? 1 : addr == v.get && instr == kGetInstrT ? 2 : -1;
+    if (thumb) return !v.twl ? -1 : addr == v.set && instr == kSetInstrT ? 1 : addr == v.get && instr == kGetInstrT ? 2
+                    : v.gx && addr == v.gx && instr == kGxInstrT ? 5 : -1;
     return addr == v.wake && instr == kWakeInstr ? 0 : !v.twl && addr == v.set && instr == kSetInstr ? 1
          : !v.twl && addr == v.get && instr == kGetInstr ? 2 : v.gx && addr == v.gx && instr == kGxInstr ? 5 : -1;
 }
@@ -449,7 +457,7 @@ __attribute__((noinline)) bool Refix(melonDS::ARMv5* c, State& s, Mem& m)
     s.fkey[0] = c->DTCMBase; s.fkey[1] = c->DTCMMask; s.fkey[2] = c->ITCMSize;
     const Variant& v = *s.v;
     Obj q = m.O(kIrqQueue, 8), chk = m.O(kIrqCheck, 4), osi = m.O(v.osi, v.info + 0x10 - v.osi);
-    Obj hp = m.O(c->DTCMBase + 0x3FFC, 4), tb = m.O(kIrqTable + 4, 4), op = m.O(v.hbObjPtr + 0x10, 4);
+    Obj hp = m.O(c->DTCMBase + 0x3FFC, 4), tb = m.O(kIrqTable + 4, 4), op = m.O(v.hbObjPtr + v.hbObjOff, 4);
     s.fq = q.p; s.fchk = chk.p; s.fosi = osi.p; s.fhp = hp.p; s.ftb = tb.p; s.fop = op.p;
     Obj t1 = m.O(kIrqTable, 128), t2 = m.O(v.irqTable2, 12 * 12);
     s.ftab = t1.p; s.ftabD = t1.dtcm; s.ftab2 = t2.p; s.ftab2D = t2.dtcm;
@@ -792,7 +800,7 @@ bool IrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, int&
     Obj fs = m.O(sp - 44, 44);
     if (!fs) return false;
     __builtin_prefetch(fs.p); __builtin_prefetch(fs.p + 40);
-    if (R32(s.fhp) != kIrqHandler || R32(s.ftb) != kHbFn) return false;
+    if (R32(s.fhp) != s.v->code[0].a || R32(s.ftb) != (s.v->code[12].a | 1)) return false;
     Obj o2 = m.O(R32(s.fop) + 0x18, 4);
     if (!o2) return false;
     const u32 obj = o2.r(0);
@@ -810,7 +818,7 @@ bool IrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, int&
     {
         m.W(fs, 4, c->R[5]);
         m.W(fs, 8, c->R[6]);
-        m.W(fs, 12, kHbRet);
+        m.W(fs, 12, s.v->code[0].a + 0x58);
         for (int i = 0; i < 6; i++) m.W(fs, 20 + i * 4, f[i]);
     }
     if (ob.r(0x2C) == 0)
@@ -1439,7 +1447,9 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         State& s = Get(&nds.ARM9, addr, instr & 0xFFFF, true);
         if (s.status != 1) return 0;
         const int k = Kind(*s.v, addr, instr & 0xFFFF, true);
-        return k < 0 || !(s.mask & Bit(k)) ? 0 : CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
+        if (k < 0 || !(s.mask & Bit(k))) return 0;
+        if (k == 5) return !s.gxOk ? 0 : GxIntact(&nds.ARM9, s) ? 1 : 2;
+        return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
     }
     if (!MaybeHook(instr)) return 0;
     if (instr == kCardInstr)
@@ -1556,6 +1566,9 @@ __attribute__((noinline)) bool RunThumb(melonDS::ARMv5* c, bool jit)
     const int k = Kind(*s.v, pc, in, true);
     if (k < 0 || !(s.mask & Bit(k))) return false;
     s.calls[k]++;
+#ifdef LITEV_GX_BULK
+    if (k == 5) return RunGx(c, s, jit);
+#endif
     return RunOs(c, s, k, jit);
 }
 }

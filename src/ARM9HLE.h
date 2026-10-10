@@ -29,7 +29,7 @@
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
 // W2 (TWL SDK build) has the same IRQ handler / context switch code but its thread functions and
-// OS_Set/GetIrqFunction are Thumb: hooks 1, 2, 4 (2/4 are Thumb entries); 3 and 5 are PW/PB only.
+// OS_Set/GetIrqFunction / MIi_FIFOCallback are Thumb: hooks 1-5 (2, 4, 5 Thumb entries).
 //
 // 3. Whole HBlank IRQs (~265 a frame on PW, ~3.8k Mac host instructions each through the JIT
 //    even with 1. native; ~1.7k native): when the only pending enabled IRQ is HBlank and the game's HBlank callback
@@ -72,8 +72,9 @@ namespace melonDS::A9HLE
 {
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
 inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001 || instr == 0xE5942000; }
-// Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4}); instr: the halfword
-inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418; }
+// Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4} / MIi_FIFOCallback
+// push {r3-r7, lr}); instr: the halfword
+inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8; }
 // JIT decode: is the instruction at addr (ARM, or Thumb with thumb set) a hooked entry?
 // 0 no, 1 yes (code signature verified: under the JIT this compile-time check is the code
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the
