@@ -21,6 +21,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include "NDS.h"
+#include "ARM7Prof.h"
 #include "ARM.h"
 #include "NDSCart.h"
 #include "GBACart.h"
@@ -1318,6 +1319,19 @@ u32 NDS::RunFrame()
 
 u32 NDS::RunFrame()
 {
+#ifdef LITEV_A7PROF
+    if (A7Prof::g.EndFrame())
+    {
+        // ARM7 view of main RAM (4 MB) + shared WRAM window + ARM7 WRAM, for disassembly
+        std::string o = std::string(A7Prof::g.out) + ".mem";
+        if (FILE* f = fopen(o.c_str(), "wb"))
+        {
+            for (u32 a = 0x02000000; a < 0x02400000; a += 4) { u32 v = ARM7Read32(a); fwrite(&v, 4, 1, f); }
+            for (u32 a = 0x037F8000; a < 0x03810000; a += 4) { u32 v = ARM7Read32(a); fwrite(&v, 4, 1, f); }
+            fclose(f);
+        }
+    }
+#endif
 #ifdef JIT_ENABLED
     if (EnableJIT)
         return RunFrame<CPUExecuteMode::JIT>();
@@ -4281,6 +4295,9 @@ LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite32(u32 addr, u32 val)
 
 u8 NDS::ARM7IORead8(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0);
+#endif
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[1] & 0xFF;
@@ -4333,6 +4350,9 @@ u8 NDS::ARM7IORead8(u32 addr)
 
 u16 NDS::ARM7IORead16(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0);
+#endif
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[1];
@@ -4408,6 +4428,9 @@ u16 NDS::ARM7IORead16(u32 addr)
 
 u32 NDS::ARM7IORead32(u32 addr)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0);
+#endif
     switch (addr)
     {
     case 0x04000004: return GPU.DispStat[1] | (GPU.VCount << 16);
@@ -4487,6 +4510,9 @@ u32 NDS::ARM7IORead32(u32 addr)
 
 void NDS::ARM7IOWrite8(u32 addr, u8 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(1, val, 0x00FF); return;
@@ -4589,6 +4615,9 @@ void NDS::ARM7IOWrite8(u32 addr, u8 val)
 
 void NDS::ARM7IOWrite16(u32 addr, u16 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004: GPU.SetDispStat(1, val, 0xFFFF); return;
@@ -4737,6 +4766,9 @@ void NDS::ARM7IOWrite16(u32 addr, u16 val)
 
 void NDS::ARM7IOWrite32(u32 addr, u32 val)
 {
+#ifdef LITEV_A7PROF
+    A7Prof::g.IO(addr | 0x80000000);
+#endif
     switch (addr)
     {
     case 0x04000004:

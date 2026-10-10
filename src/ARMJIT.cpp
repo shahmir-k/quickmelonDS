@@ -17,6 +17,7 @@
 */
 
 #include "ARMJIT.h"
+#include "ARM7HLE.h"
 #include "ARMJIT_Memory.h"
 #include <string.h>
 #include <assert.h>
@@ -1063,6 +1064,13 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
             instrs[i].CodeCycles = cpu->CodeCycles;
         }
         instrs[i].Info = ARMInstrInfo::Decode(thumb, cpu->Num, instrs[i].Instr, LiteralOptimizations);
+#ifdef LITEV_A7HLE
+        // HLE'd ARM7 function entry: compile it as an interpreter fallback that ends the block
+        // (decoded as an undefined instruction); A_UNK runs the native function or the original
+        // instruction. Keeps Instr, so the code hash / invalidation still see the real bytes.
+        if (cpu->Num == 1 && !thumb && A7HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr))
+            instrs[i].Info = ARMInstrInfo::Decode(false, 1, 0xE7F000F0, false);
+#endif
 
         hasMemoryInstr |= thumb
             ? (instrs[i].Info.Kind >= ARMInstrInfo::tk_LDR_PCREL && instrs[i].Info.Kind <= ARMInstrInfo::tk_STMIA)

@@ -22,6 +22,8 @@
 #include "NDS.h"
 #include "DSi.h"
 #include "ARM.h"
+#include "ARM7Prof.h"
+#include "ARM7HLE.h"
 #include "ARMInterpreter.h"
 #include "AREngine.h"
 #include "ARMJIT.h"
@@ -942,6 +944,9 @@ void ARMv4::Execute()
             JitStopToBudget();   // a stop already pending: exit at the first hop
 #endif
 
+#ifdef LITEV_A7PROF
+            const u64 a7t0 = NDS.ARM7Timestamp + Cycles;
+#endif
             if (block)
             {
 #ifdef LITEV_JIT_LAZYFLAGS
@@ -957,6 +962,9 @@ void ARMv4::Execute()
             else
                 NDS.JIT.CompileBlock(this);
 
+#ifdef LITEV_A7PROF
+            A7Prof::g.Jit(block != nullptr, NDS.ARM7Timestamp + Cycles - a7t0);
+#endif
 #if defined(LITEV_SHADOW_ASSERT)
             LiteV_ShadowAssertBudget("ARM7", Cycles, CyclesBudget,
                                      (s64)NDS.ARM7Timestamp, (s64)NDS.ARM7Target);
@@ -1009,7 +1017,14 @@ void ARMv4::Execute()
 
                 // actually execute
                 u32 icode = (CurInstr >> 6);
+#ifdef LITEV_A7PROF
+                A7Prof::g.Pre(R[15] - 4, 2, CPSR, R[14]);
+                const u32 a7pc = R[15] - 4;
+#endif
                 ARMInterpreter::THUMBInstrTable[icode](this);
+#ifdef LITEV_A7PROF
+                A7Prof::g.Post(a7pc, Cycles);
+#endif
             }
             else
             {
@@ -1023,6 +1038,15 @@ void ARMv4::Execute()
                 NextInstr[1] = CodeRead32(R[15]);
 
                 // actually execute
+#ifdef LITEV_A7PROF
+                A7Prof::g.Pre(R[15] - 8, 4, CPSR, R[14]);
+                const u32 a7pc = R[15] - 8;
+#endif
+#ifdef LITEV_A7HLE
+                if (A7HLE::CheckPending) A7HLE::CheckAt(this, R[15] - 8);
+                if ((CurInstr == 0xE92D4FF8 || CurInstr == 0xE081C002) && A7HLE::Run(this)) {}
+                else
+#endif
                 if (CheckCondition(CurInstr >> 28))
                 {
                     u32 icode = ((CurInstr >> 4) & 0xF) | ((CurInstr >> 16) & 0xFF0);
@@ -1030,6 +1054,9 @@ void ARMv4::Execute()
                 }
                 else
                     AddCycles_C();
+#ifdef LITEV_A7PROF
+                A7Prof::g.Post(a7pc, Cycles);
+#endif
             }
 
             // TODO optimize this shit!!!

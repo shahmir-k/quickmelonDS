@@ -34,6 +34,9 @@
 #include "Savestate.h"
 #include "SPI_Firmware.h"
 #include "FreeBIOS.h"
+#ifdef __APPLE__
+extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsystem_kernel
+#endif
 
 #include "xxhash/xxhash.h"
 
@@ -590,6 +593,12 @@ int main(int argc, char** argv)
     if (wav) fseek(wav, 44, SEEK_SET);
 
     auto wallStart = std::chrono::steady_clock::now();
+#ifdef __APPLE__
+    // emu-thread instructions/cycles (this thread only; render workers excluded): deterministic
+    // A/B metric on a loaded Mac, where wall time is noise.
+    uint64_t thsc0[2] = {0, 0};
+    thread_selfcounts(1, thsc0, sizeof(thsc0));
+#endif
 
     // --bench-window: measured span within the full run. windowStart is stamped
     // just before frame benchWindowStart's RunFrame; windowEnd just after frame
@@ -925,6 +934,14 @@ int main(int argc, char** argv)
     printf("mode:        %s\n", opt.jit ? "jit" : "interp");
     printf("frames:      %d\n", opt.frames);
     printf("wall_time_s: %.4f\n", wallSec);
+#ifdef __APPLE__
+    {
+        uint64_t thsc1[2] = {0, 0};
+        if (thread_selfcounts(1, thsc1, sizeof(thsc1)) == 0)
+            printf("emu_thread_instructions: %llu\nemu_thread_cycles: %llu\n",
+                   (unsigned long long)(thsc1[0] - thsc0[0]), (unsigned long long)(thsc1[1] - thsc0[1]));
+    }
+#endif
     printf("avg_fps:     %.2f\n", avgFps);
     if (haveWindow)
     {
