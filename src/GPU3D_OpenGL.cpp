@@ -1673,7 +1673,7 @@ polygons_done:
     u32 finalDispCnt = S.RenderDispCnt;
 #if defined(LITEV_GL_EDGE_MARK)
     static const bool edgeOn = OpenGL::Prop("gledge", 1) != 0;   // debug.litev.gledge=0: no outlines
-    if (!edgeOn) finalDispCnt &= ~(1u << 5);
+    if (!edgeOn || !GPU3D.EdgeMarkEnabled) finalDispCnt &= ~(1u << 5);
 #elif defined(LITEV_GL_SKIP_NOOP_EDGE)
     // drop edge marking entirely (it was a no-op before LITEV_GL_EDGE_MARK); gledgenoop=0 keeps it
     static const bool skipEdge = OpenGL::Prop("gledgenoop", 1) != 0;
