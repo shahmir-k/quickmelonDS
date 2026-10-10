@@ -22,6 +22,9 @@
 #include <optional>
 #include <chrono>
 #include <algorithm>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #include "types.h"
 #include "Args.h"
@@ -748,6 +751,15 @@ int main(int argc, char** argv)
 #ifdef __APPLE__
         uint64_t tc0[2] = {};
         thread_selfcounts(1, tc0, sizeof(tc0));
+#endif
+#ifdef __linux__
+        {   // LITEV_MARKFRAMES=A-B: name the thread "markframes" during frames A..B (perf report --comm)
+            static int ma = -1, mb = -2;
+            static bool once = [] { if (const char* m = getenv("LITEV_MARKFRAMES")) sscanf(m, "%d-%d", &ma, &mb); return true; }();
+            (void)once;
+            if (frame == ma) prctl(PR_SET_NAME, "markframes");
+            if (frame == mb + 1) prctl(PR_SET_NAME, "headless");
+        }
 #endif
         nds->RunFrame();
 #ifdef __APPLE__

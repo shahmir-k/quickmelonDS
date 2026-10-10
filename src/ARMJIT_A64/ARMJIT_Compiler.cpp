@@ -1972,6 +1972,9 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
 
     e.stubOff = stubOff;
     e.promoted = 1;
+#ifdef LITEV_JIT_DP_REVERTLIST
+    if (!e._dp0) { e._dp0 = 1; DirectPatchListed[num].push_back(site); }
+#endif
 #if LITEV_PROFILE
     melonDS::LiteProfile::g_Frame.DirectPromotions.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -2010,6 +2013,24 @@ void Compiler::DirectPatchRevertAll()
     {
         if (!ICacheTable[num]) continue;
         u32 dispOff = (u32)((u8*)DispatcherEntry[num] - GetRXBase());
+#ifdef LITEV_JIT_DP_REVERTLIST
+        // Every promoted site is listed (Promote lists it, only this clears the list), so
+        // this reverts exactly the sites the full scan below would.
+        for (u32 s : DirectPatchListed[num])
+        {
+            ICacheEntry& e = ICacheTable[num][s];
+            e._dp0 = 0;
+            if (e.promoted)
+            {
+                DirectPatchWriteBranch(e.patchOff, dispOff);
+                e.promoted = 0;
+                e.hitCount = 0;
+                any = true;
+            }
+        }
+        DirectPatchListed[num].clear();
+        continue;
+#endif
         u32 n = ICacheNextSite;   // only [1, ICacheNextSite) were ever handed out
         if (n > ICacheSites) n = ICacheSites;
         for (u32 s = 1; s < n; s++)
@@ -2565,6 +2586,9 @@ void Compiler::ICacheReset()
     for (int c = 0; c < 2; c++)
     {
         if (ICacheTable[c]) memset(ICacheTable[c], 0, (size_t)ICacheSites * sizeof(ICacheEntry));
+#if defined(LITEV_JIT_DIRECTPATCH) && defined(LITEV_JIT_DP_REVERTLIST)
+        DirectPatchListed[c].clear();
+#endif
     }
     ICacheNextSite = 1;
     NDS.ARM9.ICacheEpoch++;
