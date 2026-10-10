@@ -374,6 +374,8 @@ void SoftRenderer::SnapshotCompositeLine(u32 line)
     f.ScreenSwap = GPU.ScreenSwap;
     f.ScreensEnabled = GPU.ScreensEnabled;
     f.CaptureEnable = GPU.CaptureEnable;
+    f.CaptureCnt = GPU.CaptureCnt;
+    f.VRAMMapLCDC = GPU.VRAMMap_LCDC;
     f.Valid = 1;
     f.XPos3D = GPU.GPU3D.GetRenderXPos();
 }
@@ -585,7 +587,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         DrawScanlineB(line, dstB, BandOut2D[1][line], f.DispCntB, f.MasterBrightnessB);
 
         if (f.CaptureEnable)
-            DoCapture(line, BandOut2D[0][line], l3d);
+            DoCapture(line, BandOut2D[0][line], l3d, &f);
 
         if (f.ScreensEnabled)
         {
@@ -1028,7 +1030,7 @@ void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32*
             line3d[i] = (l3d && x >= 0 && x < 256) ? l3d[x] : 0;
             resA[i] = has3D ? SoftRenderer2D::HybridResolvePixel(descA[i], descA[256+i], line3d[i]) : descA[i];
         }
-        DoCapture(line, resA, line3d);
+        DoCapture(line, resA, line3d, &f);
     }
 
     const u32 modeA = (f.DispCntA >> 16) & 0x3;
@@ -1144,9 +1146,10 @@ void SoftRenderer::DrawScanlineB(u32 line, u32* dst, const u32* src2d, u32 dispc
     ApplyMasterBrightness(mbright, dst);
 }
 
-void SoftRenderer::DoCapture(u32 line, const u32* srcA2d, const u32* src3d)
+void SoftRenderer::DoCapture(u32 line, const u32* srcA2d, const u32* src3d, const FrameLineSnap* snap)
 {
-    u32 captureCnt = GPU.CaptureCnt;
+    u32 captureCnt = snap ? snap->CaptureCnt : GPU.CaptureCnt;
+    const u32 lcdc = snap ? snap->VRAMMapLCDC : GPU.VRAMMap_LCDC;
 
     u32 width, height;
     u32 sz = (captureCnt >> 20) & 0x3;
@@ -1165,7 +1168,7 @@ void SoftRenderer::DoCapture(u32 line, const u32* srcA2d, const u32* src3d)
         return;
 
     u32 dstvram = (captureCnt >> 16) & 0x3;
-    if (!(GPU.VRAMMap_LCDC & (1<<dstvram)))
+    if (!(lcdc & (1<<dstvram)))
         return;
 
     u16* dst = (u16*)GPU.VRAM[dstvram];
@@ -1183,9 +1186,9 @@ void SoftRenderer::DoCapture(u32 line, const u32* srcA2d, const u32* src3d)
         srcB = GPU.DispFIFOBuffer;
     else
     {
-        u32 dispcnt = GPU.GPU2D_A.DispCnt;
+        u32 dispcnt = snap ? snap->DispCntA : GPU.GPU2D_A.DispCnt;
         u32 srcvram = (dispcnt >> 18) & 0x3;
-        if (GPU.VRAMMap_LCDC & (1<<srcvram))
+        if (lcdc & (1<<srcvram))
         {
             srcB = (u16*)GPU.VRAM[srcvram];
 

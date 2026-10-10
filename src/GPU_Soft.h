@@ -95,6 +95,11 @@ protected:
         u8  CaptureEnable;
         u8  Valid;
         u16 XPos3D;          // BG0HOFS as seen by the 3D layer (hybrid merge)
+        // display capture as the console had it on this line: the async render runs frames
+        // later, when the game may have remapped the destination bank for display (Pokemon
+        // White's battle intro captures its room into VRAM D, then shows D as a BG: the live
+        // checks dropped the capture -> white)
+        u32 CaptureCnt, VRAMMapLCDC;
     };
     FrameLineSnap FrameSnap[192];
     // Render-owned copy (see async pipeline): the emu thread copies FrameSnap ->
@@ -248,7 +253,8 @@ protected:
     void DrawScanlineA(u32 line, u32* dst, const u32* src2d, u32 dispcnt, u16 mbright);
     void DrawScanlineB(u32 line, u32* dst, const u32* src2d, u32 dispcnt, u16 mbright);
 
-    void DoCapture(u32 line, const u32* srcA2d, const u32* src3d);
+    // snap: the line's register snapshot (async render), else the live registers
+    void DoCapture(u32 line, const u32* srcA2d, const u32* src3d, const FrameLineSnap* snap = nullptr);
 
     void ApplyMasterBrightness(u16 regval, u32* dst);
     void ExpandColor(u32* dst);
