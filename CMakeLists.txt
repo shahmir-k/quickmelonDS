@@ -1053,6 +1053,10 @@ option(LITEV_HYB_MERGE_FASTLINES "Hybrid: fast merge for plain-3D lines" OFF)
 if (LITEV_HYB_MERGE_FASTLINES)
     add_compile_definitions(LITEV_HYB_MERGE_FASTLINES=1)
 endif()
+option(LITEV_HYB_MERGE_FASTCOPY "Hybrid: fast merge lines copy the 3D texel (no 6-bit round trip; display only, within 2/255)" OFF)
+if (LITEV_HYB_MERGE_FASTCOPY)
+    add_compile_definitions(LITEV_HYB_MERGE_FASTCOPY=1)
+endif()
 
 # GL 3D, W-buffer frames: depth 1 - z0/w from the rasterizer instead of gl_FragDepth, so the GPU's
 # early depth test works (display only; same depth order, fog converts back to w).

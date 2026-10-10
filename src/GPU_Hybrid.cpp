@@ -131,6 +131,12 @@ bool HybridRenderer::Init()
     std::string mergeFS = kHybridMergeFS;
     if (OpenGL::Prop("hybmp", 1))
         mergeFS.insert(mergeFS.find('\n') + 1, "precision mediump float;\nprecision mediump int;\n");
+#ifdef LITEV_HYB_MERGE_FASTCOPY
+    // fast lines without brightness copy the 3D texel instead of re-quantising it to 6 bits and
+    // back: PW town 3x 400 MHz ~1 ms of GPU per frame. debug.litev.hybfastcopy=0 turns it off.
+    if (OpenGL::Prop("hybfastcopy", 1))
+        mergeFS.insert(mergeFS.find('\n') + 1, "#define FAST_COPY\n");
+#endif
     if (OpenGL::Prop("hybdiv", 1))
         mergeFS.insert(mergeFS.find('\n') + 1, "#define NATIVE_VARYING\n");
     if (!OpenGL::CompileVertexFragmentProgram(MergeShader,
