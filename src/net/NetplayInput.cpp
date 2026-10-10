@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <unistd.h>
@@ -51,10 +52,30 @@ namespace melonDS
 
 namespace
 {
-constexpr u32 kMagic = 0x4E504932; // "NPI2"
 constexpr u32 kHashMagic = 0x4E504831; // "NPH1"
 
 #pragma pack(push, 1)
+#ifdef LITEV_NP_WIRE_RUNS
+constexpr u32 kMagic = 0x4E504933; // "NPI3"
+struct WireEntry    // Len frames from Frame on, all with this input
+{
+    s32 Frame;
+    u16 Len;
+    u32 Keys;
+    s16 TouchX, TouchY;
+};
+struct WireHeader
+{
+    u32 Magic;
+    u8 Player;
+    u8 Count;
+    s32 Ack;    // the sender has all of the receiver's inputs up to this applied frame
+    u32 SentUs;     // the sender's clock now
+    u32 EchoUs;     // the receiver's SentUs in the last packet the sender took (0 = none yet)
+    u32 EchoAgeUs;  // how long ago the sender took it: round trip = now - EchoUs - EchoAgeUs
+};
+#else
+constexpr u32 kMagic = 0x4E504932; // "NPI2"
 struct WireEntry
 {
     s32 Frame;
@@ -68,6 +89,7 @@ struct WireHeader
     u8 Count;
     s32 Ack;    // the sender has all of the receiver's inputs up to this applied frame
 };
+#endif
 #pragma pack(pop)
 
 struct WireHash
@@ -96,7 +118,7 @@ static sockaddr_in ParseAddr(const std::string& ipPort)
 }
 
 NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::vector<std::pair<int, std::string>>& peers, int latencyMs, const NetFaults& faults)
-    : Local(localPlayer), DelayFrames(delayFrames), Faults(faults)
+    : Local(localPlayer), DelayFrames(delayFrames), Faults(faults), CurDelay(delayFrames)
 {
     Faults.LatencyMs = latencyMs;
     for (int p = 0; p < kMaxPlayers; p++)
@@ -138,13 +160,50 @@ NetplayInput::~NetplayInput()
     if (Socket >= 0) close(Socket);
 }
 
+#ifdef LITEV_NP_ADAPTIVE_DELAY
+// The delay this player's inputs need: the slowest peer's round trip (90th percentile, last 2 s),
+// halved, plus a frame. Up at once; down one frame
+// at a time, only after the need stayed lower for 2 s (a shorter delay merges one input sample).
+void NetplayInput::Adapt(int frame)
+{
+    s64 rtt = RttMaxUs.load();
+    if (rtt < 0 || frame < DelayFrames) return;
+    int need = std::clamp((int)std::ceil(rtt / 2.0 / (1e6 / 60)) + 1, 1, kMaxDelay);
+    int cur = CurDelay.load();
+    if (need > cur) { CurDelay = need; LowFrames = 0; }
+    else if (need < cur && ++LowFrames >= 120) { CurDelay = cur - 1; LowFrames = 90; }   // then -1 per 30 frames
+    else if (need >= cur) LowFrames = 0;
+}
+#endif
+
 void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
 {
-    int applied = frame + DelayFrames;
+#ifdef LITEV_NP_ADAPTIVE_DELAY
+    if (Adaptive) Adapt(frame);
+#endif
+    int applied = frame + CurDelay.load();
     {
         std::lock_guard<std::mutex> lk(Lock);
-        Inputs[Local][applied] = input;
-        Unacked.emplace_back(applied, input);
+#ifdef LITEV_NP_ADAPTIVE_DELAY
+        // the applied frames stay contiguous: a longer delay holds the previous input over the
+        // gap, a shorter one merges this sample into the next (its presses are kept)
+        NetplayFrameInput in = input;
+        in.Keys &= Carry.Keys;  // active low
+        if (in.TouchX < 0) { in.TouchX = Carry.TouchX; in.TouchY = Carry.TouchY; }
+        if (LastApplied >= 0 && applied <= LastApplied) { Carry = in; return; }
+        Carry = {};
+        for (int f = LastApplied + 1; LastApplied >= 0 && f < applied; f++)
+        {
+            Inputs[Local][f] = LastInput;
+            Unacked.emplace_back(f, LastInput);
+        }
+        LastApplied = applied;
+        LastInput = in;
+#else
+        const NetplayFrameInput& in = input;
+#endif
+        Inputs[Local][applied] = in;
+        Unacked.emplace_back(applied, in);
         Changed.notify_all();
     }
     Send();
@@ -160,6 +219,25 @@ void NetplayInput::Send()
             // what this peer has not acknowledged yet (Unacked also holds what only others lack)
             size_t first = 0;
             while (first < Unacked.size() && Unacked[first].first <= PeerAck[peer]) first++;
+#ifdef LITEV_NP_WIRE_RUNS
+            // runs of equal inputs over consecutive frames, oldest first
+            std::vector<WireEntry> runs;
+            for (size_t i = first; i < Unacked.size(); i++)
+            {
+                auto& [f, in] = Unacked[i];
+                WireEntry* r = runs.empty() ? nullptr : &runs.back();
+                if (r && r->Frame + r->Len == f && r->Len < 0xFFFF && r->Keys == in.Keys && r->TouchX == in.TouchX && r->TouchY == in.TouchY)
+                    r->Len++;
+                else if (runs.size() == kMaxPerPacket) break;
+                else runs.push_back({f, 1, in.Keys, in.TouchX, in.TouchY});
+            }
+            int count = (int)runs.size();
+            u64 now = NowUs();
+            WireHeader header {kMagic, (u8)Local, (u8)count, RemoteUpTo[peer], (u32)now, EchoSent[peer], EchoSent[peer] ? (u32)(now - EchoAt[peer]) : 0};
+            packet.resize(sizeof(header) + count * sizeof(WireEntry));
+            memcpy(packet.data(), &header, sizeof(header));
+            if (count) memcpy(packet.data() + sizeof(header), runs.data(), count * sizeof(WireEntry));
+#else
             int count = std::min<int>((int)(Unacked.size() - first), kMaxPerPacket);
             WireHeader header {kMagic, (u8)Local, (u8)count, RemoteUpTo[peer]};
             packet.resize(sizeof(header) + count * sizeof(WireEntry));
@@ -171,6 +249,7 @@ void NetplayInput::Send()
                 WireEntry e {f, in.Keys, in.TouchX, in.TouchY};
                 memcpy(p, &e, sizeof(e));
             }
+#endif
         }
         sendto(Socket, packet.data(), packet.size(), 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
     }
@@ -248,6 +327,11 @@ NetplayFrameInput NetplayInput::Get(int player, int frame)
 
 void NetplayInput::ReceiveLoop()
 {
+#if defined(LITEV_NP_RX_PRIO) && defined(__linux__)
+    // the emulator threads run at nice -10..-16: at the default nice this thread waited for a core
+    // tens of ms under load (in-race round trips 50-100 ms on a 3-10 ms Wi-Fi link)
+    for (int nice = -16; nice < 0 && setpriority(PRIO_PROCESS, 0, nice) != 0; nice++) {}
+#endif
     std::multimap<u64, std::vector<u8>> pending; // artificial latency: (due time, packet)
     u8 buf[2048];
     u64 lastSend = 0;
@@ -296,9 +380,37 @@ void NetplayInput::ReceiveLoop()
                 {
                     WireEntry e;
                     memcpy(&e, p, sizeof(e));
+#ifdef LITEV_NP_WIRE_RUNS
+                    for (int k = std::max(0, RemoteUpTo[from] + 1 - e.Frame); k < e.Len; k++)
+                        inputs.emplace(e.Frame + k, NetplayFrameInput {e.Keys, e.TouchX, e.TouchY});
+#else
                     if (e.Frame > RemoteUpTo[from]) // older ones were received (and maybe consumed) already
                         inputs.emplace(e.Frame, NetplayFrameInput {e.Keys, e.TouchX, e.TouchY});
+#endif
                 }
+#ifdef LITEV_NP_WIRE_RUNS
+                // round trip: our send time echoed back, less how long the peer held it
+                EchoSent[from] = header.SentUs;
+                EchoAt[from] = now;
+                if (header.EchoUs)
+                {
+                    auto& rtt = Rtt[from];
+                    rtt.emplace_back(now, (u32)now - header.EchoUs - header.EchoAgeUs);
+                    while (rtt.front().first + 2000000 < now) rtt.pop_front();
+                    // the slowest peer's 90th percentile over the last 2 s: a lone Wi-Fi spike costs
+                    // one stall, not seconds of extra input lag
+                    u32 worst = 0;
+                    for (int peer : Peers)
+                    {
+                        std::vector<u32> us;
+                        for (auto& [t, v] : Rtt[peer]) us.push_back(v);
+                        if (us.empty()) continue;
+                        std::nth_element(us.begin(), us.begin() + us.size() * 9 / 10, us.end());
+                        worst = std::max(worst, us[us.size() * 9 / 10]);
+                    }
+                    RttMaxUs = worst;
+                }
+#endif
                 while (inputs.count(RemoteUpTo[from] + 1)) RemoteUpTo[from]++;
                 PeerAck[from] = std::max(PeerAck[from], header.Ack);
                 int allAcked = INT32_MAX;
@@ -873,7 +985,12 @@ bool HostHandshake(NetplaySetup& s)
         for (Guest& g : guests) oneWay.push_back(g.OneWayMs);
         std::sort(oneWay.rbegin(), oneWay.rend());
         double worst = s.Hosted ? 2 * oneWay[0] : oneWay[0] + (oneWay.size() > 1 ? oneWay[1] : 0);
-        s.Delay = std::clamp((int)std::ceil(worst / (1000.0 / 60)) + 1, 1, 8);
+#ifdef LITEV_NP_ADAPTIVE_DELAY
+        const int maxDelay = s.Hosted ? 8 : NetplayInput::kMaxDelay;   // plain Netplay adapts from here
+#else
+        const int maxDelay = 8;
+#endif
+        s.Delay = std::clamp((int)std::ceil(worst / (1000.0 / 60)) + 1, 1, maxDelay);
         AddLog(s.Log, "Netplay: worst one way %.1f ms -> input delay %d frames", worst, s.Delay);
     }
 

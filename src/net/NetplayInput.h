@@ -86,7 +86,17 @@ public:
     ~NetplayInput();
 
     bool Ok() const { return Socket >= 0; }
-    int Delay() const { return DelayFrames; }
+    int Delay() const { return DelayFrames; }   // the session's starting delay (frames before it have no input)
+#ifdef LITEV_NP_ADAPTIVE_DELAY
+    // Plain Netplay: the local player's delay follows the round trip to its slowest peer (Delay() is
+    // only where it starts). Deterministic: every device applies each input at the frame its sender
+    // chose. Off for Hosted Netplay (the server's acknowledgement semantics assume a fixed delay).
+    bool Adaptive = false;
+    static constexpr int kMaxDelay = 120;   // 2 s of input lag; past that a session only stalls
+#endif
+    int CurrentDelay() const { return CurDelay.load(); }
+    // the slowest peer's round trip (90th percentile, last 2 s, ms), -1 = no measurement yet
+    double PeerRttMs() const { return RttMaxUs.load() / 1000.0; }
     int LocalPlayer() const { return Local; }
 
     // The local player's input sampled at `frame` (applied at frame + Delay everywhere).
@@ -122,7 +132,11 @@ public:
     double MsSincePeer() const;
 
 private:
+#ifdef LITEV_NP_WIRE_RUNS
+    static constexpr int kMaxPerPacket = 96;    // runs of equal inputs (14 B each: < 1400 B a packet)
+#else
     static constexpr int kMaxPerPacket = 64;
+#endif
     static constexpr int kResendMs = 10;
 
     int Local, DelayFrames;
@@ -144,7 +158,19 @@ private:
     std::atomic<u64> StallUs {0};
     std::atomic<u64> LastPeerUs[kMaxPlayers] {};
     std::atomic<u32> DroppedMask {0};
-
+    std::atomic<int> CurDelay;
+    std::atomic<s64> RttMaxUs {-1};
+#ifdef LITEV_NP_WIRE_RUNS
+    u32 EchoSent[kMaxPlayers] {};       // the peer's send time in its last packet (its clock, us)
+    u64 EchoAt[kMaxPlayers] {};         // when we took that packet
+    std::deque<std::pair<u64, u32>> Rtt[kMaxPlayers];   // (when, round trip us), the last second
+#endif
+#ifdef LITEV_NP_ADAPTIVE_DELAY
+    int LastApplied = -1;               // the local input's newest applied frame
+    NetplayFrameInput LastInput, Carry; // the input there; what a skipped sample pressed
+    int LowFrames = 0;                  // frames the measured need has been below the current delay
+    void Adapt(int frame);
+#endif
     bool IsPeer(int player) const { return player >= 0 && player < kMaxPlayers && PeerSet[player]; }
     void ReceiveLoop();
     void Send();
