@@ -442,7 +442,7 @@ void SoftRenderer::InitBands()
     S2DBandsInit = true;
 #ifdef LITEV_SOFT2D_HYB_BANDS
     {
-        const int n = litevPropInt("debug.litev.s2dbands", 2);   // default chosen by measurement
+        const int n = litevPropInt("debug.litev.s2dbands", 3);   // 3: PW overworld uncapped 104-106 vs 102-103 (2), 89-92 (off)
         S2DBandsN = std::clamp(n, 1, S2D_NBANDS);
         Platform::Log(Platform::Info, "LITEV_S2DBANDS resolved=%d\n", S2DBandsN);
     }
