@@ -1959,22 +1959,37 @@ void GPU3D::SubmitPolygon() noexcept
         LastStripPolygon = NULL;
 }
 
+#ifdef LITEV_GX_CMD_SLIM
+void GPU3D::UpdateClipMatrixOOL() noexcept { UpdateClipMatrix(); }
+#endif
+
 void GPU3D::SubmitVertex() noexcept
 {
+#ifdef LITEV_GX_CMD_SLIM
+    // scalars, not an array (no canary); inlined into the executor's single vertex site
+    const s64 vertex0 = CurVertex[0], vertex1 = CurVertex[1], vertex2 = CurVertex[2], vertex3 = 0x1000;
+#define vertex_(i) vertex##i
+#else
     s64 vertex[4] = {(s64)CurVertex[0], (s64)CurVertex[1], (s64)CurVertex[2], 0x1000};
+#define vertex_(i) vertex[i]
+#endif
     Vertex* vertextrans = &TempVertexBuffer[VertexNumInPoly];
 
+#ifdef LITEV_GX_CMD_SLIM
+    if (ClipMatrixDirty) UpdateClipMatrixOOL();
+#else
     UpdateClipMatrix();
+#endif
 #if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
     // vertex[] components fit in s32 (CurVertex is s16, w = 0x1000), so the
     // widening 32x32->64 NEON multiply matches the scalar s64 products exactly.
     NeonMat4Vec4_s64<12>(vertextrans->Position, ClipMatrix,
-                         (s32)vertex[0], (s32)vertex[1], (s32)vertex[2], (s32)vertex[3]);
+                         (s32)vertex_(0), (s32)vertex_(1), (s32)vertex_(2), (s32)vertex_(3));
 #else
-    vertextrans->Position[0] = (vertex[0]*ClipMatrix[0] + vertex[1]*ClipMatrix[4] + vertex[2]*ClipMatrix[8] + vertex[3]*ClipMatrix[12]) >> 12;
-    vertextrans->Position[1] = (vertex[0]*ClipMatrix[1] + vertex[1]*ClipMatrix[5] + vertex[2]*ClipMatrix[9] + vertex[3]*ClipMatrix[13]) >> 12;
-    vertextrans->Position[2] = (vertex[0]*ClipMatrix[2] + vertex[1]*ClipMatrix[6] + vertex[2]*ClipMatrix[10] + vertex[3]*ClipMatrix[14]) >> 12;
-    vertextrans->Position[3] = (vertex[0]*ClipMatrix[3] + vertex[1]*ClipMatrix[7] + vertex[2]*ClipMatrix[11] + vertex[3]*ClipMatrix[15]) >> 12;
+    vertextrans->Position[0] = (vertex_(0)*ClipMatrix[0] + vertex_(1)*ClipMatrix[4] + vertex_(2)*ClipMatrix[8] + vertex_(3)*ClipMatrix[12]) >> 12;
+    vertextrans->Position[1] = (vertex_(0)*ClipMatrix[1] + vertex_(1)*ClipMatrix[5] + vertex_(2)*ClipMatrix[9] + vertex_(3)*ClipMatrix[13]) >> 12;
+    vertextrans->Position[2] = (vertex_(0)*ClipMatrix[2] + vertex_(1)*ClipMatrix[6] + vertex_(2)*ClipMatrix[10] + vertex_(3)*ClipMatrix[14]) >> 12;
+    vertextrans->Position[3] = (vertex_(0)*ClipMatrix[3] + vertex_(1)*ClipMatrix[7] + vertex_(2)*ClipMatrix[11] + vertex_(3)*ClipMatrix[15]) >> 12;
 #endif
 
     // this probably shouldn't be.
@@ -1986,12 +2001,12 @@ void GPU3D::SubmitVertex() noexcept
     if ((TexParam >> 30) == 3)
     {
 #if defined(LITEV_NEON_GEOMETRY) && defined(__ARM_NEON)
-        int64x2_t tc = NeonTex2_s64<24>(TexMatrix, (s32)vertex[0], (s32)vertex[1], (s32)vertex[2]);
+        int64x2_t tc = NeonTex2_s64<24>(TexMatrix, (s32)vertex_(0), (s32)vertex_(1), (s32)vertex_(2));
         vertextrans->TexCoords[0] = (s32)vgetq_lane_s64(tc, 0) + RawTexCoords[0];
         vertextrans->TexCoords[1] = (s32)vgetq_lane_s64(tc, 1) + RawTexCoords[1];
 #else
-        vertextrans->TexCoords[0] = ((vertex[0]*TexMatrix[0] + vertex[1]*TexMatrix[4] + vertex[2]*TexMatrix[8]) >> 24) + RawTexCoords[0];
-        vertextrans->TexCoords[1] = ((vertex[0]*TexMatrix[1] + vertex[1]*TexMatrix[5] + vertex[2]*TexMatrix[9]) >> 24) + RawTexCoords[1];
+        vertextrans->TexCoords[0] = ((vertex_(0)*TexMatrix[0] + vertex_(1)*TexMatrix[4] + vertex_(2)*TexMatrix[8]) >> 24) + RawTexCoords[0];
+        vertextrans->TexCoords[1] = ((vertex_(0)*TexMatrix[1] + vertex_(1)*TexMatrix[5] + vertex_(2)*TexMatrix[9]) >> 24) + RawTexCoords[1];
 #endif
     }
     else
@@ -2068,6 +2083,7 @@ void GPU3D::SubmitVertex() noexcept
 
     VertexPipeline = 7;
     AddCycles(3);
+#undef vertex_
 }
 
 void GPU3D::CalculateLighting() noexcept
