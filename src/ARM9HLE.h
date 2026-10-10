@@ -24,7 +24,10 @@
 // have arrived inside the elided round trip is taken right after it). Deterministic.
 // Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS:
 // 0 off, 1 all, other values = the mask below.
-// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send; 8 needs 1) for A/B of single hooks.
+// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 64 LZ; 8 needs 1; 32 is
+// reserved for the unshipped card loop) for A/B of single hooks.
+// Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black), probed when a
+// hook entry of that variant is first reached; hook 6 is position independent (any game).
 //
 // 3. Whole HBlank IRQs (~265 a frame on PW, ~3.8k Mac host instructions each through the JIT
 //    even with 1. native; ~1.7k native): when the only pending enabled IRQ is HBlank and the game's HBlank callback
@@ -45,6 +48,9 @@
 //    the guest sends to GXFIFO, and src/length where the native path would leave them.
 //
 // Diagnostics (build with LITEV_HLE_DIAG; compiled out of shipping builds):
+// 6. MIi_UncompressBackward (backward LZ, overlay/data unpacking in loading): the loop natively in
+//    256-byte chunks with the guest's exact registers at each stop (see ARM9HLE.cpp).
+//
 // LITEV_A9HLE_CHECK=1 (env, interpreter mode): compute the native result, run the guest code
 // instead, and at the guest's return compare all of main RAM, ITCM, DTCM and the registers
 // with the native prediction. LITEV_A9HLE_STATS=1: counts, host ns per native call (and measured
