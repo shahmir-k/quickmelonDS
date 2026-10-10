@@ -73,6 +73,13 @@ public:
 
     JitBlockEntry EntryPoint;
 
+#ifdef LITEV_JIT_TAILSHARE
+    // hash of everything the compiler read of this block's instructions (0 = may not be
+    // another block's tail) and their count; see TailShareRec in ARMJIT.cpp
+    u64 TailHash = 0;
+    u8 TailLen = 0;
+#endif
+
 #ifdef LITEV_JIT_LINK
     // Outgoing static exits (taken + fall-through of each followed conditional branch).
     u8 NumOutgoing = 0;

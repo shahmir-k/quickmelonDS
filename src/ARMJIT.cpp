@@ -1011,6 +1011,76 @@ u64 JitCompileTicks[JitPhase_Count] = {};
 #define JIT_PHASE(p) do {} while (0)
 #endif
 
+#ifdef LITEV_JIT_TAILSHARE
+// LITEV_JIT_TAILSHARE. Block A's instructions k..n-1 can be another live block T's whole list
+// (T starts mid-way through A: a branch target, a call return, the next block after a 32-
+// instruction cut). Then A is compiled as its head 0..k-1 plus a plain jump into T: the
+// same instructions and cycles run and the budget/stop check stays at the end of the
+// combined block, so guest state and timing are unchanged; only the copy of T is gone.
+//
+// Sfx hashes cover every input the compiler reads per instruction (the FetchedInstr fields
+// incl. the compile-time interpretation's cycles/data region, the flag-set mask from this
+// block's own flood fill, idle/follow flags) plus the CPU, Thumb state and the compile-time
+// CPU mode (CP15 inlining). Equal hash + equal length + same start = same code.
+static inline u64 TailShareMix(u64 h, u64 w)
+{
+    h ^= w + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    h *= 0xBF58476D1CE4E5B9ull;
+    return h ^ (h >> 31);
+}
+
+static u64 TailShareRec(const ARMJIT_Memory& mem, u32 num, const FetchedInstr& in, bool thumb, u64 h)
+{
+    h = TailShareMix(h, (u64)in.Addr | ((u64)in.Instr << 32));
+    h = TailShareMix(h, (u64)in.CodeCycles | ((u64)in.Info.Kind << 16) | ((u64)in.Info.SrcRegs << 32) | ((u64)in.Info.DstRegs << 48));
+    h = TailShareMix(h, (u64)in.Info.NotStrictlyNeeded | ((u64)in.BranchFlags << 16) | ((u64)in.SetFlags << 24)
+        | ((u64)in.Info.ReadFlags << 32) | ((u64)in.Info.WriteFlags << 40) | ((u64)in.Info.SpecialKind << 48)
+        | ((u64)in.Info.EndBlock << 56));
+    // the data fields are read only when compiling memory instructions (stale otherwise),
+    // the data address only as its class (fast/slow path) and, on the ARM7, its region byte
+    bool memInstr = thumb
+        ? (in.Info.Kind >= ARMInstrInfo::tk_LDR_PCREL && in.Info.Kind <= ARMInstrInfo::tk_STMIA)
+        : (in.Info.Kind >= ARMInstrInfo::ak_STR_REG_LSL && in.Info.Kind <= ARMInstrInfo::ak_STM);
+    if (memInstr)
+    {
+        u32 cls = num == 0 ? (u32)mem.ClassifyAddress9(in.DataRegion)
+            : ((u32)mem.ClassifyAddress7(in.DataRegion) | ((in.DataRegion >> 24) << 8));
+        u32 exec = 0;
+#ifdef LITEV_JIT_COND_MEMGUESS
+        exec = in.DataExecuted;
+#endif
+        h = TailShareMix(h, (u64)cls | ((u64)in.DataCycles << 32) | ((u64)exec << 40));
+    }
+    return h ? h : 1;
+}
+
+// may a tail start at instrs[k] (k >= 1)? The head's last instruction must end the head
+// the way the full block runs on: a compiled non-branch (falls through), or a followed
+// unconditional B/BL to instrs[k]. Both emit nothing at a block end that a mid-block copy
+// wouldn't, once the R[15]/CodeCycles store and the exit are left out (Compiler tailSeam).
+static bool TailShareSeam(Compiler& c, bool thumb, const FetchedInstr* instrs, int k)
+{
+    const FetchedInstr& p = instrs[k - 1];
+    if (!p.Info.Branches())
+        return p.BranchFlags == 0 && c.CanCompile(thumb, p.Info.Kind);
+    if (p.BranchFlags != branch_StaticTarget || p.Info.EndBlock)
+        return false;
+    if (thumb)
+        return p.Info.Kind == ARMInstrInfo::tk_B || p.Info.Kind == ARMInstrInfo::tk_BL_LONG;
+    return p.Cond() == 0xE && (p.Info.Kind == ARMInstrInfo::ak_B || p.Info.Kind == ARMInstrInfo::ak_BL);
+}
+
+// the block's literals all still folded as constants (a sharer depends on them too)
+static bool TailShareLiteralsOK(ARMJIT& jit, JitBlock* t)
+{
+    for (int j = 0; j < t->NumLiterals; j++)
+        if (jit.InvalidLiterals.Find(t->Literals()[j]) != -1)
+            return false;
+    return true;
+}
+
+#endif
+
 void ARMJIT::CompileBlock(ARM* cpu) noexcept
 {
     JitCompileCount++;
@@ -1502,7 +1572,55 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         if (prevBlock)
             delete prevBlock;
 
+#ifdef LITEV_JIT_TAILSHARE
+        // suffix hashes (FloodFillSetFlags above was the last change to instrs) and the
+        // shortest head whose rest is a live block (see TailShareRec)
+        u64 sfx[MaxBlockSize + 1];
+        int shareK = 0;
+        JitBlock* shareT = nullptr;
+        // (no tail when the compile below resets the cache: the tail would be gone)
+        const bool tailShare = JITCompiler.JitQOn(Compiler::jitq_TailShare) && !JITCompiler.CodeNearFull();
+        if (tailShare)
+        {
+            bool hookFree = true;
+            for (int j = 0; j < i; j++)
+                if (instrs[j].Info.Kind == (thumb ? ARMInstrInfo::tk_UNK : ARMInstrInfo::ak_UNK))
+                    hookFree = false;
+            u64 h = TailShareMix(0x7A115AAEull, cpu->Num | ((cpu->CPSR & 0x3F) << 8));
+            for (int j = i - 1; j >= 0; j--)
+                sfx[j] = h = TailShareRec(Memory, cpu->Num, instrs[j], thumb, h);
+            for (int j = 1; j < i; j++)
+                if (!hookFree || !TailShareSeam(JITCompiler, thumb, instrs, j))
+                    sfx[j] = 0;
+            if (!hookFree)
+                sfx[0] = 0;
+            auto& smap = cpu->Num == 0 ? JitBlocks9 : JitBlocks7;
+            for (int k = 1; k < i && !shareT; k++)
+            {
+                if (!sfx[k])
+                    continue;
+                auto it = smap.find(instrs[k].Addr);
+                if (it == smap.end())
+                    continue;
+                JitBlock* t = it->second;
+                if (t->TailLen == i - k && t->TailHash == sfx[k]
+                    && t->StartAddrLocal == LocaliseCodeAddress(cpu->Num, instrs[k].Addr)
+                    && TailShareLiteralsOK(*this, t))
+                {
+                    shareT = t;
+                    shareK = k;
+                }
+            }
+        }
+#endif
         block = new JitBlock(cpu->Num, i, numAddressRanges, numLiterals);
+#ifdef LITEV_JIT_TAILSHARE
+        if (tailShare)
+        {
+            block->TailHash = sfx[0];
+            block->TailLen = i;
+        }
+#endif
         block->LiteralHash = literalHash;
         block->InstrHash = instrHash;
         for (u32 j = 0; j < numAddressRanges; j++)
@@ -1519,7 +1637,13 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         JIT_PHASE(JitPhase_Alloc);
 
         JitEnableWrite();
+#ifdef LITEV_JIT_TAILSHARE
+        JITCompiler.TailShareTarget = shareT ? shareT->EntryPoint : nullptr;
+        block->EntryPoint = JITCompiler.CompileBlock(cpu, thumb, instrs, shareT ? shareK : i, hasMemoryInstr);
+        JITCompiler.TailShareTarget = nullptr;
+#else
         block->EntryPoint = JITCompiler.CompileBlock(cpu, thumb, instrs, i, hasMemoryInstr);
+#endif
         JitEnableExecute();
         JIT_PHASE(JitPhase_Emit);
 

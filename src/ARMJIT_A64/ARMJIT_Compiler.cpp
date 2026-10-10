@@ -2426,6 +2426,15 @@ bool Compiler::R15LiteralLoadFolds(CompileFunc comp)
 }
 #endif
 
+#ifdef LITEV_JIT_TAILSHARE
+// CompileBlock is about to reset the whole cache (every block, incl. a tail it would jump to)
+bool Compiler::CodeNearFull()
+{
+    return JitMemMainSize - GetCodeOffset() < 1024 * 16
+        || (JitMemMainSize + JitMemSecondarySize) - OtherCodeRegion < 1024 * 8;
+}
+#endif
+
 JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[], int instrsCount, bool hasMemInstr)
 {
     if (JitMemMainSize - GetCodeOffset() < 1024 * 16)
@@ -2546,7 +2555,13 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
                 ? &Compiler::A_Comp_MCR_CacheOp : &Compiler::A_Comp_MRC_DTCM;
 #endif
 
-        Exit = i == (instrsCount - 1) || (CurInstr.BranchFlags & branch_FollowCondNotTaken);
+#ifdef LITEV_JIT_TAILSHARE
+        // the head's last instruction is not a block end in the full block: no exit, no PC store
+        const bool tailSeam = TailShareTarget && i == instrsCount - 1;
+#else
+        const bool tailSeam = false;
+#endif
+        Exit = (i == (instrsCount - 1) && !tailSeam) || (CurInstr.BranchFlags & branch_FollowCondNotTaken);
 
         //printf("%x instr %x regs: r%x w%x n%x flags: %x %x %x\n", R15, CurInstr.Instr, CurInstr.Info.SrcRegs, CurInstr.Info.DstRegs, CurInstr.Info.ReadFlags, CurInstr.Info.NotStrictlyNeeded, CurInstr.Info.WriteFlags, CurInstr.SetFlags);
 
@@ -2567,7 +2582,7 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
             FlushPendingCycles();
         DeferCycles = !readsCycles && !isConditional;
 #endif
-        if (comp == NULL || (CurInstr.BranchFlags & branch_FollowCondTaken) || (i == instrsCount - 1 && (!CurInstr.Info.Branches() || isConditional)))
+        if (comp == NULL || (CurInstr.BranchFlags & branch_FollowCondTaken) || (i == instrsCount - 1 && !tailSeam && (!CurInstr.Info.Branches() || isConditional)))
         {
 #ifdef LITEV_EXIT_PROTO_PC
             // This R15 is only read by the not-taken edge of a followed-taken branch or the
@@ -2849,6 +2864,16 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     // exit (two possible PCs) and a dynamic branch has no compile-time target;
     // both keep the plain dispatcher exit.
     bool linked = false;
+#ifdef LITEV_JIT_TAILSHARE
+    if (TailShareTarget)
+    {
+        // RCycles carries the head's cycles into the tail; its exits check the sum,
+        // exactly where the full block would have.
+        B((const void*)TailShareTarget);
+        linked = true;
+    }
+    else
+#endif
     if (HasStaticExit && !StaticExitCond)
     {
     #ifdef LITEV_LINK_UNCOND
@@ -2999,6 +3024,9 @@ void Compiler::Reset()
 #endif
 #ifdef LITEV_JIT_MOV_ELIDE
             | jitq_MovElide
+#endif
+#ifdef LITEV_JIT_TAILSHARE
+            | jitq_TailShare
 #endif
             ;
 #if defined(__ANDROID__)

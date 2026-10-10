@@ -596,9 +596,17 @@ public:
         jitq_ColdExits = 1 << 6,     // LITEV_JIT_COLD_EXITS
         jitq_NZBranch = 1 << 7,      // LITEV_JIT_NZ_BRANCH
         jitq_MovElide = 1 << 8,      // LITEV_JIT_MOV_ELIDE
+        jitq_TailShare = 1 << 9,     // LITEV_JIT_TAILSHARE
     };
     u32 JitQ = 0;
     bool JitQOn(u32 bit) const { return (JitQ & bit) != 0; }
+#ifdef LITEV_JIT_TAILSHARE
+    // Set by ARMJIT::CompileBlock for one CompileBlock call: the instructions passed are a
+    // block's head, and its end jumps here (the entry of the live block holding the rest)
+    // instead of exiting. No budget/stop check at that seam, like inside the full block.
+    JitBlockEntry TailShareTarget = nullptr;
+    bool CodeNearFull();
+#endif
 
 #if defined(LITEV_JIT_EXIT_TAIL) || defined(LITEV_JIT_LDR_ALIGNCHK) || defined(LITEV_JIT_COLD_EXITS)
     // Cold code of the block being compiled, emitted after its last exit (EmitTailStubs) so
