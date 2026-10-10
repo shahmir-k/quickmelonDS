@@ -40,6 +40,7 @@
 #include "LiteProfile.h"
 #include "VerifyTrace.h"
 #include "InputScript.h"
+namespace melonDS { extern u64 JitCompileCount; }
 #ifdef LITEV_HEADLESS_LAN
 #include <thread>
 #include "MPInterface.h"
@@ -658,8 +659,16 @@ int main(int argc, char** argv)
         video = popen(cmd.c_str(), "w");
     }
 
+    // LITEV_LOOP=<n>: run the --frames window n more times from --savestate (profile a short burst)
+    int loopsLeft = getenv("LITEV_LOOP") ? atoi(getenv("LITEV_LOOP")) : 0;
     for (int frame = 0; frame < opt.frames; frame++)
     {
+        if (frame == opt.frames - 1 && loopsLeft > 0 && !opt.savestate.empty())
+        {
+            loopsLeft--;
+            if (!LoadSavestate(*nds, opt.savestate)) { fprintf(stderr, "error: loop reload failed\n"); return 1; }
+            frame = 0;
+        }
         if (frame == opt.reloadAt && !opt.savestate.empty())
         {
             if (!LoadSavestate(*nds, opt.savestate)) { fprintf(stderr, "error: reload failed\n"); return 1; }
@@ -679,7 +688,14 @@ int main(int argc, char** argv)
             windowStart = std::chrono::steady_clock::now();
 
         LITE_PROFILE_RESET_FRAME();
+        static const bool frameMs = getenv("LITEV_FRAME_MS") != nullptr;   // per-frame time + JIT compiles
+        const auto fms0 = std::chrono::steady_clock::now();
+        const u64 jit0 = melonDS::JitCompileCount;
         nds->RunFrame();
+        if (frameMs)
+            printf("FRAME %d %.3f ms jit %llu\n", frame,
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fms0).count(),
+                   (unsigned long long)(melonDS::JitCompileCount - jit0));
         {   // LITEV_PRINT_REGS=<frame>: display registers after that frame (diagnosis)
             static const int regsAt = getenv("LITEV_PRINT_REGS") ? atoi(getenv("LITEV_PRINT_REGS")) : -1;
             if (frame == regsAt)

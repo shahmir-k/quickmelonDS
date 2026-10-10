@@ -2356,6 +2356,7 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
 
 #ifdef LITEV_JIT_PERFMAP
+    if (litev_perfmap::g_state == 1)   // armed: name the block (formatting it costs ~2% of a compile)
     {
         char nm[24];
         snprintf(nm, sizeof(nm), "jit_a%d_%x", Num == 0 ? 9 : 7, (unsigned)instrs[0].Addr);
@@ -2395,6 +2396,10 @@ void Compiler::ICacheReset()
 void Compiler::Reset()
 {
     LoadStorePatches.clear();
+#ifdef LITEV_JIT_PATCHMAP_RESERVE
+    // one entry per compiled memory access: sized up front so compiling never rehashes it
+    LoadStorePatches.reserve(1 << 15);
+#endif
 
 #ifdef LITEV_JIT_ICACHE
     // Allocate the per-CPU inline-cache tables BEFORE Gen_Dispatcher bakes their base

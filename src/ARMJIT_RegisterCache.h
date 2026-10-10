@@ -50,6 +50,19 @@ public:
         PCAllocatableAsSrc = ~(pcAllocatableAsSrc
             ? 0
             : (1 << 15));
+#ifdef LITEV_JIT_REGALLOC_SUFFIX
+        // Prepare(i) needs, over instructions i..end, which registers are used and how often:
+        // one backward pass per block instead of a rescan per instruction (same values)
+        SuffixNeeded[instrsCount] = 0;
+        for (int r = 0; r < 16; r++) SuffixRank[instrsCount][r] = 0;
+        for (int j = instrsCount - 1; j >= 0; j--)
+        {
+            u16 regs = (Instrs[j].Info.SrcRegs & ~(1 << 15)) | Instrs[j].Info.DstRegs;
+            SuffixNeeded[j] = SuffixNeeded[j + 1] | regs;
+            regs &= ~Instrs[j].Info.NotStrictlyNeeded;
+            for (int r = 0; r < 16; r++) SuffixRank[j][r] = SuffixRank[j + 1][r] + ((regs >> r) & 1);
+        }
+#endif
     }
 
 #ifdef LITEV_JIT_GLOBALREG
@@ -161,6 +174,10 @@ public:
         for (int reg : invalidedLiterals)
             UnloadLiteral(reg);
 
+#ifdef LITEV_JIT_REGALLOC_SUFFIX
+        const u16 futureNeeded = SuffixNeeded[i];
+        const u8* ranking = SuffixRank[i];
+#else
         u16 futureNeeded = 0;
         int ranking[16];
         for (int j = 0; j < 16; j++)
@@ -173,6 +190,7 @@ public:
             for (int reg : regsNeeded)
                 ranking[reg]++;
         }
+#endif
 
         // we'll unload all registers which are never used again
         BitSet16 neverNeededAgain(LoadedRegs & ~futureNeeded);
@@ -240,6 +258,10 @@ public:
     static const Reg NativeRegAllocOrder[];
     static const int NativeRegsAvailable;
 
+#ifdef LITEV_JIT_REGALLOC_SUFFIX
+    u16 SuffixNeeded[33];      // MaxBlockSize <= 32 (ARMJIT.cpp clamps it)
+    u8 SuffixRank[33][16];
+#endif
     Reg Mapping[16];
     u32 LiteralValues[16];
 

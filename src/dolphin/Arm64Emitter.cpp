@@ -69,7 +69,7 @@ bool IsImmArithmetic(uint64_t input, u32* val, bool* shift)
 }
 
 // For AND/TST/ORR/EOR etc
-bool IsImmLogical(uint64_t value, unsigned int width, unsigned int* n, unsigned int* imm_s,
+bool IsImmLogicalUncached(uint64_t value, unsigned int width, unsigned int* n, unsigned int* imm_s,
                   unsigned int* imm_r)
 {
   // DCHECK((n != NULL) && (imm_s != NULL) && (imm_r != NULL));
@@ -277,6 +277,31 @@ bool IsImmLogical(uint64_t value, unsigned int width, unsigned int* n, unsigned 
 
   return true;
 }
+
+#ifdef LITEV_JIT_IMMLOGICAL_CACHE
+// The JIT asks about the same few mask constants on every memory access; IsImmLogical is a
+// pure function of (value, width), so a small per-thread memo returns the same answer.
+bool IsImmLogical(uint64_t value, unsigned int width, unsigned int* n, unsigned int* imm_s,
+                  unsigned int* imm_r)
+{
+  struct Entry { uint64_t value; unsigned int width; bool valid, ok; unsigned int n, s, r; };
+  static thread_local Entry cache[64];
+  Entry& e = cache[(value ^ (value >> 17) ^ (value >> 37) ^ width) & 63];
+  if (!e.valid || e.value != value || e.width != width)
+  {
+    e.ok = IsImmLogicalUncached(value, width, &e.n, &e.s, &e.r);
+    e.value = value; e.width = width; e.valid = true;
+  }
+  if (e.ok) { *n = e.n; *imm_s = e.s; *imm_r = e.r; }
+  return e.ok;
+}
+#else
+bool IsImmLogical(uint64_t value, unsigned int width, unsigned int* n, unsigned int* imm_s,
+                  unsigned int* imm_r)
+{
+  return IsImmLogicalUncached(value, width, n, imm_s, imm_r);
+}
+#endif
 
 float FPImm8ToFloat(u8 bits)
 {

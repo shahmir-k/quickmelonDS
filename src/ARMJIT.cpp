@@ -896,8 +896,11 @@ void ARMJIT::SetFastMemory(bool enabled) noexcept
     SetJITArgs(JITArgs{static_cast<unsigned>(MaxBlockSize), LiteralOptimizations, BranchOptimizations, enabled});
 }
 
+u64 JitCompileCount = 0;   // blocks compiled so far (headless LITEV_FRAME_MS)
+
 void ARMJIT::CompileBlock(ARM* cpu) noexcept
 {
+    JitCompileCount++;
     bool thumb = cpu->CPSR & 0x20;
 
     u32 blockAddr = cpu->R[15] - (thumb ? 2 : 4);
