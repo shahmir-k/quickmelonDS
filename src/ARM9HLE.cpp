@@ -2720,6 +2720,35 @@ __attribute__((noinline)) bool RunAsync(melonDS::ARMv5* c, State& s, bool jit)
 constexpr s32 kShpCyc = 245;
 // small lists (NNS_G3dGeBufferOP_N): base + per parameter word (check mode fit over 6.5k lists, within 1%)
 constexpr s32 kShpSmallCyc0 = 213, kShpSmallCycWord = 12;
+// ponytail: a skipped shape (push, 3 tests, pointer update, pop: ~10 instructions; W2 the same estimate)
+constexpr s32 kShpSkipCyc = 24;   // (check mode: 24 over 3.4k skipped shapes)
+
+// 13.: a skipped shape natively (or, check mode, compared at SHP's return)
+bool ShpSkip(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool chk)
+{
+#ifdef LITEV_HLE_DIAG
+    if (chk)
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 13, m, e);
+            g_P.small = true; g_P.gx.clear(); g_P.fit[0] = 0;
+#ifdef LITEV_A9HLE_GXCHECK
+            if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
+#endif
+        }
+        s.checks[13]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    (void)chk;
+    m.Flush();
+    s.native[13]++;
+    Return(c, e, kShpSkipCyc);
+    return true;
+}
 
 __attribute__((noinline)) bool RunShp(melonDS::ARMv5* c, State& s, bool jit)
 {
@@ -2752,8 +2781,22 @@ __attribute__((noinline)) bool RunShp(melonDS::ARMv5* c, State& s, bool jit)
         // SBC SHP: the shape of index sbc[1] in the shape resource, its function from the table
         const u32 flag = RS.r(8);
         sbc = RS.r(0);
+        if ((flag & 0x202) || !(flag & 1))
+        {
+            // the shape is skipped: SBC pointer + 2 (push {r4, lr}; flags of the tst that branched: N clear, Z set
+            // only for the "visible" bit 0 test, C clear (tst #0x200 ran first: a rotated immediate), V unchanged)
+            Obj st = m.O(sp - 8, 8);
+            if (!st) goto out;
+            m.W(st, 0, c->R[4]); m.W(st, 4, c->R[14]);
+            m.W(RS, 0, sbc + 2);
+            for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+            e.R[0] = sbc + 2;
+            e.retPc = c->R[14];
+            e.CPSR = (c->CPSR & 0x1FFFFFDF) | (!(flag & 0x200) && !(flag & 1) ? 0x40000000u : 0) | ((e.retPc & 1) << 5);
+            return ShpSkip(c, s, m, e, chk);
+        }
         const u32 idx = rd(sbc + 1, 1), ip = RS.r(0xDC);
-        ok = !(flag & 0x302) && (flag & 1) && ip && !bad;
+        ok = ip && !bad;
         u32 shp = 0, ent = 0;
         if (ok)
         {
@@ -2779,7 +2822,8 @@ __attribute__((noinline)) bool RunShp(melonDS::ARMv5* c, State& s, bool jit)
             // sent: the command word to GXFIFO, MI_CpuSend32 of the rest = the whole list
             melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
             const u8* lp = m.P(dl);
-            ok = !bad && size >= 4 && !(size & 3) && !rd(G, 4) && !rd(G + 4, 4) && !bad && lp && (dl >> 24) == 0x02
+            const u32 gb = rd(G, 4);   // OP_N: an empty GE buffer sends directly too
+            ok = !bad && size >= 4 && !(size & 3) && (!gb || !rd(gb, 4)) && !rd(G + 4, 4) && !bad && lp && (dl >> 24) == 0x02
                  && m.P(dl + size - 1) == lp + size - 1 && (dl & c->DTCMMask) != c->DTCMBase && ((dl + size - 1) & c->DTCMMask) != c->DTCMBase
                  && (chk || (gx.GeometryEnabled && gx.BulkReady()));
             fr = m.O(sp - 56, 56);
@@ -2917,8 +2961,20 @@ __attribute__((noinline)) bool RunShpT(melonDS::ARMv5* c, State& s, bool jit)
     {
         const u32 flag = RS.r(8);
         sbc = RS.r(0);
+        if ((flag & 0x202) || !(flag & 1))
+        {
+            // skipped: SBC pointer + 2; r2 = the last movs (0x200 / 1 / 2), flags of SBC SHP's adds
+            m.W(fr, 56, c->R[4]); m.W(fr, 60, c->R[5]); m.W(fr, 64, c->R[6]); m.W(fr, 68, c->R[14]);
+            m.W(RS, 0, sbc + 2);
+            for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+            e.R[0] = sbc + 2; e.R[2] = (flag & 0x200) ? 0x200 : !(flag & 1) ? 1 : 2;
+            e.retPc = c->R[14];
+            const u32 rr = sbc + 2, nzcv = (rr & 0x80000000) | ((rr == 0) << 30) | ((rr < sbc) << 29) | (((~(sbc ^ 2u) & (sbc ^ rr)) >> 31) << 28);
+            e.CPSR = (c->CPSR & 0x0FFFFFDF) | nzcv | ((e.retPc & 1) << 5);
+            return ShpSkip(c, s, m, e, chk);
+        }
         const u32 idx = rd(sbc + 1, 1), ip = RS.r(0xDC);
-        ok = !(flag & 0x302) && (flag & 1) && ip && !bad;
+        ok = ip && !bad;
         u32 shp = 0, fn = 0, h = 0;
         if (ok)
         {
