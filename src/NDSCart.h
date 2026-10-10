@@ -70,6 +70,10 @@ public:
     ~NDSCartSlot() noexcept;
     void Reset() noexcept;
     void DoSavestate(Savestate* file) noexcept;
+#ifdef LITEV_A9HLE
+    // A9HLE check mode: save / restore the ARM9 ROM-read state (interface 0, KEY2, cart command; no SRAM)
+    void HleRomState(Savestate* file) noexcept;
+#endif
 
     void DecryptSecureArea(u8* out) noexcept;
 

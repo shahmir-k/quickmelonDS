@@ -316,6 +316,17 @@ void NDSCartSlot::DoSavestate(Savestate* file) noexcept
 }
 
 
+#ifdef LITEV_A9HLE
+void NDSCartSlot::HleRomState(Savestate* file) noexcept
+{
+    file->Section("HLEC");
+    file->Var64(&Key2_X);
+    file->Var64(&Key2_Y);
+    Interfaces[0].DoSavestate(file);
+    if (Cart) Cart->CartCommon::DoSavestate(file);
+}
+#endif
+
 bool ReadROMParams(u32 gamecode, ROMListEntry* params)
 {
     u32 offset = 0;
