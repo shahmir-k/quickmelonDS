@@ -133,7 +133,18 @@ private:
     GLuint ClearShaderPlain {};
     GLuint ClearShaderBitmap {};
 
-    GLuint RenderShader[8] {};
+    GLuint RenderShader[16] {};   // flags: 1 W-buffer, 2 no discard, 4 alpha-test passes, 8 LITEV_GL_SPEC_TEXMOD
+    static bool SpecTexMod();
+    // 8 for a polygon the textured-modulate shader variant draws (LITEV_GL_SPEC_TEXMOD), else 0
+    int SpecFlag(const RendererPolygon* rp) const
+    {
+#ifdef LITEV_GL_SPEC_TEXMOD
+        return (SpecTexMod() && (rp->RenderKey & 0x80000) && rp->TexID != (GLuint)-1 && rp->TexID != (GLuint)-2
+                && ((rp->PolyData->Attr >> 4) & 0x3) == 0) ? 8 : 0;
+#else
+        return 0;
+#endif
+    }
 #ifdef LITEV_GL_ALPHATEST_2PASS
     static bool AlphaTest2Pass();
     // drawn in the two alpha-test passes: an opaque polygon that needs the alpha test, not depth-equal

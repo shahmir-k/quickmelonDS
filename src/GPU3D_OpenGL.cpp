@@ -54,7 +54,7 @@ bool GLRenderer3D::BuildRenderShader(int flags)
 #endif
 
     char shadername[32];
-    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s", wbuffer?'W':'Z', (flags & 2) ? "N" : "", (flags & 4) ? "A" : "");
+    snprintf(shadername, sizeof(shadername), "RenderShader%c%s%s%s", wbuffer?'W':'Z', (flags & 2) ? "N" : "", (flags & 4) ? "A" : "", (flags & 8) ? "S" : "");
 
     std::string vsbuf = k3DRenderVS;
     if (wbuffer)
@@ -89,6 +89,13 @@ bool GLRenderer3D::BuildRenderShader(int flags)
     {
         auto pos = fsbuf.find('\n') + 1;
         fsbuf = fsbuf.substr(0, pos) + "#define TexUnorm\n" + fsbuf.substr(pos);
+    }
+#endif
+#ifdef LITEV_GL_SPEC_TEXMOD
+    if (flags & 8)
+    {
+        auto pos = fsbuf.find('\n') + 1;
+        fsbuf = fsbuf.substr(0, pos) + "#define SpecTexMod\n" + fsbuf.substr(pos);
     }
 #endif
 
@@ -133,6 +140,22 @@ void GLRenderer3D::UseRenderShader(int flags)
 bool GLRenderer3D::NoDiscard()
 {
     static const bool on = OpenGL::Prop("glnodiscard", 1) != 0;
+    return on;
+}
+#endif
+
+#ifdef LITEV_GL_SPEC_TEXMOD
+// The no-discard opaque shaders, specialised for textured modulate polygons with a normal
+// texture (all opaque polygons in the PW town): colour = vertex colour * texel, none of the big
+// shader's branches (toon/highlight, decal, untextured, capture textures). Same maths, same
+// pixels. Needs normalized textures (LITEV_GL_TEX_UNORM). debug.litev.glspec=0 turns it off.
+bool GLRenderer3D::SpecTexMod()
+{
+#ifdef LITEV_GL_TEX_UNORM
+    static const bool on = TexUnorm() && OpenGL::Prop("glspec", 1) != 0;
+#else
+    static const bool on = false;
+#endif
     return on;
 }
 #endif
@@ -247,6 +270,13 @@ bool GLRenderer3D::Init()
 #ifdef LITEV_GL_OPAQUE_NODISCARD
     if (NoDiscard() && (!BuildRenderShader(2) || !BuildRenderShader(3)))
         return false;
+#endif
+#ifdef LITEV_GL_SPEC_TEXMOD
+    // the no-discard shaders (2, 3) and pass B (6, 7) for textured modulate polygons
+    if (SpecTexMod())
+        for (int f : {2, 3, 6, 7})
+            if (RenderShader[f] && !BuildRenderShader(f | 8))
+                return false;
 #endif
 
     if (!OpenGL::CompileVertexFragmentProgram(FinalPassEdgeShader,
@@ -449,7 +479,7 @@ GLRenderer3D::~GLRenderer3D()
 
     glDeleteBuffers(1, &ShaderConfigUBO);
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < (int)(sizeof(RenderShader) / sizeof(RenderShader[0])); i++)
     {
         if (!RenderShader[i]) continue;
         glDeleteProgram(RenderShader[i]);
@@ -567,7 +597,7 @@ void GLRenderer3D::WarmVariants()
         glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, nullptr);
         n++;
     };
-    for (int prog = 0; prog < 8; prog++)
+    for (int prog = 0; prog < (int)(sizeof(RenderShader) / sizeof(RenderShader[0])); prog++)
     {
         if (!RenderShader[prog]) continue;
         glUseProgram(RenderShader[prog]);
@@ -694,6 +724,10 @@ void GLRenderer3D::SetupPolygon(GLRenderer3D::RendererPolygon* rp, Polygon* poly
 
     u32 textype = (polygon->TexParam >> 26) & 0x7;
     u32 texattr = (polygon->TexParam >> 16) & 0x3FF;
+#ifdef LITEV_GL_SPEC_TEXMOD
+    // a batch has one blend mode (it picks the shader variant)
+    if (SpecTexMod()) rp->RenderKey |= ((polygon->Attr >> 4) & 0x3) << 3;
+#endif
     if (TexEnable && (textype != 0))
         rp->RenderKey |= (0x80000 | (texattr << 20));
 
@@ -1288,25 +1322,18 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
 {
     SC_Reset();
     int flags = S.RenderPolygonRAM[0]->WBuffer ? 1 : 0;
-#ifdef LITEV_GL_OPAQUE_NODISCARD
-    if (NoDiscard())
-    {
-        UseRenderShader(flags | 2);
-        if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[3], "uWZ0"), WZ0);
-    }
-#endif
 #ifdef LITEV_GL_ALPHATEST_2PASS
     bool twoPassAny = false;
-    if (AlphaTest2Pass())
-    {
-        UseRenderShader(flags | 4);
-        if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[5], "uWZ0"), WZ0);
-        UseRenderShader(flags | 6);
-        if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[7], "uWZ0"), WZ0);
-    }
 #endif
+    // this frame's W-buffer depth mapping, on every program of this depth mode
+    if (WZ0 > 0)
+        for (int f = flags; f < (int)(sizeof(RenderShader) / sizeof(RenderShader[0])); f += 2)
+            if (RenderShader[f])
+            {
+                UseRenderShader(f);
+                glUniform1f(glGetUniformLocation(RenderShader[f], "uWZ0"), WZ0);
+            }
     UseRenderShader(flags);
-    if (WZ0 > 0) glUniform1f(glGetUniformLocation(RenderShader[1], "uWZ0"), WZ0);
 
     //if (h != 192) glScissor(0, y<<ScaleFactor, 256<<ScaleFactor, h<<ScaleFactor);
 
@@ -1385,7 +1412,7 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
         glStencilMask(0xFF);
 
 #ifdef LITEV_GL_OPAQUE_NODISCARD
-        if (NoDiscard()) UseRenderShader(flags | ((rp->RenderKey & RenderKey_NoDiscard) ? 2 : 0));
+        if (NoDiscard()) UseRenderShader(flags | ((rp->RenderKey & RenderKey_NoDiscard) ? 2 | SpecFlag(rp) : 0));
 #endif
         i += RenderPolygonBatch(i);
     }
@@ -1417,7 +1444,7 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
         // early test: town 400 MHz 20.1 ms GPU/frame vs 17.0. Markers cleared after the pass.
         // debug.litev.glat2passb=0: the old pass B (no alpha test, clears the marker).
         static const bool passB = OpenGL::Prop("glat2passb", 1) != 0;
-        UseRenderShader(flags | (passB ? 6 : 2));
+        const int passBFlags = flags | (passB ? 6 : 2);
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glColorMaski(1, cm1[0], cm1[1], cm1[2], cm1[3]);
         glDepthFunc(GL_EQUAL);
@@ -1429,6 +1456,7 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
             const RendererPolygon* rp = &PolygonList[i];
             if (rp->PolyData->IsShadowMask || rp->PolyData->Translucent || !TwoPassPoly(rp)) { i++; continue; }
             glStencilFunc(GL_EQUAL, 0x80 | ((rp->PolyData->Attr >> 24) & 0x3F), 0xFF);
+            UseRenderShader(passBFlags | SpecFlag(rp));
             i += RenderPolygonBatch(i);
         }
         glDepthMask(GL_TRUE);

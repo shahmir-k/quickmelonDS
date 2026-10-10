@@ -1275,6 +1275,12 @@ option(LITEV_GL_BATCH_NEEDOPAQUE "GL 3D: batch alpha-31 alpha-textured transluce
 if (LITEV_GL_BATCH_NEEDOPAQUE)
     add_compile_definitions(LITEV_GL_BATCH_NEEDOPAQUE=1)
 endif()
+# GL 3D: textured modulate opaque polygons (no-discard pass, alpha-test pass B) use a short shader
+# variant without the big shader's branches. Same pixels. Runtime: debug.litev.glspec=0 off.
+option(LITEV_GL_SPEC_TEXMOD "GL 3D: short shader variant for textured modulate opaque polygons" OFF)
+if (LITEV_GL_SPEC_TEXMOD)
+    add_compile_definitions(LITEV_GL_SPEC_TEXMOD=1)
+endif()
 
 option(LITEV_SKIP_REPEAT_FRAMES "Display-only: skip 2D drawing + present of frames whose 3D repeats the previous frame while a game draws 3D at 30 Hz (runtime: GPU.SkipRepeatEnabled)" OFF)
 if (LITEV_SKIP_REPEAT_FRAMES)
