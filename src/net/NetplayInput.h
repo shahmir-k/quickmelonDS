@@ -19,6 +19,7 @@
 #ifndef NETPLAYINPUT_H
 #define NETPLAYINPUT_H
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -61,6 +62,25 @@ struct NetplayFrameInput
     s16 TouchY = -1;
 };
 
+#ifdef LITEV_NP_SPEED
+// Netplay speed (fast-forward / uncapped) travels in the input stream: bits 16..21 of a player's
+// Keys (NDS::SetKeyMask reads only bits 0..11) hold the speed that player requests for that applied
+// frame. Every device knows every player's input for frame F before it runs F, so every device
+// derives the same session speed at the same frame (SpeedAt). Speed is pacing only: emulation is
+// unaffected, so even a device that paced differently could not desync.
+// Code: 0 = no request (1x), 1..62 = multiplier x4 (0.25x steps, 2x = 8), 63 = uncapped.
+namespace NetplaySpeed
+{
+constexpr int kShift = 16;
+constexpr u32 kMask = 0x3Fu << kShift;
+constexpr int kUncapped = 63;
+inline int Encode(float m) { return m <= 0 ? kUncapped : m == 1.0f ? 0 : (int)std::min(62.0f, std::max(1.0f, m * 4 + 0.5f)); }
+inline float Multiplier(int code) { return code == kUncapped ? 0.0f : code == 0 ? 1.0f : code / 4.0f; }  // 0 = uncapped
+inline int Of(const NetplayFrameInput& in) { return (int)((in.Keys & kMask) >> kShift); }
+inline void Set(NetplayFrameInput& in, int code) { in.Keys = (in.Keys & ~kMask) | ((u32)code << kShift); }
+}
+#endif
+
 // Netplay input exchange: every device emulates every player's console, so only inputs cross the
 // network. A player's input sampled at frame F is applied at frame F + Delay on every device; the
 // local device sends it at once, so the network has Delay frames to deliver it and nobody waits.
@@ -97,6 +117,23 @@ public:
     int CurrentDelay() const { return CurDelay.load(); }
     // the slowest peer's round trip (90th percentile, last 2 s, ms), -1 = no measurement yet
     double PeerRttMs() const { return RttMaxUs.load() / 1000.0; }
+#ifdef LITEV_NP_SPEED
+    // The session speed at frame `frame`: the fastest any player requests at applied frame
+    // frame - kSpeedLag (any player may fast-forward the session; nobody vetoes). Waits until every
+    // player's input for that frame is here. The lag keeps this wait off the consoles' critical path:
+    // without it the local console at frame F waited for a peer's input at F while that peer's
+    // console waited (Wi-Fi link, in cycles a few frames apart) for our replica, which needed our
+    // next input = a deadlock (Mac 2P Shrek, frame 2204, delay 2). Now it only waits for a device
+    // more than kSpeedLag + delay frames behind: the auto-throttle.
+    // requesters: bit p = player p asks for more than 1x there. Called by one thread, frames ascending.
+    static constexpr int kSpeedLag = 30;
+    int SpeedAt(int frame, u32* requesters = nullptr);
+    // The frontend's frame period (us) now: the adaptive delay turns the round trip into frames with
+    // it (fast-forward = more frames of delay for the same network). Default 60 fps.
+    void SetFramePeriodUs(int us) { FramePeriodUs = std::max(us, 500); }
+    // time SpeedAt waited for the other players' inputs (ms)
+    double PeerWaitMs() const { return PeerWaitUs.load() / 1000.0; }
+#endif
     int LocalPlayer() const { return Local; }
 
     // The local player's input sampled at `frame` (applied at frame + Delay everywhere).
@@ -164,6 +201,14 @@ private:
     u32 EchoSent[kMaxPlayers] {};       // the peer's send time in its last packet (its clock, us)
     u64 EchoAt[kMaxPlayers] {};         // when we took that packet
     std::deque<std::pair<u64, u32>> Rtt[kMaxPlayers];   // (when, round trip us), the last second
+#endif
+#ifdef LITEV_NP_SPEED
+    std::map<int, int> SpeedChanges[kMaxPlayers];  // applied frame -> speed code, where it changes
+    int SpeedLast[kMaxPlayers] {};                 // the code at the newest frame recorded
+    int LocalUpTo = -1;                            // our own inputs are recorded up to this applied frame
+    std::atomic<int> FramePeriodUs {16667};
+    std::atomic<u64> PeerWaitUs {0};
+    void NoteSpeed(int player, int frame, const NetplayFrameInput& in);   // frames ascending, under Lock
 #endif
 #ifdef LITEV_NP_ADAPTIVE_DELAY
     int LastApplied = -1;               // the local input's newest applied frame
