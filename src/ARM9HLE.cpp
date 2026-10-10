@@ -2173,7 +2173,8 @@ __attribute__((noinline)) bool RunAsync(melonDS::ARMv5* c, State& s, bool jit)
     Expect e;
     for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
     const u32 cpsrI = (c->CPSR & 0x0FFFFFFF) | 0x60000000 | 0x80;
-    e.R[0] = 0x80; e.R[1] = cpsrI; e.R[2] = (cpsrI & ~0x80u) | oldI; e.R[3] = 0; e.R[12] = v.irqTable2;   // r3: MIi_FIFOCallback pops the 0 it stored over its r3 e.R[14] = pc + 0xDC;
+    e.R[0] = 0x80; e.R[1] = cpsrI; e.R[2] = (cpsrI & ~0x80u) | oldI; e.R[3] = 0; e.R[12] = v.irqTable2;   // r3: MIi_FIFOCallback pops the 0 it stored over its r3
+    e.R[14] = pc + 0xDC;    // lr: the bl OS_RestoreInterrupts
     e.retPc = c->R[14];
     e.CPSR = (c->CPSR & 0x0FFFFFDF) | 0x60000000 | ((e.retPc & 1) << 5);
 #ifdef LITEV_HLE_DIAG
