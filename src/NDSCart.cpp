@@ -39,6 +39,11 @@
 #include <mutex>
 #include <vector>
 
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#include <cstdlib>
+
 namespace melonDS
 {
 using Platform::Log;
@@ -46,6 +51,23 @@ using Platform::LogLevel;
 
 namespace NDSCart
 {
+
+#ifdef LITEV_CART_SYNC
+static bool CartSync()   // debug.litev.cartsync (default on), env LITEV_CARTSYNC off the device
+{
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.cartsync", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_CARTSYNC");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on;
+}
+#endif
+
 
 enum
 {
@@ -929,6 +951,12 @@ void NDSCartSlot::Interface::WriteROMCnt(u32 val, u32 mask)
     u32 xfercycle = (ROMCnt & (1<<27)) ? 8 : 5;
     u32 cmddelay = 8 + (ROMCnt & 0x1FFF);
     if (datasize) cmddelay += ((ROMCnt >> 16) & 0x3F);
+#ifdef LITEV_CART_SYNC
+    // a CPU-read transfer starts after the 8 command bytes, without the game-set gap1/gap2
+    // (thousands of cycles the game spends polling ROMCTRL)
+    if (CartSync() && datasize && !(ROMCnt & (1<<30)) && !Parent.NDS.DMAsInMode(Num, Num ? 0x12 : 0x05))
+        cmddelay = 8;
+#endif
 
     if (!(ROMCnt & (1<<30)))
     {
@@ -999,6 +1027,19 @@ void NDSCartSlot::Interface::ROMAdvanceReceive()
     // end-of-transfer condition is handled when the last data word is read from the FIFO
     if (ROMTransferPos >= ROMTransferLen)
         return;
+
+#ifdef LITEV_CART_SYNC
+    // Game-first cart reads (debug.litev.cartsync, default on): after the command's first word,
+    // refill the FIFO at once instead of one scheduler event per word. A game reading the cart
+    // with the CPU (Pokemon BW: ~6000 ROMCTRL polls a frame) then finds data ready on every poll,
+    // and the ARM9 isn't cut into 40-cycle slices by transfer events. Card DMA keeps the timed
+    // path. Deterministic, version-locked timing change.
+    if (CartSync() && !Parent.NDS.DMAsInMode(Num, Num ? 0x12 : 0x05))
+    {
+        ROMReceiveData(0);
+        return;
+    }
+#endif
 
     u32 xfercycle = (ROMCnt & (1<<27)) ? 8 : 5;
     u32 delay = 4;

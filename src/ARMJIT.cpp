@@ -118,6 +118,14 @@ struct SlowHistDumper {
 };
 static SlowHistDumper g_slowHistDumper;
 }
+// the app logs it at the end of a replay (no process exit there)
+void LitevSlowHistLine(int h, char* buf, int len)
+{
+    static const char* hn[4] = {"read", "write", "blockload", "blockstore"};
+    int n = snprintf(buf, len, "SLOWHIST %s:", hn[h]);
+    for (int r = 0; r < 16 && n < len; r++)
+        if (g_slowHist[h][r]) n += snprintf(buf + n, len - n, " reg%d=%llu", r, g_slowHist[h][r]);
+}
 #define SLOWHIST(h, cpu, addr) (g_slowHist[(h)][(cpu)->NDS.JIT.Memory.ClassifyAddress9((addr)) & 15]++)
 #else
 #define SLOWHIST(h, cpu, addr) ((void)0)

@@ -405,8 +405,11 @@ bool ARMJIT_Memory::UnmapFromRange(u32 addr, u32 num, u32 offset, u32 size) noex
 }
 
 #ifndef __SWITCH__
+u64 JitProtectCalls = 0, JitProtectFaults = 0;   // diagnosis counters (headless LITEV_FRAME_MS)
+
 void ARMJIT_Memory::SetCodeProtectionRange(u32 addr, u32 size, u32 num, int protection) noexcept
 {
+    JitProtectCalls++;
     CHECK_ALIGNED(addr);
     CHECK_ALIGNED(size);
 
@@ -846,6 +849,7 @@ bool ARMJIT_Memory::FaultHandler(FaultDescription& faultDesc, melonDS::NDS& nds)
 
         if (rewriteToSlowPath)
         {
+            JitProtectFaults++;
             nds.JIT.JitEnableWrite();
             faultDesc.FaultPC = nds.JIT.JITCompiler.RewriteMemAccess(faultDesc.FaultPC);
             nds.JIT.JitEnableExecute();

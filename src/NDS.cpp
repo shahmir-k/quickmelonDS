@@ -48,6 +48,18 @@
 
 namespace melonDS
 {
+#ifdef LITEV_ACCESS_STATS
+// diagnosis: slow-path ARM9 accesses by kind and address (headless LITEV_ACCESS_STATS dump)
+u64 LitevAccess[6][0x10000];
+u64 LitevRomctrlPC[0x100000];
+void LitevAccessCount(int kind, u32 addr)
+{
+    u32 key = (addr >> 24) != 0x04 ? (0xF000 | ((addr >> 24) << 4) | ((addr >> 20) & 0xF))
+            : (addr & 0x00F00000) ? (0x2000 | (addr & 0xFF)) : (addr & 0x1FFF);
+    LitevAccess[kind][key & 0xFFFF]++;
+    if (addr == 0x040001A4 && NDS::Current) LitevRomctrlPC[(NDS::Current->ARM9.R[15] >> 1) & 0xFFFFF]++;
+}
+#endif
 using namespace Platform;
 
 const s32 kMaxIterationCycles = 64;
@@ -1647,6 +1659,9 @@ void NDS::UpdateIRQ(u32 cpu)
 
 void NDS::SetIRQ(u32 cpu, u32 irq)
 {
+#ifdef LITEV_ACCESS_STATS
+    if (IE[cpu] & (1 << irq)) LitevAccess[cpu ? 5 : 4][0xE000 | irq]++;   // enabled IRQs raised, by source
+#endif
     IF[cpu] |= (1 << irq);
     UpdateIRQ(cpu);
 
@@ -2269,6 +2284,9 @@ return;
 
 u8 NDS::ARM9Read8(u32 addr)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(4, addr);
+#endif
     if ((addr & 0xFFFFF000) == 0xFFFF0000)
     {
         return *(u8*)&ARM9BIOS[addr & 0xFFF];
@@ -2328,6 +2346,9 @@ u8 NDS::ARM9Read8(u32 addr)
 
 u16 NDS::ARM9Read16(u32 addr)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(0, addr);
+#endif
     addr &= ~0x1;
 
     if ((addr & 0xFFFFF000) == 0xFFFF0000)
@@ -2388,6 +2409,9 @@ u16 NDS::ARM9Read16(u32 addr)
 
 u32 NDS::ARM9Read32(u32 addr)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(1, addr);
+#endif
     addr &= ~0x3;
 
     if ((addr & 0xFFFFF000) == 0xFFFF0000)
@@ -2451,6 +2475,9 @@ u32 NDS::ARM9Read32(u32 addr)
 
 void NDS::ARM9Write8(u32 addr, u8 val)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(5, addr);
+#endif
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
@@ -2490,6 +2517,9 @@ void NDS::ARM9Write8(u32 addr, u8 val)
 
 void NDS::ARM9Write16(u32 addr, u16 val)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(2, addr);
+#endif
     addr &= ~0x1;
 
     switch (addr & 0xFF000000)
@@ -2550,6 +2580,9 @@ void NDS::ARM9Write16(u32 addr, u16 val)
 
 void NDS::ARM9Write32(u32 addr, u32 val)
 {
+#ifdef LITEV_ACCESS_STATS
+    LitevAccessCount(3, addr);
+#endif
     addr &= ~0x3;
 
     switch (addr & 0xFF000000)

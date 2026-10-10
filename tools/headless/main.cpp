@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <chrono>
+#include <algorithm>
 
 #include "types.h"
 #include "Args.h"
@@ -40,7 +41,28 @@
 #include "LiteProfile.h"
 #include "VerifyTrace.h"
 #include "InputScript.h"
-namespace melonDS { extern u64 JitCompileCount; }
+namespace melonDS { extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults; }
+#ifdef LITEV_ACCESS_STATS
+namespace melonDS { extern u64 LitevAccess[6][0x10000]; extern u64 LitevRomctrlPC[0x100000]; }
+static void DumpAccessStats()
+{
+    static const char* kinds[6] = {"R16", "R32", "W16", "W32", "R8", "W8"};
+    std::vector<std::pair<unsigned long long, std::pair<int, int>>> v;
+    for (int k = 0; k < 6; k++)
+        for (int a = 0; a < 0x10000; a++)
+            if (melonDS::LitevAccess[k][a]) v.push_back({melonDS::LitevAccess[k][a], {k, a}});
+    std::sort(v.rbegin(), v.rend());
+    for (int a = 0; a < 0x100000; a++)
+        if (melonDS::LitevRomctrlPC[a] > 1000) fprintf(stderr, "ROMCTRL-PC %05X %llu\n", a << 1, (unsigned long long)melonDS::LitevRomctrlPC[a]);
+    for (size_t i = 0; i < v.size() && i < 40; i++)
+    {
+        int a = v[i].second.second;
+        if (a >= 0xE000 && a < 0xF000) { fprintf(stderr, "IRQ %s source %d %llu\n", v[i].second.first == 4 ? "ARM9" : "ARM7", a & 0xFF, (unsigned long long)v[i].first); continue; }
+        if (a >= 0xF000) fprintf(stderr, "ACCESS %s region %02X:%X %llu\n", kinds[v[i].second.first], (a >> 4) & 0xFF, a & 0xF, (unsigned long long)v[i].first);
+        else fprintf(stderr, "ACCESS %s io %08X %llu\n", kinds[v[i].second.first], a >= 0x2000 ? 0x04100000 | (a & 0xFF) : 0x04000000 | a, (unsigned long long)v[i].first);
+    }
+}
+#endif
 #ifdef LITEV_HEADLESS_LAN
 #include <thread>
 #include "MPInterface.h"
@@ -690,12 +712,13 @@ int main(int argc, char** argv)
         LITE_PROFILE_RESET_FRAME();
         static const bool frameMs = getenv("LITEV_FRAME_MS") != nullptr;   // per-frame time + JIT compiles
         const auto fms0 = std::chrono::steady_clock::now();
-        const u64 jit0 = melonDS::JitCompileCount;
+        const u64 jit0 = melonDS::JitCompileCount, prot0 = melonDS::JitProtectCalls, flt0 = melonDS::JitProtectFaults;
         nds->RunFrame();
         if (frameMs)
-            printf("FRAME %d %.3f ms jit %llu\n", frame,
+            printf("FRAME %d %.3f ms jit %llu mprotect %llu rewrites %llu\n", frame,
                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fms0).count(),
-                   (unsigned long long)(melonDS::JitCompileCount - jit0));
+                   (unsigned long long)(melonDS::JitCompileCount - jit0),
+                   (unsigned long long)(melonDS::JitProtectCalls - prot0), (unsigned long long)(melonDS::JitProtectFaults - flt0));
         {   // LITEV_PRINT_REGS=<frame>: display registers after that frame (diagnosis)
             static const int regsAt = getenv("LITEV_PRINT_REGS") ? atoi(getenv("LITEV_PRINT_REGS")) : -1;
             if (frame == regsAt)
@@ -1116,5 +1139,16 @@ int main(int argc, char** argv)
         }
     }
 
+#ifdef LITEV_ACCESS_STATS
+    DumpAccessStats();
+    if (getenv("LITEV_DUMPMEM"))
+    {
+        u32 a = strtoul(getenv("LITEV_DUMPMEM"), nullptr, 16);
+        FILE* f = fopen("/tmp/claude-501/memdump.bin", "wb");
+        for (u32 i = 0; i < 0x100; i += 4) { u32 w = nds->ARM9Read32(a + i); fwrite(&w, 4, 1, f); }
+        fclose(f);
+        fprintf(stderr, "CPSR %08X PC %08X\n", nds->ARM9.CPSR, nds->ARM9.R[15]);
+    }
+#endif
     return 0;
 }
