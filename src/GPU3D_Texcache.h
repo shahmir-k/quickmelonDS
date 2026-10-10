@@ -340,25 +340,10 @@ public:
             entry.TexPalHash = MaskedHash(GPU.VRAMFlat_TexPal, sizeof(GPU.VRAMFlat_TexPal),
                 entry.TexPalStart, entry.TexPalSize);
 
-        auto& texArrays = TexArrays[widthLog2][heightLog2];
         auto& freeTextures = FreeTextures[widthLog2][heightLog2];
 
         if (freeTextures.size() == 0)
-        {
-            texArrays.resize(texArrays.size()+1);
-            TexHandleT& array = texArrays[texArrays.size()-1];
-
-            u32 layers = std::min<u32>((8*1024*1024) / (width*height*4), 64);
-
-            // allocate new array texture
-            //printf("allocating new layer set for %d %d %d %d\n", width, height, texArrays.size()-1, array.ImageDescriptor);
-            array = TexLoader.GenerateTexture(width, height, layers);
-
-            for (u32 i = 0; i < layers; i++)
-            {
-                freeTextures.push_back(TexArrayEntry{array, i});
-            }
-        }
+            NewArray(widthLog2, heightLog2);
 
         TexArrayEntry storagePlace = freeTextures[freeTextures.size()-1];
         freeTextures.pop_back();
@@ -373,6 +358,49 @@ public:
         helper = &Cache.emplace(std::make_pair(key, entry)).first->second.LastVariant;
     }
 
+    // a new texture array for size class (widthLog2, heightLog2), its layers on the free list
+    void NewArray(u32 widthLog2, u32 heightLog2)
+    {
+        const u32 width = 8 << widthLog2, height = 8 << heightLog2;
+        auto& texArrays = TexArrays[widthLog2][heightLog2];
+        auto& freeTextures = FreeTextures[widthLog2][heightLog2];
+        texArrays.resize(texArrays.size()+1);
+        TexHandleT& array = texArrays[texArrays.size()-1];
+
+        u32 layers = std::min<u32>((8*1024*1024) / (width*height*4), 64);
+#ifdef LITEV_GL_TEXARRAY_PREALLOC
+        // Creating an array costs ~1-2 ms on the Mali (once 11 ms), whatever its size, on the GL
+        // thread the emu thread may be waiting for: a new scene needing 7-11 new sizes stalled a
+        // frame by 10-25 ms. Every size class gets a small first array at start-up (Prealloc);
+        // later arrays double the class's capacity, up to the old 8 MB. Exact (storage only).
+        {
+            u32 have = 0;
+            for (size_t i = 0; i + 1 < texArrays.size(); i++) have += TexArrayLayers[widthLog2][heightLog2][i];
+            const u32 first = std::max<u32>(1, (256*1024) / (width*height*4));
+            layers = std::min(layers, std::max(first, have));
+            TexArrayLayers[widthLog2][heightLog2].push_back(layers);
+        }
+#endif
+
+        // allocate new array texture
+        array = TexLoader.GenerateTexture(width, height, layers);
+
+        for (u32 i = 0; i < layers; i++)
+        {
+            freeTextures.push_back(TexArrayEntry{array, i});
+        }
+    }
+
+#ifdef LITEV_GL_TEXARRAY_PREALLOC
+    // the first array of every size class, up front (~64 arrays, at most 16 MB)
+    void Prealloc()
+    {
+        for (u32 i = 0; i < 8; i++)
+            for (u32 j = 0; j < 8; j++)
+                if (TexArrays[i][j].empty()) NewArray(i, j);
+    }
+#endif
+
     void Reset()
     {
         for (u32 i = 0; i < 8; i++)
@@ -383,6 +411,9 @@ public:
                     TexLoader.DeleteTexture(TexArrays[i][j][k]);
                 TexArrays[i][j].clear();
                 FreeTextures[i][j].clear();
+#ifdef LITEV_GL_TEXARRAY_PREALLOC
+                TexArrayLayers[i][j].clear();
+#endif
             }
         }
         Cache.clear();
@@ -422,6 +453,9 @@ private:
 
     std::vector<TexArrayEntry> FreeTextures[8][8];
     std::vector<TexHandleT> TexArrays[8][8];
+#ifdef LITEV_GL_TEXARRAY_PREALLOC
+    std::vector<u32> TexArrayLayers[8][8];   // layers of each array in TexArrays
+#endif
 
     u32 DecodingBuffer[1024*1024];
 };

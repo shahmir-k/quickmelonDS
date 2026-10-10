@@ -259,7 +259,7 @@ void HybridRenderer::Restart3DRendering()
 void HybridRenderer::HybridKick(int b)
 {
     // an async present may still be reading this slot on the GL thread
-    if (Present && MergeDone.load(std::memory_order_acquire) < SlotMergeSeq[b]) { LSP_EV(EV_KWAIT_BEG); Present->Wait(); LSP_EV(EV_KWAIT_END); }
+    if (Present && MergeDone.load(std::memory_order_acquire) < SlotMergeSeq[b]) { LSP_EV(EV_KWAIT_BEG); LSP_WAIT("kick-present", GPU.NDS.NumFrames, Present->Wait()); LSP_EV(EV_KWAIT_END); }
     if (HybDirect()) return;
     if (HybMap[b]) return;   // still mapped (that frame was never presented): reuse
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, DescPBO[b]);
@@ -381,18 +381,18 @@ void HybridRenderer::HybridReadback3D(u32* dst)
         if (off)
         {
             const int k = CapNext, color = GL3D()->GetCurColor(), prev = CapPrevSlot;
-            while (CapBusy[k].load(std::memory_order_acquire)) std::this_thread::yield();   // slot reuse
+            LSP_WAIT("cap-reuse", frame, while (CapBusy[k].load(std::memory_order_acquire)) std::this_thread::yield());   // slot reuse
             CapBusy[k].store(true, std::memory_order_relaxed);
             CapFrameOf[k] = frame;
             Thread3D()->Run([this, k, color, prev] { CapKickGL(k, color); if (prev >= 0) CapFinishGL(prev); }, false);
             CapPrevSlot = k;
             if (use < 0)   // a capture run starts: this frame's own read, now
             {
-                Thread3D()->Run([this, k] { CapFinishGL(k); }, true);
+                LSP_WAIT("cap-start", frame, Thread3D()->Run([this, k] { CapFinishGL(k); }, true));
                 CapPrevSlot = -1;
                 use = k;
             }
-            while (CapBusy[use].load(std::memory_order_acquire)) std::this_thread::yield();   // done by now on a run
+            LSP_WAIT("cap-busy", frame, while (CapBusy[use].load(std::memory_order_acquire)) std::this_thread::yield());   // done by now on a run
             memcpy(dst, CapOut[use], sizeof(CapOut[use]));
             CapNext = (k + 1) % 3;
             ProfReadback += HybNowMs() - t0;
@@ -539,7 +539,7 @@ void HybridRenderer::PresentIntoAsync(GLuint dstTex, int bottomY, std::function<
 
 void HybridRenderer::WaitPresent()
 {
-    if (Present && MergeDone.load(std::memory_order_acquire) < MergeSeq) Present->Wait();
+    if (Present && MergeDone.load(std::memory_order_acquire) < MergeSeq) LSP_WAIT("present", GPU.NDS.NumFrames, Present->Wait());
 }
 
 void HybridRenderer::Merge(GLuint fbo, int single, int bottomY)
