@@ -917,6 +917,8 @@ void GPU3D::UpdateClipMatrix() noexcept
 
 #ifdef LITEV_REMOTE_GX_SINK
 #define GX_SINK (Sink)
+// TimingFixed: SubmitPolygon's timing for every polygon, from nothing the geometry computes
+#define GX_FIXED_POLY_TIMING() do { PolygonPipeline = 8; VertexSlotCounter = 1; VertexSlotsFree = 0b11110; } while (0)
 std::atomic<bool> GPU3D::SinkVeto{false};
 void GPU3D::SinkOff(const char* why) noexcept
 {
@@ -1463,10 +1465,9 @@ void GPU3D::SubmitPolygon() noexcept
 #ifdef LITEV_REMOTE_GX_SINK
     if (TimingFixed)
     {
-        // as accepted below (rejected polygons return before it), whatever the geometry
-        VertexSlotCounter = 1;
-        if (nverts == 4) { PolygonPipeline = 35; VertexSlotsFree = (PolygonMode & 0x2) ? 0b11100 : 0b11110; }
-        else             { PolygonPipeline = 26; VertexSlotsFree = (PolygonMode & 0x2) ? 0b1000 : 0b1110; }
+        // every polygon timed as a culled one, whatever the geometry (the accepted timing made Mario
+        // Kart DS's GX slow enough that a console dropped out of an 8-player session)
+        GX_FIXED_POLY_TIMING();
     }
     else
 #endif
@@ -2003,8 +2004,8 @@ void GPU3D::SubmitVertex() noexcept
 #ifdef LITEV_REMOTE_GX_SINK
     if (Sink)
     {
-        // the vertex/polygon counting and the timing of SubmitVertex/SubmitPolygon, taking every
-        // polygon as accepted (no transform, culling or clipping)
+        // the vertex/polygon counting and the timing of SubmitVertex/SubmitPolygon under TimingFixed
+        // (no transform, culling or clipping)
         VertexNum++;
         VertexNumInPoly++;
         bool poly = false;
@@ -2018,9 +2019,7 @@ void GPU3D::SubmitVertex() noexcept
         if (poly)
         {
             NumConsecutivePolygons++;
-            VertexSlotCounter = 1;
-            if (PolygonMode & 0x1) { PolygonPipeline = 35; VertexSlotsFree = (PolygonMode & 0x2) ? 0b11100 : 0b11110; }
-            else                   { PolygonPipeline = 26; VertexSlotsFree = (PolygonMode & 0x2) ? 0b1000 : 0b1110; }
+            GX_FIXED_POLY_TIMING();
         }
         VertexPipeline = 7;
         AddCycles(3);

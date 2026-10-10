@@ -242,7 +242,7 @@ public:
     static bool SinkGameOK(const char* gameCode) { return gameCode && !strncmp(gameCode, "AMCE", 4); }
     void SinkUse(const char* what, u32 addr) noexcept;
     // Netplay, every console (local and remote copies alike): the polygon pipeline timing takes
-    // every polygon as accepted (on hardware a culled/clipped-away one frees the pipeline sooner),
+    // every polygon as culled (on hardware an accepted one holds the pipeline longer),
     // so the timing depends only on the command stream and a sink copy keeps its owner's timing.
     bool TimingFixed = false;
 #endif
