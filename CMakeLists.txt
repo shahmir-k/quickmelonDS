@@ -1053,6 +1053,10 @@ option(LITEV_HYB_MERGE_FASTLINES "Hybrid: fast merge for plain-3D lines" OFF)
 if (LITEV_HYB_MERGE_FASTLINES)
     add_compile_definitions(LITEV_HYB_MERGE_FASTLINES=1)
 endif()
+option(LITEV_HYB_MERGE_FASTCOPY "Hybrid: fast merge lines copy the 3D texel (no 6-bit round trip; display only, within 2/255)" OFF)
+if (LITEV_HYB_MERGE_FASTCOPY)
+    add_compile_definitions(LITEV_HYB_MERGE_FASTCOPY=1)
+endif()
 
 # GL 3D, W-buffer frames: depth 1 - z0/w from the rasterizer instead of gl_FragDepth, so the GPU's
 # early depth test works (display only; same depth order, fog converts back to w).
@@ -1279,6 +1283,12 @@ option(LITEV_GL_BATCH_NEEDOPAQUE "GL 3D: batch alpha-31 alpha-textured transluce
 if (LITEV_GL_BATCH_NEEDOPAQUE)
     add_compile_definitions(LITEV_GL_BATCH_NEEDOPAQUE=1)
 endif()
+# GL 3D: textured modulate opaque polygons (no-discard pass, alpha-test pass B) use a short shader
+# variant without the big shader's branches. Same pixels. Runtime: debug.litev.glspec=0 off.
+option(LITEV_GL_SPEC_TEXMOD "GL 3D: short shader variant for textured modulate opaque polygons" OFF)
+if (LITEV_GL_SPEC_TEXMOD)
+    add_compile_definitions(LITEV_GL_SPEC_TEXMOD=1)
+endif()
 
 option(LITEV_SKIP_REPEAT_FRAMES "Display-only: skip 2D drawing + present of frames whose 3D repeats the previous frame while a game draws 3D at 30 Hz (runtime: GPU.SkipRepeatEnabled)" OFF)
 if (LITEV_SKIP_REPEAT_FRAMES)
@@ -1311,6 +1321,10 @@ if (LITEV_NP_ADAPTIVE_DELAY)
         message(FATAL_ERROR "LITEV_NP_ADAPTIVE_DELAY needs LITEV_NP_WIRE_RUNS")
     endif()
     add_compile_definitions(LITEV_NP_ADAPTIVE_DELAY=1)
+endif()
+option(LITEV_NP_SPEED "Netplay session speed: any player can fast-forward (or uncap) the whole session; the request travels in the input stream (Keys bits 16..21), so every device switches at the same frame; the adaptive delay converts the round trip at the current frame period" OFF)
+if (LITEV_NP_SPEED)
+    add_compile_definitions(LITEV_NP_SPEED=1)
 endif()
 option(LITEV_NETPLAY_CAPTURE "Netplay: display capture alone keeps a headless console headless; only a CPU read of captured VRAM sets GPU::CaptureSeen (else any capture does)" OFF)
 if (LITEV_NETPLAY_CAPTURE)

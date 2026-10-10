@@ -1215,7 +1215,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         }
 #endif
 #ifdef LITEV_A9HLE
-        if (int hook = cpu->Num == 0 && !thumb ? A9HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr) : 0)
+        if (int hook = cpu->Num == 0 ? A9HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr, thumb) : 0)
         {
             // The hook block also covers every byte of guest code the native version replaces:
             // a write there invalidates it like a write to its own code, and recompiling
@@ -1225,7 +1225,8 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
             for (int d = 0; d < nd; d++) addDeps(0, dep[d].a, dep[d].b);
             if (hook == 1)
             {
-                instrs[i].Info = ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
+                // Thumb entries (TWL SDK OS_Set/GetIrqFunction): 0xB100 is undefined (T_UNK)
+                instrs[i].Info = thumb ? ARMInstrInfo::Decode(true, 0, 0xB100, false) : ARMInstrInfo::Decode(false, 0, 0xE7F000F0, false);
                 a9HookAt = instrs[i].Addr;
             }
         }

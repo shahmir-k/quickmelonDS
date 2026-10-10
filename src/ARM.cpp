@@ -1455,6 +1455,10 @@ void ARMv5::Execute()
                 A7Prof::g9.Pre(R[15] - 4, 2, CPSR, R[14]);
                 const u32 a9pc = R[15] - 4;
 #endif
+#ifdef LITEV_A9HLE
+                if (A9HLE::MaybeHookT(CurInstr) && A9HLE::Run(this, false)) {}
+                else
+#endif
                 ARMInterpreter::THUMBInstrTable[icode](this);
 #ifdef LITEV_A7PROF
                 A7Prof::g9.Post(a9pc, Cycles);

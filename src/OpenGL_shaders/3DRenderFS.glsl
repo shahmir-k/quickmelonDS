@@ -41,6 +41,15 @@ FRAGLOC(1) out vec4 oAttr;
 
 vec4 FinalColor()
 {
+#ifdef SpecTexMod
+    // LITEV_GL_SPEC_TEXMOD: textured, modulate, normal texture (blend mode 0)
+    vec4 scol = fColor * texture(CurTexture, vec3(fTexcoord, fPolygonAttr.y));
+#ifdef GL_ES
+    return scol.bgra;
+#else
+    return scol;
+#endif
+#endif
     vec4 col;
     vec4 vcol = fColor;
     int blendmode = (fPolygonAttr.x >> 4) & 0x3;

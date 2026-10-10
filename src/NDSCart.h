@@ -128,6 +128,18 @@ public:
     void WriteSPIData(u32 cpu, u8 val) noexcept { Interfaces[cpu].WriteSPIData(val); }
 
     u32 ReadROMCnt(u32 cpu) const noexcept { return Interfaces[cpu].ROMCnt; }
+#ifdef LITEV_A9HLE
+    // A9HLE card-read loop (ARM9): the ROMDATA reads of the guest's "poll ROMCTRL, read ROMDATA while
+    // DATA_READY" loop, up to max words, with the FIFO / transfer state (and transfer-end IRQ) those
+    // reads leave. Only for a plain ROM read refilled synchronously (LITEV_CART_SYNC, no card DMA):
+    // nothing runs between the reads then. Returns the count (0: not handled); lastCnt: ROMCTRL as
+    // the guest's poll before the last read saw it.
+    u32 HleRead9(u32* out, u32 max, u32& lastCnt);
+#ifdef LITEV_HLE_DIAG
+    // A9HLE check mode: save / restore the ARM9 ROM-read state (interface 0, KEY2, cart command; no SRAM)
+    void HleRomState(Savestate* file) noexcept;
+#endif
+#endif
     void WriteROMCnt(u32 cpu, u32 val, u32 mask) noexcept { Interfaces[cpu].WriteROMCnt(val, mask); };
 
     void WriteROMCommand(u32 cpu, u32 index, u8 val) { Interfaces[cpu].WriteROMCommand(index, val); }

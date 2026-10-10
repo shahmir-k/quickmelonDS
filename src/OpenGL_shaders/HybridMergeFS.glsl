@@ -59,6 +59,23 @@ vec4 Screen(int layer, ivec2 P)
 #endif
     if (uFast != 0)
     {
+#ifdef FAST_COPY
+        // LITEV_HYB_MERGE_FASTCOPY: no brightness, no edge overlay: the 3D texel as it is (no
+        // round trip through the 6-bit DS colour: within 2/255 of the full path)
+        if (uFast == 1 && uEdge == 0)
+        {
+            vec4 t = texelFetch(Tex3D, P, 0);
+            if (t.a >= 0.5 / 31.0)
+#ifdef GL_ES
+                return vec4(t.rgb, 1.0);   // the 3D is BGRA and the output .bgr: they cancel
+#else
+                return vec4(t.bgr, 1.0);
+#endif
+            ivec4 d = Desc(n.x + 256, n.y, layer);
+            ivec3 cd = (d.rgb << 2) | (d.rgb >> 4);
+            return vec4(vec3(cd.bgr) / 255.0, 1.0);
+        }
+#endif
         ivec4 c3 = Get3D(P);
         ivec4 px = c3.a == 0 ? Desc(n.x + 256, n.y, layer) : c3;
         if (uFast == 2)      px += ((0x3F - px) * uFastEvy) >> 4;

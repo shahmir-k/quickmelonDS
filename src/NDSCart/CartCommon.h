@@ -66,6 +66,12 @@ public:
 
     virtual void ROMCommandStart(NDSCart::NDSCartSlot& cartslot, const u8* cmd);
     virtual u32 ROMCommandReceive();
+#ifdef LITEV_A9HLE
+    // A9HLE card-read loop: the current command's data words are CartCommon's plain ROM reads
+    // (ROMCommandReceive not overridden for it), so ROMRead32 can stand in for it
+    virtual bool HleRomPlain() const { return !ResetState && CmdEncMode == 2 && ROMCmd[0] == 0xB7; }
+    u32 HleRomRead32() { return ROMRead32(); }
+#endif
     virtual void ROMCommandTransmit(u32 val) {}
     virtual void ROMCommandFinish() {}
 
