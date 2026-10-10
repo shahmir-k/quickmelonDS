@@ -565,6 +565,20 @@ if (LITEV_JIT_DIRECTPATCH)
     endif()
 endif()
 
+# RAS: guest return-address stack for the dispatcher's inline cache. Each guest call
+# site gets its own ICACHE site (monomorphic: the return lands on one address); calls
+# push it, returns pop it and use it instead of their own polymorphic site. Only the
+# host cache index changes; the dispatcher's commit/stop/budget path is unchanged ->
+# exact. Runtime: debug.litev.jitras (prop on Android, env elsewhere; default on).
+option(LITEV_JIT_RAS "Return-address stack: guest returns use the caller's ICACHE site (needs DIRECTPATCH)" OFF)
+if (LITEV_JIT_RAS)
+    if (LITEV_JIT_DIRECTPATCH)
+        add_compile_definitions(LITEV_JIT_RAS=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_RAS requires LITEV_JIT_DIRECTPATCH (and so ICACHE).")
+    endif()
+endif()
+
 # Unit 5 (M2.1): event-true scheduler slices. When ON, each scheduler iteration
 # runs the CPUs to the TRUE next deadline (next scheduled event / frame end /
 # next timer overflow) instead of the fixed kMaxIterationCycles cap, so the CPUs

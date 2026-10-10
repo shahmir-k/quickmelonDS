@@ -273,6 +273,17 @@ public:
     u32 ICacheEpoch = 0;
 #endif
 
+#ifdef LITEV_JIT_RAS
+    // Return-address stack (LITEV_JIT_RAS): a ring of ICACHE site indices pushed by guest
+    // calls (one site per BL/BLX call site) and popped by guest returns, which hand the
+    // popped site to the dispatcher instead of their own (polymorphic) site. Pure host
+    // dispatch hint: a wrong entry only misses the key/epoch check. Transient.
+    static constexpr u32 RasMask = 15;
+    u32 RasTop = 0;
+    u32 RasSite = 0;            // site popped by the last taken return, consumed at the exit
+    u32 RasRing[RasMask + 1] = {};
+#endif
+
 #ifdef LITEV_JIT_BUDGET_REG
     // Slice time base for the W15 budget register (LITEV_JIT_BUDGET_REG): the CPU's
     // Timestamp at any helper call / exit is JitTsBase - budget. JitTsPtr = &ARMxTimestamp.

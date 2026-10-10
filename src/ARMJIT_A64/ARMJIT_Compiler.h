@@ -445,6 +445,12 @@ public:
     u32 ICacheAssignSite() { return (ICacheNextSite < ICacheSites) ? ICacheNextSite++ : 0; }
 #endif
 
+#ifdef LITEV_JIT_RAS
+    bool RasOn = false;          // debug.litev.jitras, latched at Reset()
+    bool RasRetBlock = false;    // this block popped the RAS (its exits read ARM::RasSite)
+    void Comp_RasCallRet(bool regTarget, bool restoreCPSR);
+#endif
+
 #ifdef LITEV_JIT_DIRECTPATCH
     // Rewrite the 4-byte unconditional B at RX offset rxOffset to target targetRxOffset
     // + flush that word (same encoding/discipline as PatchLinkSite, but independent of
@@ -501,7 +507,7 @@ public:
 
     // Populated during CompileBlock; copied into the JitBlock by ARMJIT::CompileBlock.
     u8 NumLinkExits = 0;
-    OutgoingLink LinkExits[2];
+    OutgoingLink LinkExits[MaxOutgoingLinks];
 
     // Threaded from Comp_JumpTo(u32) to the exit tail: does the last-compiled branch
     // have a compile-time-constant same-mode target, and was it conditional?

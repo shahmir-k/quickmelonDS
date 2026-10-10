@@ -601,7 +601,7 @@ int main(int argc, char** argv)
     // Run totals: g_Frame is reset every frame, so accumulate each frame's counters
     // into totals here to observe whole-run behaviour (esp. the Unit 4 link counters).
     struct { uint64_t linksPatched=0, linksUnlinked=0, pendingPeak=0,
-                       cppReentries=0, dispatcherMisses=0, dispatcherHits=0, icacheHits=0,
+                       cppReentries=0, dispatcherMisses=0, dispatcherHits=0, icacheHits=0, rasHits=0,
                        linkSitesEmitted=0, dispatchOnlyExits=0,
                        schedIterations=0, schedEventsFired=0,
                        arm9ExecNs=0, arm7ExecNs=0, gpu3dNs=0, runSystemNs=0, spuMixNs=0,
@@ -804,6 +804,7 @@ int main(int argc, char** argv)
             profTotals.dispatcherMisses+= g_Frame.DispatcherMisses.load(std::memory_order_relaxed);
             profTotals.dispatcherHits  += g_Frame.DispatcherHits.load(std::memory_order_relaxed);
             profTotals.icacheHits      += g_Frame.ICacheHits.load(std::memory_order_relaxed);
+            profTotals.rasHits         += g_Frame.RasHits.load(std::memory_order_relaxed);
 #ifdef LITEV_JIT_DIRECTPATCH
             profTotals.directGuardHits   += g_Frame.DirectGuardHits.load(std::memory_order_relaxed);
             profTotals.directGuardMisses += g_Frame.DirectGuardMisses.load(std::memory_order_relaxed);
@@ -950,6 +951,7 @@ int main(int argc, char** argv)
     printf("dispatcher_miss: %llu\n", (unsigned long long)profTotals.dispatcherMisses);
     printf("dispatcher_hits: %llu\n", (unsigned long long)profTotals.dispatcherHits);
     printf("icache_hits:     %llu\n", (unsigned long long)profTotals.icacheHits);
+    printf("ras_hits:        %llu\n", (unsigned long long)profTotals.rasHits);
     {
         unsigned long long ic = profTotals.icacheHits, dh = profTotals.dispatcherHits;
         unsigned long long tot = ic + dh;
