@@ -20,6 +20,8 @@
 #define GPU3D_H
 
 #include <array>
+#include <atomic>
+#include <cstring>
 #include <memory>
 
 #include "Savestate.h"
@@ -225,6 +227,25 @@ public:
     // lighting just accounts its cycles (which depend only on the enabled lights), and VBlank
     // skips preparing the frame for the renderer. Cleared once the game uses display capture.
     bool Headless = false;
+#ifdef LITEV_REMOTE_GX_SINK
+    // Netplay remote copy (set by the frontend, never for the local console): the geometry engine
+    // keeps its command timing, FIFO, stack levels and status, but does no matrix/vertex/polygon
+    // math. Its results are only visible through a few registers and the test commands; the
+    // first use of one turns the sink off for good (SinkOff) and the Netplay hash check resyncs.
+    bool Sink = false;
+    void SinkOff(const char* why) noexcept;
+    // set once any console of the process reads a geometry result or runs a test command: a
+    // frontend enables sinks only while it is clear (after a warm-up on its own full console)
+    static std::atomic<bool> SinkVeto;
+    // games checked to never use geometry results (and so whose remote copies may sink),
+    // by cart game code: Mario Kart DS (USA) AMCE. Shrek (A4IE) reads RAM_COUNT in races.
+    static bool SinkGameOK(const char* gameCode) { return gameCode && !strncmp(gameCode, "AMCE", 4); }
+    void SinkUse(const char* what, u32 addr) noexcept;
+    // Netplay, every console (local and remote copies alike): the polygon pipeline timing takes
+    // every polygon as accepted (on hardware a culled/clipped-away one frees the pipeline sooner),
+    // so the timing depends only on the command stream and a sink copy keeps its owner's timing.
+    bool TimingFixed = false;
+#endif
 #ifdef LITEV_FF_HEADLESS3D
     // BankBuiltHeadless: the bank being built got polygons while Headless (fast-forward), so it
     // has no bounds/sort/depth. RenderStale: the last buffer swap skipped preparing the render

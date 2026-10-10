@@ -21,6 +21,7 @@
 #include <cstdlib>
 
 #include "LockstepMP.h"
+#include "xxhash/xxhash.h"
 #include "../Platform.h"
 #include "../NDS.h"
 #include <chrono>
@@ -184,10 +185,28 @@ void LockstepMP::Broadcast(int inst, u32 type, u8* data, int len, u64 timestamp,
     }
 }
 
+void LockstepMP::TxNote(int inst, u32 type, const u8* data, int len, u64 timestamp)
+{
+    const u64 head[3] = { type | ((u64)(u32)len << 32), timestamp, Now(inst) };
+    u64 h = XXH3_64bits_withSeed(head, sizeof(head), TxH[inst]);
+    TxH[inst] = XXH3_64bits_withSeed(data, len, h);
+    TxD[inst] = XXH3_64bits_withSeed(data, len, XXH3_64bits_withSeed(head, 8, TxD[inst]));
+    TxN[inst]++;
+    static const char* txlog = getenv("LITEV_MP_TXLOG");   // diagnostics: every sent frame, per console
+    if (txlog)
+    {
+        static FILE* f[kMaxInst];
+        if (!f[inst]) { char p[512]; snprintf(p, sizeof(p), "%s/tx%d.txt", txlog, inst); f[inst] = fopen(p, "w"); }
+        if (f[inst]) fprintf(f[inst], "%u t%u len %d now %llu ts %llu data %016llx\n", TxN[inst], type, len, (unsigned long long)Now(inst),
+                             (unsigned long long)timestamp, (unsigned long long)XXH3_64bits(data, len));
+    }
+}
+
 int LockstepMP::SendPacket(int inst, u8* data, int len, u64 timestamp)
 {
     std::lock_guard<std::mutex> lk(Lock);
     Log(inst, "SendPacket", len, timestamp);
+    TxNote(inst, 0, data, len, timestamp);
     PacketCount++;
     Broadcast(inst, 0, data, len, timestamp, Regular);
 #ifndef LITEV_MP_CLOCKWAKE
@@ -238,6 +257,7 @@ int LockstepMP::SendCmd(int inst, u8* data, int len, u64 timestamp)
 {
     std::unique_lock<std::mutex> lk(Lock);
     Log(inst, "SendCmd", len, timestamp);
+    TxNote(inst, 1, data, len, timestamp);
     PacketCount++; CmdCount++;
     HostID = inst;
 #ifdef LITEV_MP_FASTPOLL
@@ -273,6 +293,7 @@ int LockstepMP::SendAck(int inst, u8* data, int len, u64 timestamp)
 {
     std::unique_lock<std::mutex> lk(Lock);
     Log(inst, "SendAck", len, timestamp);
+    TxNote(inst, 3, data, len, timestamp);
     PacketCount++;
     // The ACK's first word (melonDS frame header) tells clients how long they may run without
     // polling for host frames: the rest of the host's CMD window (W_CmdCount, ~13-15 ms in Mario
@@ -296,6 +317,7 @@ int LockstepMP::SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid)
 {
     std::lock_guard<std::mutex> lk(Lock);
     Log(inst, "SendReply", len, timestamp);
+    TxNote(inst, 2, data, len, timestamp);
     if (St.On > 0 && St.T1 && !St.T2) St.T2 = NowNs();
     TLog(inst, "REPLY");
     PacketCount++; ReplyCount++;

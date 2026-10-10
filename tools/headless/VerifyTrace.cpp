@@ -946,6 +946,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             nds.SPU.Silent = true;  // what Netplay does to the other players' consoles
             printf("instance %d: silent (no audio mix)\n", k);
         }
+#ifdef LITEV_REMOTE_GX_SINK
+        if (getenv("LITEV_MP_GXSINK1"))   // =<frame>: what Netplay does to the other players' consoles
+            printf("instance %d: geometry sink from frame %d unless the game uses geometry results\n", k, atoi(getenv("LITEV_MP_GXSINK1")));
+#endif
 #ifdef LITEV_AGGRESSIVE_SKIP
         if (getenv("LITEV_MP_HEADLESS1"))
         {
@@ -963,6 +967,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     }
 #endif
 
+#ifdef LITEV_REMOTE_GX_SINK
+    if (getenv("LITEV_MP_GXSINK1") || getenv("LITEV_MP_GXTIMING"))   // Netplay: every console, local too
+        for (int k = 0; k < n; k++) b[k].nds->GPU.GPU3D.TimingFixed = true;
+#endif
     // Install one shared in-process link and give each instance a distinct id.
     // LITEV_MP_LOCKSTEP=1: the deterministic LockstepMP (Netplay) instead of LocalMP. Netplay
     // always uses it, as the app does: LocalMP's replies depend on thread timing, so two devices
@@ -1142,6 +1150,11 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_EVENT_TRACE
                 if (inst == 1 && getenv("LITEV_MP_EVTRACE_FROM")) gEvTraceOn = f + 1 >= atoi(getenv("LITEV_MP_EVTRACE_FROM"));
 #endif
+#ifdef LITEV_REMOTE_GX_SINK
+                static const int sinkFrom = getenv("LITEV_MP_GXSINK1") ? atoi(getenv("LITEV_MP_GXSINK1")) : -1;
+                if (inst > 0 && f == sinkFrom && !GPU3D::SinkVeto.load())
+                    bi.nds->GPU.GPU3D.Sink = true;
+#endif
                 bi.nds->RunFrame();
                 if (pace > 0 && net && inst == net->LocalPlayer())
                 {   // no catch-up after a stall (a burst would hide it in the average)
@@ -1171,6 +1184,8 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                            sw - lastSwaps, bi.nds->GPU.CaptureCount,
                            std::chrono::duration<double, std::milli>(now - lastT).count(),
                            (unsigned long long)XXH3_64bits(bi.nds->MainRAM, bi.nds->MainRAMMask + 1));
+                    if (lockstepMP)   // what the other consoles see of this one: its sent frames
+                        printf("inst%d tx %d: %016llx n=%u data=%016llx\n", inst, f + 1, (unsigned long long)lockstepMP->TxHash(inst), lockstepMP->TxCount(inst), (unsigned long long)lockstepMP->TxDataHash(inst));
                     if (getenv("LITEV_MP_STATE"))
                     {
                         // diagnostics: more of the console's state, to find what diverges first

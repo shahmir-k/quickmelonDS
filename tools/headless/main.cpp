@@ -68,7 +68,7 @@ static void DumpAccessStats()
     std::sort(v.rbegin(), v.rend());
     for (int a = 0; a < 0x100000; a++)
         if (melonDS::LitevRomctrlPC[a] > 1000) fprintf(stderr, "ROMCTRL-PC %05X %llu\n", a << 1, (unsigned long long)melonDS::LitevRomctrlPC[a]);
-    for (size_t i = 0; i < v.size() && i < 60; i++)
+    for (size_t i = 0; i < v.size() && i < 400; i++)
     {
         int a = v[i].second.second;
         if (a >= 0xC000 && a < 0xD000) { fprintf(stderr, "GXCMD %02X entries %llu\n", a & 0xFF, (unsigned long long)v[i].first); continue; }
@@ -424,6 +424,9 @@ bool LoadSavestate(NDS& nds, const std::string& path)
 
 int main(int argc, char** argv)
 {
+#ifdef LITEV_ACCESS_STATS
+    atexit(DumpAccessStats);   // (every mode, also --mp-test)
+#endif
     Options opt;
     if (!ParseArgs(argc, argv, opt))
         Usage(argv[0], 2);
@@ -1249,7 +1252,6 @@ int main(int argc, char** argv)
     }
 
 #ifdef LITEV_ACCESS_STATS
-    DumpAccessStats();
     if (getenv("LITEV_DUMPMEM"))
     {
         u32 a = strtoul(getenv("LITEV_DUMPMEM"), nullptr, 16);

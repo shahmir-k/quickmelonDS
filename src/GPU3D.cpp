@@ -915,6 +915,25 @@ void GPU3D::UpdateClipMatrix() noexcept
 
 
 
+#ifdef LITEV_REMOTE_GX_SINK
+#define GX_SINK (Sink)
+std::atomic<bool> GPU3D::SinkVeto{false};
+void GPU3D::SinkOff(const char* why) noexcept
+{
+    Sink = false;
+    Log(LogLevel::Warn, "GX sink off (%s): this remote copy's geometry results are stale until resynced\n", why);
+}
+// the game uses geometry results (any console of the process): no sinks from now on
+void GPU3D::SinkUse(const char* what, u32 addr) noexcept
+{
+    if (!SinkVeto.exchange(true, std::memory_order_relaxed))
+        Log(LogLevel::Info, "GX sink veto: the game uses geometry results (%s %08X)\n", what, addr);
+    if (Sink) SinkOff(what);
+}
+#else
+#define GX_SINK false
+#endif
+
 void GPU3D::AddCycles(s32 num) noexcept
 {
     CycleCount += num;
@@ -1441,9 +1460,21 @@ void GPU3D::SubmitPolygon() noexcept
     // submitting a polygon starts the polygon pipeline
     // noting that for now we are only reserving one vertex slot
     // further slots only get reserved if the polygon makes it through culling/clipping
+#ifdef LITEV_REMOTE_GX_SINK
+    if (TimingFixed)
+    {
+        // as accepted below (rejected polygons return before it), whatever the geometry
+        VertexSlotCounter = 1;
+        if (nverts == 4) { PolygonPipeline = 35; VertexSlotsFree = (PolygonMode & 0x2) ? 0b11100 : 0b11110; }
+        else             { PolygonPipeline = 26; VertexSlotsFree = (PolygonMode & 0x2) ? 0b1000 : 0b1110; }
+    }
+    else
+#endif
+    {
     PolygonPipeline = 8;
     VertexSlotCounter = 1;
     VertexSlotsFree = 0b11110;
+    }
 
     // culling
     // TODO: work out how it works on the real thing
@@ -1782,6 +1813,10 @@ void GPU3D::SubmitPolygon() noexcept
 
     // build the actual polygon
 
+#ifdef LITEV_REMOTE_GX_SINK
+    if (TimingFixed) {}   // (set at the top from the polygon type; here nverts is after clipping)
+    else
+#endif
     if (nverts == 4)
     {
         PolygonPipeline = 35;
@@ -1965,6 +2000,33 @@ void GPU3D::UpdateClipMatrixOOL() noexcept { UpdateClipMatrix(); }
 
 void GPU3D::SubmitVertex() noexcept
 {
+#ifdef LITEV_REMOTE_GX_SINK
+    if (Sink)
+    {
+        // the vertex/polygon counting and the timing of SubmitVertex/SubmitPolygon, taking every
+        // polygon as accepted (no transform, culling or clipping)
+        VertexNum++;
+        VertexNumInPoly++;
+        bool poly = false;
+        switch (PolygonMode)
+        {
+        case 0: if (VertexNumInPoly == 3) { VertexNumInPoly = 0; poly = true; } break;
+        case 1: if (VertexNumInPoly == 4) { VertexNumInPoly = 0; poly = true; } break;
+        case 2: if ((NumConsecutivePolygons & 1) || VertexNumInPoly == 3) { VertexNumInPoly = 2; poly = true; } break;
+        case 3: if (VertexNumInPoly == 4) { VertexNumInPoly = 2; poly = true; } break;
+        }
+        if (poly)
+        {
+            NumConsecutivePolygons++;
+            VertexSlotCounter = 1;
+            if (PolygonMode & 0x1) { PolygonPipeline = 35; VertexSlotsFree = (PolygonMode & 0x2) ? 0b11100 : 0b11110; }
+            else                   { PolygonPipeline = 26; VertexSlotsFree = (PolygonMode & 0x2) ? 0b1000 : 0b1110; }
+        }
+        VertexPipeline = 7;
+        AddCycles(3);
+        return;
+    }
+#endif
 #ifdef LITEV_GX_CMD_SLIM
     // scalars, not an array (no canary); inlined into the executor's single vertex site
     const s64 vertex0 = CurVertex[0], vertex1 = CurVertex[1], vertex2 = CurVertex[2], vertex3 = 0x1000;
@@ -2711,66 +2773,66 @@ gxs_14: // restore matrix
 gxs_15: // identity
     if (MatrixMode == 3)
     {
-        MatrixLoadIdentity(TexMatrix);
+        if (!GX_SINK) MatrixLoadIdentity(TexMatrix);
         goto gxs_end;
     }
-    MatrixLoadIdentity(MatrixMode == 0 ? ProjMatrix : PosMatrix);
+    if (!GX_SINK) MatrixLoadIdentity(MatrixMode == 0 ? ProjMatrix : PosMatrix);
     if (MatrixMode == 2)
-        MatrixLoadIdentity(VecMatrix);
+        if (!GX_SINK) MatrixLoadIdentity(VecMatrix);
     ClipMatrixDirty = true;
     cyc = 18; goto gxs_post;
 
 gxs_16: // load 4x4
     mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
-    MatrixLoad4x4(mtx, (s32*)ExecParams);
+    if (!GX_SINK) MatrixLoad4x4(mtx, (s32*)ExecParams);
     if (MatrixMode == 2)
-        MatrixLoad4x4(VecMatrix, (s32*)ExecParams);
+        if (!GX_SINK) MatrixLoad4x4(VecMatrix, (s32*)ExecParams);
     if (MatrixMode != 3) ClipMatrixDirty = true;
     cyc = MatrixMode == 3 ? 10 : 18; goto gxs_post;
 
 gxs_17: // load 4x3
     mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
-    MatrixLoad4x3(mtx, (s32*)ExecParams);
+    if (!GX_SINK) MatrixLoad4x3(mtx, (s32*)ExecParams);
     if (MatrixMode == 2)
-        MatrixLoad4x3(VecMatrix, (s32*)ExecParams);
+        if (!GX_SINK) MatrixLoad4x3(VecMatrix, (s32*)ExecParams);
     if (MatrixMode != 3) ClipMatrixDirty = true;
     cyc = MatrixMode == 3 ? 7 : 18; goto gxs_post;
 
 gxs_18: // mult 4x4
     mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
-    MatrixMult4x4(mtx, (s32*)ExecParams);
+    if (!GX_SINK) MatrixMult4x4(mtx, (s32*)ExecParams);
     if (MatrixMode == 2)
-        MatrixMult4x4(VecMatrix, (s32*)ExecParams);
+        if (!GX_SINK) MatrixMult4x4(VecMatrix, (s32*)ExecParams);
     if (MatrixMode != 3) ClipMatrixDirty = true;
     cyc = (MatrixMode == 3 ? 33 : MatrixMode == 2 ? 35 + 30 : 35) - 16; goto gxs_post;
 
 gxs_19: // mult 4x3
     mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
-    MatrixMult4x3(mtx, (s32*)ExecParams);
+    if (!GX_SINK) MatrixMult4x3(mtx, (s32*)ExecParams);
     if (MatrixMode == 2)
-        MatrixMult4x3(VecMatrix, (s32*)ExecParams);
+        if (!GX_SINK) MatrixMult4x3(VecMatrix, (s32*)ExecParams);
     if (MatrixMode != 3) ClipMatrixDirty = true;
     cyc = (MatrixMode == 3 ? 33 : MatrixMode == 2 ? 35 + 30 : 35) - 12; goto gxs_post;
 
 gxs_1A: // mult 3x3
     mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
-    MatrixMult3x3(mtx, (s32*)ExecParams);
+    if (!GX_SINK) MatrixMult3x3(mtx, (s32*)ExecParams);
     if (MatrixMode == 2)
-        MatrixMult3x3(VecMatrix, (s32*)ExecParams);
+        if (!GX_SINK) MatrixMult3x3(VecMatrix, (s32*)ExecParams);
     if (MatrixMode != 3) ClipMatrixDirty = true;
     cyc = (MatrixMode == 3 ? 33 : MatrixMode == 2 ? 35 + 30 : 35) - 9; goto gxs_post;
 
 gxs_1B: // scale (never the vector matrix)
     mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
-    MatrixScale(mtx, (s32*)ExecParams);
+    if (!GX_SINK) MatrixScale(mtx, (s32*)ExecParams);
     if (MatrixMode != 3) ClipMatrixDirty = true;
     cyc = (MatrixMode == 3 ? 33 : 35) - 3; goto gxs_post;
 
 gxs_1C: // translate
     mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
-    MatrixTranslate(mtx, (s32*)ExecParams);
+    if (!GX_SINK) MatrixTranslate(mtx, (s32*)ExecParams);
     if (MatrixMode == 2)
-        MatrixTranslate(VecMatrix, (s32*)ExecParams);
+        if (!GX_SINK) MatrixTranslate(VecMatrix, (s32*)ExecParams);
     if (MatrixMode != 3) ClipMatrixDirty = true;
     cyc = (MatrixMode == 3 ? 33 : MatrixMode == 2 ? 35 + 30 : 35) - 3; goto gxs_post;
 
@@ -2878,6 +2940,7 @@ gxs_31: // specular/emission material
     cyc = 3; goto gxs_post;
 
 gxs_32: // light direction
+    if (!GX_SINK)
     {
         u32 l = entry.Param >> 30;
         s16 dir[3];
@@ -2943,12 +3006,18 @@ gxs_60: // viewport x1,y1,x2,y2 (Y upside-down)
     Viewport[5] = (Viewport[1] - Viewport[3] + 1) & 0xFF;
     goto gxs_end;
 
-gxs_70: // box test
+gxs_70:
+#ifdef LITEV_REMOTE_GX_SINK
+    SinkUse("box test", 0);
+#endif // box test
     NumTestCommands -= 3;
     BoxTest(ExecParams);
     goto gxs_end;
 
 gxs_71: // pos test
+#ifdef LITEV_REMOTE_GX_SINK
+    SinkUse("test command", 0);
+#endif
     NumTestCommands -= 2;
     CurVertex[0] = ExecParams[0] & 0xFFFF;
     CurVertex[1] = ExecParams[0] >> 16;
@@ -2957,6 +3026,9 @@ gxs_71: // pos test
     goto gxs_end;
 
 gxs_72: // vec test
+#ifdef LITEV_REMOTE_GX_SINK
+    SinkUse("test command", 0);
+#endif
     NumTestCommands--;
     VecTest(entry.Param);
     goto gxs_end;
@@ -4439,6 +4511,9 @@ bool YSort(Polygon* a, Polygon* b)
 
 void GPU3D::VBlank() noexcept
 {
+#ifdef LITEV_REMOTE_GX_SINK
+    if (Sink && SinkVeto.load(std::memory_order_relaxed)) SinkOff("another console used geometry results");
+#endif
     if (GeometryEnabled)
     {
         // a console nobody watches skips preparing the frame for the renderer (polygon sort,
@@ -4592,6 +4667,9 @@ void GPU3D::WriteToGXFIFO(u32 val) noexcept
 
 u8 GPU3D::Read8(u32 addr) noexcept
 {
+#ifdef LITEV_REMOTE_GX_SINK
+    if (addr >= 0x04000604 && addr < 0x040006A4) SinkUse("result read", addr);
+#endif
     switch (addr)
     {
     case 0x04000600:
@@ -4631,6 +4709,9 @@ u8 GPU3D::Read8(u32 addr) noexcept
 
 u16 GPU3D::Read16(u32 addr) noexcept
 {
+#ifdef LITEV_REMOTE_GX_SINK
+    if (addr >= 0x04000604 && addr < 0x040006A4) SinkUse("result read", addr);
+#endif
     switch (addr)
     {
     case 0x04000060:
@@ -4675,6 +4756,9 @@ u16 GPU3D::Read16(u32 addr) noexcept
 
 u32 GPU3D::Read32(u32 addr) noexcept
 {
+#ifdef LITEV_REMOTE_GX_SINK
+    if (addr >= 0x04000604 && addr < 0x040006A4) SinkUse("result read", addr);
+#endif
     switch (addr)
     {
     case 0x04000060:

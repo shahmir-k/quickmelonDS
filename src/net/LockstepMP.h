@@ -108,6 +108,17 @@ public:
 
 private:
     WaitStats WS[kMaxInst];
+public:
+    // every frame a console sends (type, data, its clock): a running hash per console. A Netplay
+    // remote copy is right when this matches its owner's console (Netplay desync check; Mac gate).
+    u64 TxHash(int inst) const { return TxH[inst]; }
+    u32 TxCount(int inst) const { return TxN[inst]; }
+    u64 TxDataHash(int inst) const { return TxD[inst]; }   // contents only (not when)
+private:
+    u64 TxH[kMaxInst] {};
+    u32 TxN[kMaxInst] {};
+    u64 TxD[kMaxInst] {};
+    void TxNote(int inst, u32 type, const u8* data, int len, u64 timestamp);
     // LITEV_MP_TL=<dir>: timeline, one line per blocking event: wall ns, event, own clock, host clock
     FILE* TL[kMaxInst] {};
     void TLog(int inst, const char* ev);
