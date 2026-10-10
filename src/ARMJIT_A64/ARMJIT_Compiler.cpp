@@ -1009,6 +1009,14 @@ FixupBranch Compiler::CheckCondition(u32 cond)
         // conditionally-skipped body still observes a canonical CPSR word).
         // Comp_MaterializeFlags leaves PSTATE untouched.
         bool condValid = NZCVCondValid;
+#ifdef LITEV_JIT_NZ_BRANCH
+        // LITEV_JIT_NZ_BRANCH: EQ/NE read only Z, MI/PL only N. When that flag is one of the
+        // host-resident ones (a logical producer's N,Z), branch on host NZCV like a full
+        // producer instead of reloading the slot just written.
+        const u8 needed = (cond <= 1) ? 0x4 : (cond == 4 || cond == 5) ? 0x8 : 0;
+        if (JitQOn(jitq_NZBranch) && !condValid && needed && (NZCVDeferred & needed))
+            condValid = true;
+#endif
         Comp_MaterializeFlags();
         if (condValid)
         {
@@ -2985,6 +2993,12 @@ void Compiler::Reset()
 #endif
 #ifdef LITEV_JIT_COLD_EXITS
             | jitq_ColdExits
+#endif
+#ifdef LITEV_JIT_NZ_BRANCH
+            | jitq_NZBranch
+#endif
+#ifdef LITEV_JIT_MOV_ELIDE
+            | jitq_MovElide
 #endif
             ;
 #if defined(__ANDROID__)

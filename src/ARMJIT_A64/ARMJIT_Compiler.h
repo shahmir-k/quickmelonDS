@@ -594,6 +594,8 @@ public:
         jitq_LdrAlignChk = 1 << 4,   // LITEV_JIT_LDR_ALIGNCHK
         jitq_CodeCyclesDead = 1 << 5,// LITEV_JIT_CODECYCLES_DEAD
         jitq_ColdExits = 1 << 6,     // LITEV_JIT_COLD_EXITS
+        jitq_NZBranch = 1 << 7,      // LITEV_JIT_NZ_BRANCH
+        jitq_MovElide = 1 << 8,      // LITEV_JIT_MOV_ELIDE
     };
     u32 JitQ = 0;
     bool JitQOn(u32 bit) const { return (JitQ & bit) != 0; }

@@ -381,6 +381,9 @@ void Compiler::Comp_JumpTo(Arm64Gen::ARM64Reg addr, bool switchThumb, bool resto
     {
         if (switchThumb)
             CPSRDirty = true;
+#ifdef LITEV_JIT_MOV_ELIDE
+        if (addr != W0 || !JitQOn(jitq_MovElide))   // `mov w0, w0` when the caller computed it there
+#endif
         MOV(W0, addr);
         BL((Num ? JumpToFuncs7 : JumpToFuncs9)[switchThumb ? 0 : (Thumb + 1)]);
     }
