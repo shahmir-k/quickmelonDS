@@ -27,6 +27,12 @@
 
 struct blip_t;
 
+// FIFO bookkeeping without the sample reads (FIFO_Skip), for channel paths that read the sample
+// elsewhere (LITEV_SPU_FAST_ADPCM) or not at all (LITEV_SPU_SILENT_LAZY); RefillFIFO reads the words.
+#if defined(LITEV_SPU_SILENT_LAZY) || defined(LITEV_SPU_FAST_ADPCM)
+#define LITEV_SPU_FIFO_TRACK 1
+#endif
+
 namespace melonDS
 {
 
@@ -218,9 +224,7 @@ public:
     bool Stale = false;     // decoded values and the FIFO words in FIFOStale are not current
     bool Tracked = false;   // Restarts/Steps are valid since Start (every step since went through Run/RunTiming)
     u8 Restarts = 0;        // loop restarts since Start (capped: passes from the 2nd on are identical)
-    u8 FIFOStale = 0;       // FIFO slots buffered without reading the sample
     u32 Steps = 0;          // samples since Start or the last loop restart
-    u32 FIFOSrc[8] {};      // sample offset each FIFO slot holds
     bool LazyOK() const
     {
         if (Stale) return true;
@@ -233,13 +237,6 @@ public:
         if (Pos == oldPos + 1) Steps++;
         else { Steps = 0; if (Restarts < 6) Restarts++; }
     }
-    void FIFO_BufferTiming();
-    void FIFO_Skip(u32 size)
-    {
-        FIFOReadPos = (FIFOReadPos + size) & 0x1F;
-        FIFOLevel -= size;
-        if (FIFOLevel <= 16) FIFO_BufferTiming();
-    }
     template<u32 type> void RunTiming(u32 cycles, u32 n);
     void DoRunTiming(u32 cycles, u32 n)
     {
@@ -251,6 +248,18 @@ public:
         }
     }
     void Materialize();
+#endif
+#ifdef LITEV_SPU_FIFO_TRACK
+    u8 FIFOStale = 0;       // FIFO slots buffered without reading the sample
+    u32 FIFOSrc[8] {};      // sample offset each FIFO slot holds
+    void FIFO_BufferTiming();
+    void FIFO_Skip(u32 size)
+    {
+        FIFOReadPos = (FIFOReadPos + size) & 0x1F;
+        FIFOLevel -= size;
+        if (FIFOLevel <= 16) FIFO_BufferTiming();
+    }
+    void RefillFIFO();      // main-RAM samples only (the paths above require it)
 #endif
 
 private:

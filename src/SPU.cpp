@@ -308,11 +308,17 @@ void SPU::DoSavestate(Savestate* file)
 #ifdef LITEV_SPU_SILENT_LAZY
     if (file->Saving) MaterializeAll();
 #endif
+#ifdef LITEV_SPU_FIFO_TRACK
+    if (file->Saving) for (SPUChannel& ch : Channels) if (ch.FIFOStale) ch.RefillFIFO();
+#endif
     for (SPUChannel& channel : Channels)
         channel.DoSavestate(file);
 #ifdef LITEV_SPU_SILENT_LAZY
     if (!file->Saving)
-        for (SPUChannel& ch : Channels) { ch.Stale = ch.Tracked = false; ch.FIFOStale = 0; }
+        for (SPUChannel& ch : Channels) ch.Stale = ch.Tracked = false;
+#endif
+#ifdef LITEV_SPU_FIFO_TRACK
+    if (!file->Saving) for (SPUChannel& ch : Channels) ch.FIFOStale = 0;
 #endif
 #ifdef LITEV_SPU_ADPCM_MEMO
     if (!file->Saving) { Memos.clear(); MemoBytes = 0; MemoGen++; }
@@ -410,7 +416,10 @@ void SPUChannel::Reset()
     FIFOReadOffset = 0;
     FIFOLevel = 0;
 #ifdef LITEV_SPU_SILENT_LAZY
-    Stale = Tracked = false; Restarts = 0; Steps = 0; FIFOStale = 0;
+    Stale = Tracked = false; Restarts = 0; Steps = 0;
+#endif
+#ifdef LITEV_SPU_FIFO_TRACK
+    FIFOStale = 0;
 #endif
 }
 
@@ -475,7 +484,7 @@ void SPUChannel::FIFO_BufferData()
             else
 #endif
             FIFO[FIFOWritePos] = NDS.ARM7Read32(SrcAddr + FIFOReadOffset);
-#ifdef LITEV_SPU_SILENT_LAZY
+#ifdef LITEV_SPU_FIFO_TRACK
             FIFOSrc[FIFOWritePos] = FIFOReadOffset;
             FIFOStale &= ~(1 << FIFOWritePos);
 #endif
@@ -489,7 +498,7 @@ void SPUChannel::FIFO_BufferData()
         for (u32 i = 0; i < burstlen; i += 4)
         {
             FIFO[FIFOWritePos] = 0;
-#ifdef LITEV_SPU_SILENT_LAZY
+#ifdef LITEV_SPU_FIFO_TRACK
             FIFOSrc[FIFOWritePos] = FIFOReadOffset;
             FIFOStale &= ~(1 << FIFOWritePos);
 #endif
@@ -537,7 +546,10 @@ void SPUChannel::Start()
     FIFOReadOffset = 0;
     FIFOLevel = 0;
 #ifdef LITEV_SPU_SILENT_LAZY
-    Stale = false; Tracked = true; Restarts = 0; Steps = 0; FIFOStale = 0;
+    Stale = false; Tracked = true; Restarts = 0; Steps = 0;
+#endif
+#ifdef LITEV_SPU_FIFO_TRACK
+    FIFOStale = 0;
 #endif
 
     // when starting a channel, buffer data
@@ -884,6 +896,7 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
             {
                 if (k)
                 {
+                    for (s32 q = (np >> 1) - (pos >> 1); q > 0; q--) FIFO_Skip(1);   // the bytes of the even positions passed
                     if (pos < loop2 && np >= loop2) { valLoop = (s16)m->St[loop2]; idxLoop = m->St[loop2] >> 16; }
                     const u32 st = m->St[np];
                     val = (s16)st; idx = st >> 16;
@@ -906,6 +919,7 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
                 if (pos == 0)
                 {
                     const u32 header = *(const u32*)&ram[(src & ~3u) & mask];
+                    FIFO_Skip(4);   // (keeps the FIFO where the exact path has it: sound capture may switch to it)
                     val = (s32)(s16)(header & 0xFFFF);
                     idx = (header >> 16) & 0x7F;
                     if (idx > 88) idx = 88;
@@ -927,6 +941,7 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
                     pos = LoopPos << 1;
                     val = valLoop; idx = idxLoop;
                     curByte = ram[(src + LoopPos) & mask];
+                    FIFO_Skip(1);
 #ifdef LITEV_SPU_ADPCM_MEMO
                     okUntil = 0; stale = false;
 #endif
@@ -941,6 +956,7 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
             }
             else
             {
+                if (!(pos & 1)) FIFO_Skip(1);
 #ifdef LITEV_SPU_ADPCM_MEMO
                 if (pos < okUntil || (m && pos < m->Hi && MemoCheck(*m, pos, okUntil)))
                 {
@@ -1138,7 +1154,7 @@ s32 SPUChannel::Run(u32 cycles, bool out)
     return val;
 }
 
-#ifdef LITEV_SPU_SILENT_LAZY
+#ifdef LITEV_SPU_FIFO_TRACK
 // FIFO_BufferData without reading the sample: the same offsets, slots and level
 void SPUChannel::FIFO_BufferTiming()
 {
@@ -1162,6 +1178,16 @@ void SPUChannel::FIFO_BufferTiming()
     FIFOLevel += burstlen;
 }
 
+void SPUChannel::RefillFIFO()
+{
+    for (int i = 0; i < 8; i++)
+        if (FIFOStale & (1 << i))
+            FIFO[i] = *(u32*)&NDS.MainRAM[((SrcAddr + FIFOSrc[i]) & ~3u) & NDS.MainRAMMask];
+    FIFOStale = 0;
+}
+#endif
+
+#ifdef LITEV_SPU_SILENT_LAZY
 // Run<type>(cycles, false) n times (PCM8/PCM16/ADPCM, sample in main RAM, looped or one-shot),
 // stepping what the ARM cores can see: Timer, Pos, loop, end (busy bit), FIFO bookkeeping.
 // The decode (and the interpolation history) is left stale; Materialize rebuilds it.
@@ -1254,10 +1280,7 @@ void SPUChannel::Materialize()
 {
     if (!Stale) return;
     Stale = false;
-    for (int i = 0; i < 8; i++)
-        if (FIFOStale & (1 << i))
-            FIFO[i] = *(u32*)&NDS.MainRAM[((SrcAddr + FIFOSrc[i]) & ~3u) & NDS.MainRAMMask];
-    FIFOStale = 0;
+    RefillFIFO();
     if (KeyOn || !(Cnt & (1u<<31))) return;     // stopped, or restarting: the rest is reset first
 
     SPUChannel r(Num, NDS, InterpType);
@@ -1488,15 +1511,7 @@ void SPU::Mix(u32 spucycles)
 #endif
 }
 
-#ifdef LITEV_SPU_SILENT_LAZY
-// debug.litev.spulazy / LITEV_SPULAZY (default on; 0 = step a silent console's channels exactly)
-static bool SPULazyOn()
-{
-    static const bool on = SPUProp("debug.litev.spulazy", "LITEV_SPULAZY", 1) != 0;
-    return on;
-}
-
-#ifndef __ANDROID__
+#if !defined(__ANDROID__) && defined(LITEV_SPU_FIFO_TRACK)
 // Mac check (LITEV_SPULAZY_VERIFY=K): run an exact copy of every channel beside the lazy one;
 // compare what the ARM cores see after every batch, and every K batches rebuild the stale values
 // and compare those too. Prints mismatches to stderr.
@@ -1516,6 +1531,69 @@ static void CopyChannel(SPUChannel& d, const SPUChannel& o)
     d.FIFOWritePos = o.FIFOWritePos; d.FIFOReadOffset = o.FIFOReadOffset; d.FIFOLevel = o.FIFOLevel; d.InterpType = o.InterpType;
 }
 #endif
+#if !defined(__ANDROID__) && defined(LITEV_SPU_FAST_ADPCM)
+// Mac check (LITEV_SPUFAST_VERIFY=K): an exact copy of every channel runs beside the fast ADPCM
+// batch; after each batch the positions/FIFO bookkeeping must match, and every K batches the FIFO
+// words are refilled (as when sound capture switches to the exact path) and the decode compared.
+static void SPUFastVerify(SPU& spu, melonDS::NDS& nds, std::array<SPUChannel, 16>& chs, bool before, u32 cycles, u32 n)
+{
+    static const int every = getenv("LITEV_SPUFAST_VERIFY") ? atoi(getenv("LITEV_SPUFAST_VERIFY")) : 0;
+    if (every <= 0) return;
+    static thread_local std::unordered_map<SPU*, std::unique_ptr<SPULazyVerify>> vs;
+    auto& vp = vs[&spu];
+    if (!vp) { vp = std::make_unique<SPULazyVerify>(); vp->Shadow.reserve(16); for (int i = 0; i < 16; i++) vp->Shadow.emplace_back(i, nds, chs[i].InterpType); }
+    SPULazyVerify& v = *vp;
+    if (before)
+    {
+        for (int i = 0; i < 16; i++)
+        {
+            SPUChannel& sh = v.Shadow[i]; SPUChannel& ch = chs[i];
+            if (!v.Synced) { if (ch.FIFOStale) ch.RefillFIFO(); CopyChannel(sh, ch); continue; }
+            sh.Cnt = ch.Cnt; sh.SrcAddr = ch.SrcAddr; sh.TimerReload = ch.TimerReload; sh.LoopPos = ch.LoopPos;
+            sh.Length = ch.Length; sh.Volume = ch.Volume; sh.VolumeShift = ch.VolumeShift; sh.Pan = ch.Pan; sh.KeyOn = ch.KeyOn;
+        }
+        v.Synced = true;
+        return;
+    }
+    for (SPUChannel& sh : v.Shadow) for (u32 b = 0; b < n; b++) sh.DoRun(cycles, true);
+    v.Batches++;
+    const bool refill = (v.Batches % every) == 0;
+    for (int i = 0; i < 16; i++)
+    {
+        SPUChannel& sh = v.Shadow[i]; SPUChannel& ch = chs[i];
+        bool bad = sh.Cnt != ch.Cnt || sh.Pos != ch.Pos || sh.Timer != ch.Timer || sh.FIFOReadPos != ch.FIFOReadPos
+                   || sh.FIFOWritePos != ch.FIFOWritePos || sh.FIFOReadOffset != ch.FIFOReadOffset || sh.FIFOLevel != ch.FIFOLevel;
+        if (!bad && refill && (ch.Cnt & (1u<<31)) && ((ch.Cnt >> 29) & 3) == 2 && ch.Pos >= 8)
+        {
+            if (ch.FIFOStale) { ch.RefillFIFO(); v.Rebuilds++; }
+            bad = memcmp(sh.FIFO, ch.FIFO, sizeof(sh.FIFO)) || sh.ADPCMVal != ch.ADPCMVal || sh.ADPCMIndex != ch.ADPCMIndex
+                  || sh.ADPCMValLoop != ch.ADPCMValLoop || sh.ADPCMIndexLoop != ch.ADPCMIndexLoop || sh.CurSample != ch.CurSample;
+        }
+        if (bad)
+        {
+            if (v.TimingBad++ < 20)
+                fprintf(stderr, "SPUFAST MISMATCH ch%d batch %llu fmt %u: pos %d/%d timer %x/%x fifo %u,%u,%u,%u/%u,%u,%u,%u val %d/%d idx %d/%d fifo0 %08x/%08x\n", i,
+                        (unsigned long long)v.Batches, (ch.Cnt >> 29) & 3, sh.Pos, ch.Pos, sh.Timer, ch.Timer, sh.FIFOReadPos, sh.FIFOWritePos, sh.FIFOReadOffset,
+                        sh.FIFOLevel, ch.FIFOReadPos, ch.FIFOWritePos, ch.FIFOReadOffset, ch.FIFOLevel, sh.ADPCMVal, ch.ADPCMVal, sh.ADPCMIndex, ch.ADPCMIndex, sh.FIFO[0], ch.FIFO[0]);
+            if (ch.FIFOStale) ch.RefillFIFO();
+            CopyChannel(sh, ch);
+        }
+    }
+    if ((v.Batches % 20000) == 0)
+        fprintf(stderr, "SPUFAST %p: %llu batches, %llu refills checked, mismatches %llu\n", (void*)&spu, (unsigned long long)v.Batches,
+                (unsigned long long)v.Rebuilds, (unsigned long long)v.TimingBad);
+}
+#endif
+
+
+#ifdef LITEV_SPU_SILENT_LAZY
+// debug.litev.spulazy / LITEV_SPULAZY (default on; 0 = step a silent console's channels exactly)
+static bool SPULazyOn()
+{
+    static const bool on = SPUProp("debug.litev.spulazy", "LITEV_SPULAZY", 1) != 0;
+    return on;
+}
+
 
 void SPU::RunQuiet(u32 cycles, u32 n)
 {
@@ -1643,6 +1721,15 @@ void SPU::MixSamples(u32 spucycles)
     const u32 nticks = (u32)(LITEV_SPU_BATCH_N);
     const u32 mixcyc = spucycles;
 #endif
+#ifdef LITEV_SPU_FAST_ADPCM
+    // leaving the fast ADPCM path (sound capture on): the exact path reads the FIFO words it skipped
+    if (!chMajor)
+        for (SPUChannel& ch : Channels)
+            if (ch.FIFOStale) ch.RefillFIFO();
+#endif
+#if !defined(__ANDROID__) && defined(LITEV_SPU_FAST_ADPCM)
+    if (chMajor) SPUFastVerify(*this, NDS, Channels, true, mixcyc, nticks);
+#endif
     if (chMajor)
     {
         for (int i = 0; i < 16; i++)
@@ -1656,6 +1743,9 @@ void SPU::MixSamples(u32 spucycles)
             ch.DoRunN(mixcyc, chmajor, i, nticks);
         }
     }
+#if !defined(__ANDROID__) && defined(LITEV_SPU_FAST_ADPCM)
+    if (chMajor) SPUFastVerify(*this, NDS, Channels, false, mixcyc, nticks);
+#endif
 #endif
 #ifndef LITEV_SPU_CHMAJOR
     const u32 nticks = (u32)(LITEV_SPU_BATCH_N);
