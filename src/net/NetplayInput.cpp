@@ -160,8 +160,8 @@ NetplayInput::~NetplayInput()
 }
 
 #ifdef LITEV_NP_ADAPTIVE_DELAY
-// The delay this player's inputs need: the slowest peer's worst round trip over the last second,
-// halved (with jitter the worst one way is about that), plus a frame. Up at once; down one frame
+// The delay this player's inputs need: the slowest peer's round trip (90th percentile, last 2 s),
+// halved, plus a frame. Up at once; down one frame
 // at a time, only after the need stayed lower for 2 s (a shorter delay merges one input sample).
 void NetplayInput::Adapt(int frame)
 {
@@ -390,10 +390,18 @@ void NetplayInput::ReceiveLoop()
                 {
                     auto& rtt = Rtt[from];
                     rtt.emplace_back(now, (u32)now - header.EchoUs - header.EchoAgeUs);
-                    while (rtt.front().first + 1000000 < now) rtt.pop_front();
+                    while (rtt.front().first + 2000000 < now) rtt.pop_front();
+                    // the slowest peer's 90th percentile over the last 2 s: a lone Wi-Fi spike costs
+                    // one stall, not seconds of extra input lag
                     u32 worst = 0;
                     for (int peer : Peers)
-                        for (auto& [t, us] : Rtt[peer]) worst = std::max(worst, us);
+                    {
+                        std::vector<u32> us;
+                        for (auto& [t, v] : Rtt[peer]) us.push_back(v);
+                        if (us.empty()) continue;
+                        std::nth_element(us.begin(), us.begin() + us.size() * 9 / 10, us.end());
+                        worst = std::max(worst, us[us.size() * 9 / 10]);
+                    }
                     RttMaxUs = worst;
                 }
 #endif

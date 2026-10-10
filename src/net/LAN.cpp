@@ -623,6 +623,10 @@ void LAN::ProcessHostEvent(ENetEvent& event)
         break;
 
     case ENET_EVENT_TYPE_DISCONNECT:
+        Platform::Log(Platform::LogLevel::Warn, "LAN: %s: peer %08x disconnected (data %u): rtt %u ms, last receive %u ms ago, last send %u ms ago, %u reliable in flight\n",
+                      IsHost ? "host" : "client", event.peer->address.host, event.data, event.peer->roundTripTime,
+                      enet_time_get() - event.peer->lastReceiveTime, enet_time_get() - event.peer->lastSendTime,
+                      (unsigned)enet_list_size(&event.peer->sentReliableCommands));
         {
             Player* player = (Player*)event.peer->data;
             if (!player) break;
@@ -761,6 +765,10 @@ void LAN::ProcessClientEvent(ENetEvent& event)
         break;
 
     case ENET_EVENT_TYPE_DISCONNECT:
+        Platform::Log(Platform::LogLevel::Warn, "LAN: %s: peer %08x disconnected (data %u): rtt %u ms, last receive %u ms ago, last send %u ms ago, %u reliable in flight\n",
+                      IsHost ? "host" : "client", event.peer->address.host, event.data, event.peer->roundTripTime,
+                      enet_time_get() - event.peer->lastReceiveTime, enet_time_get() - event.peer->lastSendTime,
+                      (unsigned)enet_list_size(&event.peer->sentReliableCommands));
         {
             Player* player = (Player*)event.peer->data;
             if (!player) break;

@@ -95,7 +95,7 @@ public:
     static constexpr int kMaxDelay = 120;   // 2 s of input lag; past that a session only stalls
 #endif
     int CurrentDelay() const { return CurDelay.load(); }
-    // the slowest peer's round trip over the last second (ms), -1 = no measurement yet
+    // the slowest peer's round trip (90th percentile, last 2 s, ms), -1 = no measurement yet
     double PeerRttMs() const { return RttMaxUs.load() / 1000.0; }
     int LocalPlayer() const { return Local; }
 
