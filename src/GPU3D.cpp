@@ -4542,31 +4542,6 @@ void GPU3D::VBlank() noexcept
 
         if (FlushRequest)
         {
-#ifdef LITEV_TMP_POLYHASH
-            {
-                u64 h = 1469598103934665603ull;
-                auto mix = [&](u64 v) { h = (h ^ v) * 1099511628211ull; };
-                for (u32 i = 0; i < NumVertices; i++)
-                {
-                    const Vertex& v = CurVertexRAM[i];
-                    for (int k = 0; k < 4; k++) mix((u32)v.Position[k]);
-                    for (int k = 0; k < 3; k++) { mix((u32)v.Color[k]); mix((u32)v.FinalColor[k]); }
-                    mix((u16)v.TexCoords[0]); mix((u16)v.TexCoords[1]); mix(v.Clipped);
-                    for (int k = 0; k < 2; k++) { mix((u32)v.FinalPosition[k]); mix((u32)v.HiresPosition[k]); }
-                }
-                for (u32 i = 0; i < NumPolygons; i++)
-                {
-                    const Polygon& p = CurPolygonRAM[i];
-                    mix(p.NumVertices);
-                    for (u32 k = 0; k < p.NumVertices; k++) { mix((u64)(p.Vertices[k] - VertexRAM)); mix((u32)p.FinalZ[k]); mix((u32)p.FinalW[k]); }
-                    mix(p.WBuffer); mix(p.Attr); mix(p.TexParam); mix(p.TexPalette); mix(p.Degenerate); mix(p.FacingView);
-                    mix(p.Translucent); mix(p.IsShadowMask); mix(p.IsShadow); mix(p.Type); mix(p.VTop); mix(p.VBottom);
-                    mix((u32)p.YTop); mix((u32)p.YBottom); mix((u32)p.XTop); mix((u32)p.XBottom); mix(p.SortKey);
-                }
-                mix(NumOpaquePolygons); mix(DispCnt);
-                fprintf(stderr, "POLYHASH %u %u %016llx\n", NumPolygons, NumVertices, (unsigned long long)h);
-            }
-#endif
             CurRAMBank = CurRAMBank?0:1;
             CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
             CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
