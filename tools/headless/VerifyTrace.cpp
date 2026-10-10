@@ -1001,6 +1001,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_REMOTE_GX_SINK
     if (getenv("LITEV_MP_GXSINK1") || getenv("LITEV_MP_GXTIMING"))   // Netplay: every console, local too
         for (int k = 0; k < n; k++) b[k].nds->GPU.GPU3D.TimingFixed = true;
+#ifdef LITEV_REMOTE_GX_MODEL
+    if (getenv("LITEV_MP_GXMODEL"))   // every console: the fixed per-command GX timing
+        for (int k = 0; k < n; k++) b[k].nds->GPU.GPU3D.TimingModel = b[k].nds->GPU.GPU3D.TimingFixed = true;
+#endif
 #endif
 #ifdef LITEV_A7PROF
     if (getenv("LITEV_PROF_INST")) A7Prof::Target = b[atoi(getenv("LITEV_PROF_INST"))].nds.get();

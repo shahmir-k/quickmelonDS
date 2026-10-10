@@ -245,6 +245,14 @@ public:
     // every polygon as culled (on hardware an accepted one holds the pipeline longer),
     // so the timing depends only on the command stream and a sink copy keeps its owner's timing.
     bool TimingFixed = false;
+#ifdef LITEV_REMOTE_GX_MODEL
+    // every console of the session (with TimingFixed): GX command timing from kGXModelCost only;
+    // Sink then skips the executor (SinkEntry)
+    bool TimingModel = false;
+    static const u8 kGXModelCost[256];
+    template<bool Bulk> void SinkEntry(const CmdFIFOEntry& e) noexcept;
+    void GXModelCal(u32 cmd, s32 cyc, bool done) noexcept;
+#endif
 #endif
 #ifdef LITEV_FF_HEADLESS3D
     // BankBuiltHeadless: the bank being built got polygons while Headless (fast-forward), so it

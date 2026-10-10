@@ -2517,6 +2517,91 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 #endif
 void GPU3D::ExecuteCommand() noexcept { ExecuteCommandT<false>(); }
 
+#ifdef LITEV_REMOTE_GX_MODEL
+// GX timing model (Netplay, every console of an allowlisted game; GPU3D::TimingModel): a command
+// costs a fixed number of cycles when it runs (1 per extra parameter word), whatever the pipeline
+// state, so the copies that skip the geometry engine (GPU3D::Sink) keep their owner's timing
+// without running the executor. Values: the mean real cost per command (TimingFixed) over a Mario
+// Kart DS 8-player race (LITEV_GXMODEL_CAL); unlisted commands 1.
+const u8 GPU3D::kGXModelCost[256] = {
+#include "GPU3D_ModelCost.inc"
+};
+
+#ifndef __ANDROID__
+void GPU3D::GXModelCal(u32 cmd, s32 cyc, bool done) noexcept
+{
+    static std::mutex m; static u64 sum[256], n[256], entries = 0;
+    std::lock_guard<std::mutex> lk(m);
+    sum[cmd] += cyc; if (done) n[cmd]++;
+    if (++entries % 20000000 == 0)
+    {
+        fprintf(stderr, "GXMODEL cal after %llu entries:", (unsigned long long)entries);
+        for (int c = 0; c < 256; c++) if (n[c]) fprintf(stderr, " [0x%02X] = %.0f/*%llu*/,", c, (double)sum[c] / n[c], (unsigned long long)n[c]);
+        fprintf(stderr, "\n");
+    }
+}
+#endif
+
+// the remote copy's command: only what the guest can see (stack levels and errors, polygon/matrix
+// mode, flush), the model's cycles, and the veto on a test command
+template<bool Bulk>
+void GPU3D::SinkEntry(const CmdFIFOEntry& e) noexcept
+{
+    const u32 cmd = e.Command, np = CmdNumParams[cmd];
+    if (np > 1)
+    {
+        ExecParams[ExecParamCount] = e.Param;
+        if (++ExecParamCount < np) { CycleCount += 1; return; }
+        ExecParamCount = 0;
+    }
+    switch (cmd)
+    {
+    case 0x10: MatrixMode = e.Param & 0x3; break;
+    case 0x11: // push
+#ifdef LITEV_GX_BULK_LEAN
+        if constexpr (!Bulk)
+#endif
+        NumPushPopCommands--;
+        if (MatrixMode == 0) { if (ProjMatrixStackPointer > 0) GXStat |= (1<<15); ProjMatrixStackPointer = (ProjMatrixStackPointer + 1) & 0x1; }
+        else if (MatrixMode == 3) { if (TexMatrixStackPointer > 0) GXStat |= (1<<15); TexMatrixStackPointer = (TexMatrixStackPointer + 1) & 0x1; }
+        else { if (PosMatrixStackPointer > 30) GXStat |= (1<<15); PosMatrixStackPointer = (PosMatrixStackPointer + 1) & 0x3F; }
+        break;
+    case 0x12: // pop
+#ifdef LITEV_GX_BULK_LEAN
+        if constexpr (!Bulk)
+#endif
+        NumPushPopCommands--;
+        if (MatrixMode == 0) { if (ProjMatrixStackPointer == 0) GXStat |= (1<<15); ProjMatrixStackPointer = (ProjMatrixStackPointer - 1) & 0x1; }
+        else if (MatrixMode == 3) { if (TexMatrixStackPointer == 0) GXStat |= (1<<15); TexMatrixStackPointer = (TexMatrixStackPointer - 1) & 0x1; }
+        else
+        {
+            const s32 offset = (s32)(e.Param << 26) >> 26;
+            PosMatrixStackPointer = (PosMatrixStackPointer - offset) & 0x3F;
+            if (PosMatrixStackPointer > 30) GXStat |= (1<<15);
+        }
+        break;
+    case 0x13: case 0x14: // store / restore
+        if (MatrixMode != 0 && MatrixMode != 3 && (e.Param & 0x1F) > 30) GXStat |= (1<<15);
+        break;
+    case 0x29: PolygonAttr = e.Param; break;
+    case 0x40:
+        PolygonMode = e.Param & 0x3;
+        VertexNum = 0; VertexNumInPoly = 0; NumConsecutivePolygons = 0; LastStripPolygon = NULL;
+        CurPolygonAttr = PolygonAttr;
+        break;
+    case 0x50: // flush: as the executor
+        FlushRequest = 1; SwapCount++; FlushAttributes = e.Param & 0x3; CycleCount = 325;
+        VertexPipeline = NormalPipeline = PolygonPipeline = 0; VertexSlotCounter = 0; VertexSlotsFree = 1;
+        return;
+    case 0x70: SinkUse("box test", 0); NumTestCommands -= 3; break;
+    case 0x71: SinkUse("test command", 0); NumTestCommands -= 2; break;
+    case 0x72: SinkUse("test command", 0); NumTestCommands--; break;
+    default: break;
+    }
+    CycleCount += kGXModelCost[cmd];
+}
+#endif
+
 template<bool Bulk>
 void GPU3D::ExecuteCommandT() noexcept
 #else
@@ -2575,6 +2660,9 @@ gxfifo_threaded_top:
 #ifdef LITEV_ACCESS_STATS
     { extern u64 LitevAccess[6][0x10000]; LitevAccess[5][0xC000 | entry.Command]++; }   // GX FIFO entries by command
 #endif
+#ifdef LITEV_REMOTE_GX_MODEL
+    if (Sink) { SinkEntry<Bulk>(entry); goto gxs_sinked; }
+#endif
 #ifdef LITEV_GX_CMD_SLIM
 #ifndef LITEV_GXFIFO_THREADED
 #error "LITEV_GX_CMD_SLIM needs LITEV_GXFIFO_THREADED"
@@ -2621,6 +2709,9 @@ gxfifo_threaded_top:
         [0x1C] = &&gxs_1C, [0x23] = &&gxs_23, [0x34] = &&gxs_34,
         [0x71] = &&gxs_71, [0x70] = &&gxs_70,
     };
+#ifdef LITEV_REMOTE_GX_MODEL
+    const s32 ccModel0 = CycleCount;
+#endif
     const u32 cmd = entry.Command;
     const u32 np = CmdNumParams[cmd];
     s32 cyc;
@@ -3035,6 +3126,17 @@ gxs_72: // vec test
 gxs_post:   // a handler's trailing AddCycles
     AddCycles(cyc);
 gxs_end: ;
+#ifdef LITEV_REMOTE_GX_MODEL
+    if (cmd != 0x50)
+    {
+        const bool done = np <= 1 || ExecParamCount == 0;   // the command ran (else one of its parameters)
+#ifndef __ANDROID__
+        static const bool cal = getenv("LITEV_GXMODEL_CAL") != nullptr;   // Mac: real cycles per command (TimingFixed)
+        if (cal && !TimingModel) GXModelCal(cmd, CycleCount - ccModel0, done);
+#endif
+        if (TimingModel) CycleCount = ccModel0 + (done ? (s32)kGXModelCost[cmd] : 1);
+    }
+#endif
     }
 #else
     u32 paramsRequiredCount = CmdNumParams[entry.Command];
@@ -4211,6 +4313,9 @@ gxs_end: ;
         }
     }
 #endif // LITEV_GX_CMD_SLIM
+#ifdef LITEV_REMOTE_GX_MODEL
+gxs_sinked:
+#endif
 #ifdef LITEV_GXFIFO_THREADED
     // Threaded loop-tail: instead of returning, re-run the whole ExecuteCommand
     // body for the next queued command (mirrors Run()'s drain-loop condition).
