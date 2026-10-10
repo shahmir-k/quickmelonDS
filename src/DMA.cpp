@@ -17,6 +17,7 @@
 */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include "NDS.h"
 #include "DSi.h"
 #include "DMA.h"
@@ -702,6 +703,45 @@ void DMA::Run9()
         static int _gxinline = 1;
 #endif
 #endif
+#ifdef LITEV_GX_BULK
+        // Bulk: with the FIFO empty, take up to 64 words at once (the DMA's own timing, summed)
+        // and run their commands straight away; see GPU3D::BulkWords. Deterministic, but the
+        // geometry timing is approximate. Falls through to the per-word loops otherwise.
+#if defined(__ANDROID__)
+        static const int _gxbulk = litevDmaPropDefaultOn("debug.litev.gxbulk") ? 1 : 0;
+#else
+        static const int _gxbulk = getenv("LITEV_GXBULK") ? atoi(getenv("LITEV_GXBULK")) : 1;
+#endif
+        if (_gxbulk && SrcAddrInc > 0 && gpu3d.GeometryEnabled)
+        {
+            while (IterCount > 0 && !Stall && gpu3d.BulkReady())
+            {
+                u32 words[64];
+                const u32 n = IterCount < 64 ? IterCount : 64;
+                u32 cycles = 0;
+                for (u32 i = 0; i < n; i++)
+                {
+                    if (burststart || MRAMBurstTable[MRAMBurstCount] == 0)
+                    {
+                        MRAMBurstCount = 0;
+                        const u32 dst_n = NDS.ARM9MemTimings[0x1000][6];
+                        MRAMBurstTable = (dst_n == 2) ?
+                            DMATiming::MRAMRead32Bursts[0] : DMATiming::MRAMRead32Bursts[1];
+                    }
+                    cycles += MRAMBurstTable[MRAMBurstCount++];
+                    burststart = false;
+                    words[i] = *(u32*)&NDS.MainRAM[CurSrcAddr & NDS.MainRAMMask];
+                    CurSrcAddr += SrcAddrInc<<2;
+                }
+                NDS.ARM9Timestamp += (u64)cycles << NDS.ARM9ClockShift;
+                IterCount -= n;
+                RemCount -= n;
+                gpu3d.BulkWords(words, n);
+
+                if (NDS.ARM9Timestamp >= NDS.ARM9Target) goto gxfifo_done;
+            }
+        }
+#endif
         if (_gxtiminginline && _gxfifotiming && SrcAddrInc > 0)
         {
             while (IterCount > 0 && !Stall)
@@ -762,6 +802,9 @@ void DMA::Run9()
 
             if (NDS.ARM9Timestamp >= NDS.ARM9Target) break;
         }
+#ifdef LITEV_GX_BULK
+gxfifo_done: ;
+#endif
     }
 #endif
     else
