@@ -329,6 +329,11 @@ void Compiler::Comp_RetriveFlags(bool retriveCV)
         }
         if (!wm)
             return;
+        {
+            u8 mm = (u8)(wm >> 28);
+            if (Comp_FlagsPrefixMerge(mm))
+                return;
+        }
         LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
         if (CurInstr.SetFlags & 0x4) { CSET(W0, CC_EQ); BFI(W1, W0, 30, 1); }
         if (CurInstr.SetFlags & 0x8) { CSET(W0, CC_MI); BFI(W1, W0, 31, 1); }
@@ -395,6 +400,30 @@ void Compiler::Comp_RetriveFlags(bool retriveCV)
     }
 }
 
+#ifdef LITEV_JIT_LAZYFLAGS
+// LITEV_JIT_FLAGS_BFXIL: write the host N (N,Z / N,Z,C) flags into the JitNZCV slot, keeping
+// its lower flag bits, as MRS + LDR + BFXIL + STR instead of LDR + a CSET/BFI pair per flag +
+// STR. MRS yields host NZCV in [31:28] (low bits 0), the same bits the CSETs read; the BFXIL
+// copies slot[k-1:0] (the kept flags + zero low bits) under them. Leaves host PSTATE as is.
+// Only for a top prefix of the flags (mask 8, C or E); returns false (nothing emitted) else.
+bool Compiler::Comp_FlagsPrefixMerge(u8 m)
+{
+#ifdef LITEV_JIT_FLAGS_BFXIL
+    if (!JitQOn(jitq_FlagsBfxil) || (m != 0xC && m != 0xE))
+        return false;
+    int keep = m == 0xC ? 30 : 29;    // slot bits [keep-1:0] survive
+    MRS(X0, FIELD_NZCV);
+    LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, JitNZCV));
+    BFM(W0, W1, 0, keep - 1);         // BFXIL w0, w1, #0, #keep
+    STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, JitNZCV));
+    return true;
+#else
+    (void)m;
+    return false;
+#endif
+}
+#endif
+
 #ifdef LITEV_JIT_FIXEDREG
 void Compiler::Comp_MaterializeFlags()
 {
@@ -451,6 +480,9 @@ void Compiler::Comp_MaterializeFlags()
 #ifdef LITEV_EXIT_PROTO_NZCV
         LastFlushFull = true;
 #endif
+    }
+    else if (Comp_FlagsPrefixMerge(m))
+    {
     }
     else
     {

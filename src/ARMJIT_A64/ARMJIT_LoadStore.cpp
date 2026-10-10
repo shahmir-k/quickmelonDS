@@ -343,10 +343,41 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
             ? PatchedStoreFuncs[NDS.ConsoleType][Num][__builtin_ctz(size) - 3][rdMapped]
             : PatchedLoadFuncs[NDS.ConsoleType][Num][__builtin_ctz(size) - 3][!!(flags & memop_SignExtend)][rdMapped];
 
+#ifdef LITEV_JIT_LDR_ALIGNCHK
+        // Word / halfword LOAD: test the alignment and load from the address itself, instead of
+        // masking it (and rotating a word afterwards). An aligned access, the normal case, then
+        // has no ALU op between the address and the load nor between the load and its user
+        // (2 cycles less on the A55's load chain); a misaligned one runs the slow-path thunk
+        // from the block tail, which rotates / masks exactly as the fastmem sequence did.
+        if (!(flags & memop_Store) && size > 8 && !(size == 32 && addrIsStatic) && JitQOn(jitq_LdrAlignChk))
+        {
+            FixupBranch misaligned;
+            if (size == 32)
+            {
+                ANDI2R(W1, W0, 3);
+                misaligned = CBNZ(W1);
+            }
+            else
+                misaligned = TBNZ(W0, 0);
+            ptrdiff_t loadPosition = GetCodeOffset();
+            LDRGeneric(size, flags & memop_SignExtend, rdMapped, X0, RMemBase);
+            patch.PatchOffset = memopStart - loadPosition;
+            patch.PatchSize = GetCodeOffset() - memopStart;
+            LoadStorePatches[loadPosition] = patch;
+            TailStub t{};
+            t.Kind = 1;
+            t.A = misaligned;
+            t.Func = patch.PatchFunc;
+            t.Back = (const u8*)GetRXPtr();
+            TailStubs.push_back(t);
+        }
+        else
+#endif
+        {
         // take a chance at fastmem
         if (size > 8)
             ANDI2R(W1, W0, addressMask);
-        
+
         ptrdiff_t loadStorePosition = GetCodeOffset();
         if (flags & memop_Store)
         {
@@ -365,6 +396,7 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
         patch.PatchOffset = memopStart - loadStorePosition;
         patch.PatchSize = GetCodeOffset() - memopStart;
         LoadStorePatches[loadStorePosition] = patch;
+        }
     }
     else
     {

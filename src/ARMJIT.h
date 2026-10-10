@@ -230,7 +230,12 @@ public:
 }
 
 // Defined in assembly
+#ifdef LITEV_JIT_MEMBASE_PIN
+// memBase: this CPU's fastmem base, kept in x26 for the whole slice (blocks no longer load it)
+extern "C" void ARM_Dispatch(melonDS::ARM* cpu, melonDS::JitBlockEntry entry, void* memBase);
+#else
 extern "C" void ARM_Dispatch(melonDS::ARM* cpu, melonDS::JitBlockEntry entry);
+#endif
 #else
 namespace melonDS
 {

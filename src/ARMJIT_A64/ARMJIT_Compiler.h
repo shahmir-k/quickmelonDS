@@ -415,6 +415,7 @@ public:
     // eager shifter-C writes now that RCPSR[29] is gone (the interim memory RMW the design
     // flags as the L4 lazy-shifter-C target).
     void Comp_CPSRInsertBitToMem(Arm64Gen::ARM64Reg word, Arm64Gen::ARM64Reg src, int pos);
+    bool Comp_FlagsPrefixMerge(u8 m);
 #endif
 #endif
 
@@ -429,6 +430,9 @@ public:
     void Comp_RegShiftReg(int op, bool S, Op2& op2, Arm64Gen::ARM64Reg rs);
 
     bool Comp_MemLoadLiteral(int size, bool signExtend, int rd, u32 addr);
+#ifdef LITEV_JIT_R15_ELIDE
+    bool R15LiteralLoadFolds(CompileFunc comp);
+#endif
 
     enum
     {
@@ -578,6 +582,95 @@ public:
 #endif
 
     void Comp_BranchSpecialBehaviour(bool taken);
+
+    // JIT code-quality levers (debug.litev.jitq bitmask, latched at Reset(); default all on).
+    // Each is exact: same guest state and cycles, only the host code changes.
+    enum
+    {
+        jitq_ExitTail = 1 << 0,      // LITEV_JIT_EXIT_TAIL
+        jitq_MemBasePin = 1 << 1,    // LITEV_JIT_MEMBASE_PIN
+        jitq_FlagsBfxil = 1 << 2,    // LITEV_JIT_FLAGS_BFXIL
+        jitq_R15Elide = 1 << 3,      // LITEV_JIT_R15_ELIDE
+        jitq_LdrAlignChk = 1 << 4,   // LITEV_JIT_LDR_ALIGNCHK
+        jitq_CodeCyclesDead = 1 << 5,// LITEV_JIT_CODECYCLES_DEAD
+        jitq_ColdExits = 1 << 6,     // LITEV_JIT_COLD_EXITS
+    };
+    u32 JitQ = 0;
+    bool JitQOn(u32 bit) const { return (JitQ & bit) != 0; }
+
+#if defined(LITEV_JIT_EXIT_TAIL) || defined(LITEV_JIT_LDR_ALIGNCHK) || defined(LITEV_JIT_COLD_EXITS)
+    // Cold code of the block being compiled, emitted after its last exit (EmitTailStubs) so
+    // the executed path is contiguous: fewer instruction-cache lines per block on the A55.
+    // Branches into the tail are conditional (+-1 MB) or TBNZ (+-32 KB); a block is < 16 KB.
+    struct TailStub
+    {
+        u8 Kind;                  // 0 = link exit stub, 1 = slow load, 2 = cold exit (ColdExits[Index])
+        u32 Index;
+        Arm64Gen::FixupBranch A;  // link: budget-expired branch (B.LE); load: misaligned branch
+        Arm64Gen::FixupBranch B;  // link: the unlinked target trampoline (B)
+        bool PCElided;            // link: store NewPC to R[15]
+        u32 NewPC;
+        void* Func;               // load: patched slow-path thunk
+        const u8* Back;           // load: where to continue
+    };
+    std::vector<TailStub> TailStubs;
+    void EmitTailStubs();
+#endif
+
+#ifdef LITEV_JIT_COLD_EXITS
+    // LITEV_JIT_COLD_EXITS: the exit edge of a followed conditional branch (its taken edge for
+    // branch_FollowCondNotTaken, its not-taken edge for branch_FollowCondTaken) is compiled at
+    // the block tail with the compiler state it had in place, so the path the block follows
+    // runs straight on (no taken branch over the exit, no exit code in its cache lines).
+    struct CompState
+    {
+        RegisterCache<Compiler, Arm64Gen::ARM64Reg> RegCache;
+        FetchedInstr CurInstr;
+        u32 R15, CodeRegion, ConstantCycles;
+        bool Exit, IrregularCycles, CPSRDirty;
+#ifdef LITEV_JIT_CYCLE_BATCH
+        u32 PendingCycles;
+        bool DeferCycles;
+#endif
+#ifdef LITEV_JIT_FIXEDREG
+        u8 NZCVDeferred;
+        bool NZCVCondValid;
+#endif
+#ifdef LITEV_JIT_LAZYFLAGS
+        u8 FlagsLiveInCur;
+        bool CarryInHostResident;
+#ifdef LITEV_EXIT_PROTO_NZCV
+        bool NZCVHostSynced, LastFlushFull;
+#endif
+#endif
+#ifdef LITEV_JIT_LINK
+        bool HasStaticExit, StaticExitCond;
+        u32 StaticExitTarget, StaticExitNewPC;
+#endif
+#ifdef LITEV_EXIT_PROTO_PC
+        bool PCElided;
+#endif
+#ifdef LITEV_JIT_RAS
+        bool RasRetBlock;
+#endif
+    };
+    void SaveCompState(CompState& s);
+    void LoadCompState(const CompState& s);
+    struct ColdExit
+    {
+        CompState State;
+        u8 Kind;   // 0 = ARM taken exit (body + exit), 1 = not-taken exit, 2 = Thumb BCOND taken exit
+    };
+    std::vector<ColdExit> ColdExits;
+    // CPU fields Comp_JumpTo(u32) changes at compile time (C++ reads them after the compile:
+    // e.g. the ARM7 compile pass takes CodeCycles as the next block's code timing)
+    struct CpuJumpFields { u32 CodeRegion; s32 CodeCycles, RegionCodeCycles; MemRegion CodeMem; u32 R15; };
+    void SaveCpuJumpFields(CpuJumpFields& f);
+    void LoadCpuJumpFields(const CpuJumpFields& f);
+    bool ColdExitOK() const;
+    void DeferColdExit(Arm64Gen::FixupBranch from, u8 kind);
+    void EmitColdExit(const ColdExit& e);
+#endif
 
     JitBlockEntry AddEntryOffset(u32 offset)
     {

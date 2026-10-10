@@ -487,6 +487,31 @@ void Compiler::A_Comp_BranchXchangeReg()
 void Compiler::T_Comp_BCOND()
 {
     u32 cond = (CurInstr.Instr >> 8) & 0xF;
+#ifdef LITEV_JIT_COLD_EXITS
+    if (ColdExitOK())
+    {
+        // see Compiler::ColdExit; mirrors the in-place sequence below edge by edge
+        if (CurInstr.BranchFlags & branch_FollowCondNotTaken)
+        {
+            DeferColdExit(CheckCondition(cond ^ 1), 2);
+            IrregularCycles = true;   // what the deferred Comp_JumpTo sets
+            Comp_AddCycles_C(true);
+        }
+        else
+        {
+            FixupBranch notTaken = CheckCondition(cond);
+            s32 offset = (s32)(CurInstr.Instr << 24) >> 23;
+            Comp_JumpTo(R15 + offset + 1, true);
+            Comp_BranchSpecialBehaviour(true);
+            Comp_AddCycles_C(true);
+            DeferColdExit(notTaken, 1);
+  #ifdef LITEV_EXIT_PROTO_PC
+            PCElided = false;
+  #endif
+        }
+        return;
+    }
+#endif
     FixupBranch skipExecute = CheckCondition(cond);
 
     s32 offset = (s32)(CurInstr.Instr << 24) >> 23;
