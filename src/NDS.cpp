@@ -146,6 +146,9 @@ NDS::NDS(NDSArgs&& args, int type, void* userdata) noexcept :
         DMA(1, 3, *this),
     }
 {
+#ifdef LITEV_A7PROF
+    if (!A7Prof::Target) A7Prof::Target = this;   // (headless --mp-test picks another with LITEV_PROF_INST)
+#endif
     NDSCartSlots[0] = &NDSCartSlot;
     NDSCartSlots[1] = nullptr;
 
@@ -1323,7 +1326,7 @@ u32 NDS::RunFrame()
 u32 NDS::RunFrame()
 {
 #ifdef LITEV_A7PROF
-    if (A7Prof::g.EndFrame())
+    if (this == A7Prof::Target && A7Prof::g.EndFrame())
     {
         // ARM7 view of main RAM (4 MB) + shared WRAM window + ARM7 WRAM, for disassembly
         std::string o = std::string(A7Prof::g.out) + ".mem";
@@ -1334,7 +1337,7 @@ u32 NDS::RunFrame()
             fclose(f);
         }
     }
-    if (A7Prof::g9.EndFrame())
+    if (this == A7Prof::Target && A7Prof::g9.EndFrame())
     {
         // ARM9 view: main RAM (4 MB, bus) + ITCM (32 KB, at 0x01FF8000 in NitroSDK games)
         std::string o = std::string(A7Prof::g9.out) + ".mem";
@@ -3192,7 +3195,7 @@ bool NDS::ARM7GetMemRegion(u32 addr, bool write, MemRegion* region)
 LITEV_MEM_SPLIT_NOINLINE u8 NDS::ARM9IORead8(u32 addr)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g9.IO(addr | 0);
+    if (this == A7Prof::Target) A7Prof::g9.IO(addr | 0);
 #endif
 #ifdef LITEV_LAZY_DIV
     if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
@@ -3292,7 +3295,7 @@ LITEV_MEM_SPLIT_NOINLINE u8 NDS::ARM9IORead8(u32 addr)
 LITEV_MEM_SPLIT_NOINLINE u16 NDS::ARM9IORead16(u32 addr)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g9.IO(addr | 0);
+    if (this == A7Prof::Target) A7Prof::g9.IO(addr | 0);
 #endif
 #ifdef LITEV_LAZY_DIV
     if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
@@ -3427,7 +3430,7 @@ LITEV_MEM_SPLIT_NOINLINE u16 NDS::ARM9IORead16(u32 addr)
 LITEV_MEM_SPLIT_NOINLINE u32 NDS::ARM9IORead32(u32 addr)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g9.IO(addr | 0);
+    if (this == A7Prof::Target) A7Prof::g9.IO(addr | 0);
 #endif
 #ifdef LITEV_LAZY_DIV
     if (DivDirty && (u32)(addr - 0x04000280) < 0x30 && (u32)(addr - 0x04000290) >= 0x10) { DivDirty = false; DivDone(0); }
@@ -3663,7 +3666,7 @@ LITEV_MEM_SPLIT_NOINLINE u32 NDS::ARM9IORead32(u32 addr)
 LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite8(u32 addr, u8 val)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g9.IO(addr | 0x80000000);
+    if (this == A7Prof::Target) A7Prof::g9.IO(addr | 0x80000000);
 #endif
     switch (addr)
     {
@@ -3785,7 +3788,7 @@ LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite8(u32 addr, u8 val)
 LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite16(u32 addr, u16 val)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g9.IO(addr | 0x80000000);
+    if (this == A7Prof::Target) A7Prof::g9.IO(addr | 0x80000000);
 #endif
     switch (addr)
     {
@@ -3965,7 +3968,7 @@ LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite16(u32 addr, u16 val)
 LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite32(u32 addr, u32 val)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g9.IO(addr | 0x80000000);
+    if (this == A7Prof::Target) A7Prof::g9.IO(addr | 0x80000000);
 #endif
 #ifdef LITEV_IO_DISPATCH_TABLE
     // Fast O(1) dispatch for word-aligned accesses in the primary 8 KB I/O window
@@ -4328,7 +4331,7 @@ LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite32(u32 addr, u32 val)
 u8 NDS::ARM7IORead8(u32 addr)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g.IO(addr | 0);
+    if (this == A7Prof::Target) A7Prof::g.IO(addr | 0);
 #endif
     switch (addr)
     {
@@ -4383,7 +4386,7 @@ u8 NDS::ARM7IORead8(u32 addr)
 u16 NDS::ARM7IORead16(u32 addr)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g.IO(addr | 0);
+    if (this == A7Prof::Target) A7Prof::g.IO(addr | 0);
 #endif
     switch (addr)
     {
@@ -4461,7 +4464,7 @@ u16 NDS::ARM7IORead16(u32 addr)
 u32 NDS::ARM7IORead32(u32 addr)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g.IO(addr | 0);
+    if (this == A7Prof::Target) A7Prof::g.IO(addr | 0);
 #endif
     switch (addr)
     {
@@ -4543,7 +4546,7 @@ u32 NDS::ARM7IORead32(u32 addr)
 void NDS::ARM7IOWrite8(u32 addr, u8 val)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g.IO(addr | 0x80000000);
+    if (this == A7Prof::Target) A7Prof::g.IO(addr | 0x80000000);
 #endif
     switch (addr)
     {
@@ -4648,7 +4651,7 @@ void NDS::ARM7IOWrite8(u32 addr, u8 val)
 void NDS::ARM7IOWrite16(u32 addr, u16 val)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g.IO(addr | 0x80000000);
+    if (this == A7Prof::Target) A7Prof::g.IO(addr | 0x80000000);
 #endif
     switch (addr)
     {
@@ -4799,7 +4802,7 @@ void NDS::ARM7IOWrite16(u32 addr, u16 val)
 void NDS::ARM7IOWrite32(u32 addr, u32 val)
 {
 #ifdef LITEV_A7PROF
-    A7Prof::g.IO(addr | 0x80000000);
+    if (this == A7Prof::Target) A7Prof::g.IO(addr | 0x80000000);
 #endif
     switch (addr)
     {

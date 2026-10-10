@@ -140,6 +140,8 @@ struct Prof
         fprintf(stderr, "A7PROF: %llu frames profiled -> %s.{pcs,fns}.tsv\n", (unsigned long long)f, out);
     }
 };
+// the one console profiled (headless --mp-test: LITEV_PROF_INST=k; else the first one built)
+inline const void* Target = nullptr;
 inline Prof g{"LITEV_A7PROF", 0x18};
 inline Prof g9{"LITEV_A9PROF", 0xFFFF0018};
 }

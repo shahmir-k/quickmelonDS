@@ -1452,7 +1452,7 @@ void ARMv5::Execute()
                 if (A9HLE::CheckPending) A9HLE::CheckAt(this, R[15] - 4);
 #endif
 #ifdef LITEV_A7PROF
-                A7Prof::g9.Pre(R[15] - 4, 2, CPSR, R[14]);
+                if (&NDS == A7Prof::Target) A7Prof::g9.Pre(R[15] - 4, 2, CPSR, R[14]);
                 const u32 a9pc = R[15] - 4;
 #endif
 #ifdef LITEV_A9HLE
@@ -1461,7 +1461,7 @@ void ARMv5::Execute()
 #endif
                 ARMInterpreter::THUMBInstrTable[icode](this);
 #ifdef LITEV_A7PROF
-                A7Prof::g9.Post(a9pc, Cycles);
+                if (&NDS == A7Prof::Target) A7Prof::g9.Post(a9pc, Cycles);
 #endif
             }
             else
@@ -1477,7 +1477,7 @@ void ARMv5::Execute()
 
                 // actually execute
 #ifdef LITEV_A7PROF
-                A7Prof::g9.Pre(R[15] - 8, 4, CPSR, R[14]);
+                if (&NDS == A7Prof::Target) A7Prof::g9.Pre(R[15] - 8, 4, CPSR, R[14]);
                 const u32 a9pc = R[15] - 8;
 #endif
 #ifdef LITEV_A9HLE
@@ -1503,7 +1503,7 @@ void ARMv5::Execute()
                 else
                     AddCycles_C();
 #ifdef LITEV_A7PROF
-                A7Prof::g9.Post(a9pc, Cycles);
+                if (&NDS == A7Prof::Target) A7Prof::g9.Post(a9pc, Cycles);
 #endif
             }
 
@@ -1619,7 +1619,7 @@ void ARMv4::Execute()
                 NDS.JIT.CompileBlock(this);
 
 #ifdef LITEV_A7PROF
-            A7Prof::g.Jit(block != nullptr, NDS.ARM7Timestamp + Cycles - a7t0);
+            if (&NDS == A7Prof::Target) A7Prof::g.Jit(block != nullptr, NDS.ARM7Timestamp + Cycles - a7t0);
 #endif
 #if defined(LITEV_SHADOW_ASSERT)
             LiteV_ShadowAssertBudget("ARM7", Cycles, CyclesBudget,
@@ -1674,12 +1674,12 @@ void ARMv4::Execute()
                 // actually execute
                 u32 icode = (CurInstr >> 6);
 #ifdef LITEV_A7PROF
-                A7Prof::g.Pre(R[15] - 4, 2, CPSR, R[14]);
+                if (&NDS == A7Prof::Target) A7Prof::g.Pre(R[15] - 4, 2, CPSR, R[14]);
                 const u32 a7pc = R[15] - 4;
 #endif
                 ARMInterpreter::THUMBInstrTable[icode](this);
 #ifdef LITEV_A7PROF
-                A7Prof::g.Post(a7pc, Cycles);
+                if (&NDS == A7Prof::Target) A7Prof::g.Post(a7pc, Cycles);
 #endif
             }
             else
@@ -1695,7 +1695,7 @@ void ARMv4::Execute()
 
                 // actually execute
 #ifdef LITEV_A7PROF
-                A7Prof::g.Pre(R[15] - 8, 4, CPSR, R[14]);
+                if (&NDS == A7Prof::Target) A7Prof::g.Pre(R[15] - 8, 4, CPSR, R[14]);
                 const u32 a7pc = R[15] - 8;
 #endif
 #ifdef LITEV_A7HLE
@@ -1711,7 +1711,7 @@ void ARMv4::Execute()
                 else
                     AddCycles_C();
 #ifdef LITEV_A7PROF
-                A7Prof::g.Post(a7pc, Cycles);
+                if (&NDS == A7Prof::Target) A7Prof::g.Post(a7pc, Cycles);
 #endif
             }
 

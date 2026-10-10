@@ -3,6 +3,10 @@
     See VerifyTrace.h for the oracle rationale.
 */
 
+#ifdef __APPLE__
+#include <cstddef>
+extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsystem_kernel: this thread's PMU counts
+#endif
 #include <cstdlib>
 #include "VerifyTrace.h"
 #include "LockstepMP.h"
@@ -36,6 +40,9 @@
 #include "xxhash/xxhash.h"
 
 #include "PlatformHeadless.h"
+#ifdef LITEV_A7PROF
+#include "ARM7Prof.h"
+#endif
 #include "LiteProfile.h"
 #include "InputScript.h"
 #include "MPInterface.h"
@@ -919,7 +926,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         c.inputScript = (k < (int)scripts.size() && !scripts[k].empty()) ? scripts[k] : cfg.inputScript;
         instScripts[k] = c.inputScript;
         std::string err;
-        if (!BuildAndBoot(c, true, b[k], err)) { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
+        if (!BuildAndBoot(c, std::nullopt, b[k], err)) { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
         printf("console %d rom: %s (xxh3 %016llx)\n", k, c.rom.c_str(), (unsigned long long)b[k].romHash);
     }
     // Instance 0 knobs act on instance 0; the "1" knobs on every other instance (with two
@@ -991,6 +998,9 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_REMOTE_GX_SINK
     if (getenv("LITEV_MP_GXSINK1") || getenv("LITEV_MP_GXTIMING"))   // Netplay: every console, local too
         for (int k = 0; k < n; k++) b[k].nds->GPU.GPU3D.TimingFixed = true;
+#endif
+#ifdef LITEV_A7PROF
+    if (getenv("LITEV_PROF_INST")) A7Prof::Target = b[atoi(getenv("LITEV_PROF_INST"))].nds.get();
 #endif
     // Install one shared in-process link and give each instance a distinct id.
     // LITEV_MP_LOCKSTEP=1: the deterministic LockstepMP (Netplay) instead of LocalMP. Netplay
@@ -1270,6 +1280,15 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                         static thread_local double lastCpu = 0;
                         LockstepMP::WaitStats w = lockstepMP->TakeWaitStats(inst);
                         double fr = every;
+#ifdef __APPLE__
+                        {   // this console's thread: host instructions per frame (PMU; steadier than CPU time on a busy Mac)
+                            uint64_t c[2] = {0, 0};
+                            thread_selfcounts(1, c, sizeof(c));
+                            static thread_local uint64_t lastIns = 0;
+                            printf("inst%d ins %d: %.0f K/f\n", inst, f + 1, (c[0] - lastIns) / 1e3 / every);
+                            lastIns = c[0];
+                        }
+#endif
                         printf("inst%d wait %d: cpu %.2f ms/f | pkt %.0f calls %.1f blocked %.2f ms | host %.0f calls %.1f blocked %.2f ms | replies %.1f calls %.1f blocked %.2f ms | wakeups %.1f /f | host lock contended %.1f /f %.3f ms/f | missed wakes %.2f /f\n",
                                inst, f + 1, (cpu - lastCpu) / fr, w.Calls[0] / fr, w.Blocked[0] / fr, w.Ns[0] / 1e6 / fr,
                                w.Calls[1] / fr, w.Blocked[1] / fr, w.Ns[1] / 1e6 / fr, w.Calls[2] / fr, w.Blocked[2] / fr, w.Ns[2] / 1e6 / fr, w.Wakeups / fr, w.Contended / fr, w.LockNs / 1e6 / fr, w.Missed / fr);
