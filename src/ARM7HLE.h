@@ -18,6 +18,10 @@
 // stayed within what it handles. A note that needs a new channel (bank lookup + allocation)
 // falls back to the guest for that call (~4-14% of calls on PW).
 //
+// The SND hardware commit after a tick (0x03800870: per channel the stop / timer / volume / pan stores to the
+// SOUND registers, the shadow bytes, the flags cleared; ~550 guest instructions a call) runs natively when no
+// channel starts, with the guest's stack frames and final registers (category B: a fitted cycle estimate).
+//
 // Under the JIT the code is verified when the hook block is compiled and the block depends on
 // it (no per-call compare); MI_CpuCopy32 from ARM7 WRAM to main RAM copies through host
 // pointers with the JIT invalidation check per 16-byte granule instead of two bus calls a word.
