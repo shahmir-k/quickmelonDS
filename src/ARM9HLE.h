@@ -24,7 +24,10 @@
 // have arrived inside the elided round trip is taken right after it). Deterministic.
 // Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS:
 // 0 off, 1 all, other values = the mask below.
-// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send; 8 needs 1) for A/B of single hooks.
+// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 64 LZ; 8 needs 1; 32 is
+// reserved for the unshipped card loop) for A/B of single hooks.
+// Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black), probed when a
+// hook entry of that variant is first reached; hook 6 is position independent (any game).
 //
 // 3. Whole HBlank IRQs (~265 a frame on PW, ~3.8k Mac host instructions each through the JIT
 //    even with 1. native; ~1.7k native): when the only pending enabled IRQ is HBlank and the game's HBlank callback
@@ -44,6 +47,10 @@
 //    estimate per elided IRQ. Check mode (build with LITEV_A9HLE_GXCHECK) compares the words
 //    the guest sends to GXFIFO, and src/length where the native path would leave them.
 //
+// Diagnostics (build with LITEV_HLE_DIAG; compiled out of shipping builds):
+// 6. MIi_UncompressBackward (backward LZ, overlay/data unpacking in loading): the loop natively in
+//    256-byte chunks with the guest's exact registers at each stop (see ARM9HLE.cpp).
+//
 // LITEV_A9HLE_CHECK=1 (env, interpreter mode): compute the native result, run the guest code
 // instead, and at the guest's return compare all of main RAM, ITCM, DTCM and the registers
 // with the native prediction. LITEV_A9HLE_STATS=1: counts, host ns per native call (and measured
@@ -62,7 +69,7 @@ namespace melonDS { class ARM; class ARMv5; class NDS; }
 namespace melonDS::A9HLE
 {
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
-inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8; }
+inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001; }
 // JIT decode: is the ARM-mode instruction at addr a hooked entry?
 // 0 no, 1 yes (code signature verified: under the JIT this compile-time check is the code
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the
@@ -72,7 +79,7 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr);
 // so any write there invalidates the block (and the next compile re-verifies)
 struct Range { u32 a, b; };
 constexpr int kNumCode = 17;
-int Deps(u32 addr, const Range*& r);
+int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r);
 // Execute the hook at R15-8 (native, or the guest instruction on fallback). jit: reached from a
 // JIT-compiled hook (code already verified); else the code is compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).
@@ -86,12 +93,18 @@ void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
 // ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted)
 void BlockGone(melonDS::NDS& nds, const void* block);
 // interpreter check mode: called before every ARM9 instruction while a check is pending
+// (compiled out without LITEV_HLE_DIAG)
+#ifdef LITEV_HLE_DIAG
 extern bool CheckPending;
+void CheckAt(melonDS::ARM* cpu, u32 pc);
+#else
+constexpr bool CheckPending = false;
+inline void CheckAt(melonDS::ARM*, u32) {}
+#endif
 #ifdef LITEV_A9HLE_GXCHECK
 // check mode of 5. (diagnostic build): words written to GXFIFO / other geometry command writes
 extern std::vector<u32>* GxTap;
 extern bool GxOtherSeen;
 #endif
-void CheckAt(melonDS::ARM* cpu, u32 pc);
 }
 #endif

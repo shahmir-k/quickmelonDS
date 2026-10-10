@@ -603,6 +603,15 @@ endif()
 option(LITEV_A9HLE_GXCHECK "Diagnostic: A9HLE GX send compare mode (GXFIFO word tap)" OFF)
 if (LITEV_A9HLE_GXCHECK)
     add_compile_definitions(LITEV_A9HLE_GXCHECK=1)
+    set(LITEV_HLE_DIAG ON CACHE BOOL "" FORCE)
+endif()
+# HLE_DIAG (diagnostic): A9HLE/A7HLE compare mode (LITEV_A9HLE_CHECK / LITEV_A7HLE_CHECK /
+# LITEV_A7HLE_COMMITCHECK), dry runs (LITEV_A9HLE_DRY / _DRYIRQ) and host ns per call in the stats.
+# Without it that code is compiled out, so the shipping hooks carry none of it in their hot code.
+# Never in a shipping build.
+option(LITEV_HLE_DIAG "Diagnostic: A9HLE/A7HLE compare mode, dry runs, timing" OFF)
+if (LITEV_HLE_DIAG)
+    add_compile_definitions(LITEV_HLE_DIAG=1)
 endif()
 
 # A7PROF (diagnostic): per-guest-function ARM7 (and ARM9: env LITEV_A9PROF) profile in the interpreter (--mode interp,

@@ -17,7 +17,9 @@
 
 namespace melonDS::A7HLE
 {
+#ifdef LITEV_HLE_DIAG
 bool CheckPending = false;
+#endif
 namespace
 {
 // ---- Pokemon Black/White (NitroSDK ARM7 SND driver in ARM7 WRAM) ---------------------------
@@ -52,8 +54,12 @@ struct State
     u64 copies = 0, calls = 0, native = 0, fallbacks = 0, checks = 0, checkDiffs = 0;
 };
 std::unordered_map<const melonDS::NDS*, State> g_State;
+#ifdef LITEV_HLE_DIAG
 bool g_Check = getenv("LITEV_A7HLE_CHECK") && atoi(getenv("LITEV_A7HLE_CHECK"));
 bool g_CommitCheck = getenv("LITEV_A7HLE_COMMITCHECK") && atoi(getenv("LITEV_A7HLE_COMMITCHECK"));
+#else
+constexpr bool g_Check = false, g_CommitCheck = false;   // compare mode compiled out
+#endif
 bool g_Stats = getenv("LITEV_A7HLE_STATS") && atoi(getenv("LITEV_A7HLE_STATS"));
 
 
@@ -62,6 +68,14 @@ inline u16 R16(const u8* p) { u16 v; memcpy(&v, p, 2); return v; }
 inline u32 R32(const u8* p) { u32 v; memcpy(&v, p, 4); return v; }
 inline void W16(u8* p, u16 v) { memcpy(p, &v, 2); }
 inline void W32(u8* p, u32 v) { memcpy(p, &v, 4); }
+// a changed word written as the bus would (JIT invalidation check, store) without the bus dispatch;
+// p = host pointer of the guest word a in that region
+template <int region>
+inline void Store32(melonDS::NDS& nds, u32 a, u8* p, u32 v)
+{
+    nds.JIT.CheckAndInvalidate<1, region>(a);
+    W32(p, v);
+}
 
 bool ReadOn()
 {
@@ -438,22 +452,23 @@ struct Seq
     void w16(u32 a, u16 v) { if (a & 1) bail = true; else if (u8* p = AtW(a, 2)) W16(p, v); else bail = true; }
     void w32(u32 a, u32 v) { if (a & 3) bail = true; else if (u8* p = AtW(a, 4)) W32(p, v); else bail = true; }
 
-    // write back changed words through the bus (JIT code invalidation, same as guest stores)
-    // write back changed words through the bus (JIT code invalidation, same as guest stores)
-    void CommitRegion(u32 addr, const u8* mem, const u8* buf, const u64* bits, u32 nbits)
+    // write back changed words (JIT code invalidation, same as guest stores)
+    template <int region>
+    void CommitRegion(u32 addr, u8* mem, const u8* buf, const u64* bits, u32 nbits)
     {
         for (u32 i = 0; i < nbits; i++)
             for (u64 b = bits[i]; b; b &= b - 1)
             {
                 u32 w = (i * 64 + __builtin_ctzll(b)) * 4;
-                if (R32(mem + w) != R32(buf + w)) nds.ARM7Write32(addr + w, R32(buf + w));
+                if (R32(mem + w) != R32(buf + w)) Store32<region>(nds, addr + w, mem + w, R32(buf + w));
             }
     }
     void Commit()
     {
-        CommitRegion(kWorkA, W7(nds, kWorkA), work, dirtyW, sizeof(dirtyW) / 8);
-        if (R32(W7(nds, kRndState)) != R32(rnd)) nds.ARM7Write32(kRndState, R32(rnd));
-        if (sw) CommitRegion(sw, &nds.MainRAM[sw & nds.MainRAMMask], shared, dirtyS, sizeof(dirtyS) / 8);
+        using M = melonDS::ARMJIT_Memory;
+        CommitRegion<M::memregion_WRAM7>(kWorkA, W7(nds, kWorkA), work, dirtyW, sizeof(dirtyW) / 8);
+        if (R32(W7(nds, kRndState)) != R32(rnd)) Store32<M::memregion_WRAM7>(nds, kRndState, W7(nds, kRndState), R32(rnd));
+        if (sw) CommitRegion<M::memregion_MainRAM>(sw, &nds.MainRAM[sw & nds.MainRAMMask], shared, dirtyS, sizeof(dirtyS) / 8);
     }
 
     // ---- helpers (addresses of the PW functions they mirror) ----
@@ -904,6 +919,7 @@ struct Seq
     }
 };
 
+#ifdef LITEV_HLE_DIAG
 // check mode: one pending comparison (the hooked functions never nest)
 struct Pending
 {
@@ -911,15 +927,19 @@ struct Pending
     const char* name = "";
     u64* diffs = nullptr;
     std::vector<std::pair<u32, std::vector<u8>>> regions;   // address, expected bytes
+    bool irq = false;           // an IRQ handler ran inside the guest call
 } g_Pending;
+u64 g_IrqDiffs = 0;             // differences with an IRQ in the guest window (the native call takes it after)
 
 void ArmCheck(melonDS::ARM* cpu, const char* name, u64* diffs)
 {
     g_Pending.ret = cpu->R[14] & ~1u;
     g_Pending.name = name;
     g_Pending.diffs = diffs;
+    g_Pending.irq = false;
     CheckPending = true;
 }
+#endif
 struct StatsDump
 {
     ~StatsDump()
@@ -933,6 +953,9 @@ struct StatsDump
             fprintf(stderr, "A7HLE seq: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu\n",
                     s.status, (unsigned long long)s.calls, (unsigned long long)s.native,
                     (unsigned long long)s.fallbacks, (unsigned long long)s.checks, (unsigned long long)s.checkDiffs);
+#ifdef LITEV_HLE_DIAG
+        if (g_IrqDiffs) fprintf(stderr, "A7HLE check: %llu differences with an IRQ inside the guest call (not counted above)\n", (unsigned long long)g_IrqDiffs);
+#endif
     }
 } g_StatsDump;
 }
@@ -1018,6 +1041,7 @@ bool RunSeq(melonDS::ARM* cpu, bool jit)
     int tracks = 0;
     bool ok = !q.bail && (jit || SeqCodeIntact(nds, s));
     if (ok) { tracks = q.Main(cpu->R[0] != 0); ok = !q.bail; }
+#ifdef LITEV_HLE_DIAG
     if (ok && g_Check)
     {
         g_Pending.regions.clear();
@@ -1028,6 +1052,7 @@ bool RunSeq(melonDS::ARM* cpu, bool jit)
         s.checks++;
         ok = false;
     }
+#endif
     if (!ok)
     {
         s.fallbacks += !g_Check;
@@ -1036,12 +1061,14 @@ bool RunSeq(melonDS::ARM* cpu, bool jit)
     }
     s.native++;
     q.Commit();
+#ifdef LITEV_HLE_DIAG
     if (g_CommitCheck)                                  // every overlay write reached memory
     {
         bool bad = memcmp(W7(nds, kWorkA), q.work, sizeof(q.work)) != 0 || memcmp(W7(nds, kRndState), q.rnd, 4) != 0
                 || (q.sw && memcmp(&nds.MainRAM[q.sw & nds.MainRAMMask], q.shared, kSharedSize) != 0);
         if (bad && s.checkDiffs++ < 5) fprintf(stderr, "A7HLE COMMITCHECK seq: memory != overlay after commit\n");
     }
+#endif
     // ponytail: fixed cycle estimate (guest: ~4.2k cycles/tick for ~10 tracks on PW)
     cpu->Cycles += 150 + 400 * tracks;
     cpu->JumpTo(cpu->R[14]);
@@ -1090,6 +1117,7 @@ bool Run(melonDS::ARM* cpu, bool jit)
     u8 chans[16 * kChanSize];
     memcpy(chans, W7(nds, kChannels), sizeof(chans));
     bool ok = (jit || CodeIntact(nds, s)) && ExChannelMain(nds, s, chans, cpu->R[0] != 0);
+#ifdef LITEV_HLE_DIAG
     if (ok && g_Check)
     {
         // run the guest too; compare at its return
@@ -1098,6 +1126,7 @@ bool Run(melonDS::ARM* cpu, bool jit)
         s.checks++;
         ok = false;
     }
+#endif
     if (!ok)
     {
         s.fallbacks += !g_Check;
@@ -1107,9 +1136,10 @@ bool Run(melonDS::ARM* cpu, bool jit)
         return true;
     }
     s.native++;
+    // changed words only, as the guest's stores leave them (kChannels and the size are word aligned)
     u8* dst = W7(nds, kChannels);
-    for (u32 i = 0; i < sizeof(chans); i++)
-        if (dst[i] != chans[i]) nds.ARM7Write8(kChannels + i, chans[i]);
+    for (u32 i = 0; i < sizeof(chans); i += 4)
+        if (R32(dst + i) != R32(chans + i)) Store32<melonDS::ARMJIT_Memory::memregion_WRAM7>(nds, kChannels + i, dst + i, R32(chans + i));
     // ponytail: fixed cycle estimate (guest: ~7.3k cycles/tick for ~14 active channels on PW)
     int active = 0;
     for (int i = 0; i < 16; i++) active += chans[i * kChanSize + 3] & 1;
@@ -1118,9 +1148,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
     return true;
 }
 
+#ifdef LITEV_HLE_DIAG
 void CheckAt(melonDS::ARM* cpu, u32 pc)
 {
-    if (pc != g_Pending.ret || (cpu->CPSR & 0x1F) == 0x12) return;
+    if ((cpu->CPSR & 0x1F) == 0x12) { g_Pending.irq = true; return; }
+    if (pc != g_Pending.ret) return;
     CheckPending = false;
     melonDS::NDS& nds = cpu->NDS;
     bool diff = false;
@@ -1137,9 +1169,11 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         }
     if (diff)
     {
-        if (*g_Pending.diffs < 10) fprintf(stderr, "\n");
-        (*g_Pending.diffs)++;
+        if (*g_Pending.diffs < 10) fprintf(stderr, "%s\n", g_Pending.irq ? " (IRQ in the guest window: not counted)" : "");
+        if (g_Pending.irq) g_IrqDiffs++;
+        else (*g_Pending.diffs)++;
     }
 }
+#endif
 }
 #endif
