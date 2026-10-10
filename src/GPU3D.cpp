@@ -1564,6 +1564,9 @@ void GPU3D::SubmitPolygon() noexcept
     if (LITEV_HEADLESS(Headless))
     {
         LastStripPolygon = (PolygonMode >= 2) ? poly : NULL;
+#ifdef LITEV_FF_HEADLESS3D
+        BankBuiltHeadless = true;
+#endif
         return;
     }
 
@@ -3453,7 +3456,15 @@ void GPU3D::VBlank() noexcept
     {
         // a console nobody watches skips preparing the frame for the renderer (polygon sort,
         // Render* copies): only the renderer reads that state
+#ifdef LITEV_FF_HEADLESS3D
+        // a bank partly built unwatched is never handed to the renderer: skip its preparation and
+        // the render it would feed (the last rendered 3D stays on screen)
+        const bool badBank = FlushRequest && BankBuiltHeadless;
+        if (FlushRequest) RenderStale = !RenderingEnabled || LITEV_HEADLESS(Headless) || badBank;
+        if (RenderingEnabled && !LITEV_HEADLESS(Headless) && !badBank)
+#else
         if (RenderingEnabled && !LITEV_HEADLESS(Headless))
+#endif
         {
 #ifdef LITEV_SOFT3D_ASYNC
         // LITEV_SOFT3D_ASYNC: if this VBlank changes nothing the renderer reads, skip
@@ -3559,6 +3570,9 @@ void GPU3D::VBlank() noexcept
             NumVertices = 0;
             NumPolygons = 0;
             NumOpaquePolygons = 0;
+#ifdef LITEV_FF_HEADLESS3D
+            BankBuiltHeadless = false;
+#endif
 
             FlushRequest = 0;
         }

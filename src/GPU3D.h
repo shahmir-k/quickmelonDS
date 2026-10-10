@@ -200,6 +200,12 @@ public:
     // lighting just accounts its cycles (which depend only on the enabled lights), and VBlank
     // skips preparing the frame for the renderer. Cleared once the game uses display capture.
     bool Headless = false;
+#ifdef LITEV_FF_HEADLESS3D
+    // BankBuiltHeadless: the bank being built got polygons while Headless (fast-forward), so it
+    // has no bounds/sort/depth. RenderStale: the last buffer swap skipped preparing the render
+    // list (a Headless frame or such a bank); renders are skipped until a prepared swap.
+    bool BankBuiltHeadless = false, RenderStale = false;
+#endif
     melonDS::NDS& NDS;
     melonDS::GPU& GPU;
 

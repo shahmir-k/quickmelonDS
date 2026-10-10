@@ -710,6 +710,14 @@ if (LITEV_SPU_ADPCM_TABLE)
     add_compile_definitions(LITEV_SPU_ADPCM_TABLE=1)
 endif()
 
+# Fast-forward: frames whose 3D isn't rendered (FF frameskip) build their geometry like an unwatched
+# netplay console (render-only work skipped, emulation exact); a polygon bank built that way is
+# never rendered. Frontend sets GPU::FFHeadless3D. Runtime: debug.litev.ffheadless=0 off.
+option(LITEV_FF_HEADLESS3D "Fast-forward: skip render-only geometry work on skipped frames" OFF)
+if (LITEV_FF_HEADLESS3D)
+    add_compile_definitions(LITEV_FF_HEADLESS3D=1)
+endif()
+
 # DraStic JIT emit-quality (teardown 01, FUN_001912f0): merge the host NZCV flags into
 # guest CPSR with one MRS + masked AND/ORR (3 host instrs) instead of a per-flag CSET+BFI
 # pair (8 instrs) for full-flag arithmetic S-ops (CMP/SUBS/ADDS...). Guest CPSR N/Z/C/V

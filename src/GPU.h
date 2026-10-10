@@ -637,6 +637,11 @@ public:
     // ponytail: the very first capture's 3D layer is the stale one (3D for a frame is drawn
     // during the previous one); render 3D every frame for that if a game desyncs on it.
     bool Headless = false;
+#ifdef LITEV_FF_HEADLESS3D
+    // fast-forward (set by the frontend each frame): a frame whose 3D won't be rendered builds its
+    // geometry like a console nobody watches (GPU3D::Headless)
+    bool FFHeadless3D = false, FFHeadlessWas = false;
+#endif
     bool CaptureSeen = false;
     // Record mode: skipping a frame's drawing must not change guest state, but a display capture
     // writes the drawn picture into VRAM. Once the game has captured, draw every frame (fast-forward

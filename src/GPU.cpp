@@ -1178,6 +1178,18 @@ void GPU::StartFrame() noexcept
 #endif
     if (LITEV_HEADLESS(Headless))
         SkipThisFrame = !CaptureSeen;
+#ifdef LITEV_FF_HEADLESS3D
+    // fast-forward: this frame's 3D render is skipped (VCount 215 below), so the geometry it is
+    // built from needn't be prepared for rendering: build it like a console nobody watches (exact
+    // emulation, cycles included; only render-side data is left out). Not for a netplay console
+    // (Headless: its own setting) nor once display capture is in use (it records the 3D).
+    if (!Headless && (FFHeadless3D || FFHeadlessWas))
+    {
+        GPU3D.Headless = FFHeadless3D && SkipThisFrame && !CaptureSeen && !KeepCapturesSeen
+                         && !(CaptureCnt & (1u << 31));
+        FFHeadlessWas = FFHeadless3D;
+    }
+#endif
 #ifdef LITEV_SKIP_REPEAT_FRAMES
     SkipRepeat = NextSkipRepeat && !(CaptureCnt & (1u << 31));   // never drop a frame a capture records
     NextSkipRepeat = false;
@@ -1226,7 +1238,11 @@ void GPU::StartHBlank(u32 line) noexcept
     else if (VCount == 215)
     {
 #ifdef LITEV_AGGRESSIVE_SKIP
-        if (!SkipThisFrame && !(DiagNoDraw & 2))
+        if (!SkipThisFrame && !(DiagNoDraw & 2)
+#ifdef LITEV_FF_HEADLESS3D
+            && !GPU3D.RenderStale   // the render list wasn't prepared (fast-forward unwatched frames)
+#endif
+            )
 #endif
         Rend->Start3DRendering();
     }
