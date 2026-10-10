@@ -1095,6 +1095,29 @@ option(LITEV_GL_SKIP_NOOP_EDGE "GL 3D: skip the no-op edge marking pass" OFF)
 if (LITEV_GL_SKIP_NOOP_EDGE)
     add_compile_definitions(LITEV_GL_SKIP_NOOP_EDGE=1)
 endif()
+# GL 3D: draw every program x blend x colour-mask combination once while the renderer is set up,
+# so the Mali driver's per-variant compile (11-24 ms on first use) doesn't land mid-game on the GL
+# thread the emu thread waits for. Exact. Runtime: debug.litev.glwarm=0 off.
+option(LITEV_GL_WARM_VARIANTS "GL 3D: compile the driver's program variants at start-up" OFF)
+if (LITEV_GL_WARM_VARIANTS)
+    add_compile_definitions(LITEV_GL_WARM_VARIANTS=1)
+endif()
+# GL 3D texture cache: the first array of every texture size is created at start-up (small: at
+# most 256 KB, ~16 MB in all) and later arrays double a size's capacity up to the old 8 MB. Creating
+# an array costs ~1-2 ms (once 11 ms) on the Mali GL thread, so a scene with 7-11 new sizes stalled
+# the emu thread 10-25 ms. Exact (storage only).
+option(LITEV_GL_TEXARRAY_PREALLOC "GL 3D: texture arrays created at start-up" OFF)
+if (LITEV_GL_TEXARRAY_PREALLOC)
+    add_compile_definitions(LITEV_GL_TEXARRAY_PREALLOC=1)
+endif()
+# GL 3D: fog by framebuffer fetch blends in the shader instead of with a constant blend colour,
+# for which the Mali driver compiled a blend shader per fog colour (~23 ms on the GL thread the
+# first time a fog colour shows). Display only (blend in fp32 instead of the blend unit: at most
+# 1 LSB). Runtime: debug.litev.glfogblend=0 off.
+option(LITEV_GL_FOG_SHADER_BLEND "GL 3D: fog-fetch pass blends in the shader" OFF)
+if (LITEV_GL_FOG_SHADER_BLEND)
+    add_compile_definitions(LITEV_GL_FOG_SHADER_BLEND=1)
+endif()
 # Display-only: a game that changes MASTER_BRIGHT once in the middle of a frame (a fade step
 # landing late because the game missed VBlank, e.g. Pokemon White's area loads) tears that frame
 # (top dark, bottom bright). A single mid-frame change now applies from the next frame; two or

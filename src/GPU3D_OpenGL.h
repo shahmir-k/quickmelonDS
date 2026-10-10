@@ -19,6 +19,7 @@
 #pragma once
 
 #ifdef OGLRENDERER_ENABLED
+#include <string>
 #include "GPU3D.h"
 #include "OpenGLSupport.h"
 #include "GPU3D_TexcacheOpenGL.h"
@@ -111,6 +112,10 @@ private:
     int RenderPolygonBatch(int i) const;
     int RenderPolygonEdgeBatch(int i) const;
     void RenderSceneChunk(int y, int h);
+#ifdef LITEV_GL_WARM_VARIANTS
+    void WarmVariants();
+    bool Warmed = false;
+#endif
 
 
     enum
@@ -134,6 +139,8 @@ private:
     float WZ0 = 0;
     static bool WEarlyZ();
     static bool NoDiscard();
+    static bool FogShaderBlend();
+    static std::string FogFetchSource();
 
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};

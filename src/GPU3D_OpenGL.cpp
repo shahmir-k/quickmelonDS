@@ -19,11 +19,13 @@
 #include "GPU_OpenGL.h"
 
 #include <algorithm>
+#include <chrono>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
+#include "LitevSoftProf.h"
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #include <stdlib.h>
@@ -252,7 +254,7 @@ bool GLRenderer3D::Init()
         }
         if (TileMode && fetch && fetchDS &&
             OpenGL::CompileVertexFragmentProgram(FinalPassFogFetchShader,
-                k3DFinalPassVS, k3DFinalPassFogFetchFS, "FinalPassFogFetchShader",
+                k3DFinalPassVS, FogFetchSource(), "FinalPassFogFetchShader",
                 {{"vPosition", 0}}, {{"oColor", 0}, {"oAttr", 1}}))
         {
             uni_id = glGetUniformBlockIndex(FinalPassFogFetchShader, "uConfig");
@@ -418,6 +420,9 @@ GLRenderer3D::~GLRenderer3D()
 void GLRenderer3D::Reset()
 {
     Texcache.Reset();
+#ifdef LITEV_GL_TEXARRAY_PREALLOC
+    Texcache.Prealloc();
+#endif
     ClearBitmapDirty = 0x3;
 }
 
@@ -460,12 +465,128 @@ void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons) noexcept
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, AttrBufferTex, 0);
     glDrawBuffers(2, fbassign);
 
+#ifdef LITEV_GL_WARM_VARIANTS
+    if (!Warmed) WarmVariants();
+#endif
+#ifdef LITEV_GL_TEXARRAY_PREALLOC
+    Texcache.Prealloc();
+#endif
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     //glLineWidth(scale);
     //glLineWidth(1.5);
 }
 
+
+// fog by framebuffer fetch: LITEV_GL_FOG_SHADER_BLEND blends in the shader (debug.litev.glfogblend=0 off)
+#ifdef LITEV_GL_FOG_SHADER_BLEND
+bool GLRenderer3D::FogShaderBlend()
+{
+    static const bool on = OpenGL::Prop("glfogblend", 1) != 0;
+    return on;
+}
+#endif
+std::string GLRenderer3D::FogFetchSource()
+{
+    std::string fs = k3DFinalPassFogFetchFS;
+#ifdef LITEV_GL_FOG_SHADER_BLEND
+    if (FogShaderBlend()) fs.insert(fs.find('\n') + 1, "#define ShaderBlend\n");
+#endif
+    return fs;
+}
+
+#ifdef LITEV_GL_WARM_VARIANTS
+// The Mali driver compiles a program variant (blend/colour-mask state) on its first draw: 11-24 ms
+// on the GL thread mid-game (PW: 20.8 ms at the title screen, 24.3 ms for the first fog frame), which
+// the emu thread then waits for. Draw every program x blend x colour-mask combination the 3D passes
+// use once, into one pixel of the 3D framebuffer, while the renderer is set up. Exact: every frame
+// clears that framebuffer. debug.litev.glwarm=0 turns it off.
+void GLRenderer3D::WarmVariants()
+{
+    Warmed = true;
+    if (!OpenGL::Prop("glwarm", 1)) return;
+    const double t0 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    // one degenerate triangle in the polygon vertex/index layout
+    static const u32 zero[3 * 7] = {};
+    static const u16 idx[3] = {0, 1, 2};
+    glBindVertexArray(VertexArrayID);
+    glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(zero), zero);
+    glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, sizeof(idx), idx);
+    glViewport(0, 0, ScreenW, ScreenH);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, 1, 1);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_STENCIL_TEST);
+    glDepthFunc(GL_LESS);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
+    int n = 0;
+    auto draw = [&](bool blend, bool cm0, GLboolean a, GLboolean b, GLboolean fog) {
+        if (blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+        glColorMaski(0, cm0, cm0, cm0, cm0);
+        glColorMaski(1, a, b, fog, GL_FALSE);
+        glDrawElements(GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, nullptr);
+        n++;
+    };
+    for (int prog = 0; prog < 4; prog++)
+    {
+        if (!RenderShader[prog]) continue;
+        glUseProgram(RenderShader[prog]);
+        for (GLboolean fog : {GL_FALSE, GL_TRUE})
+        {
+            draw(false, true, GL_TRUE, GL_TRUE, fog);         // opaque (also needopaque, pass 2)
+            if (prog & 2) continue;                           // no-discard: opaque pass only
+            draw(false, true, GL_FALSE, GL_FALSE, fog);       // translucent against the clear plane
+            for (int f = 0; f < 2; f++)
+            {
+                if (f) glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
+                else   glBlendFuncSeparate(GL_ONE, GL_ZERO, GL_ONE, GL_ONE);
+                draw(true, true, GL_TRUE, GL_TRUE, fog);      // batched alpha-31 (one blended pass)
+                draw(true, true, GL_FALSE, GL_FALSE, fog);    // translucent, shadow
+            }
+        }
+        draw(false, false, GL_FALSE, GL_FALSE, GL_FALSE);    // shadow mask
+    }
+    // final passes: full-screen triangles, scissored to the same pixel
+    glBindVertexArray(ClearVertexArrayID);
+    glDepthFunc(GL_ALWAYS);
+    glDepthMask(GL_FALSE);   // depth/stencil as in the final passes
+    glStencilFunc(GL_ALWAYS, 0, 0);
+    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+    glStencilMask(0);
+    glEnable(GL_BLEND);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glUseProgram(FinalPassEdgeShader);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    glDrawArrays(GL_TRIANGLES, 0, 2*3); n++;
+    for (GLuint fs : {FinalPassFogShader, FinalPassFogFetchShader})
+    {
+        if (!fs) continue;
+        glUseProgram(fs);
+#ifdef LITEV_GL_FOG_SHADER_BLEND
+        if (fs == FinalPassFogFetchShader && FogShaderBlend()) { glDisable(GL_BLEND); glDrawArrays(GL_TRIANGLES, 0, 2*3); n++; glEnable(GL_BLEND); continue; }
+#endif
+        glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_CONSTANT_COLOR, GL_ONE_MINUS_SRC_ALPHA);
+        glDrawArrays(GL_TRIANGLES, 0, 2*3); n++;
+        glBlendFuncSeparate(GL_CONSTANT_COLOR, GL_ONE_MINUS_SRC_ALPHA, GL_CONSTANT_COLOR, GL_ONE_MINUS_SRC_ALPHA);
+        glDrawArrays(GL_TRIANGLES, 0, 2*3); n++;
+    }
+    glFinish();
+    // the state the renderer leaves after Init (every frame sets the rest itself)
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_BLEND);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glStencilMask(0xFF);
+    CurShaderID = -1;
+    const double t1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    Platform::Log(Platform::Info, "LITEV_GL_WARM_VARIANTS %d draws, %.1f ms\n", n, t1 - t0);
+}
+#endif
 
 void GLRenderer3D::AllocColorBuffers() noexcept
 {
@@ -1061,7 +1182,7 @@ int GLRenderer3D::RenderSinglePolygon(int i) const
     const RendererPolygon* rp = &PolygonList[i];
 
     SetupPolygonTexture(rp);
-    glDrawElements(rp->PrimType, rp->NumIndices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2));
+    LSP_GLDRAW(rp->RenderKey, glDrawElements(rp->PrimType, rp->NumIndices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2)));
     StatDraws++;
 
     return 1;
@@ -1090,7 +1211,7 @@ int GLRenderer3D::RenderPolygonBatch(int i) const
     }
 
     SetupPolygonTexture(rp);
-    glDrawElements(primtype, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2));
+    LSP_GLDRAW(renderkey, glDrawElements(primtype, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2)));
     StatDraws++;
     return numpolys;
 }
@@ -1116,7 +1237,7 @@ int GLRenderer3D::RenderPolygonEdgeBatch(int i) const
     }
 
     SetupPolygonTexture(rp);
-    glDrawElements(GL_LINES, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->EdgeIndicesOffset * 2));
+    LSP_GLDRAW(0xE0000000u, glDrawElements(GL_LINES, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->EdgeIndicesOffset * 2)));
     return numpolys;
 }
 
@@ -1591,7 +1712,7 @@ polygons_done:
 
             glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
 
-            glDrawArrays(GL_TRIANGLES, 0, 2*3);
+            LSP_GLDRAW(0xF0000001u, glDrawArrays(GL_TRIANGLES, 0, 2*3));
         }
 
         if (S.RenderDispCnt & (1<<7))
@@ -1616,7 +1737,13 @@ polygons_done:
                 glBlendColor((float)r/31.0, (float)g/31.0, (float)b/31.0, (float)a/31.0);
             }
 
-            glDrawArrays(GL_TRIANGLES, 0, 2*3);
+#ifdef LITEV_GL_FOG_SHADER_BLEND
+            if (fogFetch && FogShaderBlend()) glDisable(GL_BLEND);
+#endif
+            LSP_GLDRAW(0xF0000002u | (fogFetch ? 4 : 0), glDrawArrays(GL_TRIANGLES, 0, 2*3));
+#ifdef LITEV_GL_FOG_SHADER_BLEND
+            glEnable(GL_BLEND);
+#endif
         }
     }
 }
@@ -1959,7 +2086,7 @@ void GLRenderer3D::RenderPreparedFrame(int slot)
 
     glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
     glBindVertexArray(ClearVertexArrayID);
-    glDrawArrays(GL_TRIANGLES, 0, 2*3);
+    LSP_GLDRAW(0xF0000010u, glDrawArrays(GL_TRIANGLES, 0, 2*3));
 cleared:
 
     if (S.RenderNumPolygons)

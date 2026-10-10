@@ -973,7 +973,7 @@ void SoftRenderer::VBlank()
         if (P2InFlight >= 2)
         {
             const double _t0 = LSP_NOW();
-            Platform::Semaphore_Wait(AsyncDone);
+            LSP_WAIT("s2d-done", GPU.NDS.NumFrames, Platform::Semaphore_Wait(AsyncDone));
             LSP_ADD(EmuBarrier, LSP_NOW() - _t0);
             AsyncPresentBuf = P2Ring[P2PresentIdx].targetBuf;
             P2PresentIdx = (P2PresentIdx + 1) % 3;
@@ -1104,6 +1104,7 @@ void SoftRenderer::VBlank()
         Platform::Semaphore_Post(AsyncStart);
 #ifdef LITEV_SOFTPROF
         LitevSP::Tick();
+        if (LitevSP::StallLogOn()) LitevSP::StallFrame(GPU.NDS.NumFrames);
 #endif
         return;   // emu emulates frame N+1 with up to 2 renders in flight
     }
@@ -1121,6 +1122,7 @@ void SoftRenderer::VBlank()
     Platform::Semaphore_Post(AsyncStart);
 #ifdef LITEV_SOFTPROF
     LitevSP::Tick();
+    if (LitevSP::StallLogOn()) LitevSP::StallFrame(GPU.NDS.NumFrames);
 #endif
     // (d) return immediately — emu emulates frame N+1 while the render thread runs.
 }
