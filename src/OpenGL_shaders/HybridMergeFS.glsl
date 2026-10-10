@@ -13,8 +13,6 @@
 
 uniform usampler2DArray DescTex;   // 513x192x2 RGBA8UI: 2 planes x 256 + control column
 uniform sampler2D Tex3D;           // Nx 3D colour buffer
-uniform sampler2D EdgeTex;         // 256x192 edge-marking overlay of that 3D frame (3DFinalPassEdgeFS)
-uniform int uEdge;                 // 1: the frame has one
 uniform int uScale;
 uniform int uSingle;     // -1: both screens (MRT); 0/1: only that screen, to output 0
 uniform ivec2 uOrigin;   // viewport origin of this draw in the target
@@ -36,15 +34,10 @@ ivec4 Desc(int x, int y, int layer)
 ivec4 Get3D(ivec2 pos)
 {
     if (pos.x < 0 || pos.x >= 256 * uScale) return ivec4(0);
-    vec4 c = texelFetch(Tex3D, pos, 0);
-    if (uEdge != 0)
-    {
-        highp vec2 p = vec2(pos) + 0.5;
-        vec4 e = texelFetch(EdgeTex, ivec2(p / float(uScale)), 0);
-        c.rgb = mix(c.rgb, e.rgb, e.a);
-    }
 #ifdef GL_ES
-    c = c.bgra;   // the GLES 3D pass emits BGRA (3DRenderFS)
+    vec4 c = texelFetch(Tex3D, pos, 0).bgra;   // the GLES 3D pass emits BGRA (3DRenderFS)
+#else
+    vec4 c = texelFetch(Tex3D, pos, 0);
 #endif
     return ivec4(round(c * vec4(63.0, 63.0, 63.0, 31.0)));
 }

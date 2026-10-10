@@ -1185,10 +1185,6 @@ endif()
 
 # GL 3D: skip the edge-marking final pass, which can't mark anything in this renderer (no shader
 # writes the edge flag it tests) but split the 3D render pass. Exact. Runtime: debug.litev.gledgenoop=0 off.
-option(LITEV_GL_EDGE_MARK "GL 3D: DS edge marking (outlines); debug.litev.gledge=0 turns it off" OFF)
-if (LITEV_GL_EDGE_MARK)
-    add_compile_definitions(LITEV_GL_EDGE_MARK=1)
-endif()
 option(LITEV_GL_SKIP_NOOP_EDGE "GL 3D: skip the no-op edge marking pass" OFF)
 if (LITEV_GL_SKIP_NOOP_EDGE)
     add_compile_definitions(LITEV_GL_SKIP_NOOP_EDGE=1)
