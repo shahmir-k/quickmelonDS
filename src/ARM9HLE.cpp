@@ -1015,7 +1015,8 @@ constexpr u32 kClearCb[3] = {0xE3A01000, 0xE5801000, 0xE12FFF1E};    // mov r1, 
 constexpr u16 kClearCbT[3] = {0x2100, 0x6001, 0x4770};                 // Thumb (W2): movs r1, #0; str r1, [r0]; bx lr
 
 struct IoPlan { u32 n = 0, a[4], v[4]; void Add(u32 x, u32 y) { a[n] = x; v[n++] = y; } };
-bool DmaIrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, u32 bit, IoPlan& io)
+// (out of line: keeps the HBlank path of IrqOne compact)
+__attribute__((noinline)) bool DmaIrqNative(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, bool halted, u32 bit, IoPlan& io)
 {
     melonDS::NDS& nds = c->NDS;
     const Variant& v = *s.v;
@@ -2468,7 +2469,7 @@ constexpr s32 kAsyncCycT = 1351;  // TWL SDK build (W2): guest 1351 + 4 per DMA 
 // check / dry (ck): nothing written, ck = the compare point at the OS_RestoreInterrupts call); 2: handed over at
 // MIi_FIFOCallback's entry (registers set, memory flushed, c jumps there).
 struct AsyncChk { Expect e2; std::vector<std::pair<u32, u32>> io; u32 words = 0; bool fin = false; };
-int AsyncCoreT(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 arg, bool jit, Expect& e, AsyncChk* ck);
+__attribute__((noinline)) int AsyncCoreT(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 arg, bool jit, Expect& e, AsyncChk* ck);
 int AsyncCore(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 arg, bool jit, Expect& e, AsyncChk* ck)
 {
     if (s.v->twl) return AsyncCoreT(c, s, m, R, cpsr, arg, jit, e, ck);
@@ -2565,7 +2566,7 @@ int AsyncCore(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 a
 // OS_Disable/RestoreInterrupts): the same IO writes in the same order as 10., this build's frames and registers.
 // Stage 1 compares at its OS_RestoreInterrupts call (r1 = the IF value read, not modelled), stage 2 the registers at
 // its return. No hand-over path: a list whose bulk send stops early runs the guest code.
-int AsyncCoreT(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 arg, bool jit, Expect& e, AsyncChk* ck)
+__attribute__((noinline)) int AsyncCoreT(melonDS::ARMv5* c, State& s, Mem& m, const u32* R, u32 cpsr, u32 arg, bool jit, Expect& e, AsyncChk* ck)
 {
     melonDS::NDS& nds = c->NDS;
     const Variant& v = *s.v;
