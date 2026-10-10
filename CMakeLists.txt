@@ -781,6 +781,25 @@ if (LITEV_GX_CLIP_REJECT)
     add_compile_definitions(LITEV_GX_CLIP_REJECT=1)
 endif()
 
+# GX_SEND_DIRECT: the native display-list send (A9HLE hook 5) hands the list to the GX engine
+# straight from main RAM instead of copying it word by word, and adds the DMA cycles from a
+# per-chunk prefix sum of the same burst table. Exact.
+option(LITEV_GX_SEND_DIRECT "Native GX display-list send reads the list in place (exact)" OFF)
+if (LITEV_GX_SEND_DIRECT)
+    add_compile_definitions(LITEV_GX_SEND_DIRECT=1)
+endif()
+# GX_EARLY_REJECT (needs GX_CLIP_REJECT): SubmitPolygon tests a polygon the clipper would
+# reject before the backface-cull math and vertex copies; both paths end the same way. Exact.
+option(LITEV_GX_EARLY_REJECT "Reject off-screen polygons before culling (exact)" OFF)
+if (LITEV_GX_EARLY_REJECT)
+    add_compile_definitions(LITEV_GX_EARLY_REJECT=1)
+endif()
+# GX_BULK_LEAN: the bulk GX executor keeps its batch cursor in a register and skips the
+# push/pop counter that a bulk push/pop raises and lowers within its own handler. Exact.
+option(LITEV_GX_BULK_LEAN "Bulk GX executor: batch cursor in a register (exact)" OFF)
+if (LITEV_GX_BULK_LEAN)
+    add_compile_definitions(LITEV_GX_BULK_LEAN=1)
+endif()
 # GX_CLIP_LEAN: the polygon clipper (ClipAgainstPlane) reads vertices in place instead of copying
 # each one, and skips a plane side with no vertex past it (that pass only copies). Exact.
 option(LITEV_GX_CLIP_LEAN "Polygon clipper without the per-vertex copies (exact)" OFF)

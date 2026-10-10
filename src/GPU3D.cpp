@@ -45,7 +45,7 @@ static int litevGxPropDefault(const char* name, int def) {
 }
 #endif
 
-#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2) || defined(LITEV_GEOM_NEON3)) && defined(__ARM_NEON)
+#if (defined(LITEV_NEON_GEOMETRY) || defined(LITEV_GEOM_NEON2) || defined(LITEV_GEOM_NEON3) || defined(LITEV_GX_EARLY_REJECT)) && defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
 
@@ -1268,6 +1268,40 @@ static bool ClipTrivialReject(const Vertex* v, int n, u32 attr)
 }
 #endif
 
+#if defined(LITEV_GX_EARLY_REJECT) && defined(LITEV_GX_CLIP_REJECT)
+// One pass over the 3-4 vertices for both clip shortcuts: bit 0 = ClipTrivialReject's answer,
+// bit 1 = the trivial-accept test (every W > 0 and no vertex past any plane). Same comparisons.
+static inline int ClipClassify(const Vertex* v, int n, u32 attr)
+{
+#if defined(__ARM_NEON)
+    const int32x4_t p0 = vld1q_s32(v[0].Position), p1 = vld1q_s32(v[1].Position), p2 = vld1q_s32(v[2].Position);
+    const int32x4_t p3 = n == 4 ? vld1q_s32(v[3].Position) : p0;   // a repeated vertex changes no any/all
+    const int32x4x2_t a = vtrnq_s32(p0, p1), b = vtrnq_s32(p2, p3);
+    const int32x4_t X = vcombine_s32(vget_low_s32(a.val[0]), vget_low_s32(b.val[0]));
+    const int32x4_t Z = vcombine_s32(vget_high_s32(a.val[0]), vget_high_s32(b.val[0]));
+    const int32x4_t Y = vcombine_s32(vget_low_s32(a.val[1]), vget_low_s32(b.val[1]));
+    const int32x4_t W = vcombine_s32(vget_high_s32(a.val[1]), vget_high_s32(b.val[1]));
+    const int32x4_t nW = vnegq_s32(W);
+    const uint32x4_t zp = vcgtq_s32(Z, W), zm = vbicq_u32(vcltq_s32(Z, nW), zp);
+    const uint32x4_t yp = vcgtq_s32(Y, W), ym = vbicq_u32(vcltq_s32(Y, nW), yp);
+    const uint32x4_t xp = vcgtq_s32(X, W), xm = vbicq_u32(vcltq_s32(X, nW), xp);
+    if (vmaxvq_u32(zp) && !(attr & (1<<12))) return 1;
+    if (vmaxvq_u32(vorrq_u32(zp, zm))) return (vminvq_u32(zp) | vminvq_u32(zm)) ? 1 : 0;
+    if (vmaxvq_u32(vorrq_u32(yp, ym))) return (vminvq_u32(yp) | vminvq_u32(ym)) ? 1 : 0;
+    if (vmaxvq_u32(vorrq_u32(xp, xm))) return (vminvq_u32(xp) | vminvq_u32(xm)) ? 1 : 0;
+    return vminvq_u32(vcgtzq_s32(W)) ? 2 : 0;
+#else
+    if (ClipTrivialReject(v, n, attr)) return 1;
+    for (int i = 0; i < n; i++)
+    {
+        const s32 w = v[i].Position[3], x = v[i].Position[0], y = v[i].Position[1], z = v[i].Position[2];
+        if (w <= 0 || x > w || x < -w || y > w || y < -w || z > w || z < -w) return 0;
+    }
+    return 2;
+#endif
+}
+#endif
+
 void GPU3D::SubmitPolygon() noexcept
 {
 #ifdef LITEV_GX_VTX_PREFETCH
@@ -1307,6 +1341,23 @@ void GPU3D::SubmitPolygon() noexcept
     v1 = &TempVertexBuffer[1];
     v2 = &TempVertexBuffer[2];
     v3 = &TempVertexBuffer[3];
+
+#if defined(LITEV_GX_EARLY_REJECT) && defined(LITEV_GX_CLIP_REJECT)
+    // A polygon with no strip vertices to reuse (clipstart 0) that the clipper would reject
+    // ends exactly like a culled one (LastStripPolygon = NULL, nothing stored), so test it
+    // first and skip the cull normal and the vertex copies. Town: ~750 of ~1900 per frame.
+    // cls: -1 = not classified (strip vertices may be reused), else ClipClassify's bits
+    int cls = -1;
+    if (!(PolygonMode >= 2 && LastStripPolygon))
+    {
+        cls = ClipClassify(TempVertexBuffer, nverts, CurPolygonAttr);
+        if (cls & 1)
+        {
+            LastStripPolygon = NULL;
+            return;
+        }
+    }
+#endif
 
 #if defined(LITEV_GEOM_NEON2) && defined(__ARM_NEON)
     // LITEV_GEOM_NEON2: the per-polygon backface-cull normal is a (x,y,w) cross
@@ -1450,6 +1501,10 @@ void GPU3D::SubmitPolygon() noexcept
     // disables it for A/B.
     static const int _trivclip = litevGxPropDefault("debug.litev.trivclip", 1);
     bool _trivial = (_trivclip != 0);
+#if defined(LITEV_GX_EARLY_REJECT) && defined(LITEV_GX_CLIP_REJECT)
+    if (_trivial && cls >= 0) _trivial = (cls & 2) != 0;   // classified above, same vertices (clipstart 0)
+    else
+#endif
     if (_trivial)
     {
         for (int i = 0; i < nverts; i++)
@@ -1476,7 +1531,11 @@ void GPU3D::SubmitPolygon() noexcept
     else
 #endif
 #ifdef LITEV_GX_CLIP_REJECT
+#if defined(LITEV_GX_EARLY_REJECT)
+    if (clipstart == 0 && cls < 0 && ClipTrivialReject(clippedvertices, nverts, CurPolygonAttr)) nverts = 0;   // cls >= 0: not a reject
+#else
     if (clipstart == 0 && ClipTrivialReject(clippedvertices, nverts, CurPolygonAttr)) nverts = 0;
+#endif
     else
 #endif
     nverts = ClipPolygon<true>(*this, clippedvertices, nverts, clipstart);
@@ -2274,6 +2333,12 @@ void GPU3D::ExecuteCommand() noexcept
     // per-command bl/ret or prologue/epilogue. Reuses the computed-goto
     // tables below. Bit-exact (CmdFIFORead still fires per command
     // in identical order, keeping DMA/IRQ/audio timing).
+#if defined(LITEV_GX_BULK) && defined(LITEV_GX_BULK_LEAN)
+    // bulk batch cursor in a register for the whole batch (the handlers' calls made the compiler
+    // reload BulkPtr/BulkEnd from memory before every command); written back on return
+    const CmdFIFOEntry* bp = BulkPtr;
+    const CmdFIFOEntry* const be = BulkEnd;
+#endif
 gxfifo_threaded_top:
 #endif
     // M6.11: count GXFIFO commands (cheap add only; GPU3DNs times the whole
@@ -2285,11 +2350,19 @@ gxfifo_threaded_top:
     if constexpr (Bulk)
     {
         // a SWAP_BUFFERS waits for its turn in the FIFO (it resets CycleCount)
+#ifdef LITEV_GX_BULK_LEAN
+        if (bp == be || bp->Command == 0x50) { BulkPtr = bp; return; }
+        entry = *bp++;
+        // a push/pop is counted up and down within its own handler here: skip both (test
+        // commands span several entries, possibly two batches: counted as before)
+        if (entry.Command >= 0x70 && entry.Command <= 0x72) NumTestCommands++;
+#else
         if (BulkPtr == BulkEnd || BulkPtr->Command == 0x50) return;
         entry = *BulkPtr++;
         // CmdFIFOWrite counts these per entry; their handlers count them down
         if (entry.Command == 0x11 || entry.Command == 0x12) NumPushPopCommands++;
         else if (entry.Command >= 0x70 && entry.Command <= 0x72) NumTestCommands++;
+#endif
     }
     else entry = CmdFIFORead();
 #else
@@ -2344,6 +2417,9 @@ gxfifo_threaded_top:
 
         gxf_11: // push matrix
             VertexPipelineCmdDelayed4();
+            #ifdef LITEV_GX_BULK_LEAN
+            if constexpr (!Bulk)
+#endif
             NumPushPopCommands--;
             if (MatrixMode == 0)
             {
@@ -2372,6 +2448,9 @@ gxfifo_threaded_top:
 
         gxf_12: // pop matrix
             VertexPipelineCmdDelayed4();
+            #ifdef LITEV_GX_BULK_LEAN
+            if constexpr (!Bulk)
+#endif
             NumPushPopCommands--;
             if (MatrixMode == 0)
             {
