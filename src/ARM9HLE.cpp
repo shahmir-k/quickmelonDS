@@ -680,6 +680,33 @@ u32 GxSend(melonDS::ARMv5* c, u32 src, u32 len, u32 n)
     const u8* bt = (nds.ARM9MemTimings[0x1000][6] == 2) ? DMATiming::MRAMRead32Bursts[0].data() : DMATiming::MRAMRead32Bursts[1].data();
     u32 done = 0, cyc = 0, bc = 0;
     for (u32 o = 0; o < 512; o += 64) __builtin_prefetch(ram + ((src + o) & mask));
+#ifdef LITEV_GX_SEND_DIRECT
+    // The list read in place (no copy) when it doesn't wrap the RAM mirror, and the DMA cycles
+    // from a per-chunk prefix sum of the same burst table (the count restarts at every chunk).
+    if ((src & mask) + n * 4 <= mask + 1)
+    {
+        const u32* w = (const u32*)(ram + (src & mask));
+        static u32 cum[2][kGxChunk / 4 + 1];
+        static bool cumOk[2];
+        const int t = bt == DMATiming::MRAMRead32Bursts[0].data() ? 0 : 1;
+        if (!cumOk[t])
+        {
+            for (u32 i = 0, b = 0, c2 = 0; i < per; i++) { if (bt[b] == 0) b = 0; c2 += bt[b++]; cum[t][i + 1] = c2; }
+            cumOk[t] = true;
+        }
+        while (done < n && gx.BulkReady())
+        {
+            const u32 m = n - done < 64 ? n - done : 64;
+            const char* pf = (const char*)(w + done) + 512;
+            if (pf + 256 <= (const char*)(ram + mask + 1))
+                for (u32 o = 0; o < 256; o += 64) __builtin_prefetch(pf + o);
+            gx.BulkWords(w + done, m);
+            done += m;
+        }
+        cyc = (done / per) * cum[t][per] + cum[t][done % per];
+    }
+    else
+#endif
     while (done < n && gx.BulkReady())
     {
         u32 w[64];
