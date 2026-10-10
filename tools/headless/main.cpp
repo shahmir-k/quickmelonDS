@@ -741,6 +741,15 @@ int main(int argc, char** argv)
                 unsigned long pv = strtoul(q, (char**)&q, 0); q += (*q == ',');
                 if ((int)pf == frame) { nds->ARM9Write32((u32)pa, (u32)pv); fprintf(stderr, "poke32 frame %d %08lx = %08lx\n", frame, pa, pv); }
             }
+        // same through the ARM7 bus (ARM7 WRAM code)
+        if (static const char* pk = getenv("LITEV_POKE32_ARM7"); pk)
+            for (const char* q = pk; *q; )
+            {
+                unsigned long pf = strtoul(q, (char**)&q, 0); q += (*q == ':');
+                unsigned long pa = strtoul(q, (char**)&q, 0); q += (*q == ':');
+                unsigned long pv = strtoul(q, (char**)&q, 0); q += (*q == ',');
+                if ((int)pf == frame) { nds->ARM7Write32((u32)pa, (u32)pv); fprintf(stderr, "poke32 arm7 frame %d %08lx = %08lx\n", frame, pa, pv); }
+            }
         if (haveWindow && frame == opt.benchWindowStart)
             windowStart = std::chrono::steady_clock::now();
 

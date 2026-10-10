@@ -488,6 +488,9 @@ public:
     u8* CurICacheLine;
 #ifdef LITEV_A9HLE
     void* A9HLEState = nullptr;   // A9HLE per-console state (owned by ARM9HLE.cpp)
+    // JIT block that verified the code of the native IRQ path (the wake hook block, which depends
+    // on every byte of that code); null when no such block is live (ARMJIT clears it)
+    const void* A9HLEGuard = nullptr;
 #endif
 
     bool (*GetMemRegion)(u32 addr, bool write, MemRegion* region);

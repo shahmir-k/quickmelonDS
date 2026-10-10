@@ -18,6 +18,10 @@
 // stayed within what it handles. A note that needs a new channel (bank lookup + allocation)
 // falls back to the guest for that call (~4-14% of calls on PW).
 //
+// Under the JIT the code is verified when the hook block is compiled and the block depends on
+// it (no per-call compare); MI_CpuCopy32 from ARM7 WRAM to main RAM copies through host
+// pointers with the JIT invalidation check per 16-byte granule instead of two bus calls a word.
+//
 // LITEV_A7HLE_CHECK=1 (env, interpreter mode): run native AND guest, compare everything the
 // native path writes at the guest's return, report diffs. LITEV_A7HLE_COMMITCHECK=1: after a
 // native sequencer commit, verify memory equals the native result. LITEV_A7HLE_STATS=1: counts.
@@ -29,11 +33,18 @@ namespace melonDS { class ARM; class NDS; }
 
 namespace melonDS::A7HLE
 {
-// JIT decode / interpreter: is the ARM-mode instruction at addr the entry of a hooked function?
-bool IsHook(melonDS::NDS& nds, u32 addr, u32 instr);
+// JIT decode: is the ARM-mode instruction at addr the entry of a hooked function?
+// 0 no, 1 yes (its code verified now: under the JIT this compile-time check is the code check),
+// 2 hook site whose code differs now (compile the guest code, still depend on the ranges)
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr);
+// guest code the hook at addr depends on: ARMJIT adds these to the hook block's code ranges, so a
+// write there invalidates the block and the recompile re-verifies (as for A9HLE)
+struct Range { u32 a, b; };
+int Deps(u32 addr, u32 instr, Range* out);   // up to 4
 // Execute the hooked function at R15-8 (native, or the guest instruction on fallback).
+// jit: reached from a JIT-compiled hook (code verified at compile); else compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).
-bool Run(melonDS::ARM* cpu);
+bool Run(melonDS::ARM* cpu, bool jit);
 // interpreter check mode: called before every ARM7 instruction while a check is pending
 extern bool CheckPending;
 void CheckAt(melonDS::ARM* cpu, u32 pc);

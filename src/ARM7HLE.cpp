@@ -109,8 +109,12 @@ void Probe(melonDS::NDS& nds, State& s)
 
 State& Get(melonDS::NDS& nds)
 {
-    State& s = g_State[&nds];
+    static const melonDS::NDS* last = nullptr;     // per-call map lookup avoided (one console)
+    static State* lastS = nullptr;
+    if (&nds == last) return *lastS;
+    State& s = g_State[&nds];                      // map nodes are stable
     if (s.status == 0) Probe(nds, s);
+    last = &nds; lastS = &s;
     return s;
 }
 
@@ -350,7 +354,11 @@ std::unordered_map<const melonDS::NDS*, SeqState> g_Seq;
 
 SeqState& GetSeq(melonDS::NDS& nds)
 {
+    static const melonDS::NDS* last = nullptr;
+    static SeqState* lastS = nullptr;
+    if (&nds == last) return *lastS;
     SeqState& s = g_Seq[&nds];
+    last = &nds; lastS = &s;
     if (s.status != 0) return s;
     s.status = -1;
     if (!ReadOn()) return s;
@@ -951,6 +959,25 @@ void Copy32(melonDS::ARM* cpu)
     u32 src = cpu->R[0], dst = cpu->R[1];
     const u32 end = dst + cpu->R[2];
     u32 n = 0;
+    // ARM7 WRAM -> main RAM, both contiguous in host memory: host copy, the JIT invalidation
+    // check of ARM7Write32 once per 16-byte granule (what the per-word checks amount to)
+    const u32 len = (s32)dst < (s32)end ? ((end - dst + 3) & ~3u) : 0;
+    const u32 s0 = src & ~3u, d0 = dst & ~3u;
+    if (len && (s0 >> 23) == (0x03800000 >> 23) && (d0 >> 24) == 0x02
+        && (s0 & (ARM7WRAMSize - 1)) + len <= ARM7WRAMSize && (d0 & nds.MainRAMMask) + len <= nds.MainRAMMask + 1)
+    {
+        const u8* sp = &nds.ARM7WRAM[s0 & (ARM7WRAMSize - 1)];
+        u8* dp = &nds.MainRAM[d0 & nds.MainRAMMask];
+        for (u32 o = 0; o < len; o += 4)
+        {
+            if (o == 0 || ((d0 + o) & 15) == 0)
+                nds.JIT.CheckAndInvalidate<1, melonDS::ARMJIT_Memory::memregion_MainRAM>(d0 + o);
+            memcpy(dp + o, sp + o, 4);
+        }
+        n = len / 4;
+        cpu->R[2] = R32(sp + len - 4);
+        src += len; dst += len;
+    }
     while ((s32)dst < (s32)end)
     {
         u32 v = nds.ARM7Read32(src & ~3u);
@@ -981,7 +1008,7 @@ void GuestFallback(melonDS::ARM* cpu)
     ARMInterpreter::ARMInstrTable[icode](cpu);
 }
 
-bool RunSeq(melonDS::ARM* cpu)
+bool RunSeq(melonDS::ARM* cpu, bool jit)
 {
     melonDS::NDS& nds = cpu->NDS;
     SeqState& s = GetSeq(nds);
@@ -989,7 +1016,7 @@ bool RunSeq(melonDS::ARM* cpu)
     s.calls++;
     Seq q(nds);
     int tracks = 0;
-    bool ok = !q.bail && SeqCodeIntact(nds, s);
+    bool ok = !q.bail && (jit || SeqCodeIntact(nds, s));
     if (ok) { tracks = q.Main(cpu->R[0] != 0); ok = !q.bail; }
     if (ok && g_Check)
     {
@@ -1022,28 +1049,39 @@ bool RunSeq(melonDS::ARM* cpu)
 }
 }
 
-bool IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 {
-    if (instr == kCopy32[0]) return CopyOn(nds) && IsCopy32(nds, addr);
-    if (addr == kSeqEntry && instr == kSeqEntryInstr) return GetSeq(nds).status == 1;
-    if (addr != kEntry || instr != kEntryInstr) return false;
+    if (instr == kCopy32[0]) return CopyOn(nds) && IsCopy32(nds, addr) ? 1 : 0;
+    if (addr == kSeqEntry && instr == kSeqEntryInstr)
+    {
+        SeqState& s = GetSeq(nds);
+        return s.status != 1 ? 0 : SeqCodeIntact(nds, s) ? 1 : 2;
+    }
+    if (addr != kEntry || instr != kEntryInstr) return 0;
     State& s = Get(nds);
-    return s.status == 1 && s.on;
+    return !(s.status == 1 && s.on) ? 0 : CodeIntact(nds, s) ? 1 : 2;
+}
+int Deps(u32 addr, u32 instr, Range* out)
+{
+    if (instr == kCopy32[0]) { out[0] = {addr, addr + 24}; return 1; }
+    if (addr == kSeqEntry) { out[0] = {kSeqRa, kSeqRb}; out[1] = {kRndA, kRndB}; return 2; }
+    out[0] = {kR1a, kR1b}; out[1] = {kR2a, kR2b}; out[2] = {kStubA, kStubB};
+    return 3;
 }
 
-bool Run(melonDS::ARM* cpu)
+bool Run(melonDS::ARM* cpu, bool jit)
 {
     if (cpu->Num != 1 || (cpu->CPSR & 0x20)) return false;
     const u32 pc = cpu->R[15] - 8;
     melonDS::NDS& nds = cpu->NDS;
     if (cpu->CurInstr == kCopy32[0])
     {
-        if (!CopyOn(nds) || !IsCopy32(nds, pc)) return false;
+        if (!CopyOn(nds) || (!jit && !IsCopy32(nds, pc))) return false;
         g_State[&nds].copies++;
         Copy32(cpu);
         return true;
     }
-    if (pc == kSeqEntry && cpu->CurInstr == kSeqEntryInstr) return RunSeq(cpu);
+    if (pc == kSeqEntry && cpu->CurInstr == kSeqEntryInstr) return RunSeq(cpu, jit);
     if (pc != kEntry || cpu->CurInstr != kEntryInstr) return false;
     State& s = Get(nds);
     if (s.status != 1 || !s.on) return false;
@@ -1051,7 +1089,7 @@ bool Run(melonDS::ARM* cpu)
 
     u8 chans[16 * kChanSize];
     memcpy(chans, W7(nds, kChannels), sizeof(chans));
-    bool ok = CodeIntact(nds, s) && ExChannelMain(nds, s, chans, cpu->R[0] != 0);
+    bool ok = (jit || CodeIntact(nds, s)) && ExChannelMain(nds, s, chans, cpu->R[0] != 0);
     if (ok && g_Check)
     {
         // run the guest too; compare at its return
