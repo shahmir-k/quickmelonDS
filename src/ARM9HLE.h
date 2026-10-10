@@ -108,6 +108,11 @@ bool Run(melonDS::ARM* cpu, bool jit);
 // true: taken natively (registers unchanged, Cycles added); the caller then delivers any IRQ that
 // is still pending as usual (and a halted ARM9 in the OS idle loop stays halted if none is).
 bool Irq(melonDS::ARMv5* c, bool halted);
+// IRQ delivery (TriggerIRQ) while an ARM9 DMA is about to stop the CPU (Halted == 2): true = deliver it after the
+// DMA instead (A9HLEDefer; the guest enters the vector now but runs no instruction before the DMA, so its handler
+// sees the IF bits the DMA raised). Used for the GXFIFO IRQ of 11.: after the list's DMA its end IRQ is the lowest
+// pending one and is taken natively.
+bool Defer(melonDS::ARMv5* c);
 // ARMJIT: a block compiled with the wake hook (code verified, IsHook == 1) at addr
 void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
 // ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted)

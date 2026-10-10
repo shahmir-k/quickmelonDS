@@ -208,7 +208,7 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 12;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr int kKinds = 13;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
 constexpr u32 kAllHooks = 2047;
 struct State
 {
@@ -248,7 +248,7 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
 inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : 1u << k; }
 
@@ -1921,6 +1921,19 @@ bool Irq(melonDS::ARMv5* c, bool halted)
         any = true;
     }
     return any;
+}
+
+bool Defer(melonDS::ARMv5* c)
+{
+    melonDS::NDS& nds = c->NDS;
+    State* s = Active(c);
+    if (!s || CheckPending || !(nds.CPUStop & 0xF)) return false;
+    const u32 p = nds.IE[0] & nds.IF[0];
+    if ((p & (0u - p)) != 0x200000) return false;       // GXFIFO the lowest pending IRQ
+    if (!(c->A9HLEGuard ? s->dmaLive : !nds.IsJITEnabled() && s->dmaOk && (s->mask & 1024))) return false;
+    s->calls[12]++;
+    c->A9HLEDefer = true;
+    return true;
 }
 
 int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
