@@ -53,6 +53,9 @@ static uint64_t EmuThreadInstr = 0, EmuThreadCycles = 0;
 #include "VerifyTrace.h"
 #include "InputScript.h"
 namespace melonDS { extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults, JitStoreRepromotions; }
+#ifdef LITEV_JIT_COMPILE_STATS
+#include "ARMJIT_Internal.h"
+#endif
 #ifdef LITEV_ACCESS_STATS
 namespace melonDS { extern u64 LitevAccess[6][0x10000]; extern u64 LitevRomctrlPC[0x100000]; }
 static void DumpAccessStats()
@@ -784,6 +787,20 @@ int main(int argc, char** argv)
                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fms0).count(),
                    (unsigned long long)(melonDS::JitCompileCount - jit0),
                    (unsigned long long)(melonDS::JitProtectCalls - prot0), (unsigned long long)(melonDS::JitProtectFaults - flt0));
+#ifdef LITEV_JIT_COMPILE_STATS
+        if (frameMs)
+        {   // compile time per phase this frame, microseconds (src/ARMJIT_Internal.h JitPhase)
+            static u64 last[melonDS::JitPhase_Count];
+            static const double us = 1e6 / melonDS::JitTicksPerSec();
+            printf("JITPHASE %d", frame);
+            for (int p = 0; p < melonDS::JitPhase_Count; p++)
+            {
+                printf(" %.0f", (melonDS::JitCompileTicks[p] - last[p]) * us);
+                last[p] = melonDS::JitCompileTicks[p];
+            }
+            printf("\n");
+        }
+#endif
 #ifdef LITEV_JIT_STORE_REPROMOTE
         if (frameMs) printf("REPROMOTED %d %llu\n", frame, (unsigned long long)melonDS::JitStoreRepromotions);
 #endif

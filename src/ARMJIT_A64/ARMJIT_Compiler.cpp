@@ -2552,7 +2552,13 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     QuickTailCall(X0, ARM_Ret);
 #endif
 
+#ifdef LITEV_JIT_COMPILE_STATS
+    const u64 flushT0 = JitTicks();
+#endif
     FlushIcache();
+#ifdef LITEV_JIT_COMPILE_STATS
+    JitCompileTicks[JitPhase_Flush] += JitTicks() - flushT0;
+#endif
 
 
 #ifdef LITEV_JIT_PERFMAP
