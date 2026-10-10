@@ -1236,6 +1236,122 @@ int ClipPolygon(GPU3D& gpu, Vertex* vertices, int nverts, int clipstart)
     return nverts;
 }
 
+#ifdef LITEV_GX_CLIP_SLIM
+#if !defined(LITEV_GX_CLIP_LEAN) || !defined(LITEV_GEOM_CLIP_PLANESKIP)
+#error "LITEV_GX_CLIP_SLIM needs LITEV_GX_CLIP_LEAN and LITEV_GEOM_CLIP_PLANESKIP"
+#endif
+// ClipPolygon<true> with the plane as a runtime argument (exact): the templates instantiate the
+// clipper once per axis and ClipSegment once per axis and side (~12 KB inlined into SubmitPolygon),
+// so a polygon clipped against two planes ran (and pulled into the L1I) two different copies.
+// Same statements as ClipSegment / ClipAgainstPlane (PLANESKIP + CLIP_LEAN paths), plane and side
+// as values; one copy of each, out of SubmitPolygon's hot path.
+__attribute__((noinline))
+static void ClipSegmentRT(Vertex* outbuf, const Vertex* vin, const Vertex* vout, int comp, s32 plane)
+{
+    s64 factor_num = vin->Position[3] - (plane*vin->Position[comp]);
+    s32 factor_den = factor_num - (vout->Position[3] - (plane*vout->Position[comp]));
+
+#define INTERPOLATE(var)  { outbuf->var = (vin->var + ((vout->var - vin->var) * factor_num) / factor_den); }
+    for (int k = 0; k < 3; k++)
+        if (k != comp) INTERPOLATE(Position[k]);
+    INTERPOLATE(Position[3]);
+    outbuf->Position[comp] = plane*outbuf->Position[3];
+
+    INTERPOLATE(Color[0]);
+    INTERPOLATE(Color[1]);
+    INTERPOLATE(Color[2]);
+
+    INTERPOLATE(TexCoords[0]);
+    INTERPOLATE(TexCoords[1]);
+#undef INTERPOLATE
+
+    outbuf->Clipped = true;
+}
+
+static inline void ClipColorFix(Vertex* vertices, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        Vertex* vtx = &vertices[i];
+        vtx->Color[0] &= ~0xFFF; vtx->Color[0] += 0xFFF;
+        vtx->Color[1] &= ~0xFFF; vtx->Color[1] += 0xFFF;
+        vtx->Color[2] &= ~0xFFF; vtx->Color[2] += 0xFFF;
+    }
+}
+
+__attribute__((noinline))
+static int ClipPolygonRT(const GPU3D& gpu, Vertex* vertices, int nverts, int clipstart)
+{
+    for (int comp = 2; comp >= 0; comp--)   // Z, Y, X: ClipPolygon's order
+    {
+        bool any = false;
+        for (int i = clipstart; i < nverts; i++)
+        {
+            s32 p = vertices[i].Position[comp], w = vertices[i].Position[3];
+            any |= (p > w) | (p < -w);
+        }
+        if (!any)
+        {
+            ClipColorFix(vertices, nverts);
+            continue;
+        }
+
+        Vertex temp[10];
+        const Vertex* in = vertices;
+        int n = nverts;
+        bool plus = false;
+        for (int i = clipstart; i < n; i++) plus |= vertices[i].Position[comp] > vertices[i].Position[3];
+        if (plus)
+        {
+            int c = clipstart;
+            if (clipstart == 2) { temp[0] = vertices[0]; temp[1] = vertices[1]; }
+            for (int i = clipstart; i < n; i++)
+            {
+                const Vertex* vtx = &vertices[i];
+                if (vtx->Position[comp] > vtx->Position[3])
+                {
+                    if ((comp == 2) && (!(gpu.CurPolygonAttr & (1<<12)))) return 0;
+                    const Vertex* vprev = &vertices[i == 0 ? n - 1 : i - 1];
+                    if (vprev->Position[comp] <= vprev->Position[3]) ClipSegmentRT(&temp[c++], vtx, vprev, comp, 1);
+                    const Vertex* vnext = &vertices[i + 1 >= n ? 0 : i + 1];
+                    if (vnext->Position[comp] <= vnext->Position[3]) ClipSegmentRT(&temp[c++], vtx, vnext, comp, 1);
+                }
+                else
+                    temp[c++] = *vtx;
+            }
+            in = temp; n = c;
+        }
+        bool minus = false;
+        for (int i = clipstart; i < n; i++) minus |= in[i].Position[comp] < -in[i].Position[3];
+        if (minus)
+        {
+            Vertex* out = in == vertices ? temp : vertices;
+            int c = clipstart;
+            if (clipstart == 2 && out == temp) { temp[0] = vertices[0]; temp[1] = vertices[1]; }
+            for (int i = clipstart; i < n; i++)
+            {
+                const Vertex* vtx = &in[i];
+                if (vtx->Position[comp] < -vtx->Position[3])
+                {
+                    const Vertex* vprev = &in[i == 0 ? n - 1 : i - 1];
+                    if (vprev->Position[comp] >= -vprev->Position[3]) ClipSegmentRT(&out[c++], vtx, vprev, comp, -1);
+                    const Vertex* vnext = &in[i + 1 >= n ? 0 : i + 1];
+                    if (vnext->Position[comp] >= -vnext->Position[3]) ClipSegmentRT(&out[c++], vtx, vnext, comp, -1);
+                }
+                else
+                    out[c++] = *vtx;
+            }
+            in = out; n = c;
+        }
+        if (in != vertices)
+            for (int i = 0; i < n; i++) vertices[i] = in[i];
+        ClipColorFix(vertices, n);
+        nverts = n;
+    }
+    return nverts;
+}
+#endif
+
 bool ClipCoordsEqual(Vertex* a, Vertex* b)
 {
     return a->Position[0] == b->Position[0] &&
@@ -1538,7 +1654,11 @@ void GPU3D::SubmitPolygon() noexcept
 #endif
     else
 #endif
+#ifdef LITEV_GX_CLIP_SLIM
+    nverts = ClipPolygonRT(*this, clippedvertices, nverts, clipstart);
+#else
     nverts = ClipPolygon<true>(*this, clippedvertices, nverts, clipstart);
+#endif
     if (nverts == 0)
     {
         LastStripPolygon = NULL;
@@ -2378,6 +2498,458 @@ gxfifo_threaded_top:
 #ifdef LITEV_ACCESS_STATS
     { extern u64 LitevAccess[6][0x10000]; LitevAccess[5][0xC000 | entry.Command]++; }   // GX FIFO entries by command
 #endif
+#ifdef LITEV_GX_CMD_SLIM
+#ifndef LITEV_GXFIFO_THREADED
+#error "LITEV_GX_CMD_SLIM needs LITEV_GXFIFO_THREADED"
+#endif
+    // Compact command executor (exact): the switch above inlined a copy of the pre-delay
+    // (VertexPipelineCmdDelayed4/6/8, VertexPipelineSubmitCmd, StallPolygonPipeline -> AddCycles),
+    // of SubmitVertex and of each matrix routine per handler and per matrix mode: ~10 KB, most of
+    // it reloaded into the A55's 32 KB L1I on every one of the ~500 display-list sends a frame.
+    // Here the pre-delay is one table-driven block, the trailing AddCycles one site, the vertex
+    // commands share one SubmitVertex and the matrix commands pick their matrix first. Same
+    // statements in the same order per command (AddCycles touches only the cycle/pipeline state).
+    {
+    // pre-delay per command: bits 0-7 = threshold t (VertexPipeline > t: VP - t + 1 cycles, else
+    // NormalPipeline + 1; VertexPipeline never exceeds 7, so 127 = never), bit 8 = clears
+    // NormalPipeline (VertexPipelineCmdDelayed4/6/8), bit 9 = VertexPipelineSubmitCmd,
+    // bits 16+ = StallPolygonPipeline's delay (0 = not a stall)
+    enum : u32 { D4 = 127 | 0x100, D6 = 2 | 0x100, D8 = 0 | 0x100, SUB = 0x200 };
+    static const u32 kPre[256] =
+    {
+        [0 ... 255] = D4,
+        [0x20] = D6, [0x30] = D6, [0x31] = D6, [0x72] = D6,
+        [0x29] = D8, [0x2A] = D8, [0x2B] = D8, [0x33] = D8, [0x34] = D8, [0x41] = D8, [0x60] = D8, [0x71] = D8,
+        [0x23] = SUB, [0x24] = SUB, [0x25] = SUB, [0x26] = SUB, [0x27] = SUB, [0x28] = SUB,
+        [0x32] = 2 | (9 << 16), [0x40] = 0 | (1 << 16), [0x70] = 0 | (11 << 16),
+    };
+    static const void* const gxsFast[256] =
+    {
+        [0 ... 255] = &&gxs_end,
+        [0x10] = &&gxs_10, [0x11] = &&gxs_11, [0x12] = &&gxs_12,
+        [0x13] = &&gxs_13, [0x14] = &&gxs_14, [0x15] = &&gxs_15,
+        [0x20] = &&gxs_20, [0x21] = &&gxs_21, [0x22] = &&gxs_22,
+        [0x24] = &&gxs_24, [0x25] = &&gxs_25, [0x26] = &&gxs_26,
+        [0x27] = &&gxs_27, [0x28] = &&gxs_28, [0x29] = &&gxs_29,
+        [0x2A] = &&gxs_2A, [0x2B] = &&gxs_2B, [0x30] = &&gxs_30,
+        [0x31] = &&gxs_31, [0x32] = &&gxs_32, [0x33] = &&gxs_33,
+        [0x40] = &&gxs_40, [0x50] = &&gxs_50,
+        [0x60] = &&gxs_60, [0x72] = &&gxs_72,
+    };
+    static const void* const gxsFull[256] =
+    {
+        [0 ... 255] = &&gxs_end,
+        [0x16] = &&gxs_16, [0x17] = &&gxs_17, [0x18] = &&gxs_18,
+        [0x19] = &&gxs_19, [0x1A] = &&gxs_1A, [0x1B] = &&gxs_1B,
+        [0x1C] = &&gxs_1C, [0x23] = &&gxs_23, [0x34] = &&gxs_34,
+        [0x71] = &&gxs_71, [0x70] = &&gxs_70,
+    };
+    const u32 cmd = entry.Command;
+    const u32 np = CmdNumParams[cmd];
+    s32 cyc;
+    s32* mtx;   // the matrix a matrix command works on (modes 1 and 2: position)
+    if (np > 1)
+    {
+        ExecParams[ExecParamCount] = entry.Param;
+        ExecParamCount++;
+        if (ExecParamCount != 1) { cyc = 1; goto gxs_add; }
+    }
+    {
+        const u32 pre = kPre[cmd];
+        if (pre & SUB)
+        {
+            NormalPipeline = 0;
+            if (!(VertexSlotsFree & 0x1)) { NextVertexSlot(); goto gxs_dispatch; }
+            cyc = 1;
+        }
+        else
+        {
+            if ((pre >> 16) && PolygonPipeline > 0)
+            {
+                CycleCount += PolygonPipeline + (s32)(pre >> 16);
+                VertexPipeline = 0;
+                NormalPipeline = 0;
+                PolygonPipeline = 0;
+                VertexSlotCounter = 0;
+                VertexSlotsFree = 1;
+                goto gxs_dispatch;
+            }
+            const s32 t = pre & 0xFF;
+            cyc = VertexPipeline > t ? (VertexPipeline - t) + 1 : NormalPipeline + 1;
+            if (pre & 0x100) NormalPipeline = 0;
+        }
+    }
+gxs_add:
+    AddCycles(cyc);
+gxs_dispatch:
+    if (np <= 1) goto *gxsFast[cmd];
+    if (ExecParamCount < np) goto gxs_end;
+    ExecParamCount = 0;
+    goto *gxsFull[cmd];
+
+gxs_10: // matrix mode
+    MatrixMode = entry.Param & 0x3;
+    goto gxs_end;
+
+gxs_11: // push matrix
+#ifdef LITEV_GX_BULK_LEAN
+    if constexpr (!Bulk)
+#endif
+    NumPushPopCommands--;
+    if (MatrixMode == 0)
+    {
+        if (ProjMatrixStackPointer > 0) GXStat |= (1<<15);
+        memcpy(ProjMatrixStack, ProjMatrix, 16*4);
+        ProjMatrixStackPointer++;
+        ProjMatrixStackPointer &= 0x1;
+    }
+    else if (MatrixMode == 3)
+    {
+        if (TexMatrixStackPointer > 0) GXStat |= (1<<15);
+        memcpy(TexMatrixStack, TexMatrix, 16*4);
+        TexMatrixStackPointer++;
+        TexMatrixStackPointer &= 0x1;
+    }
+    else
+    {
+        if (PosMatrixStackPointer > 30) GXStat |= (1<<15);
+        memcpy(PosMatrixStack[PosMatrixStackPointer & 0x1F], PosMatrix, 16*4);
+        memcpy(VecMatrixStack[PosMatrixStackPointer & 0x1F], VecMatrix, 16*4);
+        PosMatrixStackPointer++;
+        PosMatrixStackPointer &= 0x3F;
+    }
+    cyc = 16; goto gxs_post;
+
+gxs_12: // pop matrix
+#ifdef LITEV_GX_BULK_LEAN
+    if constexpr (!Bulk)
+#endif
+    NumPushPopCommands--;
+    if (MatrixMode == 0)
+    {
+        if (ProjMatrixStackPointer == 0) GXStat |= (1<<15);
+        ProjMatrixStackPointer--;
+        ProjMatrixStackPointer &= 0x1;
+        memcpy(ProjMatrix, ProjMatrixStack, 16*4);
+        ClipMatrixDirty = true;
+        cyc = 35;
+    }
+    else if (MatrixMode == 3)
+    {
+        if (TexMatrixStackPointer == 0) GXStat |= (1<<15);
+        TexMatrixStackPointer--;
+        TexMatrixStackPointer &= 0x1;
+        memcpy(TexMatrix, TexMatrixStack, 16*4);
+        cyc = 17;
+    }
+    else
+    {
+        s32 offset = (s32)(entry.Param << 26) >> 26;
+        PosMatrixStackPointer -= offset;
+        PosMatrixStackPointer &= 0x3F;
+        if (PosMatrixStackPointer > 30) GXStat |= (1<<15);
+        memcpy(PosMatrix, PosMatrixStack[PosMatrixStackPointer & 0x1F], 16*4);
+        memcpy(VecMatrix, VecMatrixStack[PosMatrixStackPointer & 0x1F], 16*4);
+        ClipMatrixDirty = true;
+        cyc = 35;
+    }
+    goto gxs_post;
+
+gxs_13: // store matrix
+    if (MatrixMode == 0)
+        memcpy(ProjMatrixStack, ProjMatrix, 16*4);
+    else if (MatrixMode == 3)
+        memcpy(TexMatrixStack, TexMatrix, 16*4);
+    else
+    {
+        u32 addr = entry.Param & 0x1F;
+        if (addr > 30) GXStat |= (1<<15);
+        memcpy(PosMatrixStack[addr], PosMatrix, 16*4);
+        memcpy(VecMatrixStack[addr], VecMatrix, 16*4);
+    }
+    cyc = 16; goto gxs_post;
+
+gxs_14: // restore matrix
+    if (MatrixMode == 0)
+    {
+        memcpy(ProjMatrix, ProjMatrixStack, 16*4);
+        ClipMatrixDirty = true;
+        cyc = 35;
+    }
+    else if (MatrixMode == 3)
+    {
+        memcpy(TexMatrix, TexMatrixStack, 16*4);
+        cyc = 17;
+    }
+    else
+    {
+        u32 addr = entry.Param & 0x1F;
+        if (addr > 30) GXStat |= (1<<15);
+        memcpy(PosMatrix, PosMatrixStack[addr], 16*4);
+        memcpy(VecMatrix, VecMatrixStack[addr], 16*4);
+        ClipMatrixDirty = true;
+        cyc = 35;
+    }
+    goto gxs_post;
+
+gxs_15: // identity
+    if (MatrixMode == 3)
+    {
+        MatrixLoadIdentity(TexMatrix);
+        goto gxs_end;
+    }
+    MatrixLoadIdentity(MatrixMode == 0 ? ProjMatrix : PosMatrix);
+    if (MatrixMode == 2)
+        MatrixLoadIdentity(VecMatrix);
+    ClipMatrixDirty = true;
+    cyc = 18; goto gxs_post;
+
+gxs_16: // load 4x4
+    mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
+    MatrixLoad4x4(mtx, (s32*)ExecParams);
+    if (MatrixMode == 2)
+        MatrixLoad4x4(VecMatrix, (s32*)ExecParams);
+    if (MatrixMode != 3) ClipMatrixDirty = true;
+    cyc = MatrixMode == 3 ? 10 : 18; goto gxs_post;
+
+gxs_17: // load 4x3
+    mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
+    MatrixLoad4x3(mtx, (s32*)ExecParams);
+    if (MatrixMode == 2)
+        MatrixLoad4x3(VecMatrix, (s32*)ExecParams);
+    if (MatrixMode != 3) ClipMatrixDirty = true;
+    cyc = MatrixMode == 3 ? 7 : 18; goto gxs_post;
+
+gxs_18: // mult 4x4
+    mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
+    MatrixMult4x4(mtx, (s32*)ExecParams);
+    if (MatrixMode == 2)
+        MatrixMult4x4(VecMatrix, (s32*)ExecParams);
+    if (MatrixMode != 3) ClipMatrixDirty = true;
+    cyc = (MatrixMode == 3 ? 33 : MatrixMode == 2 ? 35 + 30 : 35) - 16; goto gxs_post;
+
+gxs_19: // mult 4x3
+    mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
+    MatrixMult4x3(mtx, (s32*)ExecParams);
+    if (MatrixMode == 2)
+        MatrixMult4x3(VecMatrix, (s32*)ExecParams);
+    if (MatrixMode != 3) ClipMatrixDirty = true;
+    cyc = (MatrixMode == 3 ? 33 : MatrixMode == 2 ? 35 + 30 : 35) - 12; goto gxs_post;
+
+gxs_1A: // mult 3x3
+    mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
+    MatrixMult3x3(mtx, (s32*)ExecParams);
+    if (MatrixMode == 2)
+        MatrixMult3x3(VecMatrix, (s32*)ExecParams);
+    if (MatrixMode != 3) ClipMatrixDirty = true;
+    cyc = (MatrixMode == 3 ? 33 : MatrixMode == 2 ? 35 + 30 : 35) - 9; goto gxs_post;
+
+gxs_1B: // scale (never the vector matrix)
+    mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
+    MatrixScale(mtx, (s32*)ExecParams);
+    if (MatrixMode != 3) ClipMatrixDirty = true;
+    cyc = (MatrixMode == 3 ? 33 : 35) - 3; goto gxs_post;
+
+gxs_1C: // translate
+    mtx = MatrixMode == 0 ? ProjMatrix : MatrixMode == 3 ? TexMatrix : PosMatrix;
+    MatrixTranslate(mtx, (s32*)ExecParams);
+    if (MatrixMode == 2)
+        MatrixTranslate(VecMatrix, (s32*)ExecParams);
+    if (MatrixMode != 3) ClipMatrixDirty = true;
+    cyc = (MatrixMode == 3 ? 33 : MatrixMode == 2 ? 35 + 30 : 35) - 3; goto gxs_post;
+
+gxs_20: // vertex color
+    {
+        u32 c = entry.Param;
+        VertexColor[0] = c & 0x1F;
+        VertexColor[1] = (c >> 5) & 0x1F;
+        VertexColor[2] = (c >> 10) & 0x1F;
+    }
+    goto gxs_end;
+
+gxs_21: // normal
+    Normal[0] = (s16)((entry.Param & 0x000003FF) << 6) >> 6;
+    Normal[1] = (s16)((entry.Param & 0x000FFC00) >> 4) >> 6;
+    Normal[2] = (s16)((entry.Param & 0x3FF00000) >> 14) >> 6;
+    CalculateLighting();
+    goto gxs_end;
+
+gxs_22: // texcoord
+    RawTexCoords[0] = entry.Param & 0xFFFF;
+    RawTexCoords[1] = entry.Param >> 16;
+    if ((TexParam >> 30) == 1)
+    {
+        TexCoords[0] = (RawTexCoords[0]*TexMatrix[0] + RawTexCoords[1]*TexMatrix[4] + TexMatrix[8] + TexMatrix[12]) >> 12;
+        TexCoords[1] = (RawTexCoords[0]*TexMatrix[1] + RawTexCoords[1]*TexMatrix[5] + TexMatrix[9] + TexMatrix[13]) >> 12;
+    }
+    else
+    {
+        TexCoords[0] = RawTexCoords[0];
+        TexCoords[1] = RawTexCoords[1];
+    }
+    goto gxs_end;
+
+gxs_23: // full vertex
+    CurVertex[0] = ExecParams[0] & 0xFFFF;
+    CurVertex[1] = ExecParams[0] >> 16;
+    CurVertex[2] = ExecParams[1] & 0xFFFF;
+    goto gxs_vertex;
+
+gxs_24: // 10-bit vertex
+    CurVertex[0] = (entry.Param & 0x000003FF) << 6;
+    CurVertex[1] = (entry.Param & 0x000FFC00) >> 4;
+    CurVertex[2] = (entry.Param & 0x3FF00000) >> 14;
+    goto gxs_vertex;
+
+gxs_25: // vertex XY
+    CurVertex[0] = entry.Param & 0xFFFF;
+    CurVertex[1] = entry.Param >> 16;
+    goto gxs_vertex;
+
+gxs_26: // vertex XZ
+    CurVertex[0] = entry.Param & 0xFFFF;
+    CurVertex[2] = entry.Param >> 16;
+    goto gxs_vertex;
+
+gxs_27: // vertex YZ
+    CurVertex[1] = entry.Param & 0xFFFF;
+    CurVertex[2] = entry.Param >> 16;
+    goto gxs_vertex;
+
+gxs_28: // 10-bit delta vertex
+    CurVertex[0] += (s16)((entry.Param & 0x000003FF) << 6) >> 6;
+    CurVertex[1] += (s16)((entry.Param & 0x000FFC00) >> 4) >> 6;
+    CurVertex[2] += (s16)((entry.Param & 0x3FF00000) >> 14) >> 6;
+gxs_vertex:
+    SubmitVertex();
+    goto gxs_end;
+
+gxs_29: // polygon attributes
+    PolygonAttr = entry.Param;
+    goto gxs_end;
+
+gxs_2A: // texture param
+    TexParam = entry.Param;
+    goto gxs_end;
+
+gxs_2B: // texture palette
+    TexPalette = entry.Param & 0x1FFF;
+    goto gxs_end;
+
+gxs_30: // diffuse/ambient material
+    MatDiffuse[0] = entry.Param & 0x1F;
+    MatDiffuse[1] = (entry.Param >> 5) & 0x1F;
+    MatDiffuse[2] = (entry.Param >> 10) & 0x1F;
+    MatAmbient[0] = (entry.Param >> 16) & 0x1F;
+    MatAmbient[1] = (entry.Param >> 21) & 0x1F;
+    MatAmbient[2] = (entry.Param >> 26) & 0x1F;
+    if (entry.Param & 0x8000)
+    {
+        VertexColor[0] = MatDiffuse[0];
+        VertexColor[1] = MatDiffuse[1];
+        VertexColor[2] = MatDiffuse[2];
+    }
+    cyc = 3; goto gxs_post;
+
+gxs_31: // specular/emission material
+    MatSpecular[0] = entry.Param & 0x1F;
+    MatSpecular[1] = (entry.Param >> 5) & 0x1F;
+    MatSpecular[2] = (entry.Param >> 10) & 0x1F;
+    MatEmission[0] = (entry.Param >> 16) & 0x1F;
+    MatEmission[1] = (entry.Param >> 21) & 0x1F;
+    MatEmission[2] = (entry.Param >> 26) & 0x1F;
+    UseShininessTable = (entry.Param & 0x8000) != 0;
+    cyc = 3; goto gxs_post;
+
+gxs_32: // light direction
+    {
+        u32 l = entry.Param >> 30;
+        s16 dir[3];
+        dir[0] = (s16)((entry.Param & 0x000003FF) << 6) >> 6;
+        dir[1] = (s16)((entry.Param & 0x000FFC00) >> 4) >> 6;
+        dir[2] = (s16)((entry.Param & 0x3FF00000) >> 14) >> 6;
+        LightDirection[l][0] = (-((dir[0]*VecMatrix[0] + dir[1]*VecMatrix[4] + dir[2]*VecMatrix[8] ) >> 12) << 21) >> 21;
+        LightDirection[l][1] = (-((dir[0]*VecMatrix[1] + dir[1]*VecMatrix[5] + dir[2]*VecMatrix[9] ) >> 12) << 21) >> 21;
+        LightDirection[l][2] = (-((dir[0]*VecMatrix[2] + dir[1]*VecMatrix[6] + dir[2]*VecMatrix[10]) >> 12) << 21) >> 21;
+        s32 den =              -(((dir[0]*VecMatrix[2] + dir[1]*VecMatrix[6] + dir[2]*VecMatrix[10]) << 9) >> 21) + (1<<9);
+        if (den == 0) SpecRecip[l] = 0;
+        else SpecRecip[l] = (1<<18) / den;
+    }
+    cyc = 5; goto gxs_post;
+
+gxs_33: // light color
+    {
+        u32 l = entry.Param >> 30;
+        LightColor[l][0] = entry.Param & 0x1F;
+        LightColor[l][1] = (entry.Param >> 5) & 0x1F;
+        LightColor[l][2] = (entry.Param >> 10) & 0x1F;
+    }
+    cyc = 1; goto gxs_post;
+
+gxs_34: // shininess table
+    for (int i = 0; i < 128; i += 4)
+    {
+        u32 val = ExecParams[i >> 2];
+        ShininessTable[i + 0] = val & 0xFF;
+        ShininessTable[i + 1] = (val >> 8) & 0xFF;
+        ShininessTable[i + 2] = (val >> 16) & 0xFF;
+        ShininessTable[i + 3] = val >> 24;
+    }
+    goto gxs_end;
+
+gxs_40: // begin polygons
+    PolygonMode = entry.Param & 0x3;
+    VertexNum = 0;
+    VertexNumInPoly = 0;
+    NumConsecutivePolygons = 0;
+    LastStripPolygon = NULL;
+    CurPolygonAttr = PolygonAttr;
+    goto gxs_end;
+
+gxs_50: // flush
+    FlushRequest = 1;
+    SwapCount++;
+    FlushAttributes = entry.Param & 0x3;
+    CycleCount = 325;
+    VertexPipeline = 0;
+    NormalPipeline = 0;
+    PolygonPipeline = 0;
+    VertexSlotCounter = 0;
+    VertexSlotsFree = 1;
+    goto gxs_end;
+
+gxs_60: // viewport x1,y1,x2,y2 (Y upside-down)
+    Viewport[0] = entry.Param & 0xFF;
+    Viewport[1] = (191 - ((entry.Param >> 8) & 0xFF)) & 0xFF;
+    Viewport[2] = (entry.Param >> 16) & 0xFF;
+    Viewport[3] = (191 - (entry.Param >> 24)) & 0xFF;
+    Viewport[4] = (Viewport[2] - Viewport[0] + 1) & 0x1FF;
+    Viewport[5] = (Viewport[1] - Viewport[3] + 1) & 0xFF;
+    goto gxs_end;
+
+gxs_70: // box test
+    NumTestCommands -= 3;
+    BoxTest(ExecParams);
+    goto gxs_end;
+
+gxs_71: // pos test
+    NumTestCommands -= 2;
+    CurVertex[0] = ExecParams[0] & 0xFFFF;
+    CurVertex[1] = ExecParams[0] >> 16;
+    CurVertex[2] = ExecParams[1] & 0xFFFF;
+    PosTest();
+    goto gxs_end;
+
+gxs_72: // vec test
+    NumTestCommands--;
+    VecTest(entry.Param);
+    goto gxs_end;
+
+gxs_post:   // a handler's trailing AddCycles
+    AddCycles(cyc);
+gxs_end: ;
+    }
+#else
     u32 paramsRequiredCount = CmdNumParams[entry.Command];
     if (paramsRequiredCount <= 1)
     {
@@ -3551,6 +4123,7 @@ gxfifo_threaded_top:
             }
         }
     }
+#endif // LITEV_GX_CMD_SLIM
 #ifdef LITEV_GXFIFO_THREADED
     // Threaded loop-tail: instead of returning, re-run the whole ExecuteCommand
     // body for the next queued command (mirrors Run()'s drain-loop condition).
@@ -3969,6 +4542,31 @@ void GPU3D::VBlank() noexcept
 
         if (FlushRequest)
         {
+#ifdef LITEV_TMP_POLYHASH
+            {
+                u64 h = 1469598103934665603ull;
+                auto mix = [&](u64 v) { h = (h ^ v) * 1099511628211ull; };
+                for (u32 i = 0; i < NumVertices; i++)
+                {
+                    const Vertex& v = CurVertexRAM[i];
+                    for (int k = 0; k < 4; k++) mix((u32)v.Position[k]);
+                    for (int k = 0; k < 3; k++) { mix((u32)v.Color[k]); mix((u32)v.FinalColor[k]); }
+                    mix((u16)v.TexCoords[0]); mix((u16)v.TexCoords[1]); mix(v.Clipped);
+                    for (int k = 0; k < 2; k++) { mix((u32)v.FinalPosition[k]); mix((u32)v.HiresPosition[k]); }
+                }
+                for (u32 i = 0; i < NumPolygons; i++)
+                {
+                    const Polygon& p = CurPolygonRAM[i];
+                    mix(p.NumVertices);
+                    for (u32 k = 0; k < p.NumVertices; k++) { mix((u64)(p.Vertices[k] - VertexRAM)); mix((u32)p.FinalZ[k]); mix((u32)p.FinalW[k]); }
+                    mix(p.WBuffer); mix(p.Attr); mix(p.TexParam); mix(p.TexPalette); mix(p.Degenerate); mix(p.FacingView);
+                    mix(p.Translucent); mix(p.IsShadowMask); mix(p.IsShadow); mix(p.Type); mix(p.VTop); mix(p.VBottom);
+                    mix((u32)p.YTop); mix((u32)p.YBottom); mix((u32)p.XTop); mix((u32)p.XBottom); mix(p.SortKey);
+                }
+                mix(NumOpaquePolygons); mix(DispCnt);
+                fprintf(stderr, "POLYHASH %u %u %016llx\n", NumPolygons, NumVertices, (unsigned long long)h);
+            }
+#endif
             CurRAMBank = CurRAMBank?0:1;
             CurVertexRAM = &VertexRAM[CurRAMBank ? 6144 : 0];
             CurPolygonRAM = &PolygonRAM[CurRAMBank ? 2048 : 0];
