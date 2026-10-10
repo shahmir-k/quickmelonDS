@@ -113,6 +113,12 @@ public:
     // so DMA::Run9's per-word geometry-DMA loop can inline the whole producer path. Public because
     // DMA.cpp calls it; byte-exact with WriteToGXFIFO (single source — the public fn delegates here).
     void WriteToGXFIFO_Inline(u32 val) noexcept;
+#ifdef LITEV_GX_BULK
+    // Geometry DMA in bulk (DMA::Run9): with the FIFO empty, decode `n` DMA words and run their
+    // commands now; a SWAP_BUFFERS and everything after it is queued in the FIFO as usual.
+    bool BulkReady() const noexcept;
+    void BulkWords(const u32* words, u32 n) noexcept;
+#endif
 
     u8 Read8(u32 addr) noexcept;
     u16 Read16(u32 addr) noexcept;
@@ -134,6 +140,12 @@ private:
 
     } CmdFIFOEntry;
 
+#ifdef LITEV_GX_BULK
+    // Bulk = run commands from [BulkPtr, BulkEnd) (no FIFO reads, no wait on CycleCount)
+    template<bool Bulk> void ExecuteCommandT() noexcept;
+    const CmdFIFOEntry* BulkPtr = nullptr;
+    const CmdFIFOEntry* BulkEnd = nullptr;
+#endif
     void UpdateClipMatrix() noexcept;
     void ResetRenderingState() noexcept;
     void AddCycles(s32 num) noexcept;

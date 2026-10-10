@@ -2129,7 +2129,17 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 #endif
 }
 
+#ifdef LITEV_GX_BULK
+#if !defined(LITEV_GXFIFO_THREADED) || !defined(LITEV_GXFIFO_UNIFIED) || !defined(LITEV_DMA_GXFIFO_FAST)
+#error "LITEV_GX_BULK needs LITEV_GXFIFO_THREADED, LITEV_GXFIFO_UNIFIED and LITEV_DMA_GXFIFO_FAST"
+#endif
+void GPU3D::ExecuteCommand() noexcept { ExecuteCommandT<false>(); }
+
+template<bool Bulk>
+void GPU3D::ExecuteCommandT() noexcept
+#else
 void GPU3D::ExecuteCommand() noexcept
+#endif
 {
 #ifdef LITEV_GXFIFO_THREADED
     // DraStic #3 (backlog D.7 §3): batched threaded-code interpreter. Run()'s
@@ -2144,7 +2154,21 @@ gxfifo_threaded_top:
     // Run()/drain batch so per-command clock_gettime does not distort it).
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.GXCommands);
 
+#ifdef LITEV_GX_BULK
+    CmdFIFOEntry entry;
+    if constexpr (Bulk)
+    {
+        // a SWAP_BUFFERS waits for its turn in the FIFO (it resets CycleCount)
+        if (BulkPtr == BulkEnd || BulkPtr->Command == 0x50) return;
+        entry = *BulkPtr++;
+        // CmdFIFOWrite counts these per entry; their handlers count them down
+        if (entry.Command == 0x11 || entry.Command == 0x12) NumPushPopCommands++;
+        else if (entry.Command >= 0x70 && entry.Command <= 0x72) NumTestCommands++;
+    }
+    else entry = CmdFIFORead();
+#else
     CmdFIFOEntry entry = CmdFIFORead();
+#endif
 
     //printf("FIFO: processing %02X %08X. Levels: FIFO=%d, PIPE=%d\n", entry.Command, entry.Param, CmdFIFO->Level(), CmdPIPE->Level());
 
@@ -3323,6 +3347,9 @@ gxfifo_threaded_top:
     // Threaded loop-tail: instead of returning, re-run the whole ExecuteCommand
     // body for the next queued command (mirrors Run()'s drain-loop condition).
     // One call drains the batch -> no per-command bl/ret or prologue/epilogue.
+#ifdef LITEV_GX_BULK
+    if constexpr (Bulk) goto gxfifo_threaded_top;
+#endif
     if (CycleCount <= 0 && !PipeEmpty())
     {
         if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
@@ -3331,6 +3358,79 @@ gxfifo_threaded_top:
     }
 #endif
 }
+
+#ifdef LITEV_GX_BULK
+bool GPU3D::BulkReady() const noexcept
+{
+    return !FlushRequest && PipeEmpty() && FifoEmpty() && CmdStallQueue.IsEmpty();
+}
+
+// Geometry DMA in bulk (deterministic, approximate timing). Called by DMA::Run9 with the FIFO
+// empty. The words are decoded exactly as WriteToGXFIFO does and the commands run at once,
+// ahead of the guest clock: their cycles pile up in CycleCount, so the engine stays busy
+// (GXSTAT bit 27) for the same total time, which Run() then counts down. The game sees the
+// FIFO empty throughout instead of filling and draining.
+void GPU3D::BulkWords(const u32* words, u32 n) noexcept
+{
+    Run(); // bring the engine clock up to now (the FIFO is empty: only time passes)
+
+    CmdFIFOEntry q[4*64]; // a word holds at most 4 commands; Run9 passes <= 64 words
+    u32 m = 0;
+    u32 numCmds = NumCommands, cur = CurCommand, pc = ParamCount, tp = TotalParams;
+    for (u32 i = 0; i < n; i++)
+    {
+        const u32 val = words[i];
+        // same decode as WriteToGXFIFO_Inline, with the state in registers
+        if (numCmds == 0)
+        {
+            numCmds = 4;
+            cur = val;
+            pc = 0;
+            tp = CmdNumParams[cur & 0xFF];
+            if (tp > 0) continue;
+        }
+        else
+            pc++;
+
+        for (;;)
+        {
+            if ((cur & 0xFF) || (numCmds == 4 && cur == 0))
+            {
+                q[m]._contents = 0;
+                q[m].Command = cur & 0xFF;
+                q[m].Param = val;
+                m++;
+            }
+
+            if (pc >= tp)
+            {
+                cur >>= 8;
+                numCmds--;
+                if (numCmds == 0) break;
+
+                pc = 0;
+                tp = CmdNumParams[cur & 0xFF];
+            }
+            if (pc < tp)
+                break;
+        }
+    }
+    NumCommands = numCmds; CurCommand = cur; ParamCount = pc; TotalParams = tp;
+    if (m == 0) return;
+
+    GXStat |= (1<<27);
+    BulkPtr = q; BulkEnd = q + m;
+    ExecuteCommandT<true>();
+    // from a SWAP_BUFFERS on: the FIFO, as usual (fits: the FIFO+PIPE hold 260)
+    for (; BulkPtr < BulkEnd; BulkPtr++) CmdFIFOWrite_Inline(*BulkPtr);
+    BulkPtr = BulkEnd = nullptr;
+
+    if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
+    if (NumTestCommands == 0)    GXStat &= ~(1<<0);
+    CheckFIFODMA();
+    CheckFIFOIRQ();
+}
+#endif
 
 s32 GPU3D::CyclesToRunFor() const noexcept
 {
