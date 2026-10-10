@@ -25,7 +25,7 @@
 // Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS:
 // 0 off, 1 all, other values = the mask below.
 // Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material,
-// 256 _ll_sdiv; 8 needs 1)
+// 256 _ll_sdiv, 512 GX async start; 8 needs 1)
 // for A/B of single hooks.
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
@@ -58,6 +58,8 @@
 //    callback / cache hit / buffered geometry (position independent, literal-pool globals read at the call).
 // 9. _ll_sdiv (64-bit signed divide of the compiler runtime): native quotient with the guest's exact
 //    registers / flags / stack bytes (position independent).
+// 10. MI_SendGXCommandAsync's synchronous part (PW, PB): the same IO writes in the same order, every memory
+//    byte and register up to its return; the display list's DMA-end IRQ stays guest code.
 //
 // Diagnostics (build with LITEV_HLE_DIAG; compiled out of shipping builds):
 //
