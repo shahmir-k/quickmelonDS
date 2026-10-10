@@ -142,6 +142,9 @@ void main()
     // opaque pass, polygon that can't produce a transparent pixel: no alpha test, so the Mali
     // keeps its early depth test and hidden-surface removal (any discard in the shader loses both)
     oColor = FinalColor();
+#ifdef PassBDiscard
+    if (oColor.a < 30.5/31.0) discard;   // LITEV_GL_ALPHATEST_2PASS pass B (polygon alpha is 31)
+#endif
     oAttr = vec4(float((fPolygonAttr.x >> 24) & 0x3F) / 63.0, max(gl_FragCoord.z, 1.0/255.0), float((fPolygonAttr.x >> 15) & 0x1), 1.0);
 #else
     if (uRenderMode == 2)
