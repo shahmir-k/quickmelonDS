@@ -24,7 +24,7 @@
 // have arrived inside the elided round trip is taken right after it). Deterministic.
 // Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS:
 // 0 off, 1 all, other values = the mask below.
-// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send; 8 needs 1) for A/B of single hooks.
+// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read; 8 needs 1) for A/B of single hooks.
 //
 // 3. Whole HBlank IRQs (~265 a frame on PW, ~3.8k Mac host instructions each through the JIT
 //    even with 1. native; ~1.7k native): when the only pending enabled IRQ is HBlank and the game's HBlank callback
@@ -44,6 +44,15 @@
 //    estimate per elided IRQ. Check mode (build with LITEV_A9HLE_GXCHECK) compares the words
 //    the guest sends to GXFIFO, and src/length where the native path would leave them.
 //
+// 6. CARD ROM reads with the CPU (CARDi_ReadRom's per-page loop: poll ROMCTRL, read the data
+//    port, store; ~8 guest instructions and two IO reads a word, 10-25% of PW's ARM9 guest
+//    instructions as it streams data every frame): the loop runs natively on the same cart
+//    functions in the same order (under LITEV_CART_SYNC every word but a command's first is
+//    ready at once), leaving the guest's registers/flags/stores at the loop exit (or at the loop
+//    head if the next word isn't ready: the guest polls). Category B: 31 cycles per word.
+//    Check mode reruns the native loop from the entry state (cart ROM-read state restored) at
+//    the guest's loop exit and compares registers, flags, stores, cart state, transfer IRQ.
+//
 // LITEV_A9HLE_CHECK=1 (env, interpreter mode): compute the native result, run the guest code
 // instead, and at the guest's return compare all of main RAM, ITCM, DTCM and the registers
 // with the native prediction. LITEV_A9HLE_STATS=1: counts, host ns per native call (and measured
@@ -62,7 +71,7 @@ namespace melonDS { class ARM; class ARMv5; class NDS; }
 namespace melonDS::A9HLE
 {
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
-inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8; }
+inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE5942000; }
 // JIT decode: is the ARM-mode instruction at addr a hooked entry?
 // 0 no, 1 yes (code signature verified: under the JIT this compile-time check is the code
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the

@@ -18,7 +18,7 @@
 
 namespace melonDS::A7Prof
 {
-struct PcStat { uint64_t n = 0, cyc = 0; uint32_t size = 4; };
+struct PcStat { uint64_t n = 0, cyc = 0, arr = 0; uint32_t size = 4; };   // arr: non-sequential arrivals (block entries)
 struct FnStat { uint64_t selfN = 0, selfC = 0, inclN = 0, inclC = 0, calls = 0; std::map<uint32_t, uint64_t> io; std::map<uint32_t, uint64_t> callers; };
 struct Frame { uint32_t ret, fn; bool irq; uint32_t node; };
 struct Node { uint32_t parent, fn; uint64_t selfN = 0, selfC = 0, calls = 0; };
@@ -47,6 +47,7 @@ struct Prof
         uint32_t mode = cpsr & 0x1F;
         if (pc != prevPc + prevSize)
         {
+            if (active()) pcs[pc].arr++;
             if (pc == irqVec && mode == 0x12)
             {
                 uint32_t r = (lr - 4) & ~1u;
@@ -108,8 +109,8 @@ struct Prof
         uint64_t f = frames > skipFrames ? frames - skipFrames : 1;
         std::string o(out);
         FILE* a = fopen((o + ".pcs.tsv").c_str(), "w");
-        fprintf(a, "pc\tinstr_per_frame\tcyc_per_frame\tsize\n");
-        for (auto& [pc, s] : pcs) fprintf(a, "%08x\t%.2f\t%.2f\t%u\n", pc, s.n / (double)f, s.cyc / (double)f, s.size);
+        fprintf(a, "pc\tinstr_per_frame\tcyc_per_frame\tsize\tarrivals_per_frame\n");
+        for (auto& [pc, s] : pcs) fprintf(a, "%08x\t%.2f\t%.2f\t%u\t%.2f\n", pc, s.n / (double)f, s.cyc / (double)f, s.size, s.arr / (double)f);
         fclose(a);
         FILE* b = fopen((o + ".fns.tsv").c_str(), "w");
         fprintf(b, "fn\tself_i\tself_c\tincl_i\tincl_c\tcalls\ttop_callers\tio\n");

@@ -4,6 +4,8 @@
 #include "ARM.h"
 #include "NDS.h"
 #include "ARMInterpreter.h"
+#include "NDSCart.h"
+#include "Savestate.h"
 #ifdef LITEV_GX_BULK
 #include "GPU.h"
 #include "DMA_Timings.h"
@@ -82,21 +84,29 @@ constexpr u32 kHbObjPtr = 0x020AA1B4;       // callback object = [[kHbObjPtr + 0
 constexpr u32 kHbRet = 0x01FF8148;          // OS_IrqHandler after the table call
 constexpr u32 kIdlePc = 0x020882F0, kIdleLr = 0x02085B44;   // halted in OS_Halt, called from the idle loop
 
+// 6.: CARDi_ReadRom CPU-read loop (one 512-byte page per ROM command): poll ROMCTRL, read the
+// data word, store it to the page buffer while fewer than 128 words
+constexpr u32 kCard = 0x02076EE8, kCardInstr = 0xE5942000, kCardExit = 0x02076F0C;
+constexpr u32 kCardLoop[9] = {0xE5942000, 0xE3120502, 0x0A000003, 0xE59B1000, 0xE3530080, 0x37851103, 0x32833001, 0xE3120102, 0x1AFFFFF6};
+constexpr Range kCardCode = {kCard, kCardExit};
+
 // ponytail: fixed cycle estimates (guest averages measured in check mode on PW)
 constexpr s32 kWakeCycles = 900, kSetCycles = 500, kGetCyclesBase = 27, kGetCyclesPerBit = 17;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
+constexpr int kKinds = 7;
 struct State
 {
     int status = 0;                 // 0 unprobed, 1 active, -1 off
-    u32 mask = 31;                  // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send
+    u32 mask = 63;                  // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read
     std::vector<u8> code, irqCode, gxCode;
     bool gxOk = false;              // MIi_FIFOCallback matches PW (5.)
+    bool cardOk = false;            // CARD read loop matches PW (6.)
     bool irqOk = false;             // IRQ path code matches PW (3.)
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
-    u64 calls[6] = {}, native[6] = {}, fallback[6] = {}, checks[6] = {}, diffs[6] = {}, irqDuring[6] = {};
-    u64 guestCyc[6] = {}, guestN[6] = {}, getBits = 0, gxWords = 0;
+    u64 calls[kKinds] = {}, native[kKinds] = {}, fallback[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, irqDuring[kKinds] = {};
+    u64 guestCyc[kKinds] = {}, guestN[kKinds] = {}, getBits = 0, gxWords = 0, cardWords = 0;
     u32 biosOk = 0;                 // BIOS IRQ epilogue address verified once
     u64 ns = 0;                     // stats: host time inside Run (native calls)
     // host pointers of the fixed-address OS objects, valid for fkey (DTCM base/mask, ITCM size)
@@ -110,9 +120,9 @@ bool g_Stats = getenv("LITEV_A9HLE_STATS") && atoi(getenv("LITEV_A9HLE_STATS"));
 bool g_Dry = getenv("LITEV_A9HLE_DRY") && atoi(getenv("LITEV_A9HLE_DRY"));
 // same, IRQ path (3.) only
 bool g_DryIrq = g_Dry || (getenv("LITEV_A9HLE_DRYIRQ") && atoi(getenv("LITEV_A9HLE_DRYIRQ")));
-const char* kName[6] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "cardread"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k >= 6 ? 1u << (k - 1) : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -217,6 +227,12 @@ bool GxIntact(melonDS::ARMv5* c, const State& s)
     return p && memcmp(p, s.gxCode.data(), kGxCode.b - kGxCode.a) == 0;
 }
 
+bool CardIntact(melonDS::ARMv5* c)
+{
+    const u8* p = CodePtr(c, kCard);
+    return p && memcmp(p, kCardLoop, sizeof(kCardLoop)) == 0;
+}
+
 State& Get(melonDS::ARMv5* c)
 {
     if (c->A9HLEState) return *(State*)c->A9HLEState;
@@ -245,6 +261,8 @@ State& Get(melonDS::ARMv5* c)
     for (u32 a = kGxCode.a; a < kGxCode.b; a++) { const u8* p = CodePtr(c, a); s.gxCode.push_back(p ? *p : 0); }
     s.gxOk = Fnv(s.gxCode) == kGxSig;
     if (g_Stats) fprintf(stderr, "A9HLE: GX send signature %016llx -> %s\n", (unsigned long long)Fnv(s.gxCode), s.gxOk ? "on" : "off");
+    s.cardOk = CardIntact(c);
+    if (g_Stats) fprintf(stderr, "A9HLE: card read loop -> %s\n", s.cardOk ? "on" : "off");
     return s;
 }
 
@@ -513,7 +531,7 @@ void WakeCommit(melonDS::ARMv5* c, const Expect& e)
 }
 
 // ---- 2. OS_SetIrqFunction(mask, func) ----------------------------------------------------
-bool SetIrq(melonDS::ARMv5* c, Mem& m, Expect& e)
+__attribute__((noinline)) bool SetIrq(melonDS::ARMv5* c, Mem& m, Expect& e)
 {
     u32 mask = c->R[0], fn = c->R[1], sp = c->R[13];
     u32 lr = c->R[14];
@@ -542,7 +560,7 @@ bool SetIrq(melonDS::ARMv5* c, Mem& m, Expect& e)
 }
 
 // ---- 3. OS_GetIrqFunction(mask) ----------------------------------------------------------
-bool GetIrq(melonDS::ARMv5* c, Mem& m, Expect& e, u32& bits)
+__attribute__((noinline)) bool GetIrq(melonDS::ARMv5* c, Mem& m, Expect& e, u32& bits)
 {
     u32 mask = c->R[0];
     for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
@@ -764,21 +782,183 @@ void GxCheckAt(State& s, melonDS::ARMv5* c)
 }
 #endif
 
+
+// ---- 6. CARD ROM CPU read: the page loop at once ------------------------------------------------
+// CARDi_ReadRom reads with the CPU: per 512-byte page it starts a ROM command, then loops
+//   loop: ldr r2, [ROMCTRL]; tst r2, #DATA_READY; beq 1f; ldr r1, [CARD_DATA]; cmp r3, #128;
+//         strlo r1, [r5, r3, lsl #2]; addlo r3, r3, #1; 1: tst r2, #BUSY; bne loop
+// (~8 guest instructions and two IO reads a word, 10-25% of PW's ARM9 guest instructions:
+// it streams map/graphics data every frame). Native: the same ROMCTRL / ROMData reads in the
+// same order (the same cart functions the IO reads call; under LITEV_CART_SYNC every word but
+// the command's first is ready on the next poll, nothing is scheduled in between), the same
+// stores, leaving the registers and flags the guest has at the loop exit, or at the loop head
+// when the next word isn't ready yet (the guest then polls as before). Category B: a fixed
+// cycle estimate per word; an IRQ that would arrive inside the loop is taken after it.
+// ponytail: fixed estimate (guest average per word, check mode on PW)
+constexpr s32 kCardCycWord = 31;
+
+struct CardIo { u32 r1, r2, r3, flags; bool exit; u32 words; };
+// the registers / buffer the native loop handles
+bool CardArgsOk(melonDS::ARMv5* c, u32 r3)
+{
+    melonDS::NDS& nds = c->NDS;
+    if (c->R[4] != 0x040001A4 || c->R[11] != 0x04100010) return false;
+    // IO reads pass the protection unit (else the guest's data abort)
+    if (!(c->PU_Map[0x040001A4 >> 12] & 0x01) || !(c->PU_Map[0x04100010 >> 12] & 0x01)) return false;
+    if (r3 >= 128) return true;
+    // stores [r5 + r3*4, r5 + 512): main RAM, not under a TCM, writable, one host block
+    // (a DTCM of >= 16 KB overlapping a range of <= 512 bytes holds one of its ends)
+    const u32 r5 = c->R[5], a = r5 + r3 * 4, b = r5 + 511;
+    return !((r5 & 3) || (a >> 24) != 0x02 || (b >> 24) != 0x02 || a < c->ITCMSize || ((a & c->DTCMMask) == c->DTCMBase)
+             || ((b & c->DTCMMask) == c->DTCMBase) || ((a & nds.MainRAMMask) > (b & nds.MainRAMMask))
+             || !(c->PU_Map[a >> 12] & 0x02) || !(c->PU_Map[b >> 12] & 0x02));
+}
+
+// io in: r1, r2, r3 and NZCV at the loop head; log: check mode (stores recorded, memory
+// untouched). false: nothing done (the guest runs the iteration).
+bool CardCore(melonDS::ARMv5* c, CardIo& io, std::vector<Wr>* log)
+{
+    melonDS::NDS& nds = c->NDS;
+    if (!CardArgsOk(c, io.r3)) return false;
+    const u32 r5 = c->R[5];
+    u32 r1 = io.r1, r2 = io.r2, r3 = io.r3;
+    u8* buf = nds.MainRAM;
+    melonDS::NDSCart::NDSCartSlot& slot = *nds.NDSCartSlots[0];
+    u32 n = 0;
+    bool cmpd = false, exit = false;
+    for (;;)
+    {
+        const u32 cnt = slot.ReadROMCnt(0);
+        if (!(cnt & 0x800000))
+        {
+            if (cnt & 0x80000000) break;        // not ready: the guest polls from the loop head
+            r2 = cnt; exit = true; break;       // done
+        }
+        r2 = cnt;
+        r1 = slot.ReadROMData(0);
+        cmpd = true; n++;
+        if (r3 < 128)
+        {
+            const u32 a = r5 + r3 * 4;
+            u8* p = buf + (a & nds.MainRAMMask);
+            if (__builtin_expect(log != nullptr, 0)) log->push_back({a, r1, 4});
+            else if (R32(p) != r1)
+            {
+                nds.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(a);
+                memcpy(p, &r1, 4);
+            }
+            r3++;
+        }
+        if (!(cnt & 0x80000000)) { exit = true; break; }
+    }
+    if (!n && !exit) return false;
+    // flags of the last tst r2, #BUSY (C from the rotated immediate); V: cmp r3, #128 clears it
+    io.flags = (r2 & 0x80000000) | ((r2 & 0x80000000) ? 0 : 0x40000000) | 0x20000000 | (cmpd ? 0 : (io.flags & 0x10000000));
+    io.r1 = r1; io.r2 = r2; io.r3 = r3; io.exit = exit; io.words = n;
+    return true;
+}
+
+// check mode (interpreter): the guest runs the loop; at its exit the native loop reruns from the
+// entry state (the cart's ROM-read state restored) and must produce the same registers, flags,
+// stores, cart state and transfer IRQ
+struct CardPending
+{
+    bool on = false;
+    u32 r[16] = {}, cpsr = 0, ifr = 0;
+    std::vector<u8> cart, buf;
+    u64 t0 = 0, steps = 0;
+} g_Card;
+
+__attribute__((noinline, cold)) std::vector<u8> CartState(melonDS::NDS& nds)
+{
+    melonDS::Savestate st(1 << 16);
+    nds.NDSCartSlots[0]->HleRomState(&st);
+    st.Finish();
+    const u8* b = (const u8*)st.Buffer();
+    return std::vector<u8>(b, b + st.Length());
+}
+__attribute__((noinline, cold)) void CartLoad(melonDS::NDS& nds, std::vector<u8>& v)
+{
+    melonDS::Savestate st(v.data(), (u32)v.size(), false);
+    nds.NDSCartSlots[0]->HleRomState(&st);
+}
+
+__attribute__((noinline, cold)) void CardCheckStart(melonDS::ARMv5* c, State& s)
+{
+    melonDS::NDS& nds = c->NDS;
+    g_Card.on = true;
+    for (int i = 0; i < 16; i++) g_Card.r[i] = c->R[i];
+    g_Card.cpsr = c->CPSR; g_Card.ifr = nds.IF[0];
+    g_Card.cart = CartState(nds);
+    g_Card.buf.assign(512, 0);
+    for (u32 i = 0; i < 512; i++) g_Card.buf[i] = nds.ARM9Read8(c->R[5] + i);
+    g_Card.t0 = nds.ARM9Timestamp + c->Cycles; g_Card.steps = 0;
+    CheckPending = true;
+    s.checks[6]++;
+}
+
+__attribute__((noinline, cold)) void CardCheckAt(melonDS::ARMv5* c, u32 pc)
+{
+    melonDS::NDS& nds = c->NDS;
+    State& s = g_State[&nds];
+    if (++g_Card.steps > 2000000) { fprintf(stderr, "A9HLE CHECK cardread: guest never left the loop\n"); g_Card.on = CheckPending = false; s.diffs[6]++; return; }
+    if (pc != kCardExit || (c->CPSR & 0x3F) != (g_Card.cpsr & 0x3F)) return;
+    g_Card.on = CheckPending = false;
+    const u64 gcyc = nds.ARM9Timestamp + c->Cycles - g_Card.t0;
+    const u32 g1 = c->R[1], g2 = c->R[2], g3 = c->R[3], gfl = c->CPSR & 0xF0000000, gif = nds.IF[0];
+    std::vector<u8> gbuf(512), gcart = CartState(nds);
+    for (u32 i = 0; i < 512; i++) gbuf[i] = nds.ARM9Read8(g_Card.r[5] + i);
+    // native from the entry state
+    CartLoad(nds, g_Card.cart);
+    const u32 saveR[16] = {c->R[0], c->R[1], c->R[2], c->R[3], c->R[4], c->R[5], c->R[6], c->R[7], c->R[8], c->R[9], c->R[10], c->R[11], c->R[12], c->R[13], c->R[14], c->R[15]};
+    for (int i = 0; i < 16; i++) c->R[i] = g_Card.r[i];
+    nds.IF[0] = g_Card.ifr;
+    std::vector<Wr> log;
+    CardIo io{g_Card.r[1], g_Card.r[2], g_Card.r[3], g_Card.cpsr & 0xF0000000, false, 0};
+    bool ran = CardCore(c, io, &log);
+    const u32 nif = nds.IF[0];
+    std::vector<u8> ncart = CartState(nds);
+    for (int i = 0; i < 16; i++) c->R[i] = saveR[i];
+    nds.IF[0] = gif;
+    nds.UpdateIRQ(0);
+    CartLoad(nds, gcart);
+    std::vector<u8> nbuf = g_Card.buf;
+    for (auto& w : log) for (u32 i = 0; i < 4; i++) nbuf[w.a - g_Card.r[5] + i] = (u8)(w.v >> (8 * i));
+    char b[512]; int bl = 0, nd = 0;
+    auto d = [&](const char* what, u32 g, u32 n) { if (g != n) { if (nd < 8) bl += snprintf(b + bl, sizeof(b) - bl, " %s guest %08x native %08x;", what, g, n); nd++; } };
+    if (!ran || !io.exit) { bl += snprintf(b + bl, sizeof(b) - bl, " native %s;", ran ? "stopped early" : "did nothing"); nd++; }
+    else
+    {
+        d("r1", g1, io.r1); d("r2", g2, io.r2); d("r3", g3, io.r3); d("nzcv", gfl, io.flags);
+        d("xfer irq", (gif & ~g_Card.ifr) & (1u << 19), (nif & ~g_Card.ifr) & (1u << 19));
+        for (u32 i = 0; i < 512; i++) if (gbuf[i] != nbuf[i]) { d("buf", gbuf[i], nbuf[i]); break; }
+        if (gcart != ncart) { bl += snprintf(b + bl, sizeof(b) - bl, " cart state;"); nd++; }
+    }
+    if (nd)
+    {
+        if (s.diffs[6] < 10) fprintf(stderr, "A9HLE CHECK cardread %d diffs:%s\n", nd, b);
+        s.diffs[6]++;
+    }
+    if (ran && io.exit && io.words) { s.guestCyc[6] += gcyc; s.guestN[6] += io.words; }
+}
+
 struct StatsDump
 {
     ~StatsDump()
     {
         if (!g_Stats) return;
         for (auto& [k, s] : g_State)
-            for (int i = 0; i < 6; i++)
+            for (int i = 0; i < kKinds; i++)
                 fprintf(stderr, "A9HLE %s: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu irq_during=%llu guest_cyc_avg=%.0f\n",
                         kName[i], s.status, (unsigned long long)s.calls[i], (unsigned long long)s.native[i],
                         (unsigned long long)s.fallback[i], (unsigned long long)s.checks[i], (unsigned long long)s.diffs[i],
                         (unsigned long long)s.irqDuring[i], s.guestN[i] ? (double)s.guestCyc[i] / s.guestN[i] : 0.0);
         for (auto& [k, s] : g_State)
         {
-            u64 n = s.native[0] + s.native[1] + s.native[2] + s.native[3] + s.native[4] + s.native[5];
+            u64 n = 0;
+            for (int i = 0; i < kKinds; i++) n += s.native[i];
             if (s.native[5]) fprintf(stderr, "A9HLE gxsend: %.1f words per native call\n", (double)s.gxWords / s.native[5]);
+            if (s.native[6]) fprintf(stderr, "A9HLE cardread: %.1f words per native call\n", (double)s.cardWords / s.native[6]);
             if (n) fprintf(stderr, "A9HLE: %.1f ns per native call (Run, timer pair %.1f ns subtracted)\n", (double)s.ns / n - TimerNs(), TimerNs());
         }
         for (auto& [k, s] : g_State)
@@ -847,6 +1027,7 @@ bool Irq(melonDS::ARMv5* c, bool halted)
 
 int Deps(u32 addr, const Range*& r)
 {
+    if (addr == kCard) { r = &kCardCode; return 1; }
     if (addr == kWake) { r = kCode; return kNumCode; }
     if (addr == kGx) { r = &kGxCode; return 1; }
     r = &kCode[3];              // OS_SetIrqFunction / OS_GetIrqFunction
@@ -856,63 +1037,88 @@ int Deps(u32 addr, const Range*& r)
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 {
     int k = addr == kWake && instr == kWakeInstr ? 0 : addr == kSet && instr == kSetInstr ? 1 : addr == kGet && instr == kGetInstr ? 2
-          : addr == kGx && instr == kGxInstr ? 5 : -1;
+          : addr == kGx && instr == kGxInstr ? 5 : addr == kCard && instr == kCardInstr ? 6 : -1;
     if (k < 0) return 0;
     State& s = Get(&nds.ARM9);
     if (s.status != 1 || !(s.mask & Bit(k))) return 0;
+    if (k == 6) return !s.cardOk ? 0 : CardIntact(&nds.ARM9) ? 1 : 2;
     if (k == 5) return !s.gxOk ? 0 : GxIntact(&nds.ARM9, s) ? 1 : 2;
     return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
 }
 
-bool Run(melonDS::ARM* cpu, bool jit)
+namespace
 {
-    if (cpu->Num != 0 || (cpu->CPSR & 0x20)) return false;
-    auto* c = (melonDS::ARMv5*)cpu;
-    const u32 pc = cpu->R[15] - 8;
-    int k = pc == kWake && cpu->CurInstr == kWakeInstr ? 0 : pc == kSet && cpu->CurInstr == kSetInstr ? 1
-          : pc == kGet && cpu->CurInstr == kGetInstr ? 2 : pc == kGx && cpu->CurInstr == kGxInstr ? 5 : -1;
-    if (k < 0) return false;
-    State& s = Get(c);
-    if (s.status != 1 || !(s.mask & Bit(k))) return false;
-    s.calls[k]++;
-#ifdef LITEV_GX_BULK
-    if (k == 5)
+// each kind its own function: a call touches only its own code lines (the in-order A55's L1I)
+__attribute__((noinline)) bool RunCard(melonDS::ARMv5* c, State& s, bool jit)
+{
+    if (!s.cardOk) return false;
+    bool ok = !CheckPending && (jit || CardIntact(c));
+    if (ok && g_Check)
     {
-        // a prefix: the native part, then the guest function from its first instruction
-        if (!s.gxOk) return false;
-#ifdef LITEV_A9HLE_GXCHECK
-        if (g_Check) GxCheckAt(s, c);
-#endif
-        u32 src, len, n;
-        if ((jit || GxIntact(c, s)) && GxPlan(c, src, len, n))
-        {
-            if (g_Check)
-            {
-#ifdef LITEV_A9HLE_GXCHECK
-                if (!g_Gx.on)
-                {
-                    g_Gx.on = true; g_Gx.src = src; g_Gx.len = len; g_Gx.n = n; g_Gx.w.resize(n);
-                    g_Gx.t0 = c->NDS.ARM9Timestamp + c->Cycles;
-                    for (u32 i = 0; i < n; i++) g_Gx.w[i] = R32(&c->NDS.MainRAM[(src + i * 4) & c->NDS.MainRAMMask]);
-                    g_GxTapBuf.clear(); GxOtherSeen = false; GxTap = &g_GxTapBuf;
-                    s.checks[5]++;
-                }
-#endif
-            }
-            else if (g_Dry) s.checks[5]++;
-            else
-            {
-                const u64 t0 = __builtin_expect(g_Stats, 0) ? Now() : 0;
-                s.gxWords += GxSend(c, src, len, n);
-                s.native[5]++;
-                if (__builtin_expect(g_Stats, 0)) s.ns += Now() - t0;
-            }
-        }
-        else s.fallback[5]++;
-        GuestFallback(cpu);
+        // only where the native loop makes progress (a word ready, or the transfer done)
+        const u32 cnt = c->NDS.NDSCartSlots[0]->ReadROMCnt(0);
+        if (((cnt & 0x800000) || !(cnt & 0x80000000)) && CardArgsOk(c, c->R[3])) CardCheckStart(c, s);
+        ok = false;
+    }
+    CardIo io{c->R[1], c->R[2], c->R[3], c->CPSR & 0xF0000000, false, 0};
+    const u64 t0 = __builtin_expect(g_Stats, 0) ? Now() : 0;
+    if (!ok || g_Dry || !CardCore(c, io, nullptr))
+    {
+        s.fallback[6] += !g_Check;
+        GuestFallback(c);
         return true;
     }
+    s.native[6]++;
+    s.cardWords += io.words;
+    c->R[1] = io.r1; c->R[2] = io.r2; c->R[3] = io.r3;
+    c->CPSR = (c->CPSR & 0x0FFFFFFF) | io.flags;
+    c->Cycles += kCardCycWord * (s32)io.words;
+    c->JumpTo(io.exit ? kCardExit : kCard);
+    if (__builtin_expect(g_Stats, 0)) s.ns += Now() - t0;
+    return true;
+}
+
+#ifdef LITEV_GX_BULK
+__attribute__((noinline)) bool RunGx(melonDS::ARMv5* c, State& s, bool jit)
+{
+    // a prefix: the native part, then the guest function from its first instruction
+    if (!s.gxOk) return false;
+#ifdef LITEV_A9HLE_GXCHECK
+    if (g_Check) GxCheckAt(s, c);
 #endif
+    u32 src, len, n;
+    if ((jit || GxIntact(c, s)) && GxPlan(c, src, len, n))
+    {
+        if (g_Check)
+        {
+#ifdef LITEV_A9HLE_GXCHECK
+            if (!g_Gx.on)
+            {
+                g_Gx.on = true; g_Gx.src = src; g_Gx.len = len; g_Gx.n = n; g_Gx.w.resize(n);
+                g_Gx.t0 = c->NDS.ARM9Timestamp + c->Cycles;
+                for (u32 i = 0; i < n; i++) g_Gx.w[i] = R32(&c->NDS.MainRAM[(src + i * 4) & c->NDS.MainRAMMask]);
+                g_GxTapBuf.clear(); GxOtherSeen = false; GxTap = &g_GxTapBuf;
+                s.checks[5]++;
+            }
+#endif
+        }
+        else if (g_Dry) s.checks[5]++;
+        else
+        {
+            const u64 t0 = __builtin_expect(g_Stats, 0) ? Now() : 0;
+            s.gxWords += GxSend(c, src, len, n);
+            s.native[5]++;
+            if (__builtin_expect(g_Stats, 0)) s.ns += Now() - t0;
+        }
+    }
+    else s.fallback[5]++;
+    GuestFallback(c);
+    return true;
+}
+#endif
+
+__attribute__((noinline)) bool RunOs(melonDS::ARMv5* c, State& s, int k, bool jit)
+{
     const u64 t0 = __builtin_expect(g_Stats, 0) ? Now() : 0;
     Mem m(c, g_Check || g_Dry);
     Expect e;
@@ -937,7 +1143,7 @@ bool Run(melonDS::ARM* cpu, bool jit)
     if (!ok)
     {
         s.fallback[k] += !g_Check;
-        GuestFallback(cpu);
+        GuestFallback(c);
         return true;
     }
     s.native[k]++;
@@ -946,10 +1152,40 @@ bool Run(melonDS::ARM* cpu, bool jit)
     if (__builtin_expect(g_Stats, 0)) s.ns += Now() - t0;
     return true;
 }
+}
+
+bool Run(melonDS::ARM* cpu, bool jit)
+{
+    if (cpu->Num != 0 || (cpu->CPSR & 0x20)) return false;
+    auto* c = (melonDS::ARMv5*)cpu;
+    const u32 pc = cpu->R[15] - 8, in = cpu->CurInstr;
+    int k;
+    switch (pc)
+    {
+    case kWake: k = in == kWakeInstr ? 0 : -1; break;
+    case kSet: k = in == kSetInstr ? 1 : -1; break;
+    case kGet: k = in == kGetInstr ? 2 : -1; break;
+    case kGx: k = in == kGxInstr ? 5 : -1; break;
+    case kCard: k = in == kCardInstr ? 6 : -1; break;
+    default: return false;
+    }
+    if (k < 0) return false;
+    State& s = Get(c);
+    if (s.status != 1 || !(s.mask & Bit(k))) return false;
+    s.calls[k]++;
+    if (k == 6) return RunCard(c, s, jit);
+#ifdef LITEV_GX_BULK
+    if (k == 5) return RunGx(c, s, jit);
+#else
+    if (k == 5) return false;
+#endif
+    return RunOs(c, s, k, jit);
+}
 
 void CheckAt(melonDS::ARM* cpu, u32 pc)
 {
     auto* c = (melonDS::ARMv5*)cpu;
+    if (g_Card.on) { CardCheckAt(c, pc); return; }
     const Expect& e = g_P.e;
     // guest registers as seen in the interrupted mode after the return
     u32 gR[15], gI[3] = {c->R_IRQ[0], c->R_IRQ[1], c->R_IRQ[2]}, gS[3] = {c->R_SVC[0], c->R_SVC[1], c->R_SVC[2]};
@@ -1034,7 +1270,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             if (gs[i] != e.SVC[i]) { if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " svc[%d] guest %08x native %08x;", i, gs[i], e.SVC[i]); nd++; }
         }
     }
-    if (k >= 3)
+    if (k == 3 || k == 4)
     {
         // IF: the guest acknowledged exactly HBlank (the native path does IF &= ~2)
         int acks = 0, other = 0;
