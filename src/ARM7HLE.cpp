@@ -80,14 +80,17 @@ inline void Store32(melonDS::NDS& nds, u32 a, u8* p, u32 v)
     W32(p, v);
 }
 
-bool ReadOn()
+// debug.litev.a7hle: 0 off, 1 (or unset) all, else a mask: 1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit
+bool ReadOn(u32 bit)
 {
 #if defined(__ANDROID__)
-    char b[8] = {0}; int n = __system_property_get("debug.litev.a7hle", b);
-    return (n > 0) ? (atoi(b) != 0) : true;
+    char b[16] = {0}; int n = __system_property_get("debug.litev.a7hle", b);
+    const char* e = n > 0 ? b : nullptr;
 #else
-    const char* e = getenv("debug.litev.a7hle"); return e ? (atoi(e) != 0) : true;
+    const char* e = getenv("debug.litev.a7hle");
 #endif
+    const u32 m = e ? (u32)strtoul(e, nullptr, 0) : 1;
+    return (m == 1 ? 15u : m) & bit;
 }
 
 bool StubsMatch(melonDS::NDS& nds, const State& s)
@@ -100,7 +103,7 @@ bool StubsMatch(melonDS::NDS& nds, const State& s)
 void Probe(melonDS::NDS& nds, State& s)
 {
     s.status = -1;
-    s.on = ReadOn();
+    s.on = ReadOn(1);
     if (!s.on) return;
     std::vector<u8> code;
     for (u32 a = kR1a; a < kR1b; a++) code.push_back(*W7(nds, a));
@@ -378,7 +381,7 @@ SeqState& GetSeq(melonDS::NDS& nds)
     last = &nds; lastS = &s;
     if (s.status != 0) return s;
     s.status = -1;
-    if (!ReadOn()) return s;
+    if (!ReadOn(2)) return s;
     std::vector<u8> code;
     for (u32 a = kSeqRa; a < kSeqRb; a++) code.push_back(*W7(nds, a));
     for (u32 a = kRndA; a < kRndB; a++) code.push_back(*W7(nds, a));
@@ -1029,7 +1032,7 @@ void Copy32(melonDS::ARM* cpu)
 bool CopyOn(melonDS::NDS& nds)
 {
     State& s = g_State[&nds];
-    if (s.copyOn < 0) s.copyOn = ReadOn();
+    if (s.copyOn < 0) s.copyOn = ReadOn(4);
     return s.copyOn != 0;
 }
 }
@@ -1107,7 +1110,7 @@ int HwProbe(melonDS::NDS& nds)
     State& s = Get(nds);
     if (s.hw) return s.hw;
     s.hw = -1;
-    if (!s.on) return s.hw;
+    if (!ReadOn(8)) return s.hw;
     std::vector<u8> code;
     for (u32 a = kHwRa; a < kHwRb; a++) code.push_back(*W7(nds, a));
     for (u32 a = kHwRc; a < kHwRd; a++) code.push_back(*W7(nds, a));

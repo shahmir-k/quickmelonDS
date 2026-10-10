@@ -10,7 +10,8 @@
 // Category B: guest memory results are identical, but the call takes a fixed estimated number
 // of ARM7 cycles instead of the real count, scratch registers/stack bytes are not written and
 // the channels' hardware-busy bits are sampled at entry. Deterministic and version-locked.
-// Runtime: debug.litev.a7hle (prop on Android, env elsewhere; default on), latched per NDS.
+// Runtime: debug.litev.a7hle (prop on Android, env elsewhere; default on), latched per NDS: 0 off, 1 all, else a
+// mask (1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit).
 //
 // SND_SeqMain (the sequencer: players, tracks, SSEQ bytecode, track->channel parameter update,
 // ~20% of the ARM7's guest instructions) runs natively on a copy of the sound work area, the
