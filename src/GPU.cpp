@@ -1139,6 +1139,31 @@ void GPU::DisplayFIFO(u32 x) noexcept
 }
 
 
+#ifdef LITEV_FF_HEADLESS3D
+// Fast-forward: build the bank being filled now without render-only data only if it will be
+// swapped in on a frame whose 3D isn't rendered. The 3D a frame renders (VCount 215) is the bank
+// swapped at that frame's VBlank, and games swap on a rhythm (Pokemon White: every 2nd frame,
+// a bank built across 2 frames), so predict the next swap from the last one and the period, and
+// look that frame up in the frameskip schedule. A wrong guess is caught at the swap (GPU3D
+// BankBuiltHeadless -> RenderStale: that frame keeps the previous 3D) and backs off for 2 s.
+void GPU::FFHeadlessDecide(bool frameStart) noexcept
+{
+    bool skipped = false;
+    if (FrameskipTarget > 0 && !GPU3D.FFBackoff)
+    {
+        // a bank swapped in at frame f is rendered on every non-skipped frame until the next swap,
+        // so frames f .. f+period-1 must all be skipped (frames 1..FrameskipCounter ahead are)
+        const s32 p = (s32)GPU3D.FFPeriod;
+        s32 k = (s32)(GPU3D.FFLastFlush + GPU3D.FFPeriod - GPU3D.FFFrame);
+        if (k <= 0 && frameStart) skipped = SkipThisFrame && (p - 1) <= FrameskipCounter;
+        else skipped = ((k < 1 ? 1 : k) + p - 1) <= FrameskipCounter;
+    }
+    GPU3D.Headless = FFHeadless3D && skipped && !CaptureSeen && !KeepCapturesSeen
+                     && !(CaptureCnt & (1u << 31));
+    GPU3D.FFHeadlessNow = GPU3D.Headless;
+}
+#endif
+
 void GPU::StartFrame() noexcept
 {
     ScreensEnabled = !!(NDS.PowerControl9 & (1<<0));
@@ -1183,10 +1208,11 @@ void GPU::StartFrame() noexcept
     // built from needn't be prepared for rendering: build it like a console nobody watches (exact
     // emulation, cycles included; only render-side data is left out). Not for a netplay console
     // (Headless: its own setting) nor once display capture is in use (it records the 3D).
+    GPU3D.FFFrame++;
+    if (GPU3D.FFBackoff) GPU3D.FFBackoff--;
     if (!Headless && (FFHeadless3D || FFHeadlessWas))
     {
-        GPU3D.Headless = FFHeadless3D && SkipThisFrame && !CaptureSeen && !KeepCapturesSeen
-                         && !(CaptureCnt & (1u << 31));
+        FFHeadlessDecide(true);
         FFHeadlessWas = FFHeadless3D;
     }
 #endif
@@ -1419,6 +1445,10 @@ void GPU::StartScanline(u32 line) noexcept
         NDS.CheckDMAs(1, 0x11);
 
         GPU3D.VBlank();
+#ifdef LITEV_FF_HEADLESS3D
+        // the geometry from here to the end of the frame goes to the next bank
+        if (!Headless && FFHeadless3D) FFHeadlessDecide(false);
+#endif
 
         Rend->VBlank();
 

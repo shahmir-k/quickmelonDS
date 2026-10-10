@@ -1773,7 +1773,11 @@ void GPU3D::CalculateLighting() noexcept
 {
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LightingCalls);
 
+#ifdef LITEV_FF_HEADLESS3D
+    if (LITEV_HEADLESS(Headless) && !FFHeadlessNow)
+#else
     if (LITEV_HEADLESS(Headless))
+#endif
     {
         s32 c = __builtin_popcount(CurPolygonAttr & 0xF);
         NormalPipeline = 7;
@@ -3560,6 +3564,14 @@ void GPU3D::VBlank() noexcept
         // a bank partly built unwatched is never handed to the renderer: skip its preparation and
         // the render it would feed (the last rendered 3D stays on screen)
         const bool badBank = FlushRequest && BankBuiltHeadless;
+        if (FlushRequest)
+        {
+            const u32 period = FFFrame - FFLastFlush;
+            FFPeriod = (period >= 1 && period <= 4) ? period : 1;
+            FFLastFlush = FFFrame;
+            // a bank partly built unwatched lands on a frame that renders 3D: the guess was wrong
+            if (badBank && !GPU.SkipThisFrame) FFBackoff = 120;
+        }
         if (FlushRequest) RenderStale = !RenderingEnabled || LITEV_HEADLESS(Headless) || badBank;
         if (RenderingEnabled && !LITEV_HEADLESS(Headless) && !badBank)
 #else

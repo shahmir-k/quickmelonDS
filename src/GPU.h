@@ -641,6 +641,7 @@ public:
     // fast-forward (set by the frontend each frame): a frame whose 3D won't be rendered builds its
     // geometry like a console nobody watches (GPU3D::Headless)
     bool FFHeadless3D = false, FFHeadlessWas = false;
+    void FFHeadlessDecide(bool frameStart) noexcept;
 #endif
     bool CaptureSeen = false;
     // Record mode: skipping a frame's drawing must not change guest state, but a display capture

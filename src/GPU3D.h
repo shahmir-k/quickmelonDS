@@ -217,6 +217,14 @@ public:
     // has no bounds/sort/depth. RenderStale: the last buffer swap skipped preparing the render
     // list (a Headless frame or such a bank); renders are skipped until a prepared swap.
     bool BankBuiltHeadless = false, RenderStale = false;
+    // swap rhythm, so fast-forward only builds unwatched the banks that will land on a skipped
+    // frame (Pokemon White swaps every 2nd frame): frame count, frame of the last swap, frames
+    // between swaps; FFBackoff > 0 = a prediction missed, build everything for that many frames
+    u32 FFFrame = 0, FFLastFlush = 0, FFPeriod = 1, FFBackoff = 0;
+    // Headless because of fast-forward: lighting and texgen still run (they leave the current
+    // vertex colour / texcoords, which later, rendered banks use); only per-polygon render data
+    // (which stays inside the bank) is skipped
+    bool FFHeadlessNow = false;
 #endif
     melonDS::NDS& NDS;
     melonDS::GPU& GPU;
