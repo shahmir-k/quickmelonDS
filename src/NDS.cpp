@@ -1120,6 +1120,9 @@ template <CPUExecuteMode cpuMode>
 u32 NDS::RunFrame()
 {
     Current = this;
+#ifdef LITEV_JIT_IDLE2
+    ARM9.Idle2Frame();
+#endif
 
     // M6.11: parent timer for the whole RunFrame call. The per-slice ARM9 /
     // GPU3D / ARM7 / DMA / RunSystem child buckets carve this up; residual =

@@ -21,6 +21,10 @@
 
 #include <algorithm>
 #include <optional>
+#ifdef LITEV_JIT_IDLE2
+#include <vector>
+namespace melonDS { bool LiteIdle2On(); }
+#endif
 
 #include "types.h"
 #include "MemRegion.h"
@@ -273,6 +277,10 @@ public:
     u32 ICacheEpoch = 0;
 #endif
 
+#ifdef LITEV_JIT_IDLE2
+    u32 Idle2Site = 0;   // (branch addr | thumb) of the candidate back-edge that exited (IdleLoop == 2)
+#endif
+
 #ifdef LITEV_JIT_RAS
     // Return-address stack (LITEV_JIT_RAS): a ring of ICACHE site indices pushed by guest
     // calls (one site per BL/BLX call site) and popped by guest returns, which hand the
@@ -480,6 +488,21 @@ public:
     u8* CurICacheLine;
 
     bool (*GetMemRegion)(u32 addr, bool write, MemRegion* region);
+
+#ifdef LITEV_JIT_IDLE2
+    // Generalized wait-loop skipping (see ARM.cpp, "LITEV_JIT_IDLE2").
+    struct Idle2Access { u32 Addr; u32 Val; u8 Size; bool Write; };
+    std::vector<Idle2Access>* Idle2Log = nullptr;   // set only while Idle2Trace runs
+    struct Idle2State* Idle2 = nullptr;
+    u8* Idle2EnableByte(u32 site);   // JIT compile time: per-site enable byte (null = no slot)
+    bool Idle2Handle();              // at a candidate back-edge: true = skip to ARM9Target
+    void Idle2Frame();
+    void Idle2Reset();
+    int Idle2Trace(u32 head, struct Idle2SiteInfo& s);
+    u32 Idle2Peek(u32 addr, int size);
+    bool Idle2Step();
+    bool Idle2AtBlock();
+#endif
 
 #ifdef GDBSTUB_ENABLED
     u32 ReadMem(u32 addr, int size) override;

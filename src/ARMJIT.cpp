@@ -600,6 +600,55 @@ bool IsIdleLoop(bool thumb, FetchedInstr* instrs, int instrsCount)
     return true;
 }
 
+#ifdef LITEV_JIT_IDLE2
+// Static class of a loop whose whole path instrs[0..n) is in the block (the last one is
+// the back-edge; earlier branches must be followed ones): 0 = classic idle loop (no
+// stores, no register recurrence), 1 = only stores keep it from being one (a candidate
+// for the run-time proof in ARMv5::Idle2Handle), 2 = not a wait loop (register
+// recurrence such as a counter or a walking pointer, coprocessor, call).
+static int Idle2LoopClass(bool thumb, FetchedInstr* instrs, int n)
+{
+    u16 written = 0, readFirst = 0;
+    bool store = false;
+    for (int i = 0; i < n; i++)
+    {
+        const ARMInstrInfo::Info& in = instrs[i].Info;
+        if (!thumb && in.Kind >= ARMInstrInfo::ak_MSR_IMM && in.Kind <= ARMInstrInfo::ak_SVC)
+            return 2;
+        if (i < n - 1 && in.Branches() && (in.EndBlock || (in.DstRegs & (1 << 14))))
+            return 2;
+        if (in.SpecialKind == ARMInstrInfo::special_WriteMem)
+            store = true;
+        const u16 src = in.SrcRegs & ~(1 << 15), dst = in.DstRegs & ~(1 << 15);
+        readFirst |= src & ~written;
+        if (dst & readFirst)
+            return 2;
+        written |= dst;
+    }
+    return store ? 1 : 0;
+}
+
+// Cheap static filter for back-edges whose loop leaves the block (only the block's
+// instrs[0..n) are visible): a register (other than SP/LR) read before written and then
+// written in the visible part is a counter or walking pointer -> not a wait loop.
+static bool Idle2TailOK(bool thumb, FetchedInstr* instrs, int n)
+{
+    u16 written = 0, readFirst = 0;
+    for (int i = 0; i < n; i++)
+    {
+        const ARMInstrInfo::Info& in = instrs[i].Info;
+        if (!thumb && in.Kind >= ARMInstrInfo::ak_MSR_IMM && in.Kind <= ARMInstrInfo::ak_SVC)
+            return false;
+        const u16 src = in.SrcRegs & 0x1FFF, dst = in.DstRegs & 0x1FFF;
+        readFirst |= src & ~written;
+        if (dst & readFirst)
+            return false;
+        written |= dst;
+    }
+    return true;
+}
+#endif
+
 typedef void (*InterpreterFunc)(ARM* cpu);
 
 void NOP(ARM* cpu) {}
@@ -1188,6 +1237,33 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                     }
                 }
 
+#ifdef LITEV_JIT_IDLE2
+                // A back-edge to before the current block segment (the loop path crosses
+                // followed branches, or leaves the block through calls) is never followed:
+                // classic idle loop if its in-block path qualifies, else an ARM9 candidate
+                // for the run-time wait-loop proof (ARMv5::Idle2Handle).
+                bool idle2Done = false;
+                if (cond < 0xE && target < instrs[i].Addr && target < lastSegmentStart && LiteIdle2On())
+                {
+                    int j = -1;
+                    for (int k = 0; k < i; k++)
+                        if (instrs[k].Addr == target) { j = k; break; }
+                    const int cls = j >= 0 ? Idle2LoopClass(thumb, &instrs[j], i - j + 1)
+                                           : Idle2TailOK(thumb, instrs, i + 1) ? 1 : 2;
+                    if (cls == 0)
+                    {
+                        instrs[i].BranchFlags |= branch_IdleBranch;
+                        idle2Done = true;
+                    }
+                    else if (cls == 1 && cpu->Num == 0)
+                    {
+                        instrs[i].BranchFlags |= branch_Idle2Cand;
+                        idle2Done = true;
+                    }
+                }
+                if (idle2Done) {}
+                else
+#endif
                 if (cond < 0xE && target < instrs[i].Addr && target >= lastSegmentStart)
                 {
                     // we might have an idle loop
@@ -1197,6 +1273,11 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                         instrs[i].BranchFlags |= branch_IdleBranch;
                         JIT_DEBUGPRINT("found %s idle loop %d in block %08x\n", thumb ? "thumb" : "arm", cpu->Num, blockAddr);
                     }
+#ifdef LITEV_JIT_IDLE2
+                    else if (cpu->Num == 0 && LiteIdle2On()
+                        && Idle2LoopClass(thumb, &instrs[i - backwardsOffset], backwardsOffset + 1) == 1)
+                        instrs[i].BranchFlags |= branch_Idle2Cand;
+#endif
                 }
                 else if (hasBranched && !isBackJump && i + 1 < MaxBlockSize)
                 {
@@ -1616,6 +1697,9 @@ template void ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWR
 void ARMJIT::ResetBlockCache() noexcept
 {
     Log(LogLevel::Debug, "Resetting JIT block cache...\n");
+#ifdef LITEV_JIT_IDLE2
+    NDS.ARM9.Idle2Reset(); // wait-loop proofs live exactly as long as the compiled blocks
+#endif
 
     // could be replace through a function which only resets
     // the permissions but we're too lazy

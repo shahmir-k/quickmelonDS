@@ -41,6 +41,11 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsy
 #include "xxhash/xxhash.h"
 
 #include "PlatformHeadless.h"
+#ifdef __APPLE__
+// Instructions retired / cycles of the calling thread (Apple Silicon PMU, libsystem_kernel).
+extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);
+static uint64_t EmuThreadInstr = 0, EmuThreadCycles = 0;
+#endif
 #include "LiteProfile.h"
 #include "VerifyTrace.h"
 #include "InputScript.h"
@@ -730,7 +735,19 @@ int main(int argc, char** argv)
         static const bool frameMs = getenv("LITEV_FRAME_MS") != nullptr;   // per-frame time + JIT compiles
         const auto fms0 = std::chrono::steady_clock::now();
         const u64 jit0 = melonDS::JitCompileCount, prot0 = melonDS::JitProtectCalls, flt0 = melonDS::JitProtectFaults;
+#ifdef __APPLE__
+        uint64_t tc0[2] = {};
+        thread_selfcounts(1, tc0, sizeof(tc0));
+#endif
         nds->RunFrame();
+#ifdef __APPLE__
+        {
+            uint64_t tc1[2] = {};
+            thread_selfcounts(1, tc1, sizeof(tc1));
+            EmuThreadInstr += tc1[0] - tc0[0];
+            EmuThreadCycles += tc1[1] - tc0[1];
+        }
+#endif
         if (frameMs)
             printf("FRAME %d %.3f ms jit %llu mprotect %llu rewrites %llu\n", frame,
                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fms0).count(),
@@ -955,6 +972,11 @@ int main(int argc, char** argv)
     printf("fb_changing: %s\n", anyChange ? "yes" : "no");
     printf("audio_hash:  %016llx\n", (unsigned long long)audioHash);
     printf("audio_samples: %llu\n", (unsigned long long)audioSampleCount);
+#ifdef __APPLE__
+    // emulation thread only (RunFrame), so render/worker threads don't dilute A/B deltas
+    printf("emu_thread_instructions: %llu\nemu_thread_cycles: %llu\n",
+           (unsigned long long)EmuThreadInstr, (unsigned long long)EmuThreadCycles);
+#endif
     if (wav)
     {
         const u32 n = (u32)audioSampleCount * 4, r = n + 36, rate = 48000, bps = rate * 4;

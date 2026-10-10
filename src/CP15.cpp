@@ -823,8 +823,16 @@ u32 ARMv5::CodeRead32(u32 addr, bool branch)
 }
 
 
+#ifdef LITEV_JIT_IDLE2
+// Record data accesses while ARMv5::Idle2Trace interprets a candidate wait loop.
+#define IDLE2_LOG(a, sz, v, w) do { if (__builtin_expect(Idle2Log != nullptr, 0)) Idle2Log->push_back({(a), (u32)(v), (sz), (w)}); } while (0)
+#else
+#define IDLE2_LOG(a, sz, v, w) do {} while (0)
+#endif
+
 void ARMv5::DataRead8(u32 addr, u32* val)
 {
+    IDLE2_LOG(addr, 1, 0, false);
     if (!(PU_Map[addr>>12] & 0x01))
     {
         DataAbort();
@@ -852,6 +860,7 @@ void ARMv5::DataRead8(u32 addr, u32* val)
 
 void ARMv5::DataRead16(u32 addr, u32* val)
 {
+    IDLE2_LOG(addr & ~1u, 2, 0, false);
     if (!(PU_Map[addr>>12] & 0x01))
     {
         DataAbort();
@@ -881,6 +890,7 @@ void ARMv5::DataRead16(u32 addr, u32* val)
 
 void ARMv5::DataRead32(u32 addr, u32* val)
 {
+    IDLE2_LOG(addr & ~3u, 4, 0, false);
     if (!(PU_Map[addr>>12] & 0x01))
     {
         DataAbort();
@@ -910,6 +920,7 @@ void ARMv5::DataRead32(u32 addr, u32* val)
 
 void ARMv5::DataRead32S(u32 addr, u32* val)
 {
+    IDLE2_LOG(addr & ~3u, 4, 0, false);
     addr &= ~3;
 
     if (addr < ITCMSize)
@@ -931,6 +942,7 @@ void ARMv5::DataRead32S(u32 addr, u32* val)
 
 void ARMv5::DataWrite8(u32 addr, u8 val)
 {
+    IDLE2_LOG(addr, 1, val, true);
     if (!(PU_Map[addr>>12] & 0x02))
     {
         DataAbort();
@@ -959,6 +971,7 @@ void ARMv5::DataWrite8(u32 addr, u8 val)
 
 void ARMv5::DataWrite16(u32 addr, u16 val)
 {
+    IDLE2_LOG(addr & ~1u, 2, val, true);
     if (!(PU_Map[addr>>12] & 0x02))
     {
         DataAbort();
@@ -989,6 +1002,7 @@ void ARMv5::DataWrite16(u32 addr, u16 val)
 
 void ARMv5::DataWrite32(u32 addr, u32 val)
 {
+    IDLE2_LOG(addr & ~3u, 4, val, true);
     if (!(PU_Map[addr>>12] & 0x02))
     {
         DataAbort();
@@ -1019,6 +1033,7 @@ void ARMv5::DataWrite32(u32 addr, u32 val)
 
 void ARMv5::DataWrite32S(u32 addr, u32 val)
 {
+    IDLE2_LOG(addr & ~3u, 4, val, true);
     addr &= ~3;
 
     if (addr < ITCMSize)
