@@ -528,6 +528,7 @@ public:
 
     bool IsJITFault(const u8* pc);
     u8* RewriteMemAccess(u8* pc);
+    bool CondMemGuess(bool addrIsStatic);
 #ifdef LITEV_JIT_STORE_REPROMOTE
     // A store that faulted on a code-protected page is rewritten to the slow path for good.
     // Remember its original fast-path bytes and put them back at a later frame boundary

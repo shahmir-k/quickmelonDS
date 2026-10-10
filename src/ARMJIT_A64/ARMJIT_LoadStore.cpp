@@ -24,7 +24,7 @@
 #include "../NDS.h"
 
 
-#ifdef LITEV_JIT_STORE_REPROMOTE
+#if defined(LITEV_JIT_STORE_REPROMOTE) || defined(LITEV_JIT_COND_MEMGUESS)
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
@@ -150,6 +150,28 @@ u8* Compiler::RewriteMemAccess(u8* pc)
     }
     Log(LogLevel::Error, "this is a JIT bug! %08x\n", __builtin_bswap32(*(u32*)pc));
     abort();
+}
+
+// A conditional ARM access normally takes the fastmem path whatever its region looked like,
+// since a condition that failed while compiling left DataRegion stale. When it did run, its
+// region is known: an IO/VRAM access then goes straight to the slow path instead of faulting
+// once (a signal + rewrite, ~50-80 us on the A55). Fast or slow path is guest-invisible.
+bool Compiler::CondMemGuess(bool addrIsStatic)
+{
+#ifdef LITEV_JIT_COND_MEMGUESS
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.condmemguess", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_CONDMEMGUESS");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on && (addrIsStatic || CurInstr.DataExecuted);
+#else
+    return false;
+#endif
 }
 
 bool Compiler::Comp_MemLoadLiteral(int size, bool signExtend, int rd, u32 addr)
@@ -280,7 +302,7 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
         ? NDS.JIT.Memory.ClassifyAddress9(addrIsStatic ? staticAddress : CurInstr.DataRegion)
         : NDS.JIT.Memory.ClassifyAddress7(addrIsStatic ? staticAddress : CurInstr.DataRegion);
 
-    if (NDS.JIT.FastMemoryEnabled() && ((!Thumb && CurInstr.Cond() != 0xE) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget)))
+    if (NDS.JIT.FastMemoryEnabled() && ((!Thumb && CurInstr.Cond() != 0xE && !CondMemGuess(addrIsStatic)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget)))
     {
         ptrdiff_t memopStart = GetCodeOffset();
         LoadStorePatch patch;
@@ -661,10 +683,10 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
     // loaded register), which rewrites every destination, so a partially loaded block leaves
     // no trace. Cycles were added above, identically for both paths.
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
-        && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+        && !usermode && ((CurInstr.Cond() < 0xE && !CondMemGuess(false)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
 #else
     bool compileFastPath = NDS.JIT.FastMemoryEnabled()
-        && store && !usermode && (CurInstr.Cond() < 0xE || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
+        && store && !usermode && ((CurInstr.Cond() < 0xE && !CondMemGuess(false)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget));
 #endif
 
     {

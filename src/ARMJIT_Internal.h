@@ -67,6 +67,9 @@ struct FetchedInstr
     u32 Addr;
 
     u8 DataCycles;
+#ifdef LITEV_JIT_COND_MEMGUESS
+    u8 DataExecuted;   // ran during the compile-time interpretation: DataRegion is its own access
+#endif
     u16 CodeCycles;
     u32 DataRegion;
 
