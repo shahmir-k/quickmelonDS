@@ -305,8 +305,15 @@ void SPU::DoSavestate(Savestate* file)
 
     file->Bool32(&Mute);
 
+#ifdef LITEV_SPU_SILENT_LAZY
+    if (file->Saving) MaterializeAll();
+#endif
     for (SPUChannel& channel : Channels)
         channel.DoSavestate(file);
+#ifdef LITEV_SPU_SILENT_LAZY
+    if (!file->Saving)
+        for (SPUChannel& ch : Channels) { ch.Stale = ch.Tracked = false; ch.FIFOStale = 0; }
+#endif
 #ifdef LITEV_SPU_ADPCM_MEMO
     if (!file->Saving) { Memos.clear(); MemoBytes = 0; MemoGen++; }
 #endif
@@ -339,6 +346,10 @@ void SPU::SetSampleRate(AudioSampleRate rate)
 
 void SPU::SetInterpolation(AudioInterpolation type)
 {
+#ifdef LITEV_SPU_SILENT_LAZY
+    MaterializeAll();   // (the replay assumes one interpolation setting since Start)
+    for (SPUChannel& ch : Channels) ch.Tracked = false;
+#endif
     for (SPUChannel& channel : Channels)
         channel.InterpType = type;
 }
@@ -398,6 +409,9 @@ void SPUChannel::Reset()
     FIFOWritePos = 0;
     FIFOReadOffset = 0;
     FIFOLevel = 0;
+#ifdef LITEV_SPU_SILENT_LAZY
+    Stale = Tracked = false; Restarts = 0; Steps = 0; FIFOStale = 0;
+#endif
 }
 
 void SPUChannel::DoSavestate(Savestate* file)
@@ -461,6 +475,10 @@ void SPUChannel::FIFO_BufferData()
             else
 #endif
             FIFO[FIFOWritePos] = NDS.ARM7Read32(SrcAddr + FIFOReadOffset);
+#ifdef LITEV_SPU_SILENT_LAZY
+            FIFOSrc[FIFOWritePos] = FIFOReadOffset;
+            FIFOStale &= ~(1 << FIFOWritePos);
+#endif
             FIFOReadOffset += 4;
             FIFOWritePos++;
             FIFOWritePos &= 0x7;
@@ -471,6 +489,10 @@ void SPUChannel::FIFO_BufferData()
         for (u32 i = 0; i < burstlen; i += 4)
         {
             FIFO[FIFOWritePos] = 0;
+#ifdef LITEV_SPU_SILENT_LAZY
+            FIFOSrc[FIFOWritePos] = FIFOReadOffset;
+            FIFOStale &= ~(1 << FIFOWritePos);
+#endif
             FIFOReadOffset += 4;
             FIFOWritePos++;
             FIFOWritePos &= 0x7;
@@ -514,6 +536,9 @@ void SPUChannel::Start()
     FIFOWritePos = 0;
     FIFOReadOffset = 0;
     FIFOLevel = 0;
+#ifdef LITEV_SPU_SILENT_LAZY
+    Stale = false; Tracked = true; Restarts = 0; Steps = 0; FIFOStale = 0;
+#endif
 
     // when starting a channel, buffer data
     if (((Cnt >> 29) & 0x3) != 3)
@@ -807,6 +832,9 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
         return true;
     }
     if (KeyOn) { Start(); KeyOn = false; }
+#ifdef LITEV_SPU_SILENT_LAZY
+    Tracked = false;    // steps not counted here
+#endif
 
     const u8* ram = NDS.MainRAM;
     const u32 mask = NDS.MainRAMMask;
@@ -1024,6 +1052,9 @@ s32 SPUChannel::Run(u32 cycles, bool out)
             PrevSample[0] = CurSample;
         }
 
+#ifdef LITEV_SPU_SILENT_LAZY
+        const s32 oldPos = Pos;
+#endif
         switch (type)
         {
         case 0: NextSample_PCM8(); break;
@@ -1032,6 +1063,9 @@ s32 SPUChannel::Run(u32 cycles, bool out)
         case 3: NextSample_PSG(); break;
         case 4: NextSample_Noise(); break;
         }
+#ifdef LITEV_SPU_SILENT_LAZY
+        if (type < 3) CountStep(oldPos);
+#endif
 
         if (!(Cnt & (1<<31))) break;
     }
@@ -1103,6 +1137,154 @@ s32 SPUChannel::Run(u32 cycles, bool out)
     val *= Volume;
     return val;
 }
+
+#ifdef LITEV_SPU_SILENT_LAZY
+// FIFO_BufferData without reading the sample: the same offsets, slots and level
+void SPUChannel::FIFO_BufferTiming()
+{
+    const u32 totallen = LoopPos + Length;
+    if (FIFOReadOffset >= totallen)
+    {
+        const u32 repeatmode = (Cnt >> 27) & 0x3;
+        if      (repeatmode & 1) FIFOReadOffset = LoopPos;
+        else if (repeatmode & 2) return;
+    }
+    u32 burstlen = 16;
+    if ((FIFOReadOffset + 16) > totallen)
+        burstlen = totallen - FIFOReadOffset;
+    for (u32 i = 0; i < burstlen; i += 4)
+    {
+        FIFOSrc[FIFOWritePos] = FIFOReadOffset;
+        FIFOStale |= 1 << FIFOWritePos;
+        FIFOReadOffset += 4;
+        FIFOWritePos = (FIFOWritePos + 1) & 0x7;
+    }
+    FIFOLevel += burstlen;
+}
+
+// Run<type>(cycles, false) n times (PCM8/PCM16/ADPCM, sample in main RAM, looped or one-shot),
+// stepping what the ARM cores can see: Timer, Pos, loop, end (busy bit), FIFO bookkeeping.
+// The decode (and the interpolation history) is left stale; Materialize rebuilds it.
+template<u32 type>
+void SPUChannel::RunTiming(u32 cycles, u32 n)
+{
+    if (!(Cnt & (1u<<31))) return;
+    if ((Length + LoopPos) < 16) return;
+    if (KeyOn)
+    {
+        // Start() without the sample reads
+        Timer = TimerReload;
+        Pos = -3;
+        NoiseVal = 0x7FFF;
+        PrevSample[0] = PrevSample[1] = PrevSample[2] = 0;
+        CurSample = 0;
+        FIFOReadPos = FIFOWritePos = FIFOReadOffset = FIFOLevel = 0;
+        FIFO_BufferTiming();
+        FIFO_BufferTiming();
+        Tracked = true; Restarts = 0; Steps = 0;
+        KeyOn = false;
+    }
+    Stale = true;
+    const u32 total = LoopPos + Length, repeat = (Cnt >> 27) & 0x3;
+    u32 timer = Timer;
+    for (u32 b = 0; b < n; b++)
+    {
+        timer += cycles;
+        while (timer >> 16)
+        {
+            timer = TimerReload + (timer - 0x10000);
+            const s32 oldPos = Pos++;
+            bool ended = false;
+            if (type == 0)          // NextSample_PCM8
+            {
+                if (Pos >= 0)
+                {
+                    if ((u32)Pos >= total)
+                    {
+                        if (repeat & 1) Pos = LoopPos;
+                        else if (repeat & 2) ended = true;
+                    }
+                    if (!ended) FIFO_Skip(1);
+                }
+            }
+            else if (type == 1)     // NextSample_PCM16
+            {
+                if (Pos >= 0)
+                {
+                    if ((u32)(Pos << 1) >= total)
+                    {
+                        if (repeat & 1) Pos = LoopPos >> 1;
+                        else if (repeat & 2) ended = true;
+                    }
+                    if (!ended) FIFO_Skip(2);
+                }
+            }
+            else                    // NextSample_ADPCM
+            {
+                if (Pos < 8)
+                {
+                    if (Pos == 0) FIFO_Skip(4);
+                }
+                else if ((u32)(Pos >> 1) >= total)
+                {
+                    if (repeat & 1) { Pos = LoopPos << 1; FIFO_Skip(1); }
+                    else if (repeat & 2) ended = true;
+                }
+                else if (!(Pos & 0x1)) FIFO_Skip(1);
+            }
+            CountStep(oldPos);
+            if (ended)
+            {
+                CurSample = 0;
+                Cnt &= ~(1u<<31);
+                Timer = timer;
+                return;
+            }
+        }
+    }
+    Timer = timer;
+}
+
+// Rebuild what RunTiming left stale: the FIFO words (read now from where they were buffered from)
+// and, for a playing channel, the decode state, by replaying the sample's data path from Start on
+// a scratch channel. Every loop pass from the second on decodes the same values (the loop restores
+// the state saved in the first), so at most 6 restarts are replayed. Same values as stepping them
+// in time unless the game rewrote the sample meanwhile (as with the FIFO's own read-ahead).
+void SPUChannel::Materialize()
+{
+    if (!Stale) return;
+    Stale = false;
+    for (int i = 0; i < 8; i++)
+        if (FIFOStale & (1 << i))
+            FIFO[i] = *(u32*)&NDS.MainRAM[((SrcAddr + FIFOSrc[i]) & ~3u) & NDS.MainRAMMask];
+    FIFOStale = 0;
+    if (KeyOn || !(Cnt & (1u<<31))) return;     // stopped, or restarting: the rest is reset first
+
+    SPUChannel r(Num, NDS, InterpType);
+    r.Cnt = Cnt; r.SrcAddr = SrcAddr; r.TimerReload = TimerReload; r.LoopPos = LoopPos; r.Length = Length;
+    r.ADPCMVal = ADPCMVal; r.ADPCMIndex = ADPCMIndex; r.ADPCMValLoop = ADPCMValLoop;
+    r.ADPCMIndexLoop = ADPCMIndexLoop; r.ADPCMCurByte = ADPCMCurByte;
+    r.Start();
+    const u32 type = (Cnt >> 29) & 0x3;
+    const bool interp = InterpType != AudioInterpolation::None;
+    auto step = [&]() -> u32 {
+        if (interp) { r.PrevSample[2] = r.PrevSample[1]; r.PrevSample[1] = r.PrevSample[0]; r.PrevSample[0] = r.CurSample; }
+        const s32 old = r.Pos;
+        if (type == 0) r.NextSample_PCM8();
+        else if (type == 1) r.NextSample_PCM16();
+        else r.NextSample_ADPCM();
+        return r.Pos != old + 1;
+    };
+    for (u32 k = 0; k < Restarts; ) k += step();
+    for (u32 k = 0; k < Steps; k++) step();
+    if (r.Pos != Pos || !(r.Cnt & (1u<<31)))
+        Log(LogLevel::Error, "SPU lazy: channel %u replay at pos %d, channel at %d\n", Num, r.Pos, Pos);
+    CurSample = r.CurSample;
+    PrevSample[0] = r.PrevSample[0]; PrevSample[1] = r.PrevSample[1]; PrevSample[2] = r.PrevSample[2];
+    ADPCMVal = r.ADPCMVal; ADPCMIndex = r.ADPCMIndex;
+    ADPCMValLoop = r.ADPCMValLoop; ADPCMIndexLoop = r.ADPCMIndexLoop; ADPCMCurByte = r.ADPCMCurByte;
+}
+#endif
 
 void SPUChannel::PanOutput(s32 in, s32& left, s32& right)
 {
@@ -1306,9 +1488,133 @@ void SPU::Mix(u32 spucycles)
 #endif
 }
 
+#ifdef LITEV_SPU_SILENT_LAZY
+// debug.litev.spulazy / LITEV_SPULAZY (default on; 0 = step a silent console's channels exactly)
+static bool SPULazyOn()
+{
+    static const bool on = SPUProp("debug.litev.spulazy", "LITEV_SPULAZY", 1) != 0;
+    return on;
+}
+
+#ifndef __ANDROID__
+// Mac check (LITEV_SPULAZY_VERIFY=K): run an exact copy of every channel beside the lazy one;
+// compare what the ARM cores see after every batch, and every K batches rebuild the stale values
+// and compare those too. Prints mismatches to stderr.
+struct SPULazyVerify
+{
+    std::vector<SPUChannel> Shadow;
+    u64 Batches = 0, Rebuilds = 0, TimingBad = 0, DataBad = 0;
+    bool Synced = false;
+};
+static void CopyChannel(SPUChannel& d, const SPUChannel& o)
+{
+    d.Cnt = o.Cnt; d.SrcAddr = o.SrcAddr; d.TimerReload = o.TimerReload; d.LoopPos = o.LoopPos; d.Length = o.Length;
+    d.Volume = o.Volume; d.VolumeShift = o.VolumeShift; d.Pan = o.Pan; d.KeyOn = o.KeyOn; d.Timer = o.Timer; d.Pos = o.Pos;
+    memcpy(d.PrevSample, o.PrevSample, sizeof(d.PrevSample)); d.CurSample = o.CurSample; d.NoiseVal = o.NoiseVal;
+    d.ADPCMVal = o.ADPCMVal; d.ADPCMIndex = o.ADPCMIndex; d.ADPCMValLoop = o.ADPCMValLoop; d.ADPCMIndexLoop = o.ADPCMIndexLoop;
+    d.ADPCMCurByte = o.ADPCMCurByte; memcpy(d.FIFO, o.FIFO, sizeof(d.FIFO)); d.FIFOReadPos = o.FIFOReadPos;
+    d.FIFOWritePos = o.FIFOWritePos; d.FIFOReadOffset = o.FIFOReadOffset; d.FIFOLevel = o.FIFOLevel; d.InterpType = o.InterpType;
+}
+#endif
+
+void SPU::RunQuiet(u32 cycles, u32 n)
+{
+#ifndef __ANDROID__
+    static const int verifyEvery = getenv("LITEV_SPULAZY_VERIFY") ? atoi(getenv("LITEV_SPULAZY_VERIFY")) : 0;
+    static thread_local std::unordered_map<SPU*, std::unique_ptr<SPULazyVerify>> verifies;
+    SPULazyVerify* v = nullptr;
+    if (verifyEvery > 0)
+    {
+        auto& vp = verifies[this];
+        if (!vp) vp = std::make_unique<SPULazyVerify>();
+        v = vp.get();
+        if (v->Shadow.empty())
+        {
+            if (const char* it = getenv("LITEV_SPULAZY_INTERP")) SetInterpolation((AudioInterpolation)atoi(it));
+            v->Shadow.reserve(16);
+            for (int i = 0; i < 16; i++) v->Shadow.emplace_back(i, NDS, Channels[i].InterpType);
+        }
+        for (int i = 0; i < 16; i++)
+        {
+            SPUChannel& sh = v->Shadow[i]; const SPUChannel& ch = Channels[i];
+            if (!v->Synced) { MaterializeAll(); CopyChannel(sh, ch); continue; }
+            // registers the guest may have written since the last batch
+            sh.Cnt = ch.Cnt; sh.SrcAddr = ch.SrcAddr; sh.TimerReload = ch.TimerReload; sh.LoopPos = ch.LoopPos;
+            sh.Length = ch.Length; sh.Volume = ch.Volume; sh.VolumeShift = ch.VolumeShift; sh.Pan = ch.Pan; sh.KeyOn = ch.KeyOn;
+        }
+        v->Synced = true;
+        for (SPUChannel& sh : v->Shadow)
+            for (u32 b = 0; b < n; b++) sh.DoRun(cycles, false);
+    }
+#endif
+    for (SPUChannel& ch : Channels)
+    {
+        if (!(ch.Cnt & (1u<<31))) continue;
+        if (ch.LazyOK()) { ch.DoRunTiming(cycles, n); AnyStale = true; }
+        else for (u32 b = 0; b < n; b++) ch.DoRun(cycles, false);
+    }
+    for (u32 b = 0; b < n; b++) NDS.Mic.Advance(cycles << 1);
+#ifndef __ANDROID__
+    if (v)
+    {
+        v->Batches++;
+        const bool rebuild = (v->Batches % verifyEvery) == 0;
+        if (rebuild) { MaterializeAll(); v->Rebuilds++; }
+        for (int i = 0; i < 16; i++)
+        {
+            const SPUChannel& sh = v->Shadow[i]; const SPUChannel& ch = Channels[i];
+            if (sh.Cnt != ch.Cnt || sh.Pos != ch.Pos || sh.Timer != ch.Timer || sh.KeyOn != ch.KeyOn || sh.FIFOReadPos != ch.FIFOReadPos
+                || sh.FIFOWritePos != ch.FIFOWritePos || sh.FIFOReadOffset != ch.FIFOReadOffset || sh.FIFOLevel != ch.FIFOLevel)
+            {
+                if (v->TimingBad++ < 20)
+                    fprintf(stderr, "SPULAZY TIMING %p ch%d batch %llu: cnt %08x/%08x pos %d/%d timer %x/%x fifo %u,%u,%u,%u/%u,%u,%u,%u\n", (void*)this, i,
+                            (unsigned long long)v->Batches, sh.Cnt, ch.Cnt, sh.Pos, ch.Pos, sh.Timer, ch.Timer, sh.FIFOReadPos, sh.FIFOWritePos,
+                            sh.FIFOReadOffset, sh.FIFOLevel, ch.FIFOReadPos, ch.FIFOWritePos, ch.FIFOReadOffset, ch.FIFOLevel);
+                CopyChannel(v->Shadow[i], ch);
+                continue;
+            }
+            if (!rebuild || !(ch.Cnt & (1u<<31))) continue;
+            const u32 fmt = (ch.Cnt >> 29) & 3;
+            bool bad = sh.CurSample != ch.CurSample || memcmp(sh.PrevSample, ch.PrevSample, sizeof(sh.PrevSample)) || memcmp(sh.FIFO, ch.FIFO, sizeof(sh.FIFO));
+            if (fmt == 2 && ch.Pos >= 8)
+                bad |= sh.ADPCMVal != ch.ADPCMVal || sh.ADPCMIndex != ch.ADPCMIndex || sh.ADPCMValLoop != ch.ADPCMValLoop
+                       || sh.ADPCMIndexLoop != ch.ADPCMIndexLoop || (sh.ADPCMCurByte != ch.ADPCMCurByte);
+            if (bad)
+            {
+                if (v->DataBad++ < 20)
+                    fprintf(stderr, "SPULAZY DATA %p ch%d batch %llu fmt %u pos %d restarts %u steps %u: cur %d/%d val %d/%d idx %d/%d byte %02x/%02x fifo0 %08x/%08x\n", (void*)this, i,
+                            (unsigned long long)v->Batches, fmt, ch.Pos, ch.Restarts, ch.Steps, sh.CurSample, ch.CurSample, sh.ADPCMVal, ch.ADPCMVal,
+                            sh.ADPCMIndex, ch.ADPCMIndex, sh.ADPCMCurByte, ch.ADPCMCurByte, sh.FIFO[0], ch.FIFO[0]);
+                CopyChannel(v->Shadow[i], ch);
+            }
+        }
+        if ((v->Batches % 20000) == 0)
+            fprintf(stderr, "SPULAZY %p: %llu batches, %llu rebuilds, timing mismatches %llu, value mismatches %llu\n", (void*)this,
+                    (unsigned long long)v->Batches, (unsigned long long)v->Rebuilds, (unsigned long long)v->TimingBad, (unsigned long long)v->DataBad);
+    }
+#endif
+}
+#endif
+
 void SPU::MixSamples(u32 spucycles)
 {
     LITE_PROFILE_SCOPE(spuTimer, melonDS::LiteProfile::g_Frame.SPUMixNs);
+#ifdef LITEV_SPU_SILENT_LAZY
+    {
+        const bool quiet = LITEV_HEADLESS(Silent) && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7)) && NDS.ConsoleType == 0;
+        if (quiet && (Cnt & (1<<15)) && SPULazyOn())
+        {
+            // the batch below with every channel's output unused: channel-major, timing only where possible
+#ifdef LITEV_SPU_BATCH
+            RunQuiet(spucycles, (u32)(LITEV_SPU_BATCH_N));
+#else
+            RunQuiet(spucycles, 1);
+#endif
+            return;
+        }
+        if (!quiet && AnyStale) MaterializeAll();
+    }
+#endif
 
 
 #ifdef LITEV_SPU_BATCH
@@ -1815,11 +2121,39 @@ u32 SPU::Read32(u32 addr)
     return 0;
 }
 
+#ifdef LITEV_SPU_SILENT_LAZY
+// A write that changes what a playing channel plays (format, repeat, source, loop start, length)
+// ends its replayable history: rebuild its stale values with the old registers first, then step it
+// exactly until its next start. (Volume, pan and pitch writes change nothing replayed.)
+struct SPUChannelWriteGuard
+{
+    SPUChannel& Ch;
+    const u32 Cnt, Src, Loop, Len;
+    const bool Playing;
+    explicit SPUChannelWriteGuard(SPUChannel& ch) : Ch(ch), Cnt(ch.Cnt), Src(ch.SrcAddr), Loop(ch.LoopPos), Len(ch.Length),
+        Playing((ch.Stale || ch.Tracked) && (ch.Cnt & (1u<<31)) && !ch.KeyOn) {}
+    ~SPUChannelWriteGuard()
+    {
+        if (!Playing || !(Ch.Cnt & (1u<<31))) return;
+        if (!((Ch.Cnt ^ Cnt) & 0x78000000) && Ch.SrcAddr == Src && Ch.LoopPos == Loop && Ch.Length == Len) return;
+        const u32 c = Ch.Cnt, s = Ch.SrcAddr, l = Ch.LoopPos, n = Ch.Length;
+        Ch.Cnt = Cnt; Ch.SrcAddr = Src; Ch.LoopPos = Loop; Ch.Length = Len;
+        Ch.Materialize();
+        Ch.Cnt = c; Ch.SrcAddr = s; Ch.LoopPos = l; Ch.Length = n;
+        Ch.Tracked = false;
+    }
+};
+#define LITEV_SPU_WRITE_GUARD(chan) SPUChannelWriteGuard lazyGuard(*chan)
+#else
+#define LITEV_SPU_WRITE_GUARD(chan)
+#endif
+
 void SPU::Write8(u32 addr, u8 val)
 {
     if (addr < 0x04000500)
     {
         SPUChannel* chan = &Channels[(addr >> 4) & 0xF];
+        LITEV_SPU_WRITE_GUARD(chan);
 
         switch (addr & 0xF)
         {
@@ -1861,6 +2195,7 @@ void SPU::Write16(u32 addr, u16 val)
     if (addr < 0x04000500)
     {
         SPUChannel* chan = &Channels[(addr >> 4) & 0xF];
+        LITEV_SPU_WRITE_GUARD(chan);
 
         switch (addr & 0xF)
         {
@@ -1910,6 +2245,7 @@ void SPU::Write32(u32 addr, u32 val)
     if (addr < 0x04000500)
     {
         SPUChannel* chan = &Channels[(addr >> 4) & 0xF];
+        LITEV_SPU_WRITE_GUARD(chan);
 
         switch (addr & 0xF)
         {

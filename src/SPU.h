@@ -210,6 +210,49 @@ public:
 
     void PanOutput(s32 in, s32& left, s32& right);
 
+#ifdef LITEV_SPU_SILENT_LAZY
+    // A console nobody hears (SPU::Silent, no sound capture) steps its main-RAM PCM/ADPCM channels'
+    // timing only: position, loop, end (the busy bit the ARM7 reads), FIFO bookkeeping. The sample
+    // values (decode state, FIFO words) only reach the guest through sound capture, so they are
+    // rebuilt (Materialize) before capture, a savestate or a register change can see them.
+    bool Stale = false;     // decoded values and the FIFO words in FIFOStale are not current
+    bool Tracked = false;   // Restarts/Steps are valid since Start (every step since went through Run/RunTiming)
+    u8 Restarts = 0;        // loop restarts since Start (capped: passes from the 2nd on are identical)
+    u8 FIFOStale = 0;       // FIFO slots buffered without reading the sample
+    u32 Steps = 0;          // samples since Start or the last loop restart
+    u32 FIFOSrc[8] {};      // sample offset each FIFO slot holds
+    bool LazyOK() const
+    {
+        if (Stale) return true;
+        const u32 fmt = (Cnt >> 29) & 0x3;
+        return fmt < 3 && ((Cnt >> 27) & 0x3) && (Tracked || KeyOn)
+            && (SrcAddr >> 24) == 0x02 && SrcAddr + LoopPos + Length <= 0x03000000;
+    }
+    void CountStep(s32 oldPos)
+    {
+        if (Pos == oldPos + 1) Steps++;
+        else { Steps = 0; if (Restarts < 6) Restarts++; }
+    }
+    void FIFO_BufferTiming();
+    void FIFO_Skip(u32 size)
+    {
+        FIFOReadPos = (FIFOReadPos + size) & 0x1F;
+        FIFOLevel -= size;
+        if (FIFOLevel <= 16) FIFO_BufferTiming();
+    }
+    template<u32 type> void RunTiming(u32 cycles, u32 n);
+    void DoRunTiming(u32 cycles, u32 n)
+    {
+        switch ((Cnt >> 29) & 0x3)
+        {
+        case 0: RunTiming<0>(cycles, n); return;
+        case 1: RunTiming<1>(cycles, n); return;
+        default: RunTiming<2>(cycles, n); return;
+        }
+    }
+    void Materialize();
+#endif
+
 private:
     melonDS::NDS& NDS;
 };
@@ -354,6 +397,11 @@ private:
 
     std::array<SPUChannel, 16> Channels;
     std::array<SPUCaptureUnit, 2> Capture;
+#ifdef LITEV_SPU_SILENT_LAZY
+    bool AnyStale = false;
+    void MaterializeAll() { for (SPUChannel& ch : Channels) ch.Materialize(); AnyStale = false; }
+    void RunQuiet(u32 cycles, u32 n);
+#endif
 };
 
 }
