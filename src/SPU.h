@@ -20,6 +20,9 @@
 #define SPU_H
 
 #include "Savestate.h"
+#include <memory>
+#include <vector>
+#include <unordered_map>
 #include "Platform.h"
 
 struct blip_t;
@@ -137,6 +140,19 @@ public:
     // out=false: advance and decode exactly, but skip the output value (nobody hears it)
     template<u32 type> s32 Run(u32 cycles, bool out = true);
 
+#ifdef LITEV_SPU_ADPCM_MEMO
+    // decoded ADPCM states of the channel's current sample, by position (see RunADPCMFast)
+    struct ADPCMMemo
+    {
+        std::vector<u32> St;    // pos -> (u16)val | idx << 16, valid for 8 <= pos < Hi
+        std::vector<u8> Raw;    // the sample bytes they were decoded from
+        u32 Src = 0, Loop = 0, Total = 0;
+        s32 Hi = 0;
+    };
+    ADPCMMemo* Memo = nullptr;  // the SPU's memo of the current sample (shared by all channels)
+    u32 MemoGen = 0;
+    bool MemoCheck(ADPCMMemo& m, s32 pos, s32& okUntil);
+#endif
 #ifdef LITEV_SPU_FAST_ADPCM
     // approximate ADPCM channel over n output ticks: state in locals, sample bytes read straight
     // from main RAM instead of through the 32-byte channel FIFO. false = not applicable
@@ -258,6 +274,12 @@ class SPU
 {
 public:
     explicit SPU(melonDS::NDS& nds, AudioBitDepth bitdepth, AudioInterpolation interpolation, double outputSampleRate);
+#ifdef LITEV_SPU_ADPCM_MEMO
+    std::unordered_map<u64, std::unique_ptr<SPUChannel::ADPCMMemo>> Memos;   // by (src, loop, total)
+    size_t MemoBytes = 0;
+    u32 MemoGen = 1;    // bumped when Memos is cleared (channels drop their pointers)
+    SPUChannel::ADPCMMemo* GetMemo(u32 src, u32 loop, u32 total);
+#endif
     ~SPU();
     void Reset();
     void DoSavestate(Savestate* file);
@@ -279,6 +301,10 @@ public:
     void SetApplyBias(bool enable);
 
     void Mix(u32 spucycles);
+    void MixSamples(u32 spucycles);
+#ifdef LITEV_SPU_BENCH
+    void Bench(u32 spucycles);
+#endif
     void BufferAudio();
 
     void TrimOutput();

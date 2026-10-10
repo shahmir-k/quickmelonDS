@@ -44,6 +44,7 @@
 #endif
 
 #include <cstdlib>
+#include <chrono>
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
@@ -306,6 +307,9 @@ void SPU::DoSavestate(Savestate* file)
 
     for (SPUChannel& channel : Channels)
         channel.DoSavestate(file);
+#ifdef LITEV_SPU_ADPCM_MEMO
+    if (!file->Saving) { Memos.clear(); MemoBytes = 0; MemoGen++; }
+#endif
 
     for (SPUCaptureUnit& capture : Capture)
         capture.DoSavestate(file);
@@ -686,6 +690,41 @@ LITEV_SPU_INL void SPUChannel::NextSample_ADPCM()
     CurSample = ADPCMVal;
 }
 
+#ifdef LITEV_SPU_BENCH
+static int BenchDiv = 0, BenchMemo = -1;
+#endif
+// debug.litev.<prop> on Android, <env> elsewhere; read once
+[[maybe_unused]] static int SPUProp(const char* prop, const char* env, int def)
+{
+#if defined(__ANDROID__)
+    char b[PROP_VALUE_MAX] = {0};
+    (void)env;
+    return __system_property_get(prop, b) > 0 ? atoi(b) : def;
+#else
+    (void)prop;
+    const char* e = getenv(env);
+    return e ? atoi(e) : def;
+#endif
+}
+
+#ifdef LITEV_SPU_RATE_DIV
+// Quality-for-speed (debug.litev.spudiv / LITEV_SPUDIV = 1, 2 or 4, default 1): mix at 32768/div Hz.
+// Each channel still steps every sample of its own (exact Timer/Pos/end/busy at the batch end, which
+// is all the ARM cores can see), but its output value, the pan mix and the blip delta are computed
+// once per div ticks. Only with the channel-major batch (no sound capture, someone listening).
+static u32 SPURateDiv()
+{
+    static const u32 d = [] {
+        const int v = SPUProp("debug.litev.spudiv", "LITEV_SPUDIV", 1);
+        return (u32)((v == 2 || v == 4) && (LITEV_SPU_BATCH_N) % v == 0 ? v : 1);
+    }();
+#ifdef LITEV_SPU_BENCH
+    if (BenchDiv) return BenchDiv;
+#endif
+    return d;
+}
+#endif
+
 #ifdef LITEV_SPU_FAST_ADPCM
 // Game-first ADPCM (debug.litev.spufast, default on): the same decode, loop and end handling as
 // NextSample_ADPCM + Run<2>, but over a batch with the channel state in locals and the sample
@@ -705,6 +744,59 @@ static bool SPUFastOn()
     }();
     return on;
 }
+
+#ifdef LITEV_SPU_ADPCM_MEMO
+// ADPCM decode memo (debug.litev.spumemo / LITEV_SPUMEMO, default on). A looping ADPCM sample decodes
+// to the same states on every pass (the loop restarts from the state saved at the loop point), and
+// the same instrument sample is keyed on again and again, so the first pass records each position's
+// decoded state and later passes look it up instead of decoding. Every 16-byte block is checked
+// against the bytes it was decoded from before it is replayed (a game rewriting a sample, e.g. a
+// streamed ring buffer, decodes it afresh). Same output as decoding; only the decode work changes.
+static constexpr u32 MemoMaxBytes = 0x10000;       // per sample
+static constexpr size_t MemoCapBytes = 8 << 20;     // all of them (then start over)
+
+SPUChannel::ADPCMMemo* SPU::GetMemo(u32 src, u32 loop, u32 total)
+{
+    auto& m = Memos[(u64)src | ((u64)loop << 27) | ((u64)total << 44)];
+    if (!m)
+    {
+        if (MemoBytes + 9 * total > MemoCapBytes)
+        {
+            Memos.clear(); MemoBytes = 0; MemoGen++;
+            return GetMemo(src, loop, total);
+        }
+        m = std::make_unique<SPUChannel::ADPCMMemo>();
+        m->St.resize(2 * total); m->Raw.resize(total);
+        m->Src = src; m->Loop = loop; m->Total = total;
+        MemoBytes += 9 * total;
+    }
+    return m.get();
+}
+
+static bool SPUMemoOn()
+{
+    static const bool on = SPUProp("debug.litev.spumemo", "LITEV_SPUMEMO", 1) != 0;
+#ifdef LITEV_SPU_BENCH
+    if (BenchMemo >= 0) return BenchMemo;
+#endif
+    return on;
+}
+
+// can positions from pos on be replayed? okUntil = end of the checked block
+bool SPUChannel::MemoCheck(ADPCMMemo& m, s32 pos, s32& okUntil)
+{
+    const u32 b0 = (u32)(pos >> 1) & ~15u;
+    const u32 e = std::min(b0 + 16, (u32)(m.Hi + 1) >> 1);
+    const u32 a = (m.Src + b0) & NDS.MainRAMMask;
+    if (a + (e - b0) <= NDS.MainRAMMask + 1 && !memcmp(&NDS.MainRAM[a], &m.Raw[b0], e - b0))
+    {
+        okUntil = std::min((s32)(b0 + 16) << 1, m.Hi);
+        return true;
+    }
+    m.Hi = std::max(8, (s32)b0 << 1);   // this block changed: decode (and record) it again
+    return false;
+}
+#endif
 
 bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
 {
@@ -728,10 +820,53 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
     u32 curByte = ADPCMCurByte;
     s32 cur = CurSample, p0 = PrevSample[0], p1 = PrevSample[1], p2 = PrevSample[2];
     bool on = true;
+#ifdef LITEV_SPU_ADPCM_MEMO
+    ADPCMMemo* m = nullptr;
+    if (SPUMemoOn() && total <= MemoMaxBytes)
+    {
+        m = Memo;
+        if (!m || MemoGen != NDS.SPU.MemoGen || m->Src != src || m->Loop != LoopPos || m->Total != total)
+        {
+            Memo = m = NDS.SPU.GetMemo(src, LoopPos, total);
+            MemoGen = NDS.SPU.MemoGen;
+        }
+    }
+    s32 okUntil = 0;        // positions below this are checked and replayed from the memo
+    bool stale = false;     // curByte not loaded (replayed positions don't read the sample)
+#endif
 
+#ifdef LITEV_SPU_ADPCM_MEMO
+    // each output tick steps the channel kmin or kmin+1 samples (timer stays in [reload, 0x10000))
+    const u32 period = 0x10000 - reload, kmin = cycles / period, rem = cycles - kmin * period;
+    const s32 loop2 = (s32)(LoopPos << 1);
+#endif
     for (int b = 0; b < n; b++)
     {
         if (!on) { dst[b][col] = 0; continue; }
+#ifdef LITEV_SPU_ADPCM_MEMO
+        // all of this tick's samples checked and in the memo: jump to the last one
+        if (m && pos >= 8 && timer >= reload)
+        {
+            u32 t = timer + rem, k = kmin;
+            if (t >= 0x10000) { t -= period; k++; }
+            const s32 np = pos + (s32)k;
+            if (np >= okUntil && np < m->Hi)   // check the blocks up to np
+                for (s32 q = std::max(okUntil, pos + 1); q <= np && MemoCheck(*m, q, okUntil); q = okUntil) {}
+            if (np < okUntil)
+            {
+                if (k)
+                {
+                    if (pos < loop2 && np >= loop2) { valLoop = (s16)m->St[loop2]; idxLoop = m->St[loop2] >> 16; }
+                    const u32 st = m->St[np];
+                    val = (s16)st; idx = st >> 16;
+                    if (interp) { p2 = p1; p1 = p0; p0 = (s16)m->St[np - 1]; }
+                    cur = val; pos = np; stale = true;
+                }
+                timer = t;
+                goto stepped;
+            }
+        }
+#endif
         timer += cycles;
         while (timer >> 16)
         {
@@ -747,6 +882,13 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
                     idx = (header >> 16) & 0x7F;
                     if (idx > 88) idx = 88;
                     valLoop = val; idxLoop = idx;
+#ifdef LITEV_SPU_ADPCM_MEMO
+                    if (m && (m->Hi < 8 || memcmp(&m->Raw[0], &header, 4)))
+                    {
+                        memcpy(&m->Raw[0], &header, 4);
+                        m->Hi = 8;
+                    }
+#endif
                 }
                 continue;
             }
@@ -757,6 +899,9 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
                     pos = LoopPos << 1;
                     val = valLoop; idx = idxLoop;
                     curByte = ram[(src + LoopPos) & mask];
+#ifdef LITEV_SPU_ADPCM_MEMO
+                    okUntil = 0; stale = false;
+#endif
                 }
                 else if (repeat & 2)
                 {
@@ -768,18 +913,45 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
             }
             else
             {
+#ifdef LITEV_SPU_ADPCM_MEMO
+                if (pos < okUntil || (m && pos < m->Hi && MemoCheck(*m, pos, okUntil)))
+                {
+                    const u32 st = m->St[pos];
+                    val = (s16)st; idx = st >> 16;
+                    stale = true;
+                }
+                else
+                {
+                if (!(pos & 1)) curByte = ram[(src + (pos >> 1)) & mask];
+                else if (stale) curByte = ram[(src + (pos >> 1)) & mask] >> 4;
+                else            curByte >>= 4;
+                stale = false;
+#else
                 if (!(pos & 1)) curByte = ram[(src + (pos >> 1)) & mask];
                 else            curByte >>= 4;
+#endif
                 // (a branch-free signed 16-entry table measured slower on the RG DS: 4.5% -> 6.4%)
                 const u32 nib = curByte & 0x7;
                 const s32 diff = ADPCMTabs.Diff[idx][nib];
                 if (curByte & 0x8) { val -= diff; if (val < -0x7FFF) val = -0x7FFF; }
                 else               { val += diff; if (val > 0x7FFF)  val = 0x7FFF; }
                 idx = ADPCMTabs.Next[idx][nib];
+#ifdef LITEV_SPU_ADPCM_MEMO
+                if (m && pos == m->Hi)
+                {
+                    if (!(pos & 1)) m->Raw[pos >> 1] = (u8)curByte;
+                    m->St[pos] = (u16)val | ((u32)idx << 16);
+                    m->Hi++;
+                }
+                }
+#endif
                 if (pos == (s32)(LoopPos << 1)) { valLoop = val; idxLoop = idx; }
             }
             cur = val;
         }
+#ifdef LITEV_SPU_ADPCM_MEMO
+    stepped:
+#endif
         if (!on || Volume == 0) { dst[b][col] = 0; continue; }
         s32 v = cur;
         if (interp)
@@ -791,6 +963,9 @@ bool SPUChannel::RunADPCMFast(u32 cycles, s32 (*dst)[16], int col, int n)
         dst[b][col] = v * Volume;
     }
 
+#ifdef LITEV_SPU_ADPCM_MEMO
+    if (stale) curByte = ram[(src + (pos >> 1)) & mask] >> (4 * (pos & 1));
+#endif
     Timer = timer; Pos = pos; ADPCMVal = val; ADPCMIndex = idx;
     ADPCMValLoop = valLoop; ADPCMIndexLoop = idxLoop; ADPCMCurByte = (u8)curByte;
     CurSample = (s16)cur; PrevSample[0] = (s16)p0; PrevSample[1] = (s16)p1; PrevSample[2] = (s16)p2;
@@ -1060,7 +1235,78 @@ void SPUCaptureUnit::Run(u32 cycles, s32 sample)
 
 
 
+#ifdef LITEV_SPU_BENCH
+// Mac measurement only (-DLITEV_SPU_BENCH, LITEV_SPU_BENCH=1): before each real batch, run it once per
+// option set on a copy of the channel/mic/output state and time each, interleaved so the busy Mac's
+// noise hits all of them alike. Prints the totals at exit.
+struct SPUBenchVariant { const char* name; u32 div; int memo; blip_t* l; blip_t* r; int timer; s16 last[2]; double ns; };
+static SPUBenchVariant BenchV[] = {
+    {"current", 1, 0}, {"memo", 1, 1}, {"div2", 2, 0}, {"memo+div2", 2, 1}, {"memo+div4", 4, 1}, {"div4", 4, 0},
+};
+static constexpr int BenchN = sizeof(BenchV) / sizeof(BenchV[0]);
+static u64 BenchCalls, BenchKept;
+static struct BenchPrint { ~BenchPrint() {
+    if (!BenchKept) return;
+    fprintf(stderr, "SPU bench: %llu batches, %llu kept\n", (unsigned long long)BenchCalls, (unsigned long long)BenchKept);
+    for (auto& v : BenchV)
+        fprintf(stderr, "  %-10s %8.0f ns/batch  %5.1f%%\n", v.name, v.ns / BenchKept, 100.0 * v.ns / BenchV[0].ns);
+} } BenchPrinter;
+
+void SPU::Bench(u32 spucycles)
+{
+    static const bool on = getenv("LITEV_SPU_BENCH") != nullptr;
+    if (!on || !(Cnt & (1<<15)) || ((Capture[0].Cnt | Capture[1].Cnt) & (1<<7)) || LITEV_HEADLESS(Silent)) return;
+    static std::vector<u8> chs(sizeof(Channels)), mic(sizeof(NDS.Mic));
+    static std::vector<s16> out(2 * OutputBufferSize);
+    memcpy(chs.data(), (void*)&Channels, sizeof(Channels));
+    memcpy(mic.data(), (void*)&NDS.Mic, sizeof(NDS.Mic));
+    blip_t* const rl = BlipLeft; blip_t* const rr = BlipRight; s16* const rout = OutputBuffer;
+    const int rtimer = BlipTimer; const s16 rlast0 = OutputLastSamples[0], rlast1 = OutputLastSamples[1];
+    const u32 rrd = OutputBufferReadPos, rwr = OutputBufferWritePos;
+    OutputBuffer = out.data();
+    double t[BenchN];
+    for (int k = 0; k < BenchN; k++)
+    {
+        SPUBenchVariant& v = BenchV[(k + BenchCalls) % BenchN];
+        if (!v.l) { v.l = blip_new(512); v.r = blip_new(512);
+                    blip_set_rates(v.l, INTERNAL_SAMPLE_RATE, OutputSampleRate); blip_set_rates(v.r, INTERNAL_SAMPLE_RATE, OutputSampleRate); }
+        memcpy((void*)&Channels, chs.data(), sizeof(Channels));
+        memcpy((void*)&NDS.Mic, mic.data(), sizeof(NDS.Mic));
+        BlipLeft = v.l; BlipRight = v.r; BlipTimer = v.timer; OutputLastSamples[0] = v.last[0]; OutputLastSamples[1] = v.last[1];
+        BenchDiv = v.div; BenchMemo = v.memo;
+        const auto t0 = std::chrono::steady_clock::now();
+        MixSamples(spucycles);
+        t[(k + BenchCalls) % BenchN] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+        v.timer = BlipTimer; v.last[0] = OutputLastSamples[0]; v.last[1] = OutputLastSamples[1];
+    }
+    BenchDiv = 0; BenchMemo = -1;
+    memcpy((void*)&Channels, chs.data(), sizeof(Channels));
+    memcpy((void*)&NDS.Mic, mic.data(), sizeof(NDS.Mic));
+    BlipLeft = rl; BlipRight = rr; OutputBuffer = rout; BlipTimer = rtimer;
+    OutputLastSamples[0] = rlast0; OutputLastSamples[1] = rlast1; OutputBufferReadPos = rrd; OutputBufferWritePos = rwr;
+    BenchCalls++;
+    double lo = t[0], hi = t[0];
+    for (double x : t) { lo = std::min(lo, x); hi = std::max(hi, x); }
+    if (hi > 8 * lo) return;   // preempted
+    BenchKept++;
+    for (int k = 0; k < BenchN; k++) BenchV[k].ns += t[k];
+}
+#endif
+
 void SPU::Mix(u32 spucycles)
+{
+#ifdef LITEV_SPU_BENCH
+    Bench(spucycles);
+#endif
+    MixSamples(spucycles);
+#ifdef LITEV_SPU_BATCH
+    NDS.ScheduleEvent(Event_SPU, true, MixInterval * (LITEV_SPU_BATCH_N), 0, MixInterval >> 1);
+#else
+    NDS.ScheduleEvent(Event_SPU, true, MixInterval, 0, MixInterval >> 1);
+#endif
+}
+
+void SPU::MixSamples(u32 spucycles)
 {
     LITE_PROFILE_SCOPE(spuTimer, melonDS::LiteProfile::g_Frame.SPUMixNs);
 
@@ -1083,6 +1329,14 @@ void SPU::Mix(u32 spucycles)
     s32 chmajor[LITEV_SPU_BATCH_N][16];
     const bool chMajor = (Cnt & (1<<15)) && !((Capture[0].Cnt | Capture[1].Cnt) & (1<<7))
                          && !LITEV_HEADLESS(Silent);
+#ifdef LITEV_SPU_RATE_DIV
+    const u32 rateDiv = chMajor ? SPURateDiv() : 1;
+    const u32 nticks = (u32)(LITEV_SPU_BATCH_N) / rateDiv;
+    const u32 mixcyc = spucycles * rateDiv;
+#else
+    const u32 nticks = (u32)(LITEV_SPU_BATCH_N);
+    const u32 mixcyc = spucycles;
+#endif
     if (chMajor)
     {
         for (int i = 0; i < 16; i++)
@@ -1090,15 +1344,21 @@ void SPU::Mix(u32 spucycles)
             SPUChannel& ch = Channels[i];
             if (!(ch.Cnt & (1u<<31)))
             {
-                for (u32 b = 0; b < (u32)(LITEV_SPU_BATCH_N); b++) chmajor[b][i] = 0;
+                for (u32 b = 0; b < nticks; b++) chmajor[b][i] = 0;
                 continue;
             }
-            ch.DoRunN(spucycles, chmajor, i, LITEV_SPU_BATCH_N);
+            ch.DoRunN(mixcyc, chmajor, i, nticks);
         }
     }
 #endif
-    for (u32 _spubatch = 0; _spubatch < (u32)(LITEV_SPU_BATCH_N); _spubatch++)
+#ifndef LITEV_SPU_CHMAJOR
+    const u32 nticks = (u32)(LITEV_SPU_BATCH_N);
+    const u32 mixcyc = spucycles;
+#endif
+    for (u32 _spubatch = 0; _spubatch < nticks; _spubatch++)
     {
+#else
+    const u32 mixcyc = spucycles;
 #endif
 
     s32 left = 0, right = 0;
@@ -1119,12 +1379,12 @@ void SPU::Mix(u32 spucycles)
         if (chMajor) memcpy(cv, chmajor[_spubatch], sizeof(cv));
         else
 #endif
-        for (int i = 0; i < 16; i++) cv[i] = Channels[i].DoRun(spucycles, !quiet);
+        for (int i = 0; i < 16; i++) cv[i] = Channels[i].DoRun(mixcyc, !quiet);
         const s32 ch1 = cv[1], ch3 = cv[3];   // raw values for the routing switch below
 
         if (quiet)
         {
-            NDS.Mic.Advance(spucycles << 1);
+            NDS.Mic.Advance(mixcyc << 1);
             goto mixed;
         }
 
@@ -1272,7 +1532,7 @@ void SPU::Mix(u32 spucycles)
         output[1] = (s16)std::clamp(rightoutput, -0x8000, 0x7FFF);
     }
 
-    NDS.Mic.Advance(spucycles << 1);
+    NDS.Mic.Advance(mixcyc << 1);
 
     if (NDS.ConsoleType == 1)
     {
@@ -1288,7 +1548,7 @@ void SPU::Mix(u32 spucycles)
         output[1] &= 0xFFC0;
     }
 
-    BlipTimer += spucycles;
+    BlipTimer += mixcyc;
 
     if (output[0] != OutputLastSamples[0])
         blip_add_delta(BlipLeft, BlipTimer, (int) output[0] - OutputLastSamples[0]);
@@ -1304,9 +1564,6 @@ mixed:;
 
 #ifdef LITEV_SPU_BATCH
     }
-    NDS.ScheduleEvent(Event_SPU, true, MixInterval * (LITEV_SPU_BATCH_N), 0, MixInterval >> 1);
-#else
-    NDS.ScheduleEvent(Event_SPU, true, MixInterval, 0, MixInterval >> 1);
 #endif
 }
 

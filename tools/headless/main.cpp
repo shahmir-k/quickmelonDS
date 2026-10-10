@@ -585,6 +585,9 @@ int main(int argc, char** argv)
     XXH3_64bits_reset(audioHashState);
     u64 audioSampleCount = 0;                 // stereo frames drained
     std::vector<s16> audioDrain(2048 * 2);    // interleaved L/R scratch buffer
+    // LITEV_WAV=<path>: also write the output as a 48 kHz 16-bit stereo WAV (listening tests)
+    FILE* wav = getenv("LITEV_WAV") ? fopen(getenv("LITEV_WAV"), "wb") : nullptr;
+    if (wav) fseek(wav, 44, SEEK_SET);
 
     auto wallStart = std::chrono::steady_clock::now();
 
@@ -841,6 +844,7 @@ int main(int argc, char** argv)
             if (got <= 0) break;
             XXH3_64bits_update(audioHashState, audioDrain.data(),
                                (size_t)got * 2 * sizeof(s16));
+            if (wav) fwrite(audioDrain.data(), 4, (size_t)got, wav);
             audioSampleCount += (u64)got;
             if (got < 2048) break;
         }
@@ -930,6 +934,14 @@ int main(int argc, char** argv)
     printf("fb_changing: %s\n", anyChange ? "yes" : "no");
     printf("audio_hash:  %016llx\n", (unsigned long long)audioHash);
     printf("audio_samples: %llu\n", (unsigned long long)audioSampleCount);
+    if (wav)
+    {
+        const u32 n = (u32)audioSampleCount * 4, r = n + 36, rate = 48000, bps = rate * 4;
+        const u8 h[44] = {'R','I','F','F', u8(r), u8(r>>8), u8(r>>16), u8(r>>24), 'W','A','V','E','f','m','t',' ',
+                          16,0,0,0, 1,0, 2,0, u8(rate), u8(rate>>8), u8(rate>>16), 0, u8(bps), u8(bps>>8), u8(bps>>16), 0,
+                          4,0, 16,0, 'd','a','t','a', u8(n), u8(n>>8), u8(n>>16), u8(n>>24)};
+        fseek(wav, 0, SEEK_SET); fwrite(h, 1, 44, wav); fclose(wav);
+    }
 #if LITEV_PROFILE
     printf("links_patched:   %llu\n", (unsigned long long)profTotals.linksPatched);
     printf("links_unlinked:  %llu\n", (unsigned long long)profTotals.linksUnlinked);
