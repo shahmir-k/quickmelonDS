@@ -4560,7 +4560,10 @@ void GPU3D::RunUntimed() noexcept
     const u64 now = NDS.ARM9Timestamp >> NDS.ARM9ClockShift;
     const s32 elapsed = (s32)(now - Timestamp);
     Timestamp = now;
-    if (CycleCount == 0 && PipeEmpty()) return;   // idle (ZeroTiming already ran)
+    // idle: nothing queued and the busy bit already clear. The busy bit must be part of the test:
+    // BulkWords runs its commands itself (CycleCount stays 0 untimed) after setting the bit, and a
+    // game that then polls GXSTAT for idle would wait forever (PW's house-entry softlock).
+    if (CycleCount == 0 && PipeEmpty() && !(GXStat & (1<<27))) return;
     if (!GeometryEnabled || FlushRequest) return;
     if (CycleCount > 0 && (CycleCount -= elapsed) > 0) return;   // post-swap busy window
     if (!PipeEmpty())
