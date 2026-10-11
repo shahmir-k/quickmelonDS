@@ -954,8 +954,8 @@ void ARMv5::DataWrite8(u32 addr, u8 val)
     if (addr < ITCMSize)
     {
         DataCycles = 1;
+        NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr, (u8*)&ITCM[addr & (ITCMPhysicalSize - 1)], (u8)val);
         *(u8*)&ITCM[addr & (ITCMPhysicalSize - 1)] = val;
-        NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr);
         return;
     }
     if ((addr & DTCMMask) == DTCMBase)
@@ -985,8 +985,8 @@ void ARMv5::DataWrite16(u32 addr, u16 val)
     if (addr < ITCMSize)
     {
         DataCycles = 1;
+        NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr, (u16*)&ITCM[addr & (ITCMPhysicalSize - 1)], (u16)val);
         *(u16*)&ITCM[addr & (ITCMPhysicalSize - 1)] = val;
-        NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr);
         return;
     }
     if ((addr & DTCMMask) == DTCMBase)
@@ -1016,8 +1016,8 @@ void ARMv5::DataWrite32(u32 addr, u32 val)
     if (addr < ITCMSize)
     {
         DataCycles = 1;
+        NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr, (u32*)&ITCM[addr & (ITCMPhysicalSize - 1)], (u32)val);
         *(u32*)&ITCM[addr & (ITCMPhysicalSize - 1)] = val;
-        NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr);
         return;
     }
     if ((addr & DTCMMask) == DTCMBase)
@@ -1039,10 +1039,10 @@ void ARMv5::DataWrite32S(u32 addr, u32 val)
     if (addr < ITCMSize)
     {
         DataCycles += 1;
-        *(u32*)&ITCM[addr & (ITCMPhysicalSize - 1)] = val;
 #ifdef JIT_ENABLED
-        NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr);
+        NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr, (u32*)&ITCM[addr & (ITCMPhysicalSize - 1)], (u32)val);
 #endif
+        *(u32*)&ITCM[addr & (ITCMPhysicalSize - 1)] = val;
         return;
     }
     if ((addr & DTCMMask) == DTCMBase)

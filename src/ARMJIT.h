@@ -63,8 +63,45 @@ public:
     {
         u32 localAddr = Memory.LocaliseAddress(region, num, addr);
         if (CodeMemRegions[region][(localAddr & 0x7FFFFFF) / 512].Code & (1 << ((localAddr & 0x1FF) / 16)))
+        {
+#ifdef LITEV_JIT_SILENT_STATS
+            SilentStats[2]++;
+#endif
             InvalidateByAddr(localAddr);
+        }
     }
+    // Store variant: dst is the host location the caller writes val to right after this call.
+    // LITEV_JIT_SILENT_STORE: a store of the value already there leaves the code (and its blocks,
+    // page protection and patches) untouched. Inspired by DSperate's silent-store elimination
+    // (mem::store_code, src/core/mem/page_table.h, https://github.com/beebono/DSperate, f5fa35e).
+    // Not exact here (OFF): the guest bytes are the same, but keeping the blocks changes what gets
+    // recompiled later, and this JIT's cycle charges depend on block shape (e.g. a block-final
+    // conditional branch charges its not-taken cycles on both edges), so The Sims 3 diverges at f899.
+    // Census (LITEV_JIT_SILENT_STATS): 24 silent of 182 code-hit stores in the 19297-frame PW
+    // recording, 0 of 8 in the 8P MKDS race; the PW transition invalidations come from A9HLE natives.
+    template <u32 num, int region, typename T>
+    void CheckAndInvalidate(u32 addr, const T* dst, T val) noexcept
+    {
+        u32 localAddr = Memory.LocaliseAddress(region, num, addr);
+        if (CodeMemRegions[region][(localAddr & 0x7FFFFFF) / 512].Code & (1 << ((localAddr & 0x1FF) / 16)))
+        {
+            const bool silent = *dst == val;
+#ifdef LITEV_JIT_SILENT_STATS
+            SilentStats[silent]++;
+#endif
+#ifdef LITEV_JIT_SILENT_STORE
+            if (silent && SilentStoreOn)
+                return;
+#endif
+            InvalidateByAddr(localAddr);
+        }
+    }
+#ifdef LITEV_JIT_SILENT_STORE
+    bool SilentStoreOn = true;   // headless A/B in one binary: LITEV_JIT_SILENT_STORE_OFF=1
+#endif
+#ifdef LITEV_JIT_SILENT_STATS
+    u64 SilentStats[3] {};       // code-hit stores: [0] changed the value, [1] same value, [2] value unknown (other callers)
+#endif
     JitBlockEntry LookUpBlock(u32 num, u64* entries, u32 offset, u32 addr) noexcept;
     bool SetupExecutableRegion(u32 num, u32 blockAddr, u64*& entry, u32& start, u32& size, int* regionOut = nullptr) noexcept;
 #ifdef LITEV_JIT_REGION_CACHE
@@ -258,6 +295,8 @@ public:
     void ResetBlockCache() noexcept {}
     template <u32, int>
     void CheckAndInvalidate(u32 addr) noexcept {}
+    template <u32, int, typename T>
+    void CheckAndInvalidate(u32, const T*, T) noexcept {}
 
     ARMJIT_Memory Memory;
 };

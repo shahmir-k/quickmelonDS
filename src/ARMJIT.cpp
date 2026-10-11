@@ -216,7 +216,7 @@ void SlowWrite9(u32 addr, ARMv5* cpu, u32 val)
 
     if (addr < cpu->ITCMSize)
     {
-        cpu->NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr);
+        cpu->NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(addr, (T*)&cpu->ITCM[addr & 0x7FFF], (T)val);
         *(T*)&cpu->ITCM[addr & 0x7FFF] = val;
     }
     else if ((addr & cpu->DTCMMask) == cpu->DTCMBase)
@@ -282,7 +282,7 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
                 const u32 a = addr + (i << 2);
                 if (Write)
                 {
-                    cpu->NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(a);
+                    cpu->NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_ITCM>(a, (u32*)&cpu->ITCM[a & 0x7FFF], (u32)data[i]);
                     *(u32*)&cpu->ITCM[a & 0x7FFF] = (u32)data[i];
                 }
                 else
@@ -317,7 +317,7 @@ void SlowBlockTransfer9(u32 addr, u64* data, u32 num, ARMv5* cpu)
                 const u32 a = addr + (i << 2);
                 if (Write)
                 {
-                    nds.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(a);
+                    nds.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(a, (u32*)&nds.MainRAM[a & nds.MainRAMMask], (u32)data[i]);
                     *(u32*)&nds.MainRAM[a & nds.MainRAMMask] = (u32)data[i];
                 }
                 else
@@ -745,7 +745,11 @@ ARMJIT::ARMJIT(melonDS::NDS& nds, std::optional<JITArgs> jit) noexcept :
         LiteralOptimizations(jit.has_value() ? jit->LiteralOptimizations : false),
         BranchOptimizations(jit.has_value() ? jit->BranchOptimizations : false),
         FastMemory((jit.has_value() ? jit->FastMemory : false) && ARMJIT_Memory::IsFastMemSupported())
-{}
+{
+#ifdef LITEV_JIT_SILENT_STORE
+    SilentStoreOn = !getenv("LITEV_JIT_SILENT_STORE_OFF");
+#endif
+}
 
 void ARMJIT::RetireJitBlock(JitBlock* block) noexcept
 {
