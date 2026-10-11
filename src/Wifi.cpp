@@ -2185,10 +2185,13 @@ void Wifi::USTick()
             // they reach it late (Netplay delivers them kDelay after they were sent), and a beacon
             // taken between a CMD and its ACK delayed the ACK and the client dropped out of the
             // session, Mario Kart DS with 6+ consoles)
-            if ((!IsMPClient) || (USTimestamp > NextSync && !(LinkDelaysRegularFrames && MPInExchange)))
+            // (also not while a host frame it already took waits to start (RXTimestamp): the radio
+            // is about to receive it, and a regular frame taken now would push it back)
+            if ((!IsMPClient) || (USTimestamp > NextSync && !(LinkDelaysRegularFrames && (MPInExchange || RXTimestamp))))
             {
                 if ((!(RXCounter & 0x1FF & kTimeCheckMask)) && (!ComStatus))
                 {
+                    NDS.MPClientRX = IsMPClient;
                     CheckRX(0);
                 }
             }

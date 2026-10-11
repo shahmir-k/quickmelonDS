@@ -79,6 +79,7 @@ public:
 #ifdef LITEV_MP_CLOCKWAKE
         for (auto& w : WakeAt) w.store(UINT64_MAX, std::memory_order_relaxed);
 #endif
+        for (int& h : ClientHost) h = -1;
     }
 
     void Process() override {}
@@ -168,6 +169,8 @@ private:
     u64 CmdTime[kMaxInst] {};   // when each console last sent a CMD (its clock)
     bool Stopped = false;
     std::function<u64()> Clock[kMaxInst];
+    const NDS* Console[kMaxInst] {};   // (SetWake) for NDS::MPClientRX
+    int ClientHost[kMaxInst];           // the sender of the last host frame each console took (-1 none since Begin)
     FILE* Trace[kMaxInst] {};   // LITEV_MP_TRACE=<dir>: one line per link call, per instance
 #ifdef LITEV_MP_FASTPOLL
     bool TraceOn = false;
