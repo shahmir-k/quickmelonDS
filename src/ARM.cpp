@@ -1181,6 +1181,8 @@ void ARM::TriggerIRQ()
     // PW's HBlank IRQ taken natively (registers unchanged); deliver anything still pending
     if (Num == 0 && A9HLE::Irq((ARMv5*)this, false) && !IRQ)
         return;
+    if (Num == 0 && Halted == 2 && A9HLE::Defer((ARMv5*)this))
+        return;
 #endif
 
     // liteDS-v2 Unit 2 (shadow, inert): an IRQ being delivered forces the slice to
@@ -1283,6 +1285,10 @@ void ARMv5::Execute()
         if (Halted == 2)
         {
             Halted = 0;
+#ifdef LITEV_A9HLE
+            // the IRQ whose vector entry A9HLE::Defer moved past the DMA: at the same instruction boundary
+            if (A9HLEDefer) { A9HLEDefer = false; if (IRQ) TriggerIRQ(); }
+#endif
         }
         else if (NDS.HaltInterrupted(0))
         {

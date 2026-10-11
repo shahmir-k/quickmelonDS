@@ -491,6 +491,7 @@ public:
     // JIT block that verified the code of the native IRQ path (the wake hook block, which depends
     // on every byte of that code); null when no such block is live (ARMJIT clears it)
     const void* A9HLEGuard = nullptr;
+    bool A9HLEDefer = false;      // an IRQ delivery moved past the DMA that stops the CPU (A9HLE::Defer)
 #endif
 
     bool (*GetMemRegion)(u32 addr, bool write, MemRegion* region);

@@ -25,7 +25,8 @@
 // Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS:
 // 0 off, 1 all, other values = the mask below.
 // Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material,
-// 256 _ll_sdiv, 512 GX async start; 8 needs 1)
+// 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ,
+// 2048 G3D shape (needs 512), 4096 VEC_Normalize; 8 needs 1)
 // for A/B of single hooks.
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
@@ -56,10 +57,19 @@
 // 8. NNS G3D material (NNSi_G3dFuncSbc_MAT + MAT_InternalDefault + NNS_G3dGeBufferOP_N + MI_CpuSend32):
 //    the material result, the stack/state writes and the 7 GXFIFO words natively, guest fallback on any
 //    callback / cache hit / buffered geometry (position independent, literal-pool globals read at the call).
+//    W2 (TWL SDK build, Thumb NNS): the same at SBC MAT's Thumb entry (variant code, exact bytes).
 // 9. _ll_sdiv (64-bit signed divide of the compiler runtime): native quotient with the guest's exact
 //    registers / flags / stack bytes (position independent).
-// 10. MI_SendGXCommandAsync's synchronous part (PW, PB): the same IO writes in the same order, every memory
+// 10. MI_SendGXCommandAsync's synchronous part (PW, PB; W2: Thumb, TWL SDK build): the same IO writes in the same order, every memory
 //    byte and register up to its return; the display list's DMA-end IRQ stays guest code.
+// 11. That DMA-end IRQ (PW, PB, W2: Thumb) natively at delivery like 3.: OS_IrqHandler -> OSi_IrqCallback -> MIi_DMACallback
+//    (OS_DisableIrqMask, GXSTAT, OS_SetIrqFunction, busy = 0, NNS G3D's "[arg] = 0" callback) with the same IO writes
+//    in order, the IRQ stack bytes and the banked IRQ registers.
+// 13. NNS G3D shape (PW, PB; W2: Thumb): SBC SHP -> SHP_InternalDefault -> NNS_G3dGeSendDL natively at SHP's entry: a list of
+//    >= 0x100 bytes with 10.'s work (from the register file the guest has at MI_SendGXCommandAsync), a small one as
+//    NNS_G3dGeBufferOP_N's direct GXFIFO send (BulkWords); the frames, flags and registers up to SHP's return.
+//
+// 14. VEC_Normalize (position independent: PW, PB, W2): the divider / sqrt stores, results, frame, registers natively.
 //
 // Diagnostics (build with LITEV_HLE_DIAG; compiled out of shipping builds):
 //
@@ -82,10 +92,10 @@ namespace melonDS::A9HLE
 {
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
 inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001 || instr == 0xE5942000
-                                        || instr == 0xE92D4010 || instr == 0xE92D58F0; }
+                                        || instr == 0xE92D4010 || instr == 0xE92D58F0 || instr == 0xE92D4FF8; }
 // Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4} / MIi_FIFOCallback
-// push {r3-r7, lr}); instr: the halfword
-inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8; }
+// push {r3-r7, lr} / SBC MAT push {r4-r6, lr}); instr: the halfword
+inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8 || instr == 0xB570; }
 // JIT decode: is the instruction at addr (ARM, or Thumb with thumb set) a hooked entry?
 // 0 no, 1 yes (code signature verified: under the JIT this compile-time check is the code
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the
@@ -104,6 +114,11 @@ bool Run(melonDS::ARM* cpu, bool jit);
 // true: taken natively (registers unchanged, Cycles added); the caller then delivers any IRQ that
 // is still pending as usual (and a halted ARM9 in the OS idle loop stays halted if none is).
 bool Irq(melonDS::ARMv5* c, bool halted);
+// IRQ delivery (TriggerIRQ) while an ARM9 DMA is about to stop the CPU (Halted == 2): true = deliver it after the
+// DMA instead (A9HLEDefer; the guest enters the vector now but runs no instruction before the DMA, so its handler
+// sees the IF bits the DMA raised). Used for the GXFIFO IRQ of 11.: after the list's DMA its end IRQ is the lowest
+// pending one and is taken natively.
+bool Defer(melonDS::ARMv5* c);
 // ARMJIT: a block compiled with the wake hook (code verified, IsHook == 1) at addr
 void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
 // ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted)
