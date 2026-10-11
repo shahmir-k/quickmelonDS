@@ -507,6 +507,11 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
 
     for (;;)
     {
+#ifdef LITEV_MP_FUTEX
+        // before the look at the queue and clocks: Sleep waits only if no wake came since (a stale
+        // SeqSeen from an earlier wait made every futex wait return at once: the host spun here)
+        SeqSeen[inst] = SleepSeq[inst].load(std::memory_order_acquire);
+#endif
         // which clients are past the deadline, BEFORE reading the queue: a reply sent before the
         // deadline is queued before its sender's clock passes it, so it is then always seen
         u16 passed = 0;

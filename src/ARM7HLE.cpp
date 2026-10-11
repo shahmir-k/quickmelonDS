@@ -28,7 +28,6 @@ namespace
 // SinIdx, envelope + literal pools), [0x03801418,0x038014D4) (UpdateLfo, GetLfoValue) and the
 // shared-WRAM Thumb SVC stubs [0x037FB574,0x037FB598) (GetPitchTable / GetVolumeTable).
 constexpr u32 kChannels = 0x03809FBC, kChanSize = 0x54;     // (PW: the SND hardware commit's)
-constexpr u32 kDbSqTable = 0x03808E48;              // SNDi_DecibelSquareTable (s16) (PW: the sequencer's)
 constexpr u32 kTwlFlag = 0x03FFFFC8;
 
 // SND_ExChannelMain per game build. Mario Kart DS (2005 NitroSDK, older compiler: envelope / sweep / LFO in their own
@@ -60,6 +59,7 @@ constexpr ExVar kEx[] = {
 // (u8 x 724). A loaded BIOS must contain the same bytes (the real tables) or the HLE stays off.
 constexpr u32 kFreePitch = 0x169C, kFreeVol = 0x1CB0;
 
+struct HwVar;
 struct State
 {
     int status = 0;                 // 0 unprobed, 1 active, -1 off
@@ -72,13 +72,21 @@ struct State
     u64 copies = 0, calls = 0, native = 0, fallbacks = 0, checks = 0, checkDiffs = 0;
     int hw = 0;                     // SND hardware commit: 0 unprobed, 1 on, -1 off
     std::vector<u8> hwCode;
-    u64 hwN[5] = {};                // calls, native, fallback, checks, check diffs
+    const HwVar* hv = nullptr;      // the matching build
+    u64 hwN[6] = {};                // calls, native, fallback, checks, check diffs, charged cycles (diag)
 };
 std::unordered_map<const melonDS::NDS*, State> g_State;
 #ifdef LITEV_HLE_DIAG
 bool g_Check = getenv("LITEV_A7HLE_CHECK") && atoi(getenv("LITEV_A7HLE_CHECK"));
 bool g_CommitCheck = getenv("LITEV_A7HLE_COMMITCHECK") && atoi(getenv("LITEV_A7HLE_COMMITCHECK"));
-// LITEV_A7HLE_FROM=<frame>: ExChannelMain runs the guest code before that frame (an A/B in a scene reached by a
+// LITEV_A7HLE_DEFER=1 (with LITEV_A7HLE_CHECK=1, JIT mode): compare at the next A7HLE hook entry instead of the guest's
+// return (the JIT has no per-instruction check): SND commit -> SeqMain -> ExChannelMain are called back to back, so
+// the commit and the sequencer are checked in scenes the interpreter never reaches (MKDS race). Not compared:
+// registers, stack frames, SOUNDxCNT bit 31.
+bool g_Defer = getenv("LITEV_A7HLE_DEFER") && atoi(getenv("LITEV_A7HLE_DEFER"));
+// LITEV_A7HLE_CYCADJ=n: n more cycles per native call (timing-sensitivity tests of the MKDS 8P session)
+s32 g_CycAdj = getenv("LITEV_A7HLE_CYCADJ") ? atoi(getenv("LITEV_A7HLE_CYCADJ")) : 0;
+// LITEV_A7HLE_FROM=<frame>: the A7 hooks run the guest code before that frame (an A/B in a scene reached by a
 // timing-sensitive input script, e.g. the MKDS 8-console race)
 u32 g_From = getenv("LITEV_A7HLE_FROM") ? (u32)atoi(getenv("LITEV_A7HLE_FROM")) : 0;
 #else
@@ -107,7 +115,9 @@ inline void Store32(melonDS::NDS& nds, u32 a, u8* p, u32 v)
     W32(p, v);
 }
 
-// debug.litev.a7hle: 0 off, 1 (or unset) all, else a mask: 1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit
+// debug.litev.a7hle: 0 off, 1 (or unset) all but 16, else a mask: 1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit,
+// 16 SeqMain / SND commit on Mario Kart DS's driver too (default off: with them the Mac 8-console LockstepMP race (fixed harness,
+// liteDS-main 5b2f7c6a) ends in "Communication error" on 5 of 7 remote consoles; the hooks' results are compare-mode exact)
 bool ReadOn(u32 bit)
 {
 #if defined(__ANDROID__)
@@ -379,22 +389,39 @@ bool CodeIntact(melonDS::NDS& nds, const State& s)
 // (sequence data, tables) go to memory. Anything unhandled (a note that needs a new channel:
 // bank lookup + channel allocation) or a write outside the overlay abandons the copy and the
 // guest code runs instead.
-constexpr u32 kSeqEntry = 0x038015C4;
-constexpr u32 kSeqEntryInstr = 0xE92D47F0;         // push {r4-r10, lr}
-constexpr u32 kSeqRa = 0x03801190, kSeqRb = 0x03802E74;
-constexpr u32 kRndA = 0x03800574, kRndB = 0x038005A0;
-constexpr u64 kSeqSig = 0x5b3b713e31e0c679ull;
-constexpr u32 kWorkA = 0x03809F9C, kWorkB = 0x0380AF3C;
-constexpr u32 kSharedPtr = 0x03809FB8, kSharedSize = 0x280;
-constexpr u32 kRndState = 0x03809360;
-constexpr u32 kPlayers = 0x0380A4FC, kTracks = 0x0380A73C;
-constexpr u32 kAttackTable = 0x03808F5C;
+// Per driver build (SeqVar): the work area has the same layout in both (printEnabled, seq cache, shared work pointer
+// +0x1C, channels +0x20, players +0x560, tracks +0x7A0; 0xFA0 bytes). Mario Kart DS (2005 NitroSDK, driver in shared
+// WRAM): the same sequencer code, except TrackUpdateChannel truncates volume / fader to s16 instead of clamping them
+// to -0x8000, and there is no 0xD7 (mute) command. Ranges: every byte the native version replaces (MKDS: CalcRandom ..
+// SeqMain [0x037FBF70,0x037FEF54), the 32-bit divide, the decibel-square and attack tables).
+constexpr u32 kWorkSize = 0xFA0, kSharedSize = 0x280;
+constexpr u32 kWShared = 0x1C, kWPlayers = 0x560, kWTracks = 0x7A0;   // offsets in the work area
+struct SeqVar
+{
+    const char* name;
+    u32 entry, instr;
+    Range3 code[4];
+    u64 sig;
+    u32 work, rnd, dbSq, attack;    // sound work area, random state, SNDi_DecibelSquareTable, attack table
+    bool clamp, mute;               // TrackUpdateChannel clamps volume / fader to -0x8000; command 0xD7 exists
+    s32 cyc0, cycTrack, cycStep, cycCmd, cycChan, cycPlayer;   // ponytail: fixed estimate (MKDS: check-mode fit): base + per
+                                    // updated track, stepped track, command, channel update, active player
+};
+constexpr SeqVar kSeqV[] = {
+    {"PW/PB/W2", 0x038015C4, 0xE92D47F0 /* push {r4-r10, lr} */,
+     {{0x03801190, 0x03802E74}, {0x03800574, 0x038005A0}, {0, 0}, {0, 0}}, 0x5b3b713e31e0c679ull,
+     0x03809F9C, 0x03809360, 0x03808E48, 0x03808F5C, true, true, 150, 400, 0, 0, 0, 0},
+    {"MKDS", 0x037FEEB4, 0xE92D47F0 /* push {r4-r10, lr} */,
+     {{0x037FBF70, 0x037FEF54}, {0x0380697C, 0x03806D38}, {0x03806F40, 0x03807040}, {0x03807054, 0x03807067}}, 0x7e34b2b9c5282c13ull,
+     0x03807EAC, 0x038075A0, 0x03806F40, 0x03807054, false, false, 249, 70, 154, 313, 42, 752},   // 87k calls, p95 15%
+};
 
 struct SeqState
 {
     int status = 0;
+    const SeqVar* v = nullptr;
     std::vector<u8> code;
-    u64 calls = 0, native = 0, fallbacks = 0, checks = 0, checkDiffs = 0;
+    u64 calls = 0, native = 0, fallbacks = 0, checks = 0, checkDiffs = 0, cyc = 0;
 };
 std::unordered_map<const melonDS::NDS*, SeqState> g_Seq;
 
@@ -409,11 +436,17 @@ SeqState& GetSeq(melonDS::NDS& nds)
     s.status = -1;
     if (!ReadOn(2)) return s;
     std::vector<u8> code;
-    for (u32 a = kSeqRa; a < kSeqRb; a++) code.push_back(*W7(nds, a));
-    for (u32 a = kRndA; a < kRndB; a++) code.push_back(*W7(nds, a));
-    u64 h = 0xcbf29ce484222325ull;
-    for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
-    if (h != kSeqSig) return s;
+    for (const SeqVar& v : kSeqV)
+    {
+        code.clear();
+        for (const Range3& r : v.code)
+            for (u32 a = r.a; a < r.b; a++) code.push_back(*P7(nds, a));
+        u64 h = 0xcbf29ce484222325ull;
+        for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
+        if (g_Stats) fprintf(stderr, "A7HLE: SeqMain %s signature %016llx\n", v.name, (unsigned long long)h);
+        if (h == v.sig) { s.v = &v; break; }
+    }
+    if (!s.v || (s.v != &kSeqV[0] && !ReadOn(16))) { s.v = nullptr; return s; }
     s.code = std::move(code);
     s.status = 1;
     return s;
@@ -421,24 +454,30 @@ SeqState& GetSeq(melonDS::NDS& nds)
 
 bool SeqCodeIntact(melonDS::NDS& nds, const SeqState& s)
 {
-    return memcmp(W7(nds, kSeqRa), s.code.data(), kSeqRb - kSeqRa) == 0
-        && memcmp(W7(nds, kRndA), s.code.data() + (kSeqRb - kSeqRa), kRndB - kRndA) == 0;
+    const u8* c = s.code.data();
+    for (const Range3& r : s.v->code)
+        for (u32 a = r.a; a < r.b; a++, c++)
+            if (*P7(nds, a) != *c) return false;
+    return true;
 }
 
 struct Seq
 {
     melonDS::NDS& nds;
-    u8 work[kWorkB - kWorkA];
+    const SeqVar& V;                // driver build
+    const u32 wA;                   // its work area
+    u8 work[kWorkSize];
     u8 shared[kSharedSize];
     u8 rnd[4];
     u32 sw = 0;                     // shared work address (0 = none)
     bool bail = false;
+    u32 steps = 0, cmds = 0, chans = 0, players = 0; // tracks stepped, commands, channel updates, active players (cycle estimate)
 
-    explicit Seq(melonDS::NDS& n) : nds(n)
+    explicit Seq(melonDS::NDS& n, const SeqVar& sv) : nds(n), V(sv), wA(sv.work)
     {
-        memcpy(work, W7(nds, kWorkA), sizeof(work));
-        memcpy(rnd, W7(nds, kRndState), 4);
-        sw = R32(work + (kSharedPtr - kWorkA));
+        memcpy(work, W7(nds, wA), sizeof(work));
+        memcpy(rnd, W7(nds, V.rnd), 4);
+        sw = R32(work + kWShared);
         if (sw)
         {
             // shared work in main RAM only, word aligned, not wrapping the RAM mask
@@ -448,7 +487,7 @@ struct Seq
         }
     }
 
-    u64 dirtyW[(kWorkB - kWorkA + 255) / 256] = {};      // one bit per word
+    u64 dirtyW[(kWorkSize + 255) / 256] = {};      // one bit per word
     u64 dirtyS[(kSharedSize + 255) / 256] = {};
     static void Mark(u64* bits, u32 o, u32 n)
     {
@@ -457,17 +496,17 @@ struct Seq
     // writable overlay pointer for [a, a+n): marks those words for Commit
     u8* AtW(u32 a, u32 n)
     {
-        if (a - kWorkA <= (kWorkB - kWorkA) - n) { Mark(dirtyW, a - kWorkA, n); return work + (a - kWorkA); }
+        if (a - wA <= kWorkSize - n) { Mark(dirtyW, a - wA, n); return work + (a - wA); }
         if (sw && a - sw <= kSharedSize - n) { Mark(dirtyS, a - sw, n); return shared + (a - sw); }
-        if (a - kRndState <= 4 - n) return rnd + (a - kRndState);
+        if (a - V.rnd <= 4 - n) return rnd + (a - V.rnd);
         return nullptr;
     }
     // overlay pointer for [a, a+n)
     u8* At(u32 a, u32 n)
     {
-        if (a - kWorkA <= (kWorkB - kWorkA) - n) return work + (a - kWorkA);
+        if (a - wA <= kWorkSize - n) return work + (a - wA);
         if (sw && a - sw <= kSharedSize - n) return shared + (a - sw);
-        if (a - kRndState <= 4 - n) return rnd + (a - kRndState);
+        if (a - V.rnd <= 4 - n) return rnd + (a - V.rnd);
         return nullptr;
     }
     // reads outside the overlay: ARM7 WRAM / main RAM directly, anything else through the bus
@@ -498,30 +537,30 @@ struct Seq
     void Commit()
     {
         using M = melonDS::ARMJIT_Memory;
-        CommitRegion<M::memregion_WRAM7>(kWorkA, W7(nds, kWorkA), work, dirtyW, sizeof(dirtyW) / 8);
-        if (R32(W7(nds, kRndState)) != R32(rnd)) Store32<M::memregion_WRAM7>(nds, kRndState, W7(nds, kRndState), R32(rnd));
+        CommitRegion<M::memregion_WRAM7>(wA, W7(nds, wA), work, dirtyW, sizeof(dirtyW) / 8);
+        if (R32(W7(nds, V.rnd)) != R32(rnd)) Store32<M::memregion_WRAM7>(nds, V.rnd, W7(nds, V.rnd), R32(rnd));
         if (sw) CommitRegion<M::memregion_MainRAM>(sw, &nds.MainRAM[sw & nds.MainRAMMask], shared, dirtyS, sizeof(dirtyS) / 8);
     }
 
     // ---- helpers (addresses of the PW functions they mirror) ----
     u16 CalcRandom()                                    // 03800574
     {
-        u32 st = r32(kRndState) * 0x19660Du + 0x3C6EF35Fu;
-        w32(kRndState, st);
+        u32 st = r32(V.rnd) * 0x19660Du + 0x3C6EF35Fu;
+        w32(V.rnd, st);
         return (u16)(st >> 16);
     }
     void CacheFetch(u32 addr)                           // 03801DCC
     {
         u32 a = addr & ~3u;
-        w32(kWorkA + 4, a);
-        w32(kWorkA + 8, a + 16);
-        for (u32 i = 0; i < 4; i++) w32(kWorkA + 0xC + i * 4, nds.ARM7Read32(a + i * 4));
+        w32(wA + 4, a);
+        w32(wA + 8, a + 16);
+        for (u32 i = 0; i < 4; i++) w32(wA + 0xC + i * 4, nds.ARM7Read32(a + i * 4));
     }
     u8 ReadU8(u32 t)                                    // 038018DC
     {
         u32 cur = r32(t + 0x28);
-        if (cur < r32(kWorkA + 4) || cur >= r32(kWorkA + 8)) CacheFetch(cur);
-        u8 b = r8(kWorkA + 0xC + (cur - r32(kWorkA + 4)));
+        if (cur < r32(wA + 4) || cur >= r32(wA + 8)) CacheFetch(cur);
+        u8 b = r8(wA + 0xC + (cur - r32(wA + 4)));
         w32(t + 0x28, cur + 1);
         return b;
     }
@@ -529,7 +568,7 @@ struct Seq
     u32 ReadU24(u32 t) { u32 a = ReadU8(t); u32 b = ReadU8(t); u32 c = ReadU8(t); return a | (b << 8) | (c << 16); }
     u32 VarPtr(u32 p, u32 var)                          // 03802D78
     {
-        u32 s = r32(kSharedPtr);
+        u32 s = r32(wA + kWShared);
         if (!s) return 0;
         if (var < 16) return s + 0x20 + r8(p + 1) * 0x24 + var * 2;
         return s + 0x260 + (var - 16) * 2;
@@ -563,7 +602,7 @@ struct Seq
     {
         if (i > 15) return 0;
         u8 idx = r8(p + 8 + i);
-        return idx == 0xFF ? 0 : kTracks + idx * 0x40;
+        return idx == 0xFF ? 0 : wA + kWTracks + idx * 0x40;
     }
     static u16 DecayCoeff(u32 v)                        // 038014D4
     {
@@ -572,7 +611,7 @@ struct Seq
         if (v < 0x32) return (u16)(v * 2 + 1);
         return (u16)((s32)0x1E00 / (s32)(0x7E - v));
     }
-    void SetAttack(u32 c, u32 v) { w8(c + 0x1C, v >= 0x6D ? r8(kAttackTable + (0x7F - v)) : (u8)(0xFF - v)); }
+    void SetAttack(u32 c, u32 v) { w8(c + 0x1C, v >= 0x6D ? r8(V.attack + (0x7F - v)) : (u8)(0xFF - v)); }
     void SetRelease(u32 c, u32 v) { w16(c + 0x20, DecayCoeff(v)); }
 
     void UpdateChannels(u32 t, u32 p, bool release)     // 038021AC TrackUpdateChannel
@@ -580,7 +619,7 @@ struct Seq
         const u8* T = At(t, 0x40);
         const u8* P = At(p, 0x24);
         if (!T || !P) { bail = true; return; }
-        const u8* db = W7(nds, kDbSqTable);
+        const u8* db = W7(nds, V.dbSq);
         s32 vol = (s16)R16(db + T[4] * 2) + (s16)R16(db + T[5] * 2) + (s16)R16(db + P[5] * 2);
         s32 pitch = (s16)R16(T + 0xC) + (((s32)(s8)T[6] * (s32)(T[7] << 6)) >> 7);
         s32 pan = (s8)T[8];
@@ -588,14 +627,18 @@ struct Seq
         if (panRange != 0x7F) pan = (pan * panRange + 0x40) >> 7;
         pan += (s8)T[9];
         s32 fader = (s16)R16(T + 0xA) + (s16)R16(P + 6);
-        if (vol < -0x8000) vol = -0x8000;
-        if (fader < -0x8000) fader = -0x8000;
+        if (V.clamp)
+        {
+            if (vol < -0x8000) vol = -0x8000;
+            if (fader < -0x8000) fader = -0x8000;
+        }
         if (pan < -128) pan = -128; else if (pan > 127) pan = 127;
         for (u32 c = R32(T + 0x3C); c; )
         {
             u8* C = At(c, 0x54);
-            if (!C || c < kWorkA) { bail = true; return; }
-            const u32 o = c - kWorkA;
+            if (!C || c < wA) { bail = true; return; }
+            const u32 o = c - wA;
+            chans++;
             Mark(dirtyW, o + 4, 4);                     // userDecay2 (+6)
             W16(C + 6, (u16)fader);
             if (C[2] != 3)
@@ -636,7 +679,7 @@ struct Seq
         if (!t) return;
         ReleaseChannels(t, p, -1);
         FreeChannels(t);
-        u32 ta = kTracks + r8(p + 8 + i) * 0x40;
+        u32 ta = wA + kWTracks + r8(p + 8 + i) * 0x40;
         w8(ta, r8(ta) & ~1);
         w8(p + 8 + i, 0xFF);
     }
@@ -686,6 +729,7 @@ struct Seq
             bool special = false, run = true;
             int vt = 0;
             u32 cmd = ReadU8(t);
+            cmds++;
             if (cmd == 0xA2) { cmd = ReadU8(t); run = (r8(t) >> 6) & 1; }
             if (cmd == 0xA0) { cmd = ReadU8(t); vt = 3; special = true; }
             if (cmd == 0xA1) { cmd = ReadU8(t); vt = 4; special = true; }
@@ -823,7 +867,7 @@ struct Seq
                 }
                 case 0xD5: w8(t + 5, par); break;
                 case 0xD6: break;                       // print variable (no effect)
-                case 0xD7: Mute(t, p, par); break;
+                case 0xD7: if (V.mute) Mute(t, p, par); break;
                 default: break;
                 }
                 break;
@@ -912,6 +956,7 @@ struct Seq
         {
             u32 t = GetTrack(p, i);
             if (!t || !r32(t + 0x28)) continue;
+            steps++;
             if (StepTrack(t, p, playNotes) == 0) playing = true;
             else StopTrack(p, i);
         }
@@ -923,9 +968,10 @@ struct Seq
         int tracks = 0;
         for (u32 i = 0; i < 16 && !bail; i++)
         {
-            u32 p = kPlayers + i * 0x24;
+            u32 p = wA + kWPlayers + i * 0x24;
             u8 f = r8(p);
             if (!(f & 1)) continue;
+            players++;
             if (f & 2)
             {
                 if (step && !(f & 4))
@@ -935,7 +981,7 @@ struct Seq
                     u32 j = 0;
                     for (; j < ticks && !bail; j++)
                         if (StepPlayer(p, true)) { StopPlayer(p); break; }
-                    u32 s = r32(kSharedPtr);
+                    u32 s = r32(wA + kWShared);
                     if (s) { u32 a = s + r8(p + 1) * 0x24 + 0x40; w32(a, r32(a) + j); }
                     u32 inc = ((u32)r16(p + 0x18) * (u32)r16(p + 0x1A)) << 8;
                     w16(p + 0x1C, (u16)(r16(p + 0x1C) + (inc >> 16)));
@@ -945,7 +991,7 @@ struct Seq
             }
             if (r8(p) & 1) status |= 1u << i;
         }
-        u32 s = r32(kSharedPtr);
+        u32 s = r32(wA + kWShared);
         if (s) w32(s + 4, status);
         return tracks;
     }
@@ -963,9 +1009,10 @@ struct Pending
     std::vector<std::pair<u32, std::vector<u8>>> regions;   // address, expected bytes
     bool irq = false;           // an IRQ handler ran inside the guest call
     bool regs = false;          // also compare r0-r3, r12 and NZCV at the return (expected: R, cpsr)
+    bool deferred = false;      // compared at the next hook entry (LITEV_A7HLE_DEFER): memory + SPU only
     u32 R[16] = {}, cpsr = 0;
-    u64 t0 = 0; u32 fit[3] = {};            // guest cycles of the call (fit of the cycle estimates)
-    std::vector<std::pair<int, u32>> spu;   // SPU state: (channel * 4 + what (0 Cnt & 0xFFFF, 1 pan byte, 2 Cnt bit 31, 3 timer), value)
+    u64 t0 = 0; u32 fit[6] = {};            // guest cycles of the call (fit of the cycle estimates)
+    std::vector<std::pair<int, u32>> spu;   // SPU state: (channel * 8 + what (0 Cnt & 0xFFFF, 1 pan byte, 2 Cnt bit 31, 3 timer, 4 Cnt byte 0), value)
 };
 thread_local Pending g_Pending;
 u64 g_IrqDiffs = 0;
@@ -979,6 +1026,7 @@ void ArmCheck(melonDS::ARM* cpu, const char* name, u64* diffs)
     g_Pending.diffs = diffs;
     g_Pending.irq = false;
     g_Pending.regs = false;
+    g_Pending.deferred = false;
     g_Pending.spu.clear();
     CheckPending = true;
 }
@@ -993,12 +1041,12 @@ struct StatsDump
                     s.status, (unsigned long long)s.copies, (unsigned long long)s.calls, (unsigned long long)s.native,
                     (unsigned long long)s.fallbacks, (unsigned long long)s.checks, (unsigned long long)s.checkDiffs);
         for (auto& [k, s] : g_Seq)
-            fprintf(stderr, "A7HLE seq: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu\n",
+            fprintf(stderr, "A7HLE seq: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu cyc=%llu\n",
                     s.status, (unsigned long long)s.calls, (unsigned long long)s.native,
-                    (unsigned long long)s.fallbacks, (unsigned long long)s.checks, (unsigned long long)s.checkDiffs);
+                    (unsigned long long)s.fallbacks, (unsigned long long)s.checks, (unsigned long long)s.checkDiffs, (unsigned long long)s.cyc);
         for (auto& [k, s] : g_State)
-            fprintf(stderr, "A7HLE hwcommit: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu\n", s.hw,
-                    (unsigned long long)s.hwN[0], (unsigned long long)s.hwN[1], (unsigned long long)s.hwN[2], (unsigned long long)s.hwN[3], (unsigned long long)s.hwN[4]);
+            fprintf(stderr, "A7HLE hwcommit: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu cyc=%llu\n", s.hw,
+                    (unsigned long long)s.hwN[0], (unsigned long long)s.hwN[1], (unsigned long long)s.hwN[2], (unsigned long long)s.hwN[3], (unsigned long long)s.hwN[4], (unsigned long long)s.hwN[5]);
 #ifdef LITEV_HLE_DIAG
         if (g_BusyDiffs) fprintf(stderr, "A7HLE check: %llu exchannel differences with a channel stopping inside the guest call (busy bits sampled at entry; not counted)\n", (unsigned long long)g_BusyDiffs);
         if (g_IrqDiffs) fprintf(stderr, "A7HLE check: %llu differences with an IRQ inside the guest call (not counted above)\n", (unsigned long long)g_IrqDiffs);
@@ -1078,24 +1126,28 @@ void GuestFallback(melonDS::ARM* cpu)
     ARMInterpreter::ARMInstrTable[icode](cpu);
 }
 
-bool RunSeq(melonDS::ARM* cpu, bool jit)
+__attribute__((noinline)) bool RunSeq(melonDS::ARM* cpu, bool jit)
 {
     melonDS::NDS& nds = cpu->NDS;
     SeqState& s = GetSeq(nds);
-    if (s.status != 1) return false;
+    if (s.status != 1 || cpu->R[15] - 8 != s.v->entry) return false;
     s.calls++;
-    Seq q(nds);
+    Seq q(nds, *s.v);
     int tracks = 0;
     bool ok = !q.bail && (jit || SeqCodeIntact(nds, s));
+#ifdef LITEV_HLE_DIAG
+    ok = ok && nds.NumFrames >= g_From;
+#endif
     if (ok) { tracks = q.Main(cpu->R[0] != 0); ok = !q.bail; }
 #ifdef LITEV_HLE_DIAG
     if (ok && g_Check)
     {
         g_Pending.regions.clear();
-        g_Pending.regions.push_back({kWorkA, std::vector<u8>(q.work, q.work + sizeof(q.work))});
-        g_Pending.regions.push_back({kRndState, std::vector<u8>(q.rnd, q.rnd + 4)});
+        g_Pending.regions.push_back({q.wA, std::vector<u8>(q.work, q.work + sizeof(q.work))});
+        g_Pending.regions.push_back({q.V.rnd, std::vector<u8>(q.rnd, q.rnd + 4)});
         if (q.sw) g_Pending.regions.push_back({q.sw, std::vector<u8>(q.shared, q.shared + kSharedSize)});
         ArmCheck(cpu, "seq", &s.checkDiffs);
+        g_Pending.t0 = nds.ARM7Timestamp + cpu->Cycles; g_Pending.fit[0] = tracks; g_Pending.fit[1] = q.steps; g_Pending.fit[2] = ~0u; g_Pending.fit[3] = q.cmds; g_Pending.fit[4] = q.chans; g_Pending.fit[5] = q.players;
         s.checks++;
         ok = false;
     }
@@ -1111,32 +1163,58 @@ bool RunSeq(melonDS::ARM* cpu, bool jit)
 #ifdef LITEV_HLE_DIAG
     if (g_CommitCheck)                                  // every overlay write reached memory
     {
-        bool bad = memcmp(W7(nds, kWorkA), q.work, sizeof(q.work)) != 0 || memcmp(W7(nds, kRndState), q.rnd, 4) != 0
+        bool bad = memcmp(W7(nds, q.wA), q.work, sizeof(q.work)) != 0 || memcmp(W7(nds, q.V.rnd), q.rnd, 4) != 0
                 || (q.sw && memcmp(&nds.MainRAM[q.sw & nds.MainRAMMask], q.shared, kSharedSize) != 0);
         if (bad && s.checkDiffs++ < 5) fprintf(stderr, "A7HLE COMMITCHECK seq: memory != overlay after commit\n");
     }
 #endif
-    // ponytail: fixed cycle estimate (guest: ~4.2k cycles/tick for ~10 tracks on PW)
-    cpu->Cycles += 150 + 400 * tracks;
+    // ponytail: fixed cycle estimate (PW guest: ~4.2k cycles/tick for ~10 tracks; MKDS: check-mode fit)
+    const SeqVar& v = *s.v;
+    const s32 cyc = v.cyc0 + v.cycTrack * tracks + v.cycStep * (s32)q.steps + v.cycCmd * (s32)q.cmds + v.cycChan * (s32)q.chans
+                    + v.cycPlayer * (s32)q.players;
+    cpu->Cycles += cyc;
+#ifdef LITEV_HLE_DIAG
+    s.cyc += cyc;
+    cpu->Cycles += g_CycAdj;
+#endif
     cpu->JumpTo(cpu->R[14]);
     return true;
 }
 }
 
-// ---- SND hardware commit (PW/PB/W2 0x03800870) ---------------------------------------------------
+// ---- SND hardware commit (PW/PB/W2 0x03800870, MKDS 0x037FD130) ------------------------------------------------
 // After a sound tick the driver commits each channel's pending hardware updates (the SNDExChannel flag bits 3-7
 // of byte 3: start, stop, timer, volume, pan) with one helper call per update (SOUNDxCNT / SOUNDxTMR stores), then
 // sets the start bits and clears the flags: ~550 guest instructions a call (3.2 calls a frame, 12-15% of the ARM7's
-// guest instructions on PW). Natively when no channel starts (the three start paths stay guest code) and the
-// master-effect adjustment is off ([0x03809A5C] <= 0): the same SOUND register stores in the same order, the
-// volume / pan shadow bytes, the flag bytes, the stack frames below sp and the guest's final registers / flags.
+// guest instructions on PW). Natively when no channel starts (the three start paths stay guest code): the same SOUND
+// register stores in the same order, the volume / pan shadow bytes, the flag bytes, the stack frames below sp and
+// the guest's final registers / flags. PW: only with the master-effect adjustment off ([fx] <= 0). MKDS (2005 driver,
+// shared WRAM; its effect level is > 0 in the race): the effect (0x037FBA94: volume scaled by pan for channels other
+// than 1 and 3 when the pan is < 0x18 or > 0x68) natively, its helpers' registers and frames.
 // Category B: a fixed cycle estimate (check-mode fit).
-constexpr u32 kHwEntry = 0x03800870, kHwInstr = 0xE92D47F0;       // push {r4-r10, lr}
-constexpr u32 kHwRa = 0x038000EC, kHwRb = 0x0380021C, kHwRc = 0x03800870, kHwRd = 0x03800A5C;   // helpers, the function
-constexpr u64 kHwSig = 0x24e4d4770c4a81dcull;
-constexpr u32 kHwFx = 0x03809A5C, kHwVol = 0x03809A70, kHwPan = 0x03809A60, kHwPanOvr = 0x0380935C;
-// ponytail: fixed estimate, check-mode fit: base + per channel with updates + per volume / pan / stop / timer store
-constexpr s32 kHwCyc0 = 482, kHwCycCh = 42, kHwCycVol = 40, kHwCycOther = 13;   // 6.9k calls, within 1.5%
+namespace
+{
+struct HwVar
+{
+    const char* name;
+    u32 entry, instr;
+    Range3 code[2];                 // helpers, the function (literal pools included)
+    u64 sig;
+    u32 chans, fx, vol, pan, panOvr;    // channels, master effect level, volume / pan shadow bytes, pan override
+    bool mk;                        // 2005 driver: effect natively, its helpers' registers / frames
+    u32 retVol, retPan;             // return addresses the volume / pan helpers push
+    s32 cyc0, cycCh, cycVol, cycOther, cycFx;   // ponytail: fixed estimate (check-mode fit): base + per channel with updates
+                                    // + per volume / other store + per effect scaling (MKDS)
+};
+constexpr HwVar kHwV[] = {
+    {"PW/PB/W2", 0x03800870, 0xE92D47F0 /* push {r4-r10, lr} */, {{0x038000EC, 0x0380021C}, {0x03800870, 0x03800A5C}},
+     0x24e4d4770c4a81dcull, 0x03809FBC, 0x03809A5C, 0x03809A70, 0x03809A60, 0x0380935C, false, 0x038009D0, 0x038009F0,
+     482, 42, 40, 13, 0},   // 6.9k calls, within 1.5%
+    {"MKDS", 0x037FD130, 0xE92D47F0 /* push {r4-r10, lr} */, {{0x037FBA94, 0x037FBD38}, {0x037FD130, 0x037FD31C}},
+     0x52806648b3d4f885ull, 0x03807ECC, 0x0380796C, 0x03807980, 0x03807970, 0x0380759C, true, 0x037FD290, 0x037FD2B0,
+     482, 39, 66, 15, 18},  // 88k calls (8-console menus), p95 0.4%
+};
+}
 int HwProbe(melonDS::NDS& nds)
 {
     State& s = Get(nds);
@@ -1144,32 +1222,47 @@ int HwProbe(melonDS::NDS& nds)
     s.hw = -1;
     if (!ReadOn(8)) return s.hw;
     std::vector<u8> code;
-    for (u32 a = kHwRa; a < kHwRb; a++) code.push_back(*W7(nds, a));
-    for (u32 a = kHwRc; a < kHwRd; a++) code.push_back(*W7(nds, a));
-    u64 h = 0xcbf29ce484222325ull;
-    for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
-    if (g_Stats) fprintf(stderr, "A7HLE: SND hw commit signature %016llx\n", (unsigned long long)h);
-    if (h != kHwSig) return s.hw;
+    for (const HwVar& v : kHwV)
+    {
+        code.clear();
+        for (const Range3& r : v.code)
+            for (u32 a = r.a; a < r.b; a++) code.push_back(*P7(nds, a));
+        u64 h = 0xcbf29ce484222325ull;
+        for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
+        if (g_Stats) fprintf(stderr, "A7HLE: SND hw commit %s signature %016llx\n", v.name, (unsigned long long)h);
+        if (h == v.sig) { s.hv = &v; break; }
+    }
+    if (!s.hv || (s.hv != &kHwV[0] && !ReadOn(16))) { s.hv = nullptr; return s.hw; }
     s.hwCode = std::move(code);
     return s.hw = 1;
 }
 bool HwIntact(melonDS::NDS& nds)
 {
     const State& s = Get(nds);
-    return memcmp(W7(nds, kHwRa), s.hwCode.data(), kHwRb - kHwRa) == 0
-        && memcmp(W7(nds, kHwRc), s.hwCode.data() + (kHwRb - kHwRa), kHwRd - kHwRc) == 0;
+    const u8* c = s.hwCode.data();
+    for (const Range3& r : s.hv->code)
+        for (u32 a = r.a; a < r.b; a++, c++)
+            if (*P7(nds, a) != *c) return false;
+    return true;
 }
 
 __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
 {
     melonDS::NDS& nds = cpu->NDS;
     if (HwProbe(nds) != 1) return false;
-    u64* g_Hw = Get(nds).hwN;
+    State& S = Get(nds);
+    const HwVar& V = *S.hv;
+    if (cpu->R[15] - 8 != V.entry) return false;
+    u64* g_Hw = S.hwN;
     g_Hw[0]++;
     const u32 sp = cpu->R[13];
-    u8* ch = W7(nds, kChannels);
-    bool ok = !CheckPending && (jit || HwIntact(nds)) && (s32)R32(W7(nds, kHwFx)) <= 0
+    u8* ch = W7(nds, V.chans);
+    const s32 fx = (s32)R32(W7(nds, V.fx));
+    bool ok = !CheckPending && (jit || HwIntact(nds)) && (V.mk || fx <= 0)
               && (sp >> 16) == 0x0380 && ((sp - 72) >> 16) == 0x0380 && !(sp & 3);
+#ifdef LITEV_HLE_DIAG
+    ok = ok && nds.NumFrames >= g_From;
+#endif
     u32 any = 0;
     for (int i = 0; ok && i < 16; i++)
     {
@@ -1189,11 +1282,20 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
     u32 nst = 0;
     for (int i = 0; i < 7; i++) st[nst++] = {sp - 32 + i * 4, cpu->R[4 + i]};
     st[nst++] = {sp - 4, cpu->R[14]};
-    struct Io { u32 a, v; u8 sz; } io[4 * 16];
-    u32 nio = 0, nvol = 0, nother = 0, nch = 0;
+    struct Io { u32 a, v; u8 sz; } io[5 * 16];
+    u32 nio = 0, nvol = 0, nother = 0, nch = 0, nfx = 0;
     u8 flags[16], vol[16], pan[16];
     bool vset[16] = {}, pset[16] = {};
-    const s32 ovr = (s32)R32(W7(nds, kHwPanOvr));
+    const s32 ovr = (s32)R32(W7(nds, V.panOvr));
+    // MKDS 0x037FBA94: the effect's volume for pan p (r2 / r12 as it leaves them)
+    auto fxVol = [&](u32 v, s32 p) -> u32
+    {
+        if (p < 0x18) { nfx++; r2 = 0x7FFF - (u32)fx; return (u32)((s32)(v * ((u32)(p + 0x28) * (u32)fx + (r2 << 6))) >> 21); }
+        if (p <= 0x68) return v;
+        nfx++;
+        ip = (u32)fx; r2 = 0u - (u32)fx;
+        return (u32)((s32)(v * ((u32)(p - 0x28) * r2 + (((u32)fx + 0x7FFF) << 6))) >> 21);
+    };
     for (int i = 0; i < 16; i++)
     {
         u8* c = ch + i * kChanSize;
@@ -1206,7 +1308,8 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
             // stop: SOUNDxCNT &= ~0x80000000 (32-bit read and store)
             const u32 cnt = nds.ARM7Read32(hw);
             io[nio++] = {hw, cnt & ~0x80000000u, 4};
-            r1 = cnt & ~0x80000000u; r2 = cnt; r3 = i << 4;
+            if (V.mk) { r2 = cnt & ~0x80000000u; ip = hw; }
+            else { r1 = cnt & ~0x80000000u; r2 = cnt; r3 = i << 4; }
             nother++;
         }
         if (f & 4)
@@ -1217,22 +1320,44 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
         }
         if (f & 8)
         {
-            // volume: shadow byte, SOUNDxCNT low halfword (push {r3, r4, r5, lr} at sp - 72)
+            // volume: shadow byte, SOUNDxCNT low halfword (PW: push {r3, r4, r5, lr} at sp - 72; MKDS: push {r4, r5, lr}
+            // at sp - 68, the effect for pan = SOUNDxCNT byte 2)
             const u32 v = R16(c + 0x24);
             vol[i] = v & 0xFF; vset[i] = true;
-            r1 = (v & 0xFF) | ((v >> 8) << 8); r2 = v >> 8; ip = kHwVol;
-            io[nio++] = {hw, r1 & 0xFFFF, 2};
-            st[nst++] = {sp - 72, r3}; st[nst++] = {sp - 68, 2}; st[nst++] = {sp - 64, 1}; st[nst++] = {sp - 60, 0x038009D0};
+            if (V.mk)
+            {
+                u32 lo = v & 0xFF;
+                r2 = v >> 8;
+                if (fx > 0 && ((r2 = 1u << i) & 0xFFF5)) { r2 = nds.ARM7Read8(hw + 2); lo = fxVol(lo, (s32)r2); }
+                io[nio++] = {hw, (lo | ((v >> 8) << 8)) & 0xFFFF, 2};
+            }
+            else
+            {
+                r1 = (v & 0xFF) | ((v >> 8) << 8); r2 = v >> 8; ip = V.vol;
+                io[nio++] = {hw, r1 & 0xFFFF, 2};
+                st[nst++] = {sp - 72, r3};
+            }
+            st[nst++] = {sp - 68, 2}; st[nst++] = {sp - 64, 1}; st[nst++] = {sp - 60, V.retVol};
             nvol++;
         }
         if (f & 0x10)
         {
-            // pan: shadow byte, the override if >= 0, SOUNDxCNT byte 2 (push {r4, lr} at sp - 64)
+            // pan: shadow byte, the override if >= 0, SOUNDxCNT byte 2 (push {r4, lr} at sp - 64); MKDS: the effect's
+            // volume for the new pan into SOUNDxCNT byte 0
             pan[i] = c[0x23]; pset[i] = true;
             r1 = ovr >= 0 ? (u32)ovr : c[0x23];
             io[nio++] = {hw + 2, r1 & 0xFF, 1};
-            r2 = R32(W7(nds, kHwFx)); r3 = kHwFx;
-            st[nst++] = {sp - 64, 2}; st[nst++] = {sp - 60, 0x038009F0};
+            if (V.mk)
+            {
+                r2 = (u32)fx;
+                if (fx > 0 && (r2 = (1u << i) & 0xFFF5))
+                {
+                    r2 = V.vol;
+                    io[nio++] = {hw, fxVol(vset[i] ? vol[i] : *W7(nds, V.vol + i), (s32)r1) & 0xFF, 1};
+                }
+            }
+            else { r2 = (u32)fx; r3 = V.fx; }
+            st[nst++] = {sp - 64, 2}; st[nst++] = {sp - 60, V.retPan};
             nother++;
         }
     }
@@ -1244,11 +1369,11 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
         g_Pending.regions.clear();
         for (int i = 0; i < 16; i++)
         {
-            if (flags[i] >> 3) g_Pending.regions.push_back({kChannels + i * kChanSize + 3, {(u8)(flags[i] & 7)}});
-            if (vset[i]) g_Pending.regions.push_back({kHwVol + i, {vol[i]}});
-            if (pset[i]) g_Pending.regions.push_back({kHwPan + i, {pan[i]}});
+            if (flags[i] >> 3) g_Pending.regions.push_back({V.chans + i * kChanSize + 3, {(u8)(flags[i] & 7)}});
+            if (vset[i]) g_Pending.regions.push_back({V.vol + i, {vol[i]}});
+            if (pset[i]) g_Pending.regions.push_back({V.pan + i, {pan[i]}});
         }
-        for (u32 k = 0; k < nst; k++)
+        for (u32 k = 0; k < nst && !g_Defer; k++)
         {
             bool later = false;     // a later push to the same slot: compare the last one only
             for (u32 j = k + 1; j < nst; j++) later |= st[j].a == st[k].a;
@@ -1258,14 +1383,22 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
         }
         ArmCheck(cpu, "hwcommit", &g_Hw[4]);
         g_Pending.regs = true;
-        g_Pending.t0 = nds.ARM7Timestamp + cpu->Cycles; g_Pending.fit[0] = nch; g_Pending.fit[1] = nvol; g_Pending.fit[2] = nother;
+        g_Pending.t0 = nds.ARM7Timestamp + cpu->Cycles; g_Pending.fit[0] = nch; g_Pending.fit[1] = nvol; g_Pending.fit[2] = nother; g_Pending.fit[3] = nfx;
         for (int i = 0; i < 16; i++) g_Pending.R[i] = cpu->R[i];
-        g_Pending.R[0] = r0; g_Pending.R[1] = 0x54; g_Pending.R[2] = r2; g_Pending.R[3] = kChannels; g_Pending.R[12] = ip;
+        g_Pending.R[0] = r0; g_Pending.R[1] = 0x54; g_Pending.R[2] = r2; g_Pending.R[3] = V.chans; g_Pending.R[12] = ip;
         g_Pending.cpsr = 0x60000000;    // cmp r4, #16 (16)
         for (u32 k = 0; k < nio; k++)
         {
             const int c = (io[k].a >> 4) & 15, o = io[k].a & 15;
-            g_Pending.spu.push_back({c * 4 + (o == 8 ? 3 : o == 2 ? 1 : io[k].sz == 4 ? 2 : 0), io[k].v});
+            if (o == 0 && io[k].sz == 1)    // byte 0 after a halfword store to the same channel: one expectation
+            {
+                bool merged = false;
+                for (auto& [w, v] : g_Pending.spu)
+                    if (w == c * 8) { v = (v & 0xFF00) | io[k].v; merged = true; }
+                if (!merged) g_Pending.spu.push_back({c * 8 + 4, io[k].v});
+                continue;
+            }
+            g_Pending.spu.push_back({c * 8 + (o == 8 ? 3 : o == 2 ? 1 : io[k].sz == 4 ? 2 : 0), io[k].v});
         }
         g_Hw[3]++;
         GuestFallback(cpu);
@@ -1281,18 +1414,23 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
     auto st8 = [&](u32 a, u8 v) { u8* p = W7(nds, a); if (*p != v) { nds.JIT.CheckAndInvalidate<1, melonDS::ARMJIT_Memory::memregion_WRAM7>(a & ~3u); *p = v; } };
     for (int i = 0; i < 16; i++)
     {
-        if (flags[i] >> 3) st8(kChannels + i * kChanSize + 3, flags[i] & 7);
-        if (vset[i]) st8(kHwVol + i, vol[i]);
-        if (pset[i]) st8(kHwPan + i, pan[i]);
+        if (flags[i] >> 3) st8(V.chans + i * kChanSize + 3, flags[i] & 7);
+        if (vset[i]) st8(V.vol + i, vol[i]);
+        if (pset[i]) st8(V.pan + i, pan[i]);
     }
     for (u32 k = 0; k < nst; k++)
     {
         u8* p = W7(nds, st[k].a);
         if (R32(p) != st[k].v) Store32<melonDS::ARMJIT_Memory::memregion_WRAM7>(nds, st[k].a, p, st[k].v);
     }
-    cpu->R[0] = r0; cpu->R[1] = 0x54; cpu->R[2] = r2; cpu->R[3] = kChannels; cpu->R[12] = ip;
+    cpu->R[0] = r0; cpu->R[1] = 0x54; cpu->R[2] = r2; cpu->R[3] = V.chans; cpu->R[12] = ip;
     cpu->CPSR = (cpu->CPSR & 0x0FFFFFFF) | 0x60000000;
-    cpu->Cycles += kHwCyc0 + kHwCycCh * (s32)nch + kHwCycVol * (s32)nvol + kHwCycOther * (s32)nother;
+    const s32 cyc = V.cyc0 + V.cycCh * (s32)nch + V.cycVol * (s32)nvol + V.cycOther * (s32)nother + V.cycFx * (s32)nfx;
+    cpu->Cycles += cyc;
+#ifdef LITEV_HLE_DIAG
+    g_Hw[5] += cyc;
+    cpu->Cycles += g_CycAdj;
+#endif
     g_Hw[1]++;
     (void)any;
     cpu->JumpTo(cpu->R[14]);
@@ -1301,12 +1439,13 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
 
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 {
-    if (addr == kHwEntry && instr == kHwInstr) return HwProbe(nds) != 1 ? 0 : HwIntact(nds) ? 1 : 2;
+    if ((addr == kHwV[0].entry && instr == kHwV[0].instr) || (addr == kHwV[1].entry && instr == kHwV[1].instr))
+        return HwProbe(nds) != 1 || addr != Get(nds).hv->entry ? 0 : HwIntact(nds) ? 1 : 2;
     if (instr == kCopy32[0]) return CopyOn(nds) && IsCopy32(nds, addr) ? 1 : 0;
-    if (addr == kSeqEntry && instr == kSeqEntryInstr)
+    if ((addr == kSeqV[0].entry && instr == kSeqV[0].instr) || (addr == kSeqV[1].entry && instr == kSeqV[1].instr))
     {
         SeqState& s = GetSeq(nds);
-        return s.status != 1 ? 0 : SeqCodeIntact(nds, s) ? 1 : 2;
+        return s.status != 1 || addr != s.v->entry ? 0 : SeqCodeIntact(nds, s) ? 1 : 2;
     }
     if (!((addr == kEx[0].entry && instr == kEx[0].instr) || (addr == kEx[1].entry && instr == kEx[1].instr))) return 0;
     State& s = Get(nds);
@@ -1316,8 +1455,15 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 int Deps(u32 addr, u32 instr, Range* out)
 {
     if (instr == kCopy32[0]) { out[0] = {addr, addr + 24}; return 1; }
-    if (addr == kHwEntry) { out[0] = {kHwRa, kHwRb}; out[1] = {kHwRc, kHwRd}; return 2; }
-    if (addr == kSeqEntry) { out[0] = {kSeqRa, kSeqRb}; out[1] = {kRndA, kRndB}; return 2; }
+    for (const HwVar& v : kHwV)
+        if (addr == v.entry) { out[0] = {v.code[0].a, v.code[0].b}; out[1] = {v.code[1].a, v.code[1].b}; return 2; }
+    for (const SeqVar& v : kSeqV)
+        if (addr == v.entry)
+        {
+            int n = 0;
+            for (const Range3& r : v.code) if (r.b > r.a) out[n++] = {r.a, r.b};
+            return n;
+        }
     const ExVar& v = addr == kEx[1].entry ? kEx[1] : kEx[0];
     for (int i = 0; i < 3; i++) out[i] = {v.code[i].a, v.code[i].b};
     return 3;
@@ -1328,6 +1474,9 @@ bool Run(melonDS::ARM* cpu, bool jit)
     if (cpu->Num != 1 || (cpu->CPSR & 0x20)) return false;
     const u32 pc = cpu->R[15] - 8;
     melonDS::NDS& nds = cpu->NDS;
+#ifdef LITEV_HLE_DIAG
+    if (g_Defer && CheckPending && cpu == g_Pending.cpu) { g_Pending.ret = pc; g_Pending.deferred = true; CheckAt(cpu, pc); }
+#endif
     if (cpu->CurInstr == kCopy32[0])
     {
         if (!CopyOn(nds) || (!jit && !IsCopy32(nds, pc))) return false;
@@ -1335,8 +1484,10 @@ bool Run(melonDS::ARM* cpu, bool jit)
         Copy32(cpu);
         return true;
     }
-    if (pc == kSeqEntry && cpu->CurInstr == kSeqEntryInstr) return RunSeq(cpu, jit);
-    if (pc == kHwEntry && cpu->CurInstr == kHwInstr) return RunHw(cpu, jit);
+    if ((pc == kSeqV[0].entry && cpu->CurInstr == kSeqV[0].instr) || (pc == kSeqV[1].entry && cpu->CurInstr == kSeqV[1].instr))
+        return RunSeq(cpu, jit);
+    if ((pc == kHwV[0].entry && cpu->CurInstr == kHwV[0].instr) || (pc == kHwV[1].entry && cpu->CurInstr == kHwV[1].instr))
+        return RunHw(cpu, jit);
     if (!((pc == kEx[0].entry && cpu->CurInstr == kEx[0].instr) || (pc == kEx[1].entry && cpu->CurInstr == kEx[1].instr))) return false;
     State& s = Get(nds);
     if (s.status == 0) Probe(nds, s);
@@ -1382,6 +1533,9 @@ bool Run(melonDS::ARM* cpu, bool jit)
     int active = 0;
     for (int i = 0; i < 16; i++) active += chans[i * kChanSize + 3] & 1;
     cpu->Cycles += s.v->cyc0 + s.v->cycCh * active;
+#ifdef LITEV_HLE_DIAG
+    cpu->Cycles += g_CycAdj;
+#endif
     cpu->JumpTo(cpu->R[14]);
     return true;
 }
@@ -1408,20 +1562,22 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         }
     if (g_Pending.fit[1] == ~0u && !g_Pending.irq && getenv("LITEV_A7HLE_HWFIT"))
         fprintf(stderr, "EXFIT %u %llu\n", g_Pending.fit[0], (unsigned long long)(nds.ARM7Timestamp + cpu->Cycles - g_Pending.t0));
-    g_Pending.fit[1] = 0;
+    if (g_Pending.fit[2] == ~0u && !g_Pending.irq && getenv("LITEV_A7HLE_HWFIT"))
+        fprintf(stderr, "SEQFIT %u %u %u %u %u %llu\n", g_Pending.fit[0], g_Pending.fit[1], g_Pending.fit[3], g_Pending.fit[4], g_Pending.fit[5], (unsigned long long)(nds.ARM7Timestamp + cpu->Cycles - g_Pending.t0));
     if (g_Pending.regs && !g_Pending.irq && getenv("LITEV_A7HLE_HWFIT"))
-        fprintf(stderr, "HWFIT %u %u %u %llu\n", g_Pending.fit[0], g_Pending.fit[1], g_Pending.fit[2], (unsigned long long)(nds.ARM7Timestamp + cpu->Cycles - g_Pending.t0));
+        fprintf(stderr, "HWFIT %u %u %u %u %llu\n", g_Pending.fit[0], g_Pending.fit[1], g_Pending.fit[2], g_Pending.fit[3], (unsigned long long)(nds.ARM7Timestamp + cpu->Cycles - g_Pending.t0));
+    g_Pending.fit[1] = g_Pending.fit[2] = g_Pending.fit[3] = 0;
     if (g_Pending.regs)
     {
         const int ri[5] = {0, 1, 2, 3, 12};
         for (int r : ri)
-            if (cpu->R[r] != g_Pending.R[r])
+            if (!g_Pending.deferred && cpu->R[r] != g_Pending.R[r])
             {
                 if (!diff && *g_Pending.diffs < 10) fprintf(stderr, "A7HLE CHECK %s diffs:", g_Pending.name);
                 if (*g_Pending.diffs < 10) fprintf(stderr, " r%d guest %08x native %08x;", r, cpu->R[r], g_Pending.R[r]);
                 diff = true;
             }
-        if ((cpu->CPSR ^ g_Pending.cpsr) & 0xF0000000)
+        if (!g_Pending.deferred && ((cpu->CPSR ^ g_Pending.cpsr) & 0xF0000000))
         {
             if (!diff && *g_Pending.diffs < 10) fprintf(stderr, "A7HLE CHECK %s diffs:", g_Pending.name);
             if (*g_Pending.diffs < 10) fprintf(stderr, " nzcv guest %x native %x;", cpu->CPSR >> 28, g_Pending.cpsr >> 28);
@@ -1429,14 +1585,15 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         }
         for (auto& [w, v] : g_Pending.spu)
         {
-            if ((w & 3) == 3) continue;     // SOUNDxTMR is write-only (the timer path ran 0 times in the PW profiles)
-            const u32 cnt = nds.ARM7Read32(0x04000400 + (w >> 2) * 16);
-            const u32 got = (w & 3) == 0 ? cnt & 0xFFFF : (w & 3) == 1 ? (cnt >> 16) & 0xFF : cnt & 0x80000000;
-            const u32 want = (w & 3) == 2 ? 0 : (w & 3) == 1 ? v & 0x7F : v;
-            if (((w & 3) == 1 ? got & 0x7F : got) != want)
+            const int k = w & 7;            // (channel * 8 + what: 0 Cnt & 0xFFFF, 1 pan byte, 2 Cnt bit 31, 3 timer, 4 Cnt byte 0)
+            if (k == 3 || (k == 2 && g_Pending.deferred)) continue;           // SOUNDxTMR is write-only (the timer path ran 0 times in the PW profiles)
+            const u32 cnt = nds.ARM7Read32(0x04000400 + (w >> 3) * 16);
+            const u32 got = k == 0 ? cnt & 0xFFFF : k == 1 ? (cnt >> 16) & 0x7F : k == 4 ? cnt & 0x7F : cnt & 0x80000000;
+            const u32 want = k == 2 ? 0 : k == 1 || k == 4 ? v & 0x7F : v;
+            if (got != want)
             {
                 if (!diff && *g_Pending.diffs < 10) fprintf(stderr, "A7HLE CHECK %s diffs:", g_Pending.name);
-                if (*g_Pending.diffs < 10) fprintf(stderr, " spu ch%d/%d guest %x native %x;", w >> 2, w & 3, got, want);
+                if (*g_Pending.diffs < 10) fprintf(stderr, " spu ch%d/%d guest %x native %x;", w >> 3, k, got, want);
                 diff = true;
             }
         }

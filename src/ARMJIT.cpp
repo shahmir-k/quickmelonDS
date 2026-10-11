@@ -1063,7 +1063,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
 
 #if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
     // + room for an A9HLE/A7HLE hook block's dependency ranges (see below)
-    const int maxRanges = MaxBlockSize + 48;
+    const int maxRanges = MaxBlockSize + 96;
 #else
     const int maxRanges = MaxBlockSize;
 #endif

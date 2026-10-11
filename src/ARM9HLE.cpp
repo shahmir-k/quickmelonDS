@@ -57,10 +57,20 @@ constexpr int kNumWake = 12;    // code ranges of 1. and 2. (signature sig); the
 
 // 8. for the TWL SDK build (W2): NNS G3D in Thumb. SBC MAT (entry), MAT_InternalDefault, NNS_G3dGeBufferOP_N,
 // MI_CpuSend32 (ARM), the material function table, the material cache, NNS_G3dGlb, the mask table, the GE buffer object
-struct MatT { u32 sbc, def, opn, snd, tab, cache, glb, mask, ge; Range code[4]; u64 sig; };
+// 17.: the material animation / texture matrix functions of a build, as the guest stores their pointers (Thumb | 1):
+// NNSi_G3dAnmBlendMat, NNSi_G3dAnmCalcNsBta (texture SRT), NNSi_G3dAnmCalcNsBtp (texture pattern), the texture matrix send
+// (render state +0xF0), the address of its per-SRT-flags function table and the functions of that table for the flag
+// combinations without a rotation (2, 3, 6, 7; the others divide on the divider unit: guest code)
+struct MatAnmVar { u32 blend, bta, btp, tex, tab, tf[4]; };
+struct MatT { u32 sbc, def, opn, snd, tab, cache, glb, mask, ge; Range code[11]; u64 sig; MatAnmVar anm; };
+// (code: 8.'s functions, then 17.'s: the blend, the dictionary search, the pattern frame / name lookups, the track readers +
+// texture SRT, the texture / palette / pattern functions, the texture matrix functions with the send and its literal pool)
 constexpr MatT kW2Mat = {0x020668A4, 0x02066584, 0x02067D48, 0x020786B0, 0x0209B370, 0x02143CB4, 0x02143ACC, 0x02094440, 0x021469B4,
-                         {{0x020668A4, 0x02066918}, {0x02066584, 0x020668A4}, {0x02067D48, 0x02067DD0}, {0x020786B0, 0x020786C8}},
-                         0x4fbe252de9fcc4e2ull};
+                         {{0x020668A4, 0x02066918}, {0x02066584, 0x020668A4}, {0x02067D48, 0x02067DD0}, {0x020786B0, 0x020786C8},
+                          {0x02065C84, 0x02065CC8}, {0x02068484, 0x020685A0}, {0x020686F4, 0x02068790}, {0x02069A44, 0x02069C90},
+                          {0x02069D24, 0x02069D50}, {0x02069DEC, 0x02069F10}, {0x0206A334, 0x0206A740}},
+                         0x588870eaef71b1e2ull,
+                         {0x02065C85, 0x02069D25, 0x02069ECD, 0x0206A5F8, 0x0209B4E0, {0x0206A334, 0x0206A3B0, 0x0206A590, 0x0206A5D4}}};
 
 // OSThread: +0 context {cpsr, r0-r14, pc, sp_svc, CP context (+0x48, 0x1C bytes)}, +0x64 state,
 // +0x68 list link, +0x70 priority, +0x78 queue, +0x7C/+0x80 queue link prev/next
@@ -247,15 +257,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 17;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 32767;
+constexpr int kKinds = 19;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 131071;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -263,6 +273,8 @@ struct State
     bool dmaOk = false;             // DMA-end IRQ path matches (11.)
     bool shpOk = false;             // G3D shape path matches (13.)
     bool matTOk = false;            // 8. in Thumb (W2) matches
+    u32 anmDef = 0; bool anmOk = false;
+    u32 sbcLive = 0;                // 18.: what was verified with the loop's hook block (SbcVerify)     // 17. (ARM build): the code of MAT_InternalDefault at anmDef verified at the last compile
     std::vector<u8> matTCode;
     bool hbLive = false, dmaLive = false;   // 3. / 11. verified when the wake hook block (A9HLEGuard) was compiled
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
@@ -290,9 +302,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -490,7 +502,7 @@ __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 in
         if (g_Stats) fprintf(stderr, "A9HLE: GX send signature %016llx -> %s\n", (unsigned long long)Fnv(s.gxCode), s.gxOk ? "on" : "off");
         if (v.matT)
         {
-            CodeBytes(c, s.matTCode, v.matT->code, 0, 4);
+            CodeBytes(c, s.matTCode, v.matT->code, 0, 11);
             s.matTOk = Fnv(s.matTCode) == v.matT->sig;
             if (g_Stats) fprintf(stderr, "A9HLE: G3D material (Thumb) signature %016llx -> %s\n", (unsigned long long)Fnv(s.matTCode), s.matTOk ? "on" : "off");
         }
@@ -635,6 +647,7 @@ struct Pending
     u64 lzOwn = 0, lzLastTs = 0; bool lzLastIn = false;
     std::vector<u32> gx;    // G3D material check: the GXFIFO words of the native path
     bool gxOn = false;      // ... captured from BulkWords (GxTap) + the guest's GXFIFO stores
+    u32 fitA[8] = {};       // G3D material animation check: the cycle model's counts
     u32 fit[4] = {};        // _ll_sdiv check: normalization shifts, dividend shifts, nonzero, estimate
     std::vector<std::pair<u32, u32>> io;    // GX async check: the IO writes of the native plan (IME toggles left out)
     Expect fin; u32 finA = 0, finV = 0;     // G3D shape check, stage 2: registers at SHP's return, the SBC pointer word
@@ -1653,6 +1666,21 @@ constexpr u32 kSend32Code[6] = {0xE080C002, 0xE150000C, 0xB8B00004, 0xB5812000, 
 // ponytail: fixed estimate (guest average in check mode, PW town / gift box / overworld / title)
 constexpr s32 kMatCyc = 512, kMatCycNoSend = 325;
 
+// 17. (defined after 15.'s Node): the material's texture SRT, its animations and the texture matrix send on the material result
+// r[14]; the texture matrix's GX words appended to gw (n). false: fall back to the guest code. cnt: the cycle model's counts
+bool MatAnm(melonDS::ARMv5* c, Mem& m, const MatAnmVar& v, u32 md, u32 h, u32 ro, u32 idx, u32 texFn, bool send, u32* r, u32* gw, u32& n, u32* cnt);
+int MatAnmAt(melonDS::ARMv5* c, u32 def);           // the ARM build's 17. code at its distances from MAT_InternalDefault: 0/1/2
+MatAnmVar MatAnmPW(melonDS::ARMv5* c, u32 def);     // its pointers (PW, PB)
+// 18. (defined after 13.)
+constexpr u32 kSbcInstr = 0xE5941008;   // ldr r1, [r4, #8] (the loop head)
+// (offset from SBC SHP, bytes): the loop function, RET .. NODE, NOP, POSSCALE, MAT, NODEDESC
+enum : s32 { kSbcFn = -0xBCC, kSbcHead = -0xBC0, kSbcRet = -0x87C, kSbcNode = -0x854, kSbcNop = -0x8A4, kSbcPs = 0x13A0,
+             kSbcMat = -0x184, kSbcNd = 0xA0 };
+constexpr u32 kW2SbcHead = 0x0206617C;    // W2 (Thumb): ldr r0, [r4]
+int SbcDeps(melonDS::ARMv5* c, const Variant& v, Range* r);
+u32 SbcVerify(melonDS::ARMv5* c, State& s);
+s32 MatAnmCyc(const u32* cnt, bool send, int thumb);
+
 bool CodeEq(melonDS::ARMv5* c, u32 a, const u32* w, u32 n, const u16* sk, u32 ns)
 {
     for (u32 i = 0, j = 0; i < n; i++)
@@ -1685,7 +1713,9 @@ int MatAt(melonDS::ARMv5* c, u32 entry, u32& def, u32& opn, u32& snd)
            && snd && CodeEq(c, snd, kSend32Code, 6, nullptr, 0) ? 1 : 2;
 }
 
-bool MatNative(melonDS::ARMv5* c, Mem& m, Expect& e, u32 pc, u32 def, u32 opn, u32* gw, bool& send)
+// av: 17. on and verified (else the texture SRT / animation cases fall back); anim: out, 17.'s path taken (no stack frames
+// written, scratch registers / flags left: the SBC loop calls MAT through its table); ngw: GX words (gw: room for 32)
+bool MatNative(melonDS::ARMv5* c, Mem& m, Expect& e, u32 pc, u32 def, u32 opn, u32* gw, u32& ngw, bool& send, const MatAnmVar* av, bool& anim, u32* cnt)
 {
     bool bad = false;
     auto rd = [&](u32 a, u32 n) -> u32 {
@@ -1719,9 +1749,11 @@ bool MatNative(melonDS::ARMv5* c, Mem& m, Expect& e, u32 pc, u32 def, u32 opn, u
     const u32 r8 = opt == 0x40 ? lit(def + 285 * 4) + idx * 0x38 : rs + 0xF4;
     Obj R8 = m.O(r8, 0x38);
     const u32 h = rd(md + 0x1E, 2);
-    if (!R8 || bad || (h & 1)) return false;
+    if (!R8 || bad) return false;
     const u32 anm = rd(ro + 8, 4);
-    if (anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit)) return false;    // material animation callback
+    const bool anmOn = anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit);    // material animation (17.)
+    anim = (h & 1) || anmOn;                                                // (or the material's texture SRT)
+    if (anim && !av) return false;
     const u32 glb = lit(def + 286 * 4), mt = lit(def + 287 * 4);
     const u32 t1 = rd(mt + ((h >> 6) & 7) * 4, 4), t2 = rd(mt + ((h >> 9) & 7) * 4, 4);
     const u32 v0 = h & 0x20;
@@ -1734,21 +1766,39 @@ bool MatNative(melonDS::ARMv5* c, Mem& m, Expect& e, u32 pc, u32 def, u32 opn, u
     send = vc & 0x1F0000;   // else an invisible material: [rs + 8] |= 2, no send
     const u32 fl = send ? (flag | 8) & ~2u : flag | 0xA;
     if (bad || (send && (fl & 0x100))) return false;     // (send path) the no-send flag
+    const u32 vcRaw = vc;
     if (send && v0) vc &= ~0x1F0000u;
     Obj st = m.O(sp - 80, 80);
     if (!st) return false;
     const u32 cmd0 = kMatCode[288], cmd1 = kMatCode[289];
-    // stack: MAT push {r4, lr}; MAT_InternalDefault push {r3-r8, lr} + locals (the OP_N arguments); OP_N push {r4-r6, lr}
-    m.W(st, 72, c->R[4]); m.W(st, 76, c->R[14]);
-    m.W(st, 44, idx); m.W(st, 48, rs); m.W(st, 52, c->R[5]); m.W(st, 56, c->R[6]); m.W(st, 60, c->R[7]); m.W(st, 64, c->R[8]);
-    m.W(st, 68, pc + 0x9C);
     if (send)
     {
         // NNS_G3dGeBufferOP_N: no buffering ([ge + 4] clear) and no GE buffer or an empty one: straight to GXFIFO
         const u32 ge = lit(opn + 55 * 4), gb = rd(ge, 4);
         if (rd(ge + 4, 4) || (gb && rd(gb, 4)) || bad) return false;
-        m.W(st, 16, cmd0); m.W(st, 20, v4); m.W(st, 24, v8); m.W(st, 28, vc); m.W(st, 32, cmd1); m.W(st, 36, v10); m.W(st, 40, v14);
-        m.W(st, 0, cbT); m.W(st, 4, r8); m.W(st, 8, vc); m.W(st, 12, def + 0x420);
+    }
+    if (!anim)
+    {
+        // stack: MAT push {r4, lr}; MAT_InternalDefault push {r3-r8, lr} + locals (the OP_N arguments); OP_N push {r4-r6, lr}
+        m.W(st, 72, c->R[4]); m.W(st, 76, c->R[14]);
+        m.W(st, 44, idx); m.W(st, 48, rs); m.W(st, 52, c->R[5]); m.W(st, 56, c->R[6]); m.W(st, 60, c->R[7]); m.W(st, 64, c->R[8]);
+        m.W(st, 68, pc + 0x9C);
+        if (send)
+        {
+            m.W(st, 16, cmd0); m.W(st, 20, v4); m.W(st, 24, v8); m.W(st, 28, vc); m.W(st, 32, cmd1); m.W(st, 36, v10); m.W(st, 40, v14);
+            m.W(st, 0, cbT); m.W(st, 4, r8); m.W(st, 8, vc); m.W(st, 12, def + 0x420);
+        }
+    }
+    u32 r[14] = {v0, v4, v8, vc, v10, v14};
+    ngw = 7;
+    if (anim)
+    {
+        for (int i = 6; i < 14; i++) r[i] = R8.r(i * 4);
+        r[3] = vcRaw;      // (the wireframe clear comes after the animation)
+        u32 tn = 0;
+        if (!MatAnm(c, m, *av, md, h, anmOn ? ro : 0, idx, RS.r(0xF0), send, r, gw + 7, tn, cnt)) return false;
+        if (send && (r[0] & 0x20)) r[3] &= ~0x1F0000u;
+        ngw = 7 + tn;
     }
     // render state, material result
     m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFF00u) | idx << 8);
@@ -1756,8 +1806,8 @@ bool MatNative(melonDS::ARMv5* c, Mem& m, Expect& e, u32 pc, u32 def, u32 opn, u
     m.W(RS, 0xB0, r8);
     if (opt == 0x40) m.W(RS, bo, bits | bit);
     m.W(RS, 0, sbc + 2);
-    m.W(R8, 0, v0); m.W(R8, 4, v4); m.W(R8, 8, v8); m.W(R8, 0xC, vc); m.W(R8, 0x10, v10); m.W(R8, 0x14, v14);
-    gw[0] = cmd0; gw[1] = v4; gw[2] = v8; gw[3] = vc; gw[4] = cmd1; gw[5] = v10; gw[6] = v14;
+    for (int i = 0; i < (anim ? 14 : 6); i++) m.W(R8, i * 4, r[i]);
+    gw[0] = cmd0; gw[1] = r[1]; gw[2] = r[2]; gw[3] = r[3]; gw[4] = cmd1; gw[5] = r[4]; gw[6] = r[5];
     for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
     e.R[0] = sbc + 2; e.R[3] = idx;
     if (send) { e.R[1] = kOpnCode[56]; e.R[2] = v14; e.R[12] = sp - 36; e.R[14] = opn + 0xD8; }
@@ -1781,36 +1831,42 @@ __attribute__((noinline)) bool RunMat(melonDS::ARMv5* c, State& s, bool jit)
     melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
     Mem m(c, g_Check || g_Dry);
     Expect e;
-    u32 gw[7];
-    bool send = false;
-    bool ok = !CheckPending && opn && MatNative(c, m, e, pc, def, opn, gw, send) && (!send || (gx.GeometryEnabled && gx.BulkReady()));
+    u32 gw[32], ngw = 0, cnt[8] = {};
+    bool send = false, anim = false;
+    // 17.: under the JIT verified when this block was compiled (IsHook), the interpreter checks per call
+    const bool anmOk = (s.mask & 32768) && (jit ? s.anmDef == def && s.anmOk : MatAnmAt(c, def) == 1);
+    const MatAnmVar av = MatAnmPW(c, def);
+    bool ok = !CheckPending && opn && MatNative(c, m, e, pc, def, opn, gw, ngw, send, anmOk ? &av : nullptr, anim, cnt)
+              && (!send || (gx.GeometryEnabled && gx.BulkReady()));
+    s.calls[17] += anim;
 #ifdef LITEV_HLE_DIAG
     if (ok && (g_Check || g_Dry))
     {
         m.Flush();      // logs only
         if (g_Check)
         {
-            ArmCheck(c, 8, m, e);
-            g_P.gx.assign(gw, gw + (send ? 7 : 0));
+            ArmCheck(c, anim ? 17 : 8, m, e);
+            g_P.gx.assign(gw, gw + (send ? ngw : 0));
             g_P.fit[0] = send;
+            for (int i = 0; i < 8; i++) g_P.fitA[i] = cnt[i];
 #ifdef LITEV_A9HLE_GXCHECK
             if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
 #endif
         }
-        s.checks[8]++;
+        s.checks[anim ? 17 : 8]++;
         ok = false;
     }
 #endif
     if (!ok)
     {
-        s.fallback[8] += !g_Check;
+        s.fallback[anim ? 17 : 8] += !g_Check;
         GuestFallback(c);
         return true;
     }
     m.Flush();
-    if (send) gx.BulkWords(gw, 7);
-    s.native[8]++;
-    Return(c, e, send ? kMatCyc : kMatCycNoSend);
+    if (send) gx.BulkWords(gw, ngw);
+    s.native[anim ? 17 : 8]++;
+    Return(c, e, anim ? MatAnmCyc(cnt, send, 0) : send ? kMatCyc : kMatCycNoSend);
     return true;
 }
 #endif
@@ -1824,7 +1880,7 @@ __attribute__((noinline)) bool RunMat(melonDS::ARMv5* c, State& s, bool jit)
 // ponytail: fixed estimates (check-mode guest averages, W2 town)
 constexpr s32 kMatTCyc = 483, kMatTCycNoSend = 307;   // (no invisible material in the W2 states: 8.'s ratio)
 
-bool MatTNative(melonDS::ARMv5* c, Mem& m, Expect& e, const MatT& t, u32* gw, bool& send)
+bool MatTNative(melonDS::ARMv5* c, Mem& m, Expect& e, const MatT& t, u32* gw, u32& ngw, bool& send, bool anmOn17, bool& anim, u32* cnt)
 {
     bool bad = false;
     auto rd = [&](u32 a, u32 n) -> u32 {
@@ -1857,9 +1913,11 @@ bool MatTNative(melonDS::ARMv5* c, Mem& m, Expect& e, const MatT& t, u32* gw, bo
     const u32 r8 = opt == 0x40 ? t.cache + idx * 0x38 : rs + 0xF4;
     Obj R8 = m.O(r8, 0x38);
     const u32 h = rd(md + 0x1E, 2);
-    if (!R8 || bad || (h & 1)) return false;
+    if (!R8 || bad) return false;
     const u32 anm = rd(ro + 8, 4);
-    if (anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit)) return false;     // material animation callback
+    const bool anmOn = anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit);     // material animation (17.)
+    anim = (h & 1) || anmOn;
+    if (anim && !anmOn17) return false;
     const u32 t1 = rd(t.mask + ((h >> 6) & 7) * 4, 4), t2 = rd(t.mask + ((h >> 9) & 7) * 4, 4);
     const u32 v0 = h & 0x20;
     const u32 v4 = (rd(t.glb + 0x14, 4) & ~t1) | (rd(md + 4, 4) & t1);
@@ -1877,22 +1935,37 @@ bool MatTNative(melonDS::ARMv5* c, Mem& m, Expect& e, const MatT& t, u32* gw, bo
         const u32 gb = rd(t.ge, 4);
         if (rd(t.ge + 4, 4) || (gb && rd(gb, 4)) || bad) return false;
     }
+    const u32 vcRaw = vc;
     if (send && v0) vc &= ~0x1F0000u;
     // stack (S = sp): SBC MAT push {r4-r6, lr} at S-16; MAT_InternalDefault push {r3-r7, lr} at S-40, locals at M = S-72
     // ([M] the callback timing, [M+4] the command word, [M+8] the 6 parameters); OP_N push {r3-r7, lr} at M-24
     Obj st = m.O(S - 96, 96);
     if (!st) return false;
     const u32 M = S - 72;
-    const u32 w0[4] = {c->R[4], c->R[5], c->R[6], c->R[14]}, w1[6] = {idx, rs, fn, hmd * 4, c->R[7], t.sbc + 0x67};
-    for (int i = 0; i < 4; i++) m.W(st, 80 + i * 4, w0[i]);
-    for (int i = 0; i < 6; i++) m.W(st, 56 + i * 4, w1[i]);
-    m.W(st, 24, cbT);
     const u32 cmd0 = 0x00293130, cmd1 = 0x00002B2A;
-    if (send)
+    if (!anim)
     {
-        const u32 w2[7] = {cmd0, v4, v8, vc, cmd1, v10, v14}, w3[6] = {ro, r8, rs, md, idx, t.def + 0x2D3};
-        for (int i = 0; i < 7; i++) m.W(st, 28 + i * 4, w2[i]);
-        for (int i = 0; i < 6; i++) m.W(st, i * 4, w3[i]);
+        const u32 w0[4] = {c->R[4], c->R[5], c->R[6], c->R[14]}, w1[6] = {idx, rs, fn, hmd * 4, c->R[7], t.sbc + 0x67};
+        for (int i = 0; i < 4; i++) m.W(st, 80 + i * 4, w0[i]);
+        for (int i = 0; i < 6; i++) m.W(st, 56 + i * 4, w1[i]);
+        m.W(st, 24, cbT);
+        if (send)
+        {
+            const u32 w2[7] = {cmd0, v4, v8, vc, cmd1, v10, v14}, w3[6] = {ro, r8, rs, md, idx, t.def + 0x2D3};
+            for (int i = 0; i < 7; i++) m.W(st, 28 + i * 4, w2[i]);
+            for (int i = 0; i < 6; i++) m.W(st, i * 4, w3[i]);
+        }
+    }
+    u32 r[14] = {v0, v4, v8, vc, v10, v14};
+    ngw = 7;
+    if (anim)
+    {
+        for (int i = 6; i < 14; i++) r[i] = R8.r(i * 4);
+        r[3] = vcRaw;      // (the wireframe clear comes after the animation)
+        u32 tn = 0;
+        if (!MatAnm(c, m, t.anm, md, h, anmOn ? ro : 0, idx, RS.r(0xF0), send, r, gw + 7, tn, cnt)) return false;
+        if (send && (r[0] & 0x20)) r[3] &= ~0x1F0000u;
+        ngw = 7 + tn;
     }
     // render state, material result
     m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFF00u) | idx << 8);
@@ -1900,15 +1973,15 @@ bool MatTNative(melonDS::ARMv5* c, Mem& m, Expect& e, const MatT& t, u32* gw, bo
     m.W(RS, 0xB0, r8);
     if (opt == 0x40) m.W(RS, bo, bits | bit);
     m.W(RS, 0, sbc + 2);
-    m.W(R8, 0, v0); m.W(R8, 4, v4); m.W(R8, 8, v8); m.W(R8, 0xC, vc); m.W(R8, 0x10, v10); m.W(R8, 0x14, v14);
-    gw[0] = cmd0; gw[1] = v4; gw[2] = v8; gw[3] = vc; gw[4] = cmd1; gw[5] = v10; gw[6] = v14;
+    for (int i = 0; i < (anim ? 14 : 6); i++) m.W(R8, i * 4, r[i]);
+    gw[0] = cmd0; gw[1] = r[1]; gw[2] = r[2]; gw[3] = r[3]; gw[4] = cmd1; gw[5] = r[4]; gw[6] = r[5];
     for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
     e.R[0] = sbc + 2; e.R[3] = idx;
     if (send) { e.R[1] = v0; e.R[2] = v14; e.R[12] = M + 32; e.R[14] = t.opn + 0x7D; }
     else { e.R[1] = fl8; e.R[2] = anm; e.R[12] = dict + ofs + 4; e.R[14] = t.sbc + 0x67; }
     e.retPc = c->R[14];
     // SBC MAT's adds r0, r0, #2 sets the flags
-    const u32 r = sbc + 2, nzcv = (r & 0x80000000) | ((r == 0) << 30) | ((r < sbc) << 29) | (((~(sbc ^ 2u) & (sbc ^ r)) >> 31) << 28);
+    const u32 r0 = sbc + 2, nzcv = (r0 & 0x80000000) | ((r0 == 0) << 30) | ((r0 < sbc) << 29) | (((~(sbc ^ 2u) & (sbc ^ r0)) >> 31) << 28);
     e.CPSR = (c->CPSR & 0x0FFFFFDF) | nzcv | ((e.retPc & 1) << 5);
     return true;
 }
@@ -1918,37 +1991,39 @@ __attribute__((noinline)) bool RunMatT(melonDS::ARMv5* c, State& s, bool jit)
     melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
     Mem m(c, g_Check || g_Dry);
     Expect e;
-    u32 gw[7];
-    bool send = false;
-    bool ok = !CheckPending && s.matTOk && (jit || MatTIntact(c, s)) && MatTNative(c, m, e, *s.v->matT, gw, send)
+    u32 gw[32], ngw = 0, cnt[8] = {};
+    bool send = false, anim = false;
+    bool ok = !CheckPending && s.matTOk && (jit || MatTIntact(c, s)) && MatTNative(c, m, e, *s.v->matT, gw, ngw, send, s.mask & 32768, anim, cnt)
               && (!send || (gx.GeometryEnabled && gx.BulkReady()));
+    s.calls[17] += anim;
 #ifdef LITEV_HLE_DIAG
     if (ok && (g_Check || g_Dry))
     {
         m.Flush();      // logs only
         if (g_Check)
         {
-            ArmCheck(c, 8, m, e);
-            g_P.gx.assign(gw, gw + (send ? 7 : 0));
+            ArmCheck(c, anim ? 17 : 8, m, e);
+            g_P.gx.assign(gw, gw + (send ? ngw : 0));
             g_P.fit[0] = send;
+            for (int i = 0; i < 8; i++) g_P.fitA[i] = cnt[i];
 #ifdef LITEV_A9HLE_GXCHECK
             if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
 #endif
         }
-        s.checks[8]++;
+        s.checks[anim ? 17 : 8]++;
         ok = false;
     }
 #endif
     if (!ok)
     {
-        s.fallback[8] += !g_Check;
+        s.fallback[anim ? 17 : 8] += !g_Check;
         GuestFallback(c);
         return true;
     }
     m.Flush();
-    if (send) gx.BulkWords(gw, 7);
-    s.native[8]++;
-    Return(c, e, send ? kMatTCyc : kMatTCycNoSend);
+    if (send) gx.BulkWords(gw, ngw);
+    s.native[anim ? 17 : 8]++;
+    Return(c, e, anim ? MatAnmCyc(cnt, send, 1) : send ? kMatTCyc : kMatTCycNoSend);
     return true;
 }
 #endif
@@ -2268,6 +2343,243 @@ struct Node
         Norm(o + 6);
     }
 };
+
+// ---- 17. NNS G3D material animation / texture matrix (with 8.) -----------------------------------------------------
+// What 8. falls back on in MAT_InternalDefault: the material's own texture SRT (TEXMTX_USE), the material animation
+// (NNSi_G3dAnmBlendMat over the animation objects: NNSi_G3dAnmCalcNsBta = texture SRT tracks, NNSi_G3dAnmCalcNsBtp =
+// texture pattern: frame search, texture / palette lookup by name in the texture's dictionaries) and the texture matrix
+// (render state +0xF0: per SRT-flags function, magnification, MTX_MODE / MTX_LOAD or MULT_4x4 / MTX_MODE through
+// NNS_G3dGeBufferOP_N). PW town 7.7 calls a frame, ~490 guest instructions each (14% of the ARM9's); W2 town 16.5 x ~600
+// (25%). Natively on the material result r[] (14 words) and 8.'s GX words; anything else (another animation function, a
+// texture matrix with a rotation: it divides on the divider unit, a missing texture / name, NNSi_G3dAnmCalcNsBma: material
+// colours, it can change the visibility) runs the guest code.
+// Memory: the material result, the render state (8.); the callee stack frames below sp, the scratch registers and the flags
+// are not written (dead after the return: the SBC loop calls MAT through its table; the check skips them, as for 15.).
+// ARM build (PW, PB): the functions at fixed distances from MAT_InternalDefault, checked by a hash of their code words
+// (main-RAM literals masked: the native code reads the texture matrix table's); W2: exact bytes in kW2Mat.
+// Category B: a fitted cycle estimate.
+enum : s32 { kMaBlend = -0xB10, kMaDict = 0x2C14, kMaNames = 0x2FE8, kMaTrk = 0x4B0C, kMaBta = 0x4EEC, kMaBtp = 0x500C,
+             kMaTex = 0x59B0, kMaTf = 0x56EC };
+constexpr struct { s32 off; u32 len; } kMaFn[7] = {
+    {kMaBlend, 0x6C}, {kMaDict, 0x1C0}, {kMaNames, 0x100}, {kMaTrk, 0x30C}, {kMaBta, 0x44}, {kMaBtp, 0x1B4}, {kMaTf, 0x40C}};
+constexpr u64 kMaSig = 0x3c2a1b268d7998caull;
+
+int MatAnmAt(melonDS::ARMv5* c, u32 def)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    for (auto& f : kMaFn)
+        for (u32 o = 0; o < f.len; o += 4)
+        {
+            const u8* p = CodePtr(c, def + f.off + o);
+            if (!p) return 0;
+            u32 w = R32(p);
+            if (w - 0x02000000 < 0x00400000) w = 0;     // main-RAM address literals
+            for (int b = 0; b < 4; b++) h = (h ^ ((w >> (8 * b)) & 0xFF)) * 0x100000001b3ull;
+        }
+    if (g_Stats && h != kMaSig) fprintf(stderr, "A9HLE: G3D material animation signature %016llx at %08x\n", (unsigned long long)h, def);
+    return h == kMaSig ? 1 : 2;
+}
+MatAnmVar MatAnmPW(melonDS::ARMv5* c, u32 def)
+{
+    const u8* p = CodePtr(c, def + kMaTex + 0x144);
+    return {def + kMaBlend, def + kMaBta, def + kMaBtp + 0x140, def + kMaTex, p ? R32(p) : 0,
+            {def + kMaTf, def + kMaTf + 0x7C, def + kMaTf + 0x25C, def + kMaTf + 0x2A0}};
+}
+
+// ponytail: fitted estimate (check mode without IRQs): base + per animation object + BTA + BTP + palette + dictionary step +
+// frame search step + texture matrix + TEXMTX_USE; [0] ARM build (PW town / gift box / title / loading, 9.6k calls, mean
+// error 1.9%, p95 7.7%), [1] W2 (town, town2: 8.8k calls, p95 1.8%). (No invisible animated material in the states: 8.'s
+// send / no-send difference.)
+constexpr s32 kMaCyc[2][9] = {{641, -54, 445, 376, 376, 21, 15, 266, 47}, {562, 5, 291, 235, 235, 23, 10, 327, 36}};
+s32 MatAnmCyc(const u32* cnt, bool send, int thumb)
+{
+    const s32* k = kMaCyc[thumb];
+    s32 v = k[0];
+    for (int i = 0; i < 8; i++) v += k[i + 1] * (s32)cnt[i];
+    return send ? v : v - (thumb ? 176 : 187);
+}
+
+namespace Ma
+{
+// the dictionary entry of name (NNS_G3dGetResDataByName): linear under 16 entries, else the Patricia tree; 0: none
+__attribute__((noinline)) u32 Dict(Node& q, u32 d, u32 name, u32* cnt)
+{
+    const u32 n = q.rd(d + 1, 1), o6 = q.rd(d + 6, 2), names = d + o6 + q.rd(d + o6 + 2, 2);
+    u32 nm[4];
+    for (int k = 0; k < 4; k++) nm[k] = q.rd(name + k * 4, 4);
+    u32 i = 0;
+    if (n < 16)
+    {
+        for (; i < n; i++, cnt[4]++)
+            if (q.rd(names + i * 16, 4) == nm[0] && q.rd(names + i * 16 + 4, 4) == nm[1] && q.rd(names + i * 16 + 8, 4) == nm[2]
+                && q.rd(names + i * 16 + 12, 4) == nm[3]) break;
+        if (i == n) return 0;
+    }
+    else
+    {
+        const u32 t = d + 8, c0 = q.rd(t + 1, 1);
+        if (!c0) return 0;
+        u32 prev = q.rd(t, 1), node = t + c0 * 4, rb = q.rd(node, 1);
+        while (prev > rb)
+        {
+            if (q.bad) return 0;
+            cnt[4]++;
+            const u32 b = (q.rd(name + (rb >> 5) * 4, 4) >> (rb & 31)) & 1;
+            prev = rb; node = t + q.rd(node + 1 + b, 1) * 4; rb = q.rd(node, 1);
+        }
+        i = q.rd(node + 3, 1);
+        if (i >= n) { q.bad = true; return 0; }     // (the guest reads address 0)
+        for (int k = 0; k < 4; k++) if (q.rd(names + i * 16 + k * 4, 4) != nm[k]) return 0;
+    }
+    return d + o6 + 4 + q.rd(d + o6, 2) * i;
+}
+// one texture SRT track value at frame f (0207053c; rot: the packed rotation track 0207063c)
+__attribute__((noinline)) u32 Track(Node& q, u32 res, u32 info, u32 data, u32 f, bool rot)
+{
+    if (info & 0x20000000) return data;
+    const u32 b = res + data;
+    u32 i = f, j = 0;
+    int k = 0;
+    if (info & 0xC0000000)
+    {
+        const u32 last = info & 0xFFFF;
+        if (info & 0x40000000)
+        {
+            i = f >> 1;
+            if (f & 1) { if (f > last) i = (last >> 1) + 1; else k = 1; }
+        }
+        else
+        {
+            const u32 r = f & 3;
+            i = f >> 2;
+            if (r && f > last) i = r + (last >> 2);
+            else if (r & 1) { if (f & 2) { j = f >> 2; i = j + 1; } else j = i + 1; k = 2; }
+            else if (r) k = 1;
+        }
+    }
+    if (k == 1) j = i + 1;
+    if (rot)
+    {
+        if (!k) return q.rd(b + i * 4, 4);
+        const u32 w = k == 2 ? 3 : 1, sh = k == 2 ? 14 : 15;
+        const u32 lo = w * (u32)q.rs16(b + i * 4) + (u32)q.rs16(b + j * 4);
+        const s32 hi = (s32)(w * (u32)q.rs16(b + i * 4 + 2) + (u32)q.rs16(b + j * 4 + 2)) >> (k == 2 ? 2 : 1);
+        return (u32)hi << 16 | (lo << sh) >> 16;
+    }
+    const bool h = info & 0x10000000;
+    auto v = [&](u32 x) { return h ? (u32)q.rs16(b + x * 2) : q.rd(b + x * 4, 4); };
+    if (!k) return v(i);
+    return k == 2 ? (u32)((s32)(3 * v(i) + v(j)) >> 2) : (u32)((s32)(v(i) + v(j)) >> 1);
+}
+// NNSi_G3dAnmCalcNsBta: the texture SRT of data entry di at the object's frame
+__attribute__((noinline)) bool Bta(Node& q, u32 p, u32 di, u32* r)
+{
+    const u32 res = q.rd(p + 8, 4), f = (u32)((s32)q.rd(p, 4) >> 12);
+    if (q.bad || res + 8 == 0 || di >= q.rd(res + 9, 1)) return false;
+    const u32 o = q.rd(res + 0xE, 2), e = res + 8 + o + 4 + q.rd(res + 8 + o, 2) * di;
+    u32 fl = r[0];
+    const u32 ts = Track(q, res, q.rd(e + 0x18, 4), q.rd(e + 0x1C, 4), f, false), tt = Track(q, res, q.rd(e + 0x20, 4), q.rd(e + 0x24, 4), f, false);
+    if (!ts && !tt) fl |= 4; else { r[9] = ts; r[10] = tt; fl &= ~4u; }
+    const u32 rt = Track(q, res, q.rd(e + 0x10, 4), q.rd(e + 0x14, 4), f, true);
+    if (rt == 0x10000000) fl |= 2; else { r[8] = rt; fl &= ~2u; }
+    const u32 ss = Track(q, res, q.rd(e, 4), q.rd(e + 4, 4), f, false), st = Track(q, res, q.rd(e + 8, 4), q.rd(e + 0xC, 4), f, false);
+    if (ss == 0x1000 && st == 0x1000) fl |= 1; else { r[6] = ss; r[7] = st; fl &= ~1u; }
+    r[0] = fl | 8;
+    r[4] = (r[4] & 0x3FFFFFFF) | 0x40000000;
+    return !q.bad;
+}
+// NNSi_G3dAnmCalcNsBtp: the texture (and palette) of data entry di at the object's frame
+__attribute__((noinline)) bool Btp(Node& q, u32 p, u32 di, u32* r, u32* cnt)
+{
+    const u32 res = q.rd(p + 8, 4), fr = (q.rd(p, 4) << 4) >> 16, tex = q.rd(p + 0x14, 4);
+    if (q.bad || res + 0xC == 0 || di >= q.rd(res + 0xD, 1) || !tex) return false;
+    const u32 o = q.rd(res + 0x12, 2), d = res + 0xC + o + 4 + q.rd(res + 0xC + o, 2) * di;
+    const u32 tab = res + q.rd(d + 6, 2), num = q.rd(d, 2);
+    u32 n = (u32)(q.rs16(d + 4) * (s32)fr) >> 12;
+    for (; n && q.rd(tab + n * 4, 2) >= fr; n--) if (q.bad || ++cnt[5] > 4096) return false;
+    for (; n + 1 < num && q.rd(tab + n * 4 + 4, 2) <= fr; n++) if (q.bad || ++cnt[5] > 4096) return false;
+    const u32 e = tab + n * 4, ti = q.rd(e + 2, 1), pi = q.rd(e + 3, 1);
+    if (q.bad || ti >= q.rd(res + 6, 1)) return false;
+    const u32 td = Dict(q, tex + 0x3C, res + q.rd(res + 8, 2) + ti * 16, cnt);
+    if (!td || q.bad) return false;
+    const u32 t0 = q.rd(td, 4), t1 = q.rd(td + 4, 4);
+    r[4] = (r[4] & 0xC00F0000) | (t0 + (q.rd(tex + ((t0 & 0x1C000000) == 0x14000000 ? 0x18 : 8), 4) & 0xFFFF));
+    r[11] = (t1 & 0x7FF) | ((t1 >> 11) & 0x7FF) << 16;
+    r[12] = r[13] = 0x1000;
+    if (pi == 0xFF) return !q.bad;
+    cnt[3]++;
+    const u32 po = q.rd(tex + 0x34, 2);
+    if (q.bad || pi >= q.rd(res + 7, 1) || !po) return false;
+    const u32 pd = Dict(q, tex + po, res + q.rd(res + 0xA, 2) + pi * 16, cnt);
+    if (!pd || q.bad) return false;
+    u32 a = q.rd(pd, 2), b = q.rd(tex + 0x2C, 4) & 0xFFFF;
+    if (!(q.rd(pd + 2, 2) & 1)) { a >>= 1; b >>= 1; }
+    r[5] = a + b;
+    return !q.bad;
+}
+inline u32 MulFx(u32 a, u32 b) { return (u32)(((s64)(s32)a * (s32)b) >> 12); }
+}
+
+bool MatAnm(melonDS::ARMv5* c, Mem& m, const MatAnmVar& v, u32 md, u32 h, u32 ro, u32 idx, u32 texFn, bool send, u32* r, u32* gw, u32& n, u32* cnt)
+{
+    Node q{c, m};
+    if (h & 1)
+    {
+        // TEXMTX_USE: the material's texture SRT (scale unless SCALEONE, rotation unless ROTZERO, translation unless TRANSZERO)
+        cnt[7]++;
+        u32 p = md + 0x2C;
+        if (h & 2) r[0] |= 1; else { r[6] = q.rd(p, 4); r[7] = q.rd(p + 4, 4); p += 8; }
+        if (h & 4) r[0] |= 2; else { r[8] = q.rd(p, 2) | q.rd(p + 2, 2) << 16; p += 4; }
+        if (h & 8) r[0] |= 4; else { r[9] = q.rd(p, 4); r[10] = q.rd(p + 4, 4); }
+        r[0] |= 8;
+    }
+    if (ro)
+    {
+        // NNSi_G3dAnmBlendMat: every animation object with this material's data
+        if (q.rd(ro + 0xC, 4) != v.blend) return false;
+        for (u32 p = q.rd(ro + 8, 4); p; p = q.rd(p + 0x10, 4))
+        {
+            if (q.bad || ++cnt[0] > 8) return false;
+            if (idx >= q.rd(p + 0x19, 1)) continue;
+            const u32 mp = q.rd(p + 0x1A + idx * 2, 2), fa = q.rd(p + 0xC, 4);
+            if ((mp & 0x300) != 0x100 || !fa) continue;
+            if (fa == v.bta) { cnt[1]++; if (!Ma::Bta(q, p, mp & 0xFF, r)) return false; }
+            else if (fa == v.btp) { cnt[2]++; if (!Ma::Btp(q, p, mp & 0xFF, r, cnt)) return false; }
+            else return false;
+        }
+    }
+    if (r[0] & 0x18)
+    {
+        r[11] = q.rd(md + 0x20, 2) | q.rd(md + 0x22, 2) << 16;
+        r[12] = q.rd(md + 0x24, 4); r[13] = q.rd(md + 0x28, 4);
+        if (send)
+        {
+            // the texture matrix (Maya mode functions; no rotation: no divider)
+            cnt[6]++;
+            const u32 k = r[0] & 7, fn = q.rd(v.tab + k * 4, 4);
+            if (texFn != v.tex || q.bad) return false;
+            u32 M[18] = {3};
+            M[16] = 0x1000; M[17] = 2;
+            const u32 oW = r[11] & 0xFFFF, oH = r[11] >> 16, sS = r[6], sT = r[7], tS = r[9], tT = r[10];
+            u32* x = M + 1;
+            if (k == 7 && fn == v.tf[3]) x[0] = x[5] = 0x1000;
+            else if (k == 3 && fn == v.tf[1]) { x[0] = x[5] = 0x1000; x[12] = (0 - tS * oW) << 4; x[13] = (tT * oH) << 4; }
+            else if (k == 6 && fn == v.tf[2]) { x[0] = sS; x[5] = sT; x[13] = (oH * (0x2000 - (sT << 1))) << 3; }
+            else if (k == 2 && fn == v.tf[0])
+            {
+                x[0] = sS; x[5] = sT;
+                x[12] = (0 - (u32)(((s64)(s32)sS * (s32)tS) >> 8)) * oW;
+                x[13] = oH * (u32)(((s64)(s32)sT * (s32)tT) >> 8) + ((oH * (0x2000 - (sT << 1))) << 3);
+            }
+            else return false;
+            if (r[12] != 0x1000) { x[0] = Ma::MulFx(r[12], x[0]); x[1] = Ma::MulFx(r[12], x[1]); x[12] = Ma::MulFx(r[12], x[12]); }
+            if (r[13] != 0x1000) { x[4] = Ma::MulFx(r[13], x[4]); x[5] = Ma::MulFx(r[13], x[5]); x[13] = Ma::MulFx(r[13], x[13]); }
+            gw[n++] = (r[0] & 8) ? 0x00101610 : 0x00101810;
+            for (int i = 0; i < 18; i++) gw[n++] = M[i];
+        }
+    }
+    return !q.bad;
+}
 
 // result: the JntAnmResult (0x58 bytes: +0 flags, +4 scale, +0x10 inverse scale (Maya), +0x28 rotation, +0x4C trans)
 // the build's functions (pointer values as stored: Thumb ones | 1) and the literal words the native code reads
@@ -2911,6 +3223,14 @@ bool Defer(melonDS::ARMv5* c)
 
 int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
 {
+#ifdef LITEV_GX_BULK
+    if (instr == kSbcInstr)
+    {
+        static thread_local Range sb[48];
+        r = sb;
+        return SbcDeps(&nds.ARM9, *Active(&nds.ARM9)->v, sb);
+    }
+#endif
     if (instr == kCardInstr)
     {
         static thread_local Range card;
@@ -2932,12 +3252,14 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     }
     if (instr == kMatInstr)
     {
-        static thread_local Range mat[3];
+        static thread_local Range mat[10];
         u32 def, opn, snd;
         MatAt(&nds.ARM9, addr, def, opn, snd);      // (after IsHook != 0) a missing call target: an empty range
         mat[0] = {def, addr + 0xB0}; mat[1] = {opn, opn ? opn + 57 * 4 : 0}; mat[2] = {snd, snd ? snd + 24 : 0};
         r = mat;
-        return 3;
+        if (!(St(&nds.ARM9).mask & 32768)) return 3;
+        for (int i = 0; i < 7; i++) mat[3 + i] = {def + kMaFn[i].off, def + kMaFn[i].off + kMaFn[i].len};     // 17.
+        return 10;
     }
 #endif
 #ifdef LITEV_GX_BULK
@@ -2983,6 +3305,12 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     }
 #ifdef LITEV_GX_BULK
     if (addr == kW2NodeEntry && (instr & 0xFFFF) == 0xB5F0) { r = kW2NodeCode; return 14; }
+    if (addr == kW2SbcHead && (instr & 0xFFFF) == 0x6820)
+    {
+        static thread_local Range sb[48];
+        r = sb;
+        return SbcDeps(&nds.ARM9, *Active(&nds.ARM9)->v, sb);
+    }
 #endif
     const Variant& v = *Active(&nds.ARM9)->v;     // after IsHook != 0
     if (addr == v.wake)
@@ -2994,7 +3322,7 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return kNumCode + 3;
     }
     if (addr == v.gx) { r = &v.gxCode; return 1; }
-    if (v.matT && addr == v.matT->sbc) { r = v.matT->code; return 4; }
+    if (v.matT && addr == v.matT->sbc) { r = v.matT->code; return 11; }
     if (v.shp && addr == v.shp)
     {
         static thread_local Range sh[13];
@@ -3022,6 +3350,13 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
     {
         if (!MaybeHookT(instr)) return 0;
 #ifdef LITEV_GX_BULK
+        if (addr == kW2SbcHead && (instr & 0xFFFF) == 0x6820)
+        {
+            State* s = Active(&nds.ARM9);
+            if (!s || !s->on || !(s->mask & 65536) || !s->v->twl) return 0;
+            s->sbcLive = SbcVerify(&nds.ARM9, *s);
+            return s->sbcLive & 1 ? 1 : 2;
+        }
         if (addr == kW2NodeEntry && (instr & 0xFFFF) == 0xB5F0)
         {
             State& s = St(&nds.ARM9);
@@ -3044,6 +3379,15 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
     }
     if (!MaybeHook(instr)) return 0;
+#ifdef LITEV_GX_BULK
+    if (instr == kSbcInstr)
+    {
+        State* s = Active(&nds.ARM9);
+        if (!s || !s->on || !(s->mask & 65536) || s->v->twl || !s->v->shp || addr != s->v->shp + kSbcHead) return 0;
+        s->sbcLive = SbcVerify(&nds.ARM9, *s);
+        return s->sbcLive & 1 ? 1 : 2;
+    }
+#endif
     if (instr == kCardInstr)
     {
         State& s = St(&nds.ARM9);
@@ -3057,7 +3401,10 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
             return !s.shpOk || !(s.mask & 2048) ? 0 : ShpIntact(&nds.ARM9, s) && AsyncIntact(&nds.ARM9, s) && GxIntact(&nds.ARM9, s)
                                                       && CodeIntact(&nds.ARM9, s, 0) ? 1 : 2;
         u32 def, opn, snd;
-        return s.on && (s.mask & 128) ? MatAt(&nds.ARM9, addr, def, opn, snd) : 0;
+        if (!s.on || !(s.mask & 128)) return 0;
+        const int k = MatAt(&nds.ARM9, addr, def, opn, snd);
+        if (k && (s.mask & 32768)) { s.anmDef = def; s.anmOk = MatAnmAt(&nds.ARM9, def) == 1; }     // 17.: verified with this block
+        return k;
     }
 #endif
 #ifdef LITEV_GX_BULK
@@ -3847,10 +4194,223 @@ __attribute__((noinline)) bool RunOs(melonDS::ARMv5* c, State& s, int k, bool ji
 }
 
 // Thumb entries (TWL SDK build: OS_Set/GetIrqFunction)
+#ifdef LITEV_GX_BULK
+// ---- 18. the NNS G3D SBC command loop (NNS_G3dDraw) -----------------------------------------------------------------
+// The loop reads the next SBC command byte, clears render-state flag 0x40 and calls the command's function through
+// NNS_G3dFuncSbcTable until a RET sets flag 0x20: ~245 commands a frame in the PW town (13 guest instructions each, 12%
+// of the ARM9's guest work; W2 town 404 x 16, 16%), and every MAT / SHP / NODEDESC command is a separate hook exit (8.,
+// 13., 15.). Natively at the loop head: the loop step, then MAT (8./17.), SHP (13.), NODEDESC (15.) through their natives
+// and NODE (visibility), POSSCALE (MTX_SCALE), RET, NOP here, command after command, until the slice's cycle budget is
+// used, an IRQ is pending, the CPU stops (a display list's DMA), the list ends or a command needs the guest (any other
+// command, a callback, a native's fallback: the loop step is done and the command's function entered as the guest's blx
+// would). The loop's own registers (PW r4 = rs, r5 = table; W2 r4 = rs + 8, r5 = rs, r6 = 0x40, r7 = table) stay; the
+// commands' scratch registers / flags are dead (the loop reloads r0-r2 for every command). PW, PB: keyed to the
+// variant's SHP address, the loop, NOP, RET, NODE and POSSCALE by a code hash; W2 (Thumb): exact bytes. The other
+// commands as their hooks verify them, at the loop block's compile. Category B: the commands' estimates + the loop's.
+// the build's addresses (Thumb entries without the bit): loop head, the loop's tail (the blx return), the command functions
+struct SbcVar { u32 head, ret, nop, rret, node, ps, mat, shp, nd, opn, ge; bool thumb; s32 cLoop, cNode, cPs, cRet, cNop; };
+constexpr struct { s32 off; u32 len; } kSbcCode[3] = {{kSbcFn, 0x44}, {kSbcNop, 0x1CC}, {kSbcPs, 0x70}};
+constexpr u64 kSbcSig = 0x651b979a2b248086ull;
+// W2: the loop (with its literal), NOP .. NODE, POSSCALE
+constexpr Range kW2SbcCode[3] = {{0x02066170, 0x020661A4}, {0x020663BC, 0x020664FC}, {0x0206768C, 0x020676D8}};
+constexpr u64 kW2SbcSig = 0x826daf6ad4bd1184ull;
+// ponytail: guest cycles (interpreter profiles, PW / W2 town): the loop per command, NODE, POSSCALE, RET, NOP
+SbcVar SbcVarOf(melonDS::ARMv5* c, const Variant& v)
+{
+    if (v.twl) return {kW2SbcHead, 0x02066194, 0x020663BC, 0x020663D0, 0x020663E8, 0x0206768C, v.matT->sbc, v.shp, kW2NodeEntry,
+                       v.matT->opn, v.matT->ge, true, 22, 87, 132, 16, 16};
+    const u32 def = v.shp + kSbcMat - kMatOff, opn = BlTarget(c, def + 263 * 4);
+    return {v.shp + kSbcHead, v.shp + kSbcHead + 0x28, v.shp + kSbcNop, v.shp + kSbcRet, v.shp + kSbcNode, v.shp + kSbcPs,
+            v.shp + kSbcMat, v.shp, v.shp + kSbcNd, opn, opn ? R32(CodePtr(c, opn + 55 * 4)) : 0, false, 24, 88, 142, 20, 18};
+}
+
+int SbcAt(melonDS::ARMv5* c, const Variant& v)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    auto add = [&](u32 a, u32 b) { for (; a < b; a++) { const u8* p = CodePtr(c, a); if (!p) return false; h = (h ^ *p) * 0x100000001b3ull; } return true; };
+    if (v.twl) { for (auto& r : kW2SbcCode) if (!add(r.a, r.b)) return 0; }
+    else for (auto& f : kSbcCode) if (!add(v.shp + f.off, v.shp + f.off + f.len)) return 0;
+    const u64 want = v.twl ? kW2SbcSig : kSbcSig;
+    if (g_Stats && h != want) fprintf(stderr, "A9HLE: G3D SBC loop signature %016llx\n", (unsigned long long)h);
+    return h == want ? 1 : 2;
+}
+// the loop hook's code ranges: its own, MAT (+ 17.), SHP (13. with 10.), NODEDESC
+int SbcDeps(melonDS::ARMv5* c, const Variant& v, Range* r)
+{
+    int n = 0;
+    if (v.twl)
+    {
+        for (auto& x : kW2SbcCode) r[n++] = x;
+        for (auto& x : v.matT->code) r[n++] = x;
+        for (auto& x : kW2NodeCode) r[n++] = x;
+    }
+    else
+    {
+        for (auto& f : kSbcCode) r[n++] = {v.shp + f.off, v.shp + f.off + f.len};
+        const u32 def = v.shp + kSbcMat - kMatOff;
+        u32 d, opn, snd;
+        MatAt(c, v.shp + kSbcMat, d, opn, snd);
+        r[n++] = {def, v.shp + kSbcMat + 0xB0}; r[n++] = {opn, opn ? opn + 57 * 4 : 0}; r[n++] = {snd, snd ? snd + 24 : 0};
+        for (auto& f : kMaFn) r[n++] = {def + f.off, def + f.off + f.len};
+        const u32 e = v.shp + kSbcNd;
+        u32 fn[4];
+        NodeAt(c, e, fn);
+        for (auto& f : kNodeFn) r[n++] = {e + f.off, e + f.off + f.len};
+        r[n++] = {fn[0], fn[0] ? fn[0] + 57 * 4 : 0}; r[n++] = {fn[1], fn[1] ? fn[1] + 24 : 0};
+        r[n++] = {fn[2], fn[2] ? fn[2] + 69 * 4 : 0}; r[n++] = {fn[3], fn[3] ? fn[3] + 14 : 0};
+    }
+    for (int i = 0; i < 3; i++) r[n++] = v.shpCode[i];
+    for (int i = 0; i < 7; i++) if (v.asyncCode[i].b) r[n++] = v.asyncCode[i];
+    r[n++] = v.gxCode; r[n++] = v.code[3]; r[n++] = v.code[9];
+    return n;
+}
+// verified with the loop's hook block (IsHook): bit 0 the loop's own code, 1 MAT (+ 17. in anmOk), 4 SHP, 8 NODEDESC
+u32 SbcVerify(melonDS::ARMv5* c, State& s)
+{
+    const Variant& v = *s.v;
+    if (SbcAt(c, v) != 1) return 0;
+    u32 ok = 1, def, opn, snd, fn[4];
+    if (v.twl)
+    {
+        if (!s.matTOk || !MatTIntact(c, s)) return 0;     // (POSSCALE's OP_N is MAT's)
+        if (s.mask & 128) ok |= 2;
+        if ((s.mask & 8192) && W2NodeAt(c) == 1) ok |= 8;
+    }
+    else
+    {
+        if (MatAt(c, v.shp + kSbcMat, def, opn, snd) != 1 || BlTarget(c, v.shp + kSbcPs + 0x58) != opn) return 0;    // (POSSCALE's OP_N)
+        if (s.mask & 128)
+        {
+            ok |= 2;
+            s.anmDef = def; s.anmOk = (s.mask & 32768) && MatAnmAt(c, def) == 1;
+        }
+        if ((s.mask & 8192) && NodeAt(c, v.shp + kSbcNd, fn) == 1) ok |= 8;
+    }
+    if (s.shpOk && (s.mask & 2560) == 2560 && ShpIntact(c, s) && AsyncIntact(c, s) && GxIntact(c, s) && CodeIntact(c, s, 0)) ok |= 4;
+    return ok;
+}
+
+// NODE (visibility) natively: false = the guest function
+bool SbcNode(melonDS::ARMv5* c, Mem& m, const Obj& RS, u32 sbc)
+{
+    u32 fl = RS.r(8);
+    if (fl & 0x200) { m.W(RS, 0, sbc + 3); return true; }
+    const u8* p = m.P(sbc + 1);
+    if (!p || m.P(sbc + 2) != p + 1) return false;
+    const u32 id = p[0], cbT = RS.r(0x14) ? RS.p[0x8E] : 0;
+    if (cbT >= 1 && cbT <= 3) return false;
+    const u32 ro = RS.r(4);
+    const u8* rp = m.P(ro);
+    if (!rp || (ro & 3) || m.P(ro + 0x4F + (id >> 5) * 4) != rp + 0x4F + (id >> 5) * 4) return false;
+    if (R32(rp + 0x18) && (R32(rp + 0x4C + (id >> 5) * 4) >> (id & 31) & 1)) return false;     // visibility animation
+    const u32 vis = p[1] & 1;
+    m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFFu) | id);
+    m.W(RS, 0xB8, RS.a + 0x184);
+    m.W(RS, 0x184, vis);
+    m.W(RS, 8, vis ? fl | 5 : (fl | 4) & ~1u);
+    m.W(RS, 0, sbc + 3);
+    return true;
+}
+
+__attribute__((noinline)) bool RunSbc(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const SbcVar V = SbcVarOf(c, *s.v);
+    const u32 L = c->R[15] - (V.thumb ? 4 : 8), ret = V.ret, back = V.thumb ? ret + 2 : ret + 4;
+    Mem m(c, false);
+    const u32 rs = c->R[V.thumb ? 5 : 4], tab = c->R[V.thumb ? 7 : 5];
+    Obj RS = m.O(rs, 0x188);
+    const u8* lp = CodePtr(c, V.thumb ? 0x020661A0 : L + 0x38);
+    const u32 ok = s.sbcLive;
+    if (!jit || CheckPending || g_Check || g_Dry || !(ok & 1) || L != V.head || !RS || !lp || tab != R32(lp)
+        || (V.thumb && (c->R[4] != rs + 8 || c->R[6] != 0x40)))
+    {
+        GuestFallback(c);
+        return true;
+    }
+    melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
+    s.calls[18]++;
+    for (u32 it = 0;; it++)
+    {
+        // the loop step: flag 0x40 cleared, the command, its function
+        const u32 sbc = RS.r(0);
+        const u8* op = m.P(sbc);
+        const u8* tp = op ? m.P(tab + (*op & 31) * 4) : nullptr;
+        if (!tp)
+        {
+            if (!it) GuestFallback(c);
+            return true;    // (at the loop's tail: the guest's ldr / tst / beq)
+        }
+        const u32 fn = R32(tp), f = fn & ~1u, cmd = *op;
+        m.W(RS, 8, RS.r(8) & ~0x40u);
+        m.Flush();
+        c->R[0] = rs; c->R[1] = cmd & 0xE0; c->R[2] = fn; c->R[14] = ret | V.thumb;
+        if (!V.thumb) c->R[3] = cmd;
+        c->Cycles += V.cLoop;
+        s.native[18]++;
+        bool done = false;
+        if ((fn & 1) == V.thumb && (f == V.mat || f == V.shp || f == V.nd))
+        {
+            if (f == V.shp ? ok & 4 : f == V.nd ? ok & 8 : ok & 2)
+            {
+                c->R[15] = f + (V.thumb ? 4 : 8);
+                const u8* ip = CodePtr(c, f);
+                c->CurInstr = V.thumb ? R16(ip) : R32(ip);
+                if (f == V.nd) RunNode(c, s, true);
+                else if (V.thumb) { if (f == V.shp) RunShpT(c, s, true); else RunMatT(c, s, true); }
+                else if (f == V.shp) RunShp(c, s, true);
+                else RunMat(c, s, true);
+                if (c->R[15] != back) return true;     // the command's guest code (its first instruction ran) or a stop
+                done = true;
+            }
+        }
+        else if ((fn & 1) != V.thumb) {}
+        else if (f == V.node && SbcNode(c, m, RS, sbc)) { c->Cycles += V.cNode; done = true; }
+        else if (f == V.rret && !RS.r(0x10)) { m.W(RS, 8, RS.r(8) | 0x20); c->Cycles += V.cRet; done = true; }
+        else if (f == V.nop && !RS.r(0xC)) { m.W(RS, 0, sbc + 1); c->Cycles += V.cNop; done = true; }
+        else if (f == V.ps)
+        {
+            const u32 fl = RS.r(8);
+            if (fl & 0x300) { m.W(RS, 0, sbc + 1); c->Cycles += V.cPs / 4; done = true; }
+            else if (V.opn && gx.GeometryEnabled && gx.BulkReady())
+            {
+                const u8* g = m.P(V.ge);
+                const u32 gb = g && m.P(V.ge + 7) == g + 7 ? R32(g) : 1;
+                const u8* gq = gb ? m.P(gb) : nullptr;
+                if (g && !R32(g + 4) && (!gb || (gq && !R32(gq))))
+                {
+                    const u32 val = RS.r(cmd & 0xE0 ? 0xE4 : 0xE0), w[4] = {0x1B, val, val, val};
+                    m.W(RS, 0, sbc + 1);
+                    m.Flush();
+                    gx.BulkWords(w, 4);
+                    c->Cycles += V.cPs;
+                    done = true;
+                }
+            }
+        }
+        m.Flush();
+        if (!done)
+        {
+            // the command's function as the guest calls it (blx: lr = the loop's tail)
+            c->JumpTo(fn);
+            return true;
+        }
+        // the loop's tail (ldr / tst #0x20 / beq head): stop there (the guest runs it) when the list ended, the slice's
+        // budget is used, an IRQ is pending or the CPU stops
+        if (c->R[15] != back) c->JumpTo(ret | V.thumb);
+        if ((RS.r(8) & 0x20) || c->Cycles >= c->CyclesBudget || c->Halted || (c->IRQ && !(c->CPSR & 0x80)) || c->StopExecution) return true;
+    }
+}
+#endif
+
 __attribute__((noinline)) bool RunThumb(melonDS::ARMv5* c, bool jit)
 {
     const u32 pc = c->R[15] - 4, in = c->CurInstr & 0xFFFF;
 #ifdef LITEV_GX_BULK
+    if (pc == kW2SbcHead && in == 0x6820)
+    {
+        State* s = Active(c);
+        return s && s->on && (s->mask & 65536) && s->v->twl && RunSbc(c, *s, jit);
+    }
     if (pc == kW2NodeEntry && in == 0xB5F0)
     {
         State& s = St(c);
@@ -3883,6 +4443,13 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 64) && RunLz(c, s, jit);
     }
+#ifdef LITEV_GX_BULK
+    if (in == kSbcInstr)
+    {
+        State* s = Active(c);
+        return s && s->on && (s->mask & 65536) && !s->v->twl && s->v->shp && pc == s->v->shp + kSbcHead && RunSbc(c, *s, jit);
+    }
+#endif
     if (in == kCardInstr)
     {
         State& s = St(c);
@@ -3993,7 +4560,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         g_State[&c->NDS].diffs[g_P.kind]++;
         return;
     }
-    if (!atVec && (pc != (e.retPc & ~1u) || ((cpu->CPSR ^ e.CPSR) & (g_P.kind == 15 ? 0x0FFFFFFFu : ~0u)))) return;
+    if (!atVec && (pc != (e.retPc & ~1u) || ((cpu->CPSR ^ e.CPSR) & (g_P.kind == 15 || g_P.kind == 17 ? 0x0FFFFFFFu : ~0u)))) return;
     if (g_P.kind == 10 || g_P.kind == 13) gR[1] = e.R[1];     // GX async: r1 = the IF value read (not modelled)
     if (g_P.kind == 6 && (cpu->R[2] != e.R[2] || cpu->R[3] != e.R[3] || cpu->R[6] != e.R[6])) return;   // LZ: same progress
     melonDS::NDS& nds = c->NDS;
@@ -4016,6 +4583,9 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         fprintf(stderr, "FXFIT %u %u %llu\n", g_P.fit[0], g_P.fit[1], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 15 && getenv("LITEV_A9HLE_NODEFIT") && !g_P.irq)
         fprintf(stderr, "NODEFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 17 && getenv("LITEV_A9HLE_MATFIT") && !g_P.irq)
+        fprintf(stderr, "MATANMFIT %u %u %u %u %u %u %u %u %u %llu\n", g_P.fit[0], g_P.fitA[0], g_P.fitA[1], g_P.fitA[2], g_P.fitA[3], g_P.fitA[4],
+                g_P.fitA[5], g_P.fitA[6], g_P.fitA[7], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 8 && getenv("LITEV_A9HLE_MATFIT") && !g_P.irq)
         fprintf(stderr, "MATFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 9 && getenv("LITEV_A9HLE_LLFIT") && !g_P.irq)
@@ -4044,7 +4614,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     {
         u8* p = m.P(a);
         if (!p || (k == 6 && (a < g_P.lzLo || a >= g_P.lzHi))) continue;
-        if (k == 15 && a - (e.R[13] - 0x400) < 0x400) continue;     // G3D node: callee frames below sp (dead)
+        if ((k == 15 || k == 17) && a - (e.R[13] - 0x400) < 0x400) continue;     // G3D node / material animation: callee frames below sp (dead)
         auto it = exp.find(a);
         u8 want = it != exp.end() ? it->second : old(a);
         if (*p != want)
@@ -4054,7 +4624,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         }
     }
     for (int i = 0; i < 15; i++)
-        if (gR[i] != e.R[i] && !(k == 15 && (i == 1 || i == 2 || i == 3 || i == 12 || i == 14)))   // G3D node: scratch
+        if (gR[i] != e.R[i] && !((k == 15 || k == 17) && (i == 1 || i == 2 || i == 3 || i == 12 || i == 14)))   // G3D node / material animation: scratch
         {
             if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " r%d guest %08x native %08x;", i, gR[i], e.R[i]);
             nd++;
@@ -4081,7 +4651,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             nd++;
         }
     }
-    if (k == 8 || (k == 13 && g_P.small) || k == 15)
+    if (k == 8 || (k == 13 && g_P.small) || k == 15 || k == 17)
     {
         // GXFIFO words: the guest's stores to GXFIFO, then what reached BulkWords (MI_CpuSend32 under GX_CPUSEND)
         std::vector<u32> gw;
