@@ -16,6 +16,7 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsy
 #endif
 #include <map>
 #include <sys/resource.h>
+#include <pthread.h>
 
 #include <cstdio>
 #include <cstring>
@@ -1148,6 +1149,9 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     auto runInstance = [&](int inst)
     {
         BuiltNDS& bi = b[inst];
+#ifdef __linux__
+        { char nm[16]; snprintf(nm, sizeof nm, "inst%d", inst); pthread_setname_np(pthread_self(), nm); }  // per-console perf/simpleperf attribution
+#endif
         // LITEV_MP_PREROLL=K:N: console K runs N frames (no input) before its frame 0, in every process: its
         // frame count then trails the others' by N at the same emulated time (on the RG DS the consoles' frame
         // counts sat >30 apart in a linked race, which deadlocked the first LITEV_NP_SPEED)
