@@ -11,7 +11,8 @@
 // of ARM7 cycles instead of the real count, scratch registers/stack bytes are not written and
 // the channels' hardware-busy bits are sampled at entry. Deterministic and version-locked.
 // Runtime: debug.litev.a7hle (prop on Android, env elsewhere; default on), latched per NDS: 0 off, 1 all, else a
-// mask (1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit).
+// mask (1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit, 16 SeqMain / commit also on the MKDS driver: default
+// off, its 8-console race session fails).
 // ExChannelMain has a variant per driver build: Pokemon B/W/W2 and Mario Kart DS (2005 SDK; the 8-player Netplay
 // benchmark: ~22% of its ARM7 guest instructions in the race).
 //
