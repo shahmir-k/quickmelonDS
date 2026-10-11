@@ -611,6 +611,15 @@ endif()
 # Never in a shipping build.
 option(LITEV_HLE_DIAG "Diagnostic: A9HLE/A7HLE compare mode, dry runs, timing" OFF)
 if (LITEV_HLE_DIAG)
+    # ARM9HLE's compare path records generalized-idle accesses, and its shared
+    # signature matcher lives with the GX bulk helpers.  Make this diagnostic
+    # configuration self-contained instead of relying on callers to discover
+    # the transitive feature set from compiler errors.
+    set(LITEV_JIT_IDLE2 ON CACHE BOOL "" FORCE)
+    set(LITEV_GX_BULK ON CACHE BOOL "" FORCE)
+    set(LITEV_GXFIFO_THREADED ON CACHE BOOL "" FORCE)
+    set(LITEV_GXFIFO_UNIFIED ON CACHE BOOL "" FORCE)
+    set(LITEV_DMA_GXFIFO_FAST ON CACHE BOOL "" FORCE)
     add_compile_definitions(LITEV_HLE_DIAG=1)
 endif()
 
