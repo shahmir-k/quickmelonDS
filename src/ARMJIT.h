@@ -163,14 +163,24 @@ public:
 #ifdef LITEV_JIT_BGEMIT
     // Background emission (see JitEmitJob). Jobs live for one block-cache epoch, by id.
     int BgMode = 0;
-    std::vector<std::unique_ptr<JitEmitJob>> Jobs;
-    std::deque<JitEmitJob*> EmitQueue;        // FIFO: the stream layout is the decode order
-    u64 QueueBound = 0, QueueFarBound = 0;    // sum of the queued jobs' code bounds
-    std::vector<JitEmitJob*> DoneList;        // emitted, not finalized yet
-    std::condition_variable_any QueueCv, DoneCv;
+    std::vector<std::unique_ptr<JitEmitJob>> JobStore;   // every job ever allocated (reused)
+    std::vector<JitEmitJob*> FreeJobs;
+    u32 NextJobId = 0;                        // = the job's entry stub index
+    // The queue: Ring[Head..Tail) waits for emission (Ring[k] is the k-th job queued since the
+    // reset, = Jobs[k]). The emulator thread alone moves Tail, the emitter (EmitLock holder) Head.
+    static constexpr u32 RingSize = 2 * 1024 * 1024 / 16;   // = the entry stub arena's capacity
+    std::unique_ptr<JitEmitJob*[]> Ring;
+    std::atomic<u32> Head {0}, Tail {0};
+    u32 Finalized = 0;                        // jobs [0, Finalized) are linked in (emulator thread)
+    u64 EnqBound = 0, EnqFarBound = 0;        // sum of the code bounds queued since the reset
+    std::atomic<s64> PublishedUsed {0}, PublishedFar {0};   // the stream's end after job Head-1
     std::thread Worker;
-    bool WorkerStop = false, WorkerBusy = false;
-    u64 BgBoundMisses = 0;
+    std::mutex SleepLock;
+    std::condition_variable SleepCv, DoneCv;
+    std::atomic<bool> EmuWaiting {false};
+    std::atomic<bool> WorkerStop {false}, WorkerSleeping {false};
+    bool EmitFront(bool onWorker);
+    u64 BgBoundMisses = 0, StatResolves = 0, StatWaits = 0, StatSteals = 0;
     void EmitJob(JitEmitJob& j, bool onWorker);   // EmitLock held
     void WaitJob(JitEmitJob& j);
     void DrainEmits();

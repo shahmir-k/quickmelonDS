@@ -223,7 +223,8 @@ struct JitEmitJob
     u32 CPSR = 0;
     u32 Id = 0;
     u32 StubOff = 0;
-    u32 Bound = 0, FarBound = 0;    // upper bounds of the code it emits (main, far region)
+    u32 Bound = 0, FarBound = 0;
+    u64 BoundPrefix = 0, FarBoundPrefix = 0;   // sum of the bounds queued before it    // upper bounds of the code it emits (main, far region)
     JitMemCtx Ctx {};
     FetchedInstr Instrs[32];
     Snap Snaps[64];
@@ -296,6 +297,7 @@ public:
     void* Gen_PendingThunk(u32 num);
     u32 WriteEntryStub(u32 jobId, u32 num);   // returns the stub's RX offset, 0 if the arena is full
     void PatchEntryStub(u32 stubOff, u32 targetOff);
+    void WriteAllEntryStubs();
     u8* RWBase = nullptr;
     std::recursive_mutex EmitLock;   // the emitter (stream cursor, patch log, code patches)
 #endif

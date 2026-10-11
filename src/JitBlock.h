@@ -76,6 +76,7 @@ public:
 #ifdef LITEV_JIT_BGEMIT
     // emitted in the background: EntryPoint is the block's entry stub, Job holds the code
     JitEmitJob* Job = nullptr;
+    u32 RealOff = 0;   // its code, once finalized (0: still through the stub)
     ~JitBlock();
 #endif
 

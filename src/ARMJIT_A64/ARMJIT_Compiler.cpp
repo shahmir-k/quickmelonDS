@@ -2081,7 +2081,11 @@ void Compiler::PatchLinkSite(u32 rxOffset, u32 targetRxOffset)
     assert(delta >= -(1 << 27) && delta < (1 << 27));
     u32 instr = 0x14000000u | ((u32)((delta >> 2)) & 0x03FFFFFFu);
 
+#ifdef LITEV_JIT_BGEMIT
+    u8* rwbase = BgLayout ? RWBase : GetWriteableRWPtr() - GetCodeOffset();   // (the cursor may be moving)
+#else
     u8* rwbase = GetWriteableRWPtr() - GetCodeOffset();   // m_rwbase
+#endif
     *(u32*)(rwbase + rxOffset) = instr;
 
     u8* rxptr = GetRXBase() + rxOffset;
@@ -2098,7 +2102,11 @@ void Compiler::DirectPatchWriteBranch(u32 rxOffset, u32 targetRxOffset)
     assert(delta >= -(1 << 27) && delta < (1 << 27));
     u32 instr = 0x14000000u | ((u32)((delta >> 2)) & 0x03FFFFFFu);
 
+#ifdef LITEV_JIT_BGEMIT
+    u8* rwbase = BgLayout ? RWBase : GetWriteableRWPtr() - GetCodeOffset();   // (the cursor may be moving)
+#else
     u8* rwbase = GetWriteableRWPtr() - GetCodeOffset();   // m_rwbase
+#endif
     *(u32*)(rwbase + rxOffset) = instr;
 
     u8* rxptr = GetRXBase() + rxOffset;
@@ -2128,7 +2136,9 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
     // headroom). Back off (reset streak, retry later) rather than promote when tight.
 #ifdef LITEV_JIT_BGEMIT
     // its own arena (the block stream belongs to the emitter, which may be another thread)
-    std::lock_guard<std::recursive_mutex> lk(EmitLock);
+    // host-only: when the emitter is busy, promote later
+    std::unique_lock<std::recursive_mutex> lk(EmitLock, std::try_to_lock);
+    if (!lk.owns_lock()) { e.hitCount = 0; return; }
     ptrdiff_t streamAt = GetCodeOffset();
     if (BgLayout)
     {
@@ -2266,9 +2276,6 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
 // missed). The leaked stub is reclaimed at the next ResetBlockCache.
 void Compiler::DirectPatchDemote(u32 num, u32 site)
 {
-#ifdef LITEV_JIT_BGEMIT
-    std::lock_guard<std::recursive_mutex> lk(EmitLock);
-#endif
     if (site == 0 || site >= ICacheSites || !ICacheTable[num]) return;
     ICacheEntry& e = ICacheTable[num][site];
     if (!e.promoted) return;
@@ -2514,18 +2521,28 @@ bool Compiler::R15LiteralLoadFolds(CompileFunc comp)
 // it); until then the thunk asks ARMJIT::PendingResolve for the code, waiting for it if needed.
 u32 Compiler::WriteEntryStub(u32 jobId, u32 num)
 {
+    // written for every id at the cache reset (WriteAllEntryStubs): stub k belongs to job k
+    (void)num;
     if (StubArenaEnd - StubCursor < 16)
         return 0;
     u32 off = (u32)StubCursor;
+    assert(off == StubArenaStart + 16 * jobId);
     StubCursor += 16;
-    u32 thunkOff = (u32)((u8*)PendingThunk[num] - GetRXBase());
-    u32* w = (u32*)(RWBase + off);
-    w[0] = 0x14000001u;
-    w[1] = 0x52800000u | ((jobId & 0xFFFF) << 5) | 17;
-    w[2] = 0x72A00000u | ((jobId >> 16) << 5) | 17;
-    w[3] = 0x14000000u | ((u32)((s32)(thunkOff - (off + 12)) >> 2) & 0x03FFFFFFu);
-    FlushIcacheSection(GetRXBase() + off, GetRXBase() + off + 16);
     return off;
+}
+
+void Compiler::WriteAllEntryStubs()
+{
+    u32 thunkOff = (u32)((u8*)PendingThunk[0] - GetRXBase());
+    for (u32 off = StubArenaStart, id = 0; off + 16 <= StubArenaEnd; off += 16, id++)
+    {
+        u32* w = (u32*)(RWBase + off);
+        w[0] = 0x14000001u;
+        w[1] = 0x52800000u | ((id & 0xFFFF) << 5) | 17;
+        w[2] = 0x72A00000u | ((id >> 16) << 5) | 17;
+        w[3] = 0x14000000u | ((u32)((s32)(thunkOff - (off + 12)) >> 2) & 0x03FFFFFFu);
+    }
+    FlushIcacheSection(GetRXBase() + StubArenaStart, GetRXBase() + StubArenaEnd);
 }
 
 void Compiler::PatchEntryStub(u32 stubOff, u32 targetOff)
@@ -2585,6 +2602,7 @@ void Compiler::CaptureEmitInputs(ARM* cpu, JitEmitJob& job)
     job.NumSnaps = 0;
     job.NumA7 = 0;
     const bool litOpt = NDS.JIT.LiteralOptimizationsEnabled();
+    u32 farParts = 0;
 
     auto literal = [&](u32 iaddr, int size, bool sx, u32 addr, u32 r15)
     {
@@ -2626,6 +2644,8 @@ void Compiler::CaptureEmitInputs(ARM* cpu, JitEmitJob& job)
         CompileFunc comp = thumb ? T_Comp[in.Info.Kind] : A_Comp[in.Info.Kind];
         if (!thumb && in.Info.Kind != ARMInstrInfo::ak_BLX_IMM && (instr >> 28) == 0xF)
             comp = nullptr;   // CompileBlock: Comp_AddCycles_C only
+        if (comp == &Compiler::A_Comp_LDM_STM || comp == &Compiler::T_Comp_PUSH_POP || comp == &Compiler::T_Comp_LDMIA_STMIA)
+            farParts++;
         if (comp == &Compiler::A_Comp_BranchImm)
         {
             u32 target = r15 + ((s32)(instr << 8) >> 6);
@@ -2672,8 +2692,10 @@ void Compiler::CaptureEmitInputs(ARM* cpu, JitEmitJob& job)
         else if (comp == &Compiler::T_Comp_LoadPCRel && litOpt)
         {
             u32 offset = (instr & 0xFF) << 2;
-            if (!literal(i, 32, false, (r15 & ~0x2) + offset, r15))
-                literal(i, 32, false, r15 + offset, r15);   // Comp_MemAccess's own literal try
+            // an invalidated literal: Comp_MemAccess tries R15 + offset itself (the same address
+            // unless R15 & 2, which then finds the same capture)
+            if (!literal(i, 32, false, (r15 & ~0x2) + offset, r15) && (r15 & 0x2))
+                literal(i, 32, false, r15 + offset, r15);
         }
 #ifdef LITEV_JIT_IDLE2
         if ((in.BranchFlags & branch_Idle2Cand) && num == 0
@@ -2681,8 +2703,9 @@ void Compiler::CaptureEmitInputs(ARM* cpu, JitEmitJob& job)
             job.Add(JitEmitJob::SnapIdle2, i).P = ((ARMv5*)cpu)->Idle2EnableByte(in.Addr | (thumb ? 1 : 0));
 #endif
     }
+    // code bounds (CheckCodeSpace): the block, and the far-region slow path of each LDM/STM
     job.Bound = 1024 + 512 * job.Count;
-    job.FarBound = 1024 + 512 * job.Count;
+    job.FarBound = 1536 * farParts;
 }
 
 JitEmitJob::Snap* Compiler::EmitSnap(u8 kind, u32 addr)
@@ -3362,11 +3385,11 @@ void Compiler::Reset()
 #ifdef LITEV_JIT_BGEMIT
     if (BgLayout)
     {
-        PendingThunk[0] = Gen_PendingThunk(0);
-        PendingThunk[1] = Gen_PendingThunk(1);
+        PendingThunk[0] = PendingThunk[1] = Gen_PendingThunk(0);
         StubCursor = StubArenaStart;
         DPCursor = DPArenaStart;
         RWBase = (u8*)GetRWPtr() - GetCodeOffset();
+        WriteAllEntryStubs();
     }
 #endif
     FlushIcache();

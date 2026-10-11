@@ -786,10 +786,15 @@ int main(int argc, char** argv)
         }
 #endif
         if (frameMs)
-            printf("FRAME %d %.3f ms jit %llu mprotect %llu rewrites %llu\n", frame,
+{
+            static u64 li, lc;   // emu-thread instructions / cycles this frame (macOS thread counters)
+            printf("FRAME %d %.3f ms jit %llu mprotect %llu rewrites %llu instr %llu cyc %llu\n", frame,
                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fms0).count(),
                    (unsigned long long)(melonDS::JitCompileCount - jit0),
-                   (unsigned long long)(melonDS::JitProtectCalls - prot0), (unsigned long long)(melonDS::JitProtectFaults - flt0));
+                   (unsigned long long)(melonDS::JitProtectCalls - prot0), (unsigned long long)(melonDS::JitProtectFaults - flt0),
+                   (unsigned long long)(EmuThreadInstr - li), (unsigned long long)(EmuThreadCycles - lc));
+            li = EmuThreadInstr; lc = EmuThreadCycles;
+            }
 #ifdef LITEV_JIT_COMPILE_STATS
         if (frameMs)
         {   // compile time per phase this frame, microseconds (src/ARMJIT_Internal.h JitPhase)

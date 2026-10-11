@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 #define XXH_STATIC_LINKING_ONLY
 #include "xxhash/xxhash.h"
@@ -387,13 +388,17 @@ INSTANTIATE_SLOWMEM(1)
 ARMJIT::~ARMJIT() noexcept
 {
 #ifdef LITEV_JIT_BGEMIT
+    if (BgMode && getenv("LITEV_JITBG_STATS"))
+        fprintf(stderr, "JITBG mode %d: resolves %llu waits %llu steals %llu bound-misses %llu\n", BgMode,
+                (unsigned long long)StatResolves, (unsigned long long)StatWaits, (unsigned long long)StatSteals,
+                (unsigned long long)BgBoundMisses);
     if (Worker.joinable())
     {
         {
-            std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
+            std::lock_guard<std::mutex> l(SleepLock);
             WorkerStop = true;
         }
-        QueueCv.notify_all();
+        SleepCv.notify_all();
         Worker.join();
     }
 #endif
@@ -759,6 +764,8 @@ ARMJIT::ARMJIT(melonDS::NDS& nds, std::optional<JITArgs> jit) noexcept :
 {
 #ifdef LITEV_JIT_BGEMIT
     BgMode = JITCompiler.BgLayout ? JitBgMode() : 0;
+    if (BgMode)
+        Ring.reset(new JitEmitJob*[RingSize]);
     if (BgMode == 2)
         Worker = std::thread([this] { WorkerLoop(); });
 #endif
@@ -791,9 +798,7 @@ JitBlock::~JitBlock()
 
 u32 ARMJIT::EntryOff(JitBlock* block) noexcept
 {
-    if (block->Job && block->Job->Finalized)
-        return JITCompiler.SubEntryOffset(block->Job->Entry);
-    return JITCompiler.SubEntryOffset(block->EntryPoint);
+    return block->RealOff ? block->RealOff : JITCompiler.SubEntryOffset(block->EntryPoint);
 }
 
 // EmitLock held. Emits one captured block at the stream's end (the queue's front).
@@ -827,6 +832,24 @@ void ARMJIT::EmitJob(JitEmitJob& j, bool onWorker)
     j.Done.store(1, std::memory_order_release);
 }
 
+// EmitLock held: emits the queue's front, if any (queue order = stream order).
+bool ARMJIT::EmitFront(bool onWorker)
+{
+    u32 h = Head.load(std::memory_order_relaxed);
+    if (h == Tail.load(std::memory_order_acquire))
+        return false;
+    EmitJob(*Ring[h], onWorker);
+    PublishedUsed.store(JITCompiler.GetCodeOffset(), std::memory_order_relaxed);
+    PublishedFar.store(JITCompiler.OtherCodeRegion, std::memory_order_relaxed);
+    Head.store(h + 1, std::memory_order_release);
+    if (onWorker && EmuWaiting.load())
+    {
+        std::lock_guard<std::mutex> l(SleepLock);
+        DoneCv.notify_all();
+    }
+    return true;
+}
+
 void ARMJIT::WorkerLoop()
 {
 #if defined(__linux__) || defined(__ANDROID__)
@@ -834,59 +857,60 @@ void ARMJIT::WorkerLoop()
 #elif defined(__APPLE__)
     pthread_setname_np("jitemit");
 #endif
-    std::unique_lock<std::recursive_mutex> lk(JITCompiler.EmitLock);
-    while (!WorkerStop)
+    while (!WorkerStop.load())
     {
-        if (EmitQueue.empty())
+        if (Head.load() != Tail.load())
         {
-            QueueCv.wait(lk);
+            std::unique_lock<std::recursive_mutex> e(JITCompiler.EmitLock, std::try_to_lock);
+            if (e.owns_lock())
+                while (EmitFront(true)) {}
+            else
+                std::this_thread::yield();
             continue;
         }
-        JitEmitJob* j = EmitQueue.front();
-        EmitQueue.pop_front();
-        QueueBound -= j->Bound; QueueFarBound -= j->FarBound;
-        WorkerBusy = true;
-        EmitJob(*j, true);
-        WorkerBusy = false;
-        DoneList.push_back(j);
-        DoneCv.notify_all();
+        std::unique_lock<std::mutex> l(SleepLock);
+        WorkerSleeping.store(true);
+        if (Head.load() == Tail.load() && !WorkerStop.load())
+            SleepCv.wait(l);
+        WorkerSleeping.store(false);
     }
 }
 
-// The emulator thread needs j's code: emit queued blocks itself (in queue order) until j is done.
+// The emulator thread needs j's code: emit queued blocks itself (in queue order) until j is done,
+// or wait while the worker is emitting.
 void ARMJIT::WaitJob(JitEmitJob& j)
 {
-    if (j.Done.load(std::memory_order_acquire))
-        return;
-    std::unique_lock<std::recursive_mutex> lk(JITCompiler.EmitLock);
+    static const bool noSteal = getenv("LITEV_JITBG_NOSTEAL") != nullptr;   // diagnosis: emulator-thread cost alone
+    if (!j.Done.load(std::memory_order_acquire))
+        StatWaits++;
     while (!j.Done.load(std::memory_order_acquire))
     {
-        if (!EmitQueue.empty())
+        if (noSteal && BgMode == 2)
         {
-            JitEmitJob* f = EmitQueue.front();
-            EmitQueue.pop_front();
-            QueueBound -= f->Bound; QueueFarBound -= f->FarBound;
-            EmitJob(*f, false);
-            DoneList.push_back(f);
+            // sleep until the worker has emitted it (counts no emulator-thread instructions)
+            std::unique_lock<std::mutex> l(SleepLock);
+            EmuWaiting.store(true);
+            if (!j.Done.load())
+                DoneCv.wait_for(l, std::chrono::milliseconds(1));
+            EmuWaiting.store(false);
+            continue;
+        }
+        std::unique_lock<std::recursive_mutex> e(JITCompiler.EmitLock, std::try_to_lock);
+        if (e.owns_lock())
+        {
+            while (!j.Done.load(std::memory_order_relaxed) && EmitFront(false))
+                StatSteals++;
         }
         else
-            DoneCv.wait(lk);   // the worker is emitting j
+            std::this_thread::yield();
     }
 }
 
+// Everything queued is emitted when this returns.
 void ARMJIT::DrainEmits()
 {
-    std::unique_lock<std::recursive_mutex> lk(JITCompiler.EmitLock);
-    while (!EmitQueue.empty())
-    {
-        JitEmitJob* f = EmitQueue.front();
-        EmitQueue.pop_front();
-        QueueBound -= f->Bound; QueueFarBound -= f->FarBound;
-        EmitJob(*f, false);
-        DoneList.push_back(f);
-    }
-    while (WorkerBusy)
-        DoneCv.wait(lk);
+    std::lock_guard<std::recursive_mutex> e(JITCompiler.EmitLock);
+    while (EmitFront(false)) {}
 }
 
 // Emulator thread: point the block's entry stub (and its lookup entry) at the code, link its exits.
@@ -894,14 +918,18 @@ void ARMJIT::FinalizeJob(JitEmitJob& j)
 {
     if (j.Finalized)
         return;
-    std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
     j.Finalized = true;
+    const u32 realOff = JITCompiler.SubEntryOffset(j.Entry);
     JitEnableWrite();
-    JITCompiler.PatchEntryStub(j.StubOff, JITCompiler.SubEntryOffset(j.Entry));
+    JITCompiler.PatchEntryStub(j.StubOff, realOff);
     JitEnableExecute();
     JitBlock* block = j.Block;
+    FreeJobs.push_back(&j);   // nothing reads it after this (its stub now jumps to the code)
     if (!block)
         return;
+    j.Block = nullptr;
+    block->Job = nullptr;
+    block->RealOff = realOff;
 #ifdef LITEV_JIT_LINK
     block->NumOutgoing = j.NumLinkExits;
     for (int k = 0; k < j.NumLinkExits; k++)
@@ -914,7 +942,7 @@ void ARMJIT::FinalizeJob(JitEmitJob& j)
     u64* entry = &FastBlockLookupRegions[block->StartAddrLocal >> 27][(block->StartAddrLocal & 0x7FFFFFF) / 2];
     u64 tag = ((u64)block->StartAddr | block->Num) << 32;
     if (*entry == (tag | j.StubOff))
-        *entry = tag | JITCompiler.SubEntryOffset(j.Entry);
+        *entry = tag | realOff;
 #ifdef LITEV_JIT_LINK
     LinkBlockOutgoing(block);
 #endif
@@ -922,25 +950,22 @@ void ARMJIT::FinalizeJob(JitEmitJob& j)
 
 void ARMJIT::ProcessDone()
 {
-    std::vector<JitEmitJob*> done;
-    {
-        std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
-        if (DoneList.empty())
-            return;
-        done.swap(DoneList);
-    }
-    std::atomic_thread_fence(std::memory_order_acquire);
+    u32 h = Head.load(std::memory_order_acquire);
+    if (Finalized == h)
+        return;
 #if defined(__aarch64__)
-    asm volatile("isb" ::: "memory");
+    asm volatile("isb" ::: "memory");   // code another core wrote is about to run here
 #endif
-    for (JitEmitJob* j : done)
-        FinalizeJob(*j);
+    for (; Finalized < h; Finalized++)
+        if (Ring[Finalized]->Id == Finalized)   // (else finalized already, by PendingResolve, and reused)
+            FinalizeJob(*Ring[Finalized]);
 }
 
 // Called from a block's entry stub (JIT context) when its code isn't linked in yet.
 JitBlockEntry ARMJIT::PendingResolve(u32 id) noexcept
 {
-    JitEmitJob& j = *Jobs[id];
+    StatResolves++;
+    JitEmitJob& j = *Ring[id];
     WaitJob(j);
 #if defined(__aarch64__)
     asm volatile("isb" ::: "memory");
@@ -955,18 +980,19 @@ JitBlockEntry ARMJIT::PendingResolve(u32 id) noexcept
 // does it wait for them to be emitted, so the decision never depends on the worker's progress.
 void ARMJIT::CheckCodeSpace(int count)
 {
-    bool reset;
+    const s64 bound = 1024 + 512 * count;
+    const s64 mainEnd = JITCompiler.JitMemMainSize, farEnd = (s64)JITCompiler.JitMemMainSize + JITCompiler.JitMemSecondarySize;
+    bool reset = JITCompiler.StubArenaEnd - JITCompiler.StubCursor < 16;
+    // the stream's end after job e-1 (or later: only more conservative), plus bounds of jobs e..
+    u32 e = Head.load(std::memory_order_acquire), t = Tail.load(std::memory_order_relaxed);
+    s64 used = PublishedUsed.load(std::memory_order_relaxed), far = PublishedFar.load(std::memory_order_relaxed);
+    u64 qb = e < t ? EnqBound - Ring[e]->BoundPrefix : 0, qf = e < t ? EnqFarBound - Ring[e]->FarBoundPrefix : 0;
+    bool sure = mainEnd - used - (s64)qb - bound >= 1024 * 16 && farEnd - far - (s64)qf - 1536 * 32 >= 1024 * 8;
+    if (!reset && !sure)
     {
-        std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
-        reset = JITCompiler.StubArenaEnd - JITCompiler.StubCursor < 16;
-        const s64 bound = 1024 + 512 * count;
-        const s64 mainEnd = JITCompiler.JitMemMainSize, farEnd = (s64)JITCompiler.JitMemMainSize + JITCompiler.JitMemSecondarySize;
-        if (!reset && (mainEnd - JITCompiler.GetCodeOffset() - (s64)QueueBound - bound < 1024 * 16
-            || farEnd - JITCompiler.OtherCodeRegion - (s64)QueueFarBound - bound < 1024 * 8))
-        {
-            DrainEmits();
-            reset = mainEnd - JITCompiler.GetCodeOffset() < 1024 * 16 || farEnd - JITCompiler.OtherCodeRegion < 1024 * 8;
-        }
+        std::lock_guard<std::recursive_mutex> l(JITCompiler.EmitLock);
+        while (EmitFront(false)) {}
+        reset = mainEnd - JITCompiler.GetCodeOffset() < 1024 * 16 || farEnd - JITCompiler.OtherCodeRegion < 1024 * 8;
     }
     if (reset)
     {
@@ -1011,7 +1037,6 @@ static inline void LiteV_UpdatePendingPeak(size_t p9, size_t p7) noexcept
 // code is finalized)
 void ARMJIT::LinkBlockOutgoing(JitBlock* block) noexcept
 {
-    std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
     auto& blocks  = block->Num == 0 ? JitBlocks9    : JitBlocks7;
     auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
     JitEnableWrite();
@@ -1045,7 +1070,6 @@ void ARMJIT::LinkBlockOutgoing(JitBlock* block) noexcept
 void ARMJIT::LinkBlock(JitBlock* block) noexcept
 {
 #ifdef LITEV_JIT_BGEMIT
-    std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
     LinkBlockOutgoing(block);
     auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
     JitEnableWrite();
@@ -1112,9 +1136,6 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
 
 void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
 {
-#ifdef LITEV_JIT_BGEMIT
-    std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
-#endif
     auto& blocks  = block->Num == 0 ? JitBlocks9    : JitBlocks7;
     auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
 
@@ -1816,25 +1837,28 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         {
             // capture what the emission reads (and make its CPU-field changes, as the base build
             // does here), give the block an entry stub, queue the emission
-            auto jp = std::make_unique<JitEmitJob>();
-            JitEmitJob& job = *jp;
-            job.Id = (u32)Jobs.size();
+            if (FreeJobs.empty())
+            {
+                JobStore.emplace_back(new JitEmitJob);   // default-init: no 4 KB zeroing
+                FreeJobs.push_back(JobStore.back().get());
+            }
+            JitEmitJob& job = *FreeJobs.back();
+            FreeJobs.pop_back();
+            job.Id = NextJobId++;
+            job.Done.store(0, std::memory_order_relaxed);
+            job.Finalized = false;
+            job.Entry = nullptr;
+            job.NumLinkExits = 0;
             job.Thumb = thumb;
             job.HasMem = hasMemoryInstr;
             job.Count = i;
             memcpy(job.Instrs, instrs, i * sizeof(FetchedInstr));
             JITCompiler.CaptureEmitInputs(cpu, job);
-            {
-                std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
-                JitEnableWrite();
-                job.StubOff = JITCompiler.WriteEntryStub(job.Id, cpu->Num);
-                JitEnableExecute();
-            }
+            job.StubOff = JITCompiler.WriteEntryStub(job.Id, cpu->Num);
             assert(job.StubOff);   // CheckCodeSpace reset the cache when the arena was full
             job.Block = block;
             block->Job = &job;
             block->EntryPoint = JITCompiler.AddEntryOffset(job.StubOff);
-            Jobs.push_back(std::move(jp));
             if (BgMode == 3)
             {
                 // verify: the base build's emission, inline, comparing every read with the capture
@@ -1847,8 +1871,10 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                 for (int k = 0; k < job.NumSnaps; k++)
                     if (!job.Snaps[k].Used)
                     {
-                        fprintf(stderr, "LITEV_JITBG_VERIFY: captured %d at %08x never read (block %08x num %d)\n",
+                        fprintf(stderr, "LITEV_JITBG_VERIFY: frame %u: captured %d at %08x never read (block %08x num %d)\n", NDS.NumFrames,
                                 job.Snaps[k].Kind, job.Snaps[k].Addr, blockAddr, cpu->Num);
+                        for (int q = 0; q < job.NumSnaps; q++)
+                            fprintf(stderr, "  snap kind %d idx %u a2 %08x state %d used %d\n", job.Snaps[q].Kind, job.Snaps[q].Addr, job.Snaps[q].A2, job.Snaps[q].State, job.Snaps[q].Used);
                         for (int q = 0; q < i; q++)
                             fprintf(stderr, "  %08x %08x kind %d bf %02x\n", instrs[q].Addr, instrs[q].Instr, instrs[q].Info.Kind, instrs[q].BranchFlags);
                         abort();
@@ -1859,14 +1885,17 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                     job.LinkExits[k] = JITCompiler.LinkExits[k];
 #endif
                 job.Done.store(1);
-                DoneList.push_back(&job);
             }
-            else
+            job.BoundPrefix = EnqBound; job.FarBoundPrefix = EnqFarBound;
+            EnqBound += job.Bound; EnqFarBound += job.FarBound;
+            Ring[job.Id] = &job;
+            Tail.store(job.Id + 1);
+            if (BgMode == 3)
+                Head.store(job.Id + 1);   // verify: emitted already
+            if (BgMode == 2 && WorkerSleeping.load())
             {
-                std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
-                EmitQueue.push_back(&job);
-                QueueBound += job.Bound; QueueFarBound += job.FarBound;
-                QueueCv.notify_one();
+                std::lock_guard<std::mutex> l(SleepLock);
+                SleepCv.notify_one();
             }
             JIT_PHASE(JitPhase_Emit);
 #ifdef LITEV_JIT_LINK
@@ -2266,8 +2295,19 @@ void ARMJIT::ResetBlockCache() noexcept
     JITCompiler.Reset();
 #ifdef LITEV_JIT_BGEMIT
     // every block is gone (their destructors detached their jobs); the stubs are wiped
-    DoneList.clear();
-    Jobs.clear();
+    PublishedUsed.store(JITCompiler.GetCodeOffset());
+    PublishedFar.store(JITCompiler.OtherCodeRegion);
+    Head.store(0); Tail.store(0);
+    Finalized = 0;
+    EnqBound = EnqFarBound = 0;
+    NextJobId = 0;
+    FreeJobs.clear();
+    for (auto& jp : JobStore)
+    {
+        jp->Block = nullptr;
+        jp->Id = ~0u;
+        FreeJobs.push_back(jp.get());
+    }
 #endif
 
 #if defined(LITEV_JIT_LINK) && defined(LITEV_SHADOW_ASSERT)

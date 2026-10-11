@@ -95,12 +95,12 @@ void Compiler::NoteProtectFault(u8* pc)
 // fastmem site is in: a store to a page that holds code faults and is rewritten again.
 void Compiler::RepromoteStores()
 {
-#ifdef LITEV_JIT_BGEMIT
-    std::lock_guard<std::recursive_mutex> lk(EmitLock);
-#endif
     u32 frame = NDS.NumFrames;
     if (frame < SlowStoreNextRetry)
         return;
+#ifdef LITEV_JIT_BGEMIT
+    std::lock_guard<std::recursive_mutex> lk(EmitLock);
+#endif
     u32 next = ~0u;
     ptrdiff_t cur = GetCodeOffset();
     NDS.JIT.JitEnableWrite();
