@@ -570,6 +570,9 @@ void NDS::Reset()
         evt.Param = 0;
     }
     SchedListMask = 0;
+#ifdef LITEV_SCHED_LEAN
+    NextEventDirty = true;
+#endif
 
     KeyInput = 0x007F03FF;
     KeyCnt[0] = 0;
@@ -768,6 +771,9 @@ bool NDS::DoSavestate(Savestate* file)
         file->Var32(&evt.Param);
     }
     file->Var32(&SchedListMask);
+#ifdef LITEV_SCHED_LEAN
+    NextEventDirty = true;
+#endif
     file->Var64(&ARM9Timestamp);
     file->Var64(&ARM9Target);
     file->Var64(&ARM7Timestamp);
@@ -882,6 +888,12 @@ u64 NDS::NextTarget()
 {
     u64 minEvent = UINT64_MAX;
 
+#ifdef LITEV_SCHED_LEAN
+    if (!NextEventDirty)
+        minEvent = NextEventTs;
+    else
+#endif
+    {
     u32 mask = SchedListMask;
     for (int i = 0; i < Event_MAX; i++)
     {
@@ -893,6 +905,11 @@ u64 NDS::NextTarget()
         }
 
         mask >>= 1;
+    }
+#ifdef LITEV_SCHED_LEAN
+    NextEventTs = minEvent;
+    NextEventDirty = false;
+#endif
     }
 
 #if defined(LITEV_EVENT_SLICES)
@@ -994,6 +1011,10 @@ u64 NDS::NextTimerDeadline()
 }
 #endif
 
+#if defined(LITEV_SCHED_LEAN) && !(defined(LITEV_TIMER_FAST) && defined(LITEV_EVENT_SLICES))
+#error "LITEV_SCHED_LEAN needs LITEV_TIMER_FAST and LITEV_EVENT_SLICES (cached, slice-bounding timer deadline)"
+#endif
+
 #if defined(LITEV_SCHED_DRAIN)
 // May the scheduler loop skip straight to the next ARM9-side step (DMA9 burst or
 // GXFIFO-stall advance) instead of finishing this iteration? Exact (guest- and
@@ -1033,6 +1054,12 @@ void NDS::RunSystem(u64 timestamp)
     if (MPWakeAt && timestamp >= MPWakeAt->load(std::memory_order_relaxed)) MPWake();
 #endif
 
+#ifdef LITEV_SCHED_LEAN
+    if (!NextEventDirty && timestamp < NextEventTs) return;   // nothing due (the slice ended on a timer or a stop)
+    // recomputed below: what stays scheduled plus what the handlers schedule (ScheduleEvent lowers it)
+    u64 nextTs = UINT64_MAX;
+    NextEventTs = UINT64_MAX; NextEventDirty = false;
+#endif
     u32 mask = SchedListMask;
     for (int i = 0; i < Event_MAX; i++)
     {
@@ -1049,15 +1076,26 @@ void NDS::RunSystem(u64 timestamp)
                 LITE_PROFILE_ADD(LiteProfile::g_Frame.SchedEventByType[i]);
 
                 EventFunc func = evt.Funcs[evt.FuncID];
+#ifdef LITEV_NPSCHED_STATS
+                SchedStats.Ev[i]++;
+#endif
 #ifdef LITEV_EVENT_TRACE
                 if (LitevEventTrace) LitevEventTrace(this, i, evt.Timestamp, SysTimestamp);
 #endif
                 func(evt.That, evt.Param);
             }
+#ifdef LITEV_SCHED_LEAN
+            else if (evt.Timestamp < nextTs)
+                nextTs = evt.Timestamp;
+#endif
         }
 
         mask >>= 1;
     }
+#ifdef LITEV_SCHED_LEAN
+    // a handler may have cancelled an event counted in nextTs: NextEventDirty is set then
+    if (nextTs < NextEventTs) NextEventTs = nextTs;
+#endif
 }
 
 u64 NDS::NextTargetSleep()
@@ -1085,6 +1123,9 @@ u64 NDS::NextTargetSleep()
 
 void NDS::RunSystemSleep(u64 timestamp)
 {
+#ifdef LITEV_SCHED_LEAN
+    NextEventDirty = true;   // edits SchedList directly
+#endif
     u64 offset = timestamp - SysTimestamp;
     SysTimestamp = timestamp;
 
@@ -1185,6 +1226,9 @@ u32 NDS::RunFrame()
             while (Running && GPU.TotalScanlines==0)
             {
                 LITE_PROFILE_ADD(LiteProfile::g_Frame.SchedulerIterations);
+#ifdef LITEV_NPSCHED_STATS
+                SchedStats.Iter++;
+#endif
 
                 u64 target = NextTarget();
                 ARM9Target = target << ARM9ClockShift;
@@ -1227,7 +1271,11 @@ u32 NDS::RunFrame()
                         ARM9.Execute<cpuMode>();
                     }
 
+#ifdef LITEV_SCHED_LEAN
+                    RunTimersDue(0);
+#else
                     RunTimers(0);
+#endif
 #if defined(LITEV_SCHED_DRAIN)
                     {
                         LITE_PROFILE_SCOPE(_gpu3dtimer, LiteProfile::g_Frame.GPU3DNs);
@@ -1274,7 +1322,11 @@ u32 NDS::RunFrame()
                             ARM7.Execute<cpuMode>();
                         }
 
+#ifdef LITEV_SCHED_LEAN
+                        RunTimersDue(1);
+#else
                         RunTimers(1);
+#endif
                     }
                 }
 
@@ -1285,6 +1337,9 @@ u32 NDS::RunFrame()
 
                 if (CPUStop & CPUStop_Sleep)
                 {
+#ifdef LITEV_SCHED_LEAN
+                    RunTimers(0); RunTimers(1);   // the sleep loop moves TimerTimestamp without counting
+#endif
                     break;
                 }
             }
@@ -1303,6 +1358,9 @@ u32 NDS::RunFrame()
         break;
     }
 
+#ifdef LITEV_SCHED_LEAN
+    if (!(CPUStop & CPUStop_Sleep)) { RunTimers(0); RunTimers(1); }   // frame boundary: timers as the eager path leaves them
+#endif
     // Ensure the last audio samples produced for this frame are available to the frontend immediately
     SPU.BufferAudio();
 
@@ -1436,12 +1494,18 @@ void NDS::ScheduleEvent(u32 id, bool periodic, s32 delay, u32 funcid, u32 param)
     evt.Param = param;
 
     SchedListMask |= (1<<id);
+#ifdef LITEV_SCHED_LEAN
+    if (evt.Timestamp < NextEventTs) NextEventTs = evt.Timestamp;
+#endif
 
     Reschedule(evt.Timestamp);
 }
 
 void NDS::CancelEvent(u32 id)
 {
+#ifdef LITEV_SCHED_LEAN
+    if (SchedListMask & (1 << id)) NextEventDirty = true;
+#endif
     SchedListMask &= ~(1<<id);
 }
 
@@ -1710,6 +1774,9 @@ void NDS::UpdateIRQ(u32 cpu)
 
 void NDS::SetIRQ(u32 cpu, u32 irq)
 {
+#ifdef LITEV_NPSCHED_STATS
+    if (IE[cpu] & (1 << irq)) SchedStats.Irq[cpu][irq]++;
+#endif
 #ifdef LITEV_ACCESS_STATS
     if (IE[cpu] & (1 << irq)) LitevAccess[cpu ? 5 : 4][0xE000 | irq]++;   // enabled IRQs raised, by source
 #endif

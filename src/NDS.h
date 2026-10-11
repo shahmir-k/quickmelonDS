@@ -264,6 +264,10 @@ public: // TODO: Encapsulate the rest of these members
     int CurCPU;
 
     SchedEvent SchedList[Event_MAX] {};
+#ifdef LITEV_NPSCHED_STATS
+    // diagnostic: per frame window, read and reset by the headless harness
+    struct SchedStatsT { u64 Iter = 0, Exec[2] = {}, HaltedSkip[2] = {}, Disp[2] = {}, Ev[Event_MAX] = {}, Irq[2][32] = {}; } SchedStats;
+#endif
     u8 ARM9MemTimings[0x40000][8];
     u32 ARM9Regions[0x40000];
     u8 ARM7MemTimings[0x20000][4];
@@ -546,6 +550,19 @@ protected:
     // ~1957 scheduler iterations/frame.
     u64 CachedTimerDeadline;
     bool TimerDeadlineDirty;
+#endif
+#ifdef LITEV_SCHED_LEAN
+    // LITEV_SCHED_LEAN (exact): timers are linear between overflows and EVENT_SLICES ends a slice at the
+    // next overflow, so the per-slice RunTimers is only needed once a timer is due (or its state is
+    // read/written, which calls RunTimers itself). The earliest scheduled event time is cached
+    // (ScheduleEvent lowers it, RunSystem recomputes it; anything else that edits SchedList marks it dirty).
+    void RunTimersDue(u32 cpu)
+    {
+        u64 t = cpu ? ARM7Timestamp : (ARM9Timestamp >> ARM9ClockShift);
+        if (TimerDeadlineDirty || t >= CachedTimerDeadline) RunTimers(cpu);
+    }
+    u64 NextEventTs = 0;
+    bool NextEventDirty = true;
 #endif
     DMA DMAs[8];
 #ifdef LITEV_DMA_ARMED_MASK

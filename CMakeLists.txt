@@ -616,6 +616,17 @@ endif()
 
 # A7PROF (diagnostic): per-guest-function ARM7 (and ARM9: env LITEV_A9PROF) profile in the interpreter (--mode interp,
 # env LITEV_A7PROF=<out prefix>). See src/ARM7Prof.h. Never in a shipping build.
+# LITEV_SCHED_LEAN: exact scheduler fast paths (same slices, same events, same guest state): timers advanced only
+# when one is due or read/written, the next event time cached instead of scanned every slice.
+option(LITEV_SCHED_LEAN "Exact: lazy timer catch-up + cached next event time" OFF)
+if (LITEV_SCHED_LEAN)
+    add_compile_definitions(LITEV_SCHED_LEAN=1)
+endif()
+# LITEV_NPSCHED_STATS: diagnostic per-console scheduler counters (iterations, CPU entries, events by type, IRQs)
+option(LITEV_NPSCHED_STATS "Diagnostic: scheduler counters" OFF)
+if (LITEV_NPSCHED_STATS)
+    add_compile_definitions(LITEV_NPSCHED_STATS=1)
+endif()
 option(LITEV_A7PROF "Diagnostic: ARM7 per-function guest profile (interpreter)" OFF)
 if (LITEV_A7PROF)
     add_compile_definitions(LITEV_A7PROF=1)
