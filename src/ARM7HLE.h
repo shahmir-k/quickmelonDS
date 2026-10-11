@@ -11,7 +11,8 @@
 // of ARM7 cycles instead of the real count, scratch registers/stack bytes are not written and
 // the channels' hardware-busy bits are sampled at entry. Deterministic and version-locked.
 // Runtime: debug.litev.a7hle (prop on Android, env elsewhere; default on), latched per NDS: 0 off, 1 all, else a
-// mask (1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit).
+// mask (1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit, 16 SeqMain / commit also on the MKDS driver: default
+// off, its 8-console race session fails).
 // ExChannelMain has a variant per driver build: Pokemon B/W/W2 and Mario Kart DS (2005 SDK; the 8-player Netplay
 // benchmark: ~22% of its ARM7 guest instructions in the race).
 //
@@ -24,6 +25,8 @@
 // The SND hardware commit after a tick (0x03800870: per channel the stop / timer / volume / pan stores to the
 // SOUND registers, the shadow bytes, the flags cleared; ~550 guest instructions a call) runs natively when no
 // channel starts, with the guest's stack frames and final registers (category B: a fitted cycle estimate).
+// SeqMain and the SND commit also have a Mario Kart DS variant (2005 driver in shared WRAM: SeqVar / HwVar; the commit
+// handles MKDS's master effect natively).
 //
 // Under the JIT the code is verified when the hook block is compiled and the block depends on
 // it (no per-call compare); MI_CpuCopy32 from ARM7 WRAM to main RAM copies through host
