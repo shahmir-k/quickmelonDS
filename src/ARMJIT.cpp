@@ -1023,7 +1023,11 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
     u32 blockAddr = cpu->R[15] - (thumb ? 2 : 4);
 
     if (JITCompiler.NearlyFull())
+    {
+        JitEnableWrite();   // (the reset rewrites the code memory)
         ResetBlockCache();
+        JitEnableExecute();
+    }
 
     u32 localAddr = LocaliseCodeAddress(cpu->Num, blockAddr);
     if (!localAddr)
