@@ -1239,7 +1239,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_NP_SPEED
                 auto runT0 = std::chrono::steady_clock::now();
 #endif
-                bi.nds->RunFrame();
+                // the frame's scanlines: the app paces by them (a game that rewinds VCOUNT, as the Wi-Fi
+                // client of a DS multiplayer session does to follow the host, runs longer frames)
+                const u32 lines = bi.nds->RunFrame();
+                const double lineScale = lines ? lines / 263.0 : 1.0;
 #ifdef LITEV_NP_SPEED
                 // per console: emulation wall time per frame (incl. link waits), and for the local
                 // console the session speed, waits for the other players' input and pacing sleeps
@@ -1270,7 +1273,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                     auto now = std::chrono::steady_clock::now();
                     if (pace > 0 && m > 0)
                     {   // no catch-up after a stall (a burst would hide it in the average)
-                        next = std::max(next + std::chrono::microseconds((int)(1e6 / (pace * m))), now);
+                        next = std::max(next + std::chrono::microseconds((int)(1e6 * lineScale / (pace * m))), now);
                         std::this_thread::sleep_until(next);
                         sleepMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now).count();
                     }
@@ -1282,7 +1285,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                 if (pace > 0 && net && inst == net->LocalPlayer())
                 {   // no catch-up after a stall (a burst would hide it in the average)
                     static thread_local auto next = std::chrono::steady_clock::now();
-                    next = std::max(next + std::chrono::microseconds(1000000 / pace), std::chrono::steady_clock::now());
+                    next = std::max(next + std::chrono::microseconds((int)(1e6 * lineScale / pace)), std::chrono::steady_clock::now());
                     std::this_thread::sleep_until(next);
                 }
 #ifdef LITEV_HOSTED_NETPLAY
