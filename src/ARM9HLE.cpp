@@ -258,15 +258,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 21;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 524287;
+constexpr int kKinds = 20;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 262143;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 DC range loops
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -303,9 +303,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "dcrange"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -3042,74 +3042,6 @@ __attribute__((noinline)) bool RunFx(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
-// ---- 20. NitroSDK DC_InvalidateRange / DC_StoreRange / DC_FlushRange -------------------------------------------------------
-// f(addr, bytes): one data-cache CP15 operation per 32-byte line from addr & ~31 while (s32)line < (s32)(addr + bytes) (at least
-// one: a do-while), DC_FlushRange with a write-buffer drain per line. The CP15 data-cache operations change no emulated state
-// (CP15Write; the JIT compiles them as no-ops), so the loop leaves only r0 = the line after the last, r1 = the end, r12 = 0
-// (flush) and the flags of the last cmp. MKDS race: 33 invalidates (2.5k guest instructions) + 7 flushes (2.3k) a frame per
-// console; PW: ~2.2k a frame. Position independent (exact code words). Category B: a fitted cycle estimate (the loop's IRQ /
-// event checks between iterations happen after it).
-constexpr u32 kDcCode[3][9] = {
-    {0xE0811000, 0xE3C0001F, 0xEE070F36, 0xE2800020, 0xE1500001, 0xBAFFFFFB, 0xE12FFF1E},                           // invalidate
-    {0xE0811000, 0xE3C0001F, 0xEE070F3A, 0xE2800020, 0xE1500001, 0xBAFFFFFB, 0xE12FFF1E},                           // store
-    {0xE3A0C000, 0xE0811000, 0xE3C0001F, 0xEE07CF9A, 0xEE070F3E, 0xE2800020, 0xE1500001, 0xBAFFFFFA, 0xE12FFF1E}};  // flush
-constexpr u32 kDcLen[3] = {7, 7, 9};
-// fitted estimate (check mode, MKDS 8-console race, 0.98M calls: guest cycles = base + per line, mean error < 1 cycle)
-constexpr s32 kDcCyc0[3] = {9, 9, 10}, kDcCycN[3] = {9, 9, 12};
-constexpr u32 kDcMaxLines = 1u << 16;
-// the variant at a (0 invalidate, 1 store, 2 flush), -1 none
-int DcAt(melonDS::ARMv5* c, u32 a)
-{
-    const u8* p = (a & 3) ? nullptr : CodePtr(c, a);
-    if (!p) return -1;
-    const int v = R32(p) == kDcCode[2][0] ? 2 : R32(p) == kDcCode[0][0] ? 0 : -1;
-    if (v < 0) return -1;
-    if (v == 2) return CodeEq(c, a, kDcCode[2], 9, nullptr, 0) ? 2 : -1;
-    const u8* q = CodePtr(c, a + 8);
-    if (!q) return -1;
-    const int w = R32(q) == kDcCode[0][2] ? 0 : R32(q) == kDcCode[1][2] ? 1 : -1;
-    return w >= 0 && CodeEq(c, a, kDcCode[w], 7, nullptr, 0) ? w : -1;
-}
-
-__attribute__((noinline)) bool RunDc(melonDS::ARMv5* c, State& s, bool jit)
-{
-    const u32 pc = c->R[15] - 8;
-    const int v = DcAt(c, pc);      // (cheap: up to 9 words; the JIT verified them at compile time)
-    if (v < 0) return false;
-    s.calls[20]++;
-    const u32 end = c->R[1] + c->R[0];
-    u32 p = c->R[0] & ~31u;
-    const s64 left = (s64)(s32)end - (s64)(s32)p;
-    const u32 n = left <= 32 ? 1 : (u32)((left + 31) >> 5);
-    if (CheckPending || n > kDcMaxLines)
-    {
-        s.fallback[20] += !g_Check;
-        GuestFallback(c);
-        return true;
-    }
-    p += n * 32;
-    Expect e;
-    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
-    e.R[0] = p; e.R[1] = end;
-    if (v == 2) e.R[12] = 0;
-    e.retPc = c->R[14];
-    e.CPSR = (c->CPSR & 0x0FFFFFDF) | Flags(p, end) | ((e.retPc & 1) << 5);
-#ifdef LITEV_HLE_DIAG
-    if (g_Check || g_Dry)
-    {
-        Mem m(c, true);
-        if (g_Check) { ArmCheck(c, 20, m, e); g_P.fit[0] = n; g_P.fit[1] = (u32)v; }
-        s.checks[20]++;
-        if (g_Check && jit) { CheckRunGuest(c, pc); return true; }
-        GuestFallback(c);
-        return true;
-    }
-#endif
-    s.native[20]++;
-    Return(c, e, kDcCyc0[v] + kDcCycN[v] * (s32)n);
-    return true;
-}
-
 // ---- 19. NNS_G2dMakeCellToOams (Mario Kart DS race: the HUD / map icons) ---------------------------------------------------------
 // NNS G2D: u16 f(GXOamAttr* dst, u16 max, const NNSG2dCellData* cell, const MtxFx22* mtx, const VecFx32* trans, u16 affineIdx,
 // BOOL doubleAffine): n = min(max, cell->numOAMAttrs) objects, each the cell's 6-byte attr0..2 copied to dst[i] (8-byte stride,
@@ -3513,13 +3445,6 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return 10;
     }
 #endif
-    if ((instr == kDcCode[0][0] || instr == kDcCode[2][0]) && DcAt(&nds.ARM9, addr) >= 0)
-    {
-        static thread_local Range dc;
-        dc = {addr, addr + kDcLen[DcAt(&nds.ARM9, addr)] * 4};
-        r = &dc;
-        return 1;
-    }
     if (instr == kNodeInstr && OamAt(&nds.ARM9, addr))
     {
         static thread_local Range oa;
@@ -3672,11 +3597,6 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return k;
     }
 #endif
-    if ((instr == kDcCode[0][0] || instr == kDcCode[2][0]) && DcAt(&nds.ARM9, addr) >= 0)
-    {
-        State& s = St(&nds.ARM9);
-        return s.on && (s.mask & 262144) ? 1 : 0;
-    }
     if (instr == kNodeInstr && OamAt(&nds.ARM9, addr))
     {
         State& s = St(&nds.ARM9);
@@ -4753,11 +4673,6 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 16384) && RunFx(c, s, jit);
     }
-    if (in == kDcCode[0][0] || in == kDcCode[2][0])
-    {
-        State& s = St(c);
-        return s.on && (s.mask & 262144) && RunDc(c, s, jit);
-    }
     if (in == kNodeInstr && OamHead(c, pc))
     {
         State& s = St(c);
@@ -4864,8 +4779,6 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         fprintf(stderr, "ASYNCFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 13 && getenv("LITEV_A9HLE_SHPFIT") && !g_P.irq)
         fprintf(stderr, "SHPFIT %d %u %llu\n", (int)g_P.small, g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
-    if (k == 20 && getenv("LITEV_A9HLE_DCFIT") && !g_P.irq)
-        fprintf(stderr, "DCFIT %u %u %llu\n", g_P.fit[0], g_P.fit[1], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 19 && getenv("LITEV_A9HLE_OAMFIT") && !g_P.irq)
         fprintf(stderr, "OAMFIT %u %u %llu\n", g_P.fit[0], g_P.fit[1], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 16 && getenv("LITEV_A9HLE_FXFIT") && !g_P.irq)
