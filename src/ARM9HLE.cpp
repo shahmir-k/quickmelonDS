@@ -258,15 +258,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 22;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 1048575;
+constexpr int kKinds = 23;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 2097151;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ, 524288 MKDS G3D material
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -303,9 +303,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -3376,6 +3376,178 @@ __attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
+// ---- 22. MKDS course collision (KCL): the prism loop's rejection pass ---------------------------------------------------------
+// The KCL sphere query 0x01FFDEE4 (MKDS USA, ITCM; game code) walks the triangle (prism) list of an octree leaf: per prism its
+// 16-byte record (height, position / face normal / 3 edge normal indices, attribute) is copied to the stack, d = query point -
+// position (VEC_Subtract 0x021484D0), then up to 4 dot products (VEC_DotProduct 0x02039828, fx32) against the face normal and
+// the edge normals, each test able to reject the prism; then attribute filters. ~60 prisms a frame per console in the race,
+// two thirds rejected. Hooked at the loop head 0x01FFE208: the rejection tests prism after prism natively, instruction by
+// instruction (the stack locals and the helpers' frames below sp as the guest leaves them, registers r0-r3, r5-r10, r12, lr
+// and flags of the path taken), handing back at the first prism passing every test (0x01FFE3CC: the guest's hit code runs)
+// or at the list's end (0x01FFEDA4). Exact bytes (FNV) of the loop, its exits, the literal and both helpers.
+// Category B: per-path cycle constants (check mode).
+constexpr u32 kKclHead = 0x01FFE208, kKclInstr = 0xE59D102C, kKclHit = 0x01FFE3CC, kKclEnd = 0x01FFEDA4;
+constexpr Range kKclCode[5] = {{0x01FFE208, 0x01FFE3CC}, {0x01FFED90, 0x01FFEDA4}, {0x01FFEE48, 0x01FFEE4C}, {0x021484D0, 0x02148504},
+                               {0x02039828, 0x02039860}};
+constexpr u64 kKclSig = 0xddc135d96e85db76ull;
+constexpr u32 kKclMaxPrisms = 64;
+// guest cycles per prism path (check mode, MKDS 8P race: 319k calls, 1.3M prisms, a least-squares fit with zero error):
+// rejected by the face normal (below / above), edge normals 1 / 2 / 3, the 3rd's 0x1E000 bound, (attribute filters: never
+// seen, the guest runs those calls), passing; + 1 per call
+constexpr s32 kKclCyc0 = 1, kKclCycPath[10] = {111, 116, 167, 218, 269, 271, 0, 0, 0, 272};
+
+int KclAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a != kKclHead) return 0;
+    std::vector<u8> b;
+    CodeBytes(c, b, kKclCode, 0, 5);
+    return Fnv(b) == kKclSig ? 1 : 2;
+}
+
+__attribute__((noinline)) bool RunKcl(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && KclAt(c, pc) != 1) return false;
+    s.calls[22]++;
+    Mem m(c, g_Check || g_Dry);
+    const u32 sp = c->R[13];
+    // the frame the loop touches: [sp - 8, sp + 0x198) (the helpers' push below sp, the locals)
+    constexpr u32 kLo = 8, kN = (0x198 + kLo) / 4;
+    Obj S = m.O(sp - kLo, kN * 4);
+    if (CheckPending || !S)
+    {
+        s.fallback[22] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    u32 sh[kN]; u8 dirty[kN] = {};
+    memcpy(sh, S.p, sizeof(sh));
+    auto L = [&](u32 o) -> u32 { return sh[(o + kLo) / 4]; };
+    auto St = [&](u32 o, u32 v) { sh[(o + kLo) / 4] = v; dirty[(o + kLo) / 4] = 1; };
+    bool bad = false;
+    auto rd = [&](u32 a, u32 n) -> u32 {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    };
+    u32 r[16];
+    for (int i = 0; i < 16; i++) r[i] = c->R[i];
+    u32 fl = c->CPSR & 0xF0000000u, end = 0, nPath[10] = {}, n = 0;
+    const u32 t = L(0x24), negT = L(0x4C), prisms = L(0x2C), pos = L(0x38), nrm = L(0x3C);
+    const u32 f50 = L(0x50), f54 = L(0x54), f58 = L(0x58);
+    const u32 ax = L(0xA0), ay = L(0xA4), az = L(0xA8);
+    s32 dx = 0, dy = 0, dz = 0;
+    // VEC_DotProduct(sp + 0xB8, sp + o) after the normal (3 x s16 at nrm + 6 * idx) was stored at sp + o
+    auto dot = [&](u32 o, u32 idx, u32 ret) -> u32 {
+        const u32 na = nrm + idx * 6;
+        const s32 nx = (s16)rd(na, 2), ny = (s16)rd(na + 2, 2), nz = (s16)rd(na + 4, 2);
+        St(o, (u32)nx); St(o + 4, (u32)ny); St(o + 8, (u32)nz);
+        St(-8u, r[4]); St(-4u, ret);            // push {r4, lr}
+        const s64 sum = (s64)dy * ny + (s64)dx * nx + (s64)dz * nz;
+        r[1] = sp + o; r[2] = (u32)nx; r[3] = (u32)dz; r[12] = (u32)dx; r[14] = ret; r[5] = na;
+        return (u32)(sum >> 12);
+    };
+    // ands (flags N Z; C from a rotated immediate's bit 31 when rot != 0, else unchanged; V unchanged)
+    auto ands = [&](u32 v, bool rotC0) { u32 f = (fl & 0x30000000u) | (v & 0x80000000u) | (v ? 0 : 0x40000000u); if (rotC0) f &= ~0x20000000u; fl = f; return v; };
+    u32 tri = r[0];
+    for (;;)
+    {
+        if (n == kKclMaxPrisms) { end = kKclHead; break; }      // r0 = the next prism, flags of the loop's cmp r0, #0
+        n++;
+        // the prism record and its position; VEC_Subtract(sp + 0xA0, sp + 0x15C, sp + 0xB8)
+        const u32 pa = prisms + tri * 16;
+        const u32 w0 = rd(pa, 4), w1 = rd(pa + 4, 4), w2 = rd(pa + 8, 4), w3 = rd(pa + 12, 4);
+        const u32 qa = pos + (w1 & 0xFFFF) * 12;
+        const u32 px = rd(qa, 4), py = rd(qa + 4, 4), pz = rd(qa + 8, 4);
+        if (bad) break;
+        St(0x90, w0); St(0x94, w1); St(0x98, w2); St(0x9C, w3);
+        St(0x15C, px); St(0x160, py); St(0x164, pz);
+        dx = (s32)(ax - px); dy = (s32)(ay - py); dz = (s32)(az - pz);
+        St(0xB8, (u32)dx); St(0xBC, (u32)dy); St(0xC0, (u32)dz);
+        r[6] = 0xC;
+        int path = 9;
+        // face normal: dot < -thickness, or dot - height >= thickness: rejected
+        r[0] = dot(0x18C, w3 & 0xFFFF, 0x01FFE280);
+        r[1] = negT; fl = Flags(r[0], r[1]);
+        if ((s32)r[0] < (s32)r[1]) path = 0;
+        else
+        {
+            r[1] = w0; r[6] = r[0] - r[1]; r[0] = t; fl = Flags(r[6], r[0]);
+            if ((s32)r[6] >= (s32)r[0]) path = 1;
+        }
+        if (path == 9)
+        {
+            // the three edge normals
+            r[0] = dot(0x174, w2 & 0xFFFF, 0x01FFE2D8);
+            r[8] = r[0]; r[0] = t; fl = Flags(r[8], r[0]);
+            if ((s32)r[8] >= (s32)r[0]) path = 2;
+        }
+        if (path == 9)
+        {
+            r[0] = dot(0x180, w2 >> 16, 0x01FFE320);
+            r[7] = r[0]; r[0] = t; fl = Flags(r[7], r[0]);
+            if ((s32)r[7] >= (s32)r[0]) path = 3;
+        }
+        if (path == 9)
+        {
+            r[0] = dot(0x168, w1 >> 16, 0x01FFE368);
+            r[9] = r[0]; r[0] = t; r[10] = r[0] - r[9]; fl = Flags(r[0], r[9]);
+            if (fl & 0x80000000u) path = 4;
+            else { fl = Flags(r[10], 0x1E000); if ((s32)r[10] > 0x1E000) path = 5; }
+        }
+        if (path == 9)
+        {
+            // the attribute filters
+            r[5] = w3 >> 16; r[0] = 0x2010;
+            if ((r[0] = ands(r[5] & r[0], false)))
+            {
+                r[0] = f50; fl = Flags(r[0], 0);
+                if (r[0] && (r[0] = ands(r[5] & 0x2000, true))) path = 6;
+                if (path == 9) { r[0] = f54; fl = Flags(r[0], 0); if (r[0] && (r[0] = ands(r[5] & 0x10, false))) path = 7; }
+            }
+            if (path == 9) { r[0] = f58; fl = Flags(r[0], 0); if (r[0] && (r[0] = ands(r[5] & 0xA000, true))) path = 8; }
+        }
+        if (path >= 6 && path <= 8) bad = true;     // (the attribute filters' rejections: never seen in the race, not timed)
+        if (bad) break;
+        nPath[path]++;
+        if (path == 9) { end = kKclHit; break; }
+        // the next prism of the list (ldrh r0, [r1, #2]!)
+        r[1] = L(0x28) + 2; r[0] = rd(r[1], 2); St(0x28, r[1]); fl = Flags(r[0], 0);
+        if (bad) break;
+        if (!r[0]) { end = kKclEnd; break; }
+        tri = r[0];
+    }
+    if (bad)
+    {
+        s.fallback[22] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    for (u32 i = 0; i < kN; i++) if (dirty[i]) m.W(S, i * 4, sh[i]);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = r[i];
+    e.R[13] = sp; e.R[15] = c->R[15];
+    e.retPc = end;
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | fl;
+    s32 cyc = kKclCyc0;
+    for (int i = 0; i < 10; i++) cyc += kKclCycPath[i] * (s32)nPath[i];
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check) { ArmCheck(c, 22, m, e); for (int i = 0; i < 4; i++) g_P.fit[i] = 0; g_P.fitA[0] = n; for (int i = 0; i < 7; i++) g_P.fitA[1 + i] = nPath[i < 6 ? i : 9]; g_P.fit[0] = nPath[6] + nPath[7] + nPath[8]; g_P.fit[1] = end == kKclHit ? 1 : end == kKclEnd ? 2 : 3; }
+        s.checks[22]++;
+        if (g_Check && jit) { CheckRunGuest(c, pc); return true; }
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    m.Flush();
+    s.native[22]++;
+    Return(c, e, cyc);
+    return true;
+}
+
 // ---- 19. NNS_G2dMakeCellToOams (Mario Kart DS race: the HUD / map icons) ---------------------------------------------------------
 // NNS G2D: u16 f(GXOamAttr* dst, u16 max, const NNSG2dCellData* cell, const MtxFx22* mtx, const VecFx32* trans, u16 affineIdx,
 // BOOL doubleAffine): n = min(max, cell->numOAMAttrs) objects, each the cell's 6-byte attr0..2 copied to dst[i] (8-byte stride,
@@ -3779,6 +3951,11 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return 10;
     }
 #endif
+    if (instr == kKclInstr && addr == kKclHead)
+    {
+        r = kKclCode;
+        return 5;
+    }
     if (instr == kMkMatInstr && addr == kMkMatSbc)
     {
         r = kMkMatCode;
@@ -3943,6 +4120,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return k;
     }
 #endif
+    if (instr == kKclInstr && addr == kKclHead)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 1048576) ? KclAt(&nds.ARM9, addr) : 0;
+    }
     if (instr == kMkMatInstr && addr == kMkMatSbc)
     {
         State& s = St(&nds.ARM9);
@@ -5029,6 +5211,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 16384) && RunFx(c, s, jit);
     }
+    if (in == kKclInstr && pc == kKclHead)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 1048576) && RunKcl(c, s, jit);
+    }
     if (in == kMkMatInstr && pc == kMkMatSbc)
     {
         State& s = St(c);
@@ -5129,7 +5316,8 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     if (!atVec && (pc != (e.retPc & ~1u) || ((cpu->CPSR ^ e.CPSR) & (g_P.kind == 15 || g_P.kind == 17 ? 0x0FFFFFFFu : ~0u)))) return;
     if (g_P.kind == 10 || g_P.kind == 13) gR[1] = e.R[1];     // GX async: r1 = the IF value read (not modelled)
     if (g_P.kind == 6 && (cpu->R[2] != e.R[2] || cpu->R[3] != e.R[3] || cpu->R[6] != e.R[6])) return;   // LZ: same progress
-    if (g_P.kind == 20 && (cpu->R[1] != e.R[1] || cpu->R[3] != e.R[3])) return;                          // streaming LZ: the same
+    if (g_P.kind == 20 && (cpu->R[1] != e.R[1] || cpu->R[3] != e.R[3])) return;
+    if (g_P.kind == 22 && (cpu->R[0] != e.R[0] || cpu->R[1] != e.R[1])) return;                          // KCL: the same prism                          // streaming LZ: the same
     melonDS::NDS& nds = c->NDS;
     if ((g_P.kind == 0 || g_P.kind == 4) && R32(&nds.MainRAM[(g_State[&nds].v->info + 4) & nds.MainRAMMask]) != e.cur) return;
     CheckPending = false;
@@ -5146,6 +5334,9 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         fprintf(stderr, "ASYNCFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 13 && getenv("LITEV_A9HLE_SHPFIT") && !g_P.irq)
         fprintf(stderr, "SHPFIT %d %u %llu\n", (int)g_P.small, g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 22 && getenv("LITEV_A9HLE_KCLFIT") && !g_P.irq)
+        fprintf(stderr, "KCLFIT %u %u %u %u %u %u %u %u %u %u %llu\n", g_P.fit[1], g_P.fitA[0], g_P.fitA[1], g_P.fitA[2], g_P.fitA[3], g_P.fitA[4],
+                g_P.fitA[5], g_P.fitA[6], g_P.fit[0], g_P.fitA[7], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 21 && getenv("LITEV_A9HLE_MKMATFIT") && !g_P.irq)
         fprintf(stderr, "MKMATFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 20 && getenv("LITEV_A9HLE_CXFIT") && !g_P.irq)
