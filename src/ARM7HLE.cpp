@@ -117,7 +117,7 @@ inline void Store32(melonDS::NDS& nds, u32 a, u8* p, u32 v)
 
 // debug.litev.a7hle: 0 off, 1 (or unset) all but 16, else a mask: 1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit,
 // 16 SeqMain / SND commit on Mario Kart DS's driver too (default off: with them the Mac 8-console LockstepMP race (fixed harness,
-// liteDS-main 5b2f7c6a) ends in "Communication error" on 5 of 7 remote consoles; the hooks' results are compare-mode exact)
+// liteDS-main 5b2f7c6a) ends in "Communication error" on 5 of 7 remote consoles; the hooks' results are compare-mode exact).
 bool ReadOn(u32 bit)
 {
 #if defined(__ANDROID__)
@@ -1436,6 +1436,122 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
     cpu->JumpTo(cpu->R[14]);
     return true;
 }
+
+// Rejected: interpreter-exact MKDS spatial propagation diverges under JIT. Keep the
+// disassembly-derived prototype out of the build until its JIT-visible state is understood.
+#if 0
+// Mario Kart DS's per-track spatial/channel propagation, 0x037FE088.  It folds a
+// track's pitch/pan/volume offsets into every linked output channel.  A child with no
+// owner invokes 0x037FCC24; that uncommon callback deliberately stays guest-side.
+namespace
+{
+constexpr u32 kMkPropEntry = 0x037FE088, kMkPropInstr = 0xE92D4FF0;
+constexpr u64 kMkPropSig = 0x6d7c3e9f49c0f167ull;
+constexpr u32 kMkPropEnd = 0x037FE1C4, kMkDbSq = 0x03806F40;
+// Interpreter check fit: 109 cycles plus 45 cycles for each linked output child.
+constexpr s32 kMkPropCycles0 = 109, kMkPropCyclesChild = 45;
+
+bool MkPropIntact(melonDS::NDS& nds)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 a = kMkPropEntry; a < kMkPropEnd; a++) h = (h ^ *P7(nds, a)) * 0x100000001b3ull;
+    return h == kMkPropSig;
+}
+
+bool RunMkProp(melonDS::ARM* cpu, bool jit)
+{
+    melonDS::NDS& nds = cpu->NDS;
+    State& S = Get(nds);
+    S.mkProp[0]++;
+    if (!ReadOn(32) || (!jit && !MkPropIntact(nds))) return false;
+    const u32 srcA = cpu->R[0], trackA = cpu->R[1];
+    const u32 sp = cpu->R[13];
+    if ((srcA >> 16) != 0x0380 || (trackA >> 16) != 0x0380 || (sp >> 16) != 0x0380 || (sp & 3)) return false;
+    u8* src = P7w(nds, srcA);
+    const u8* track = P7(nds, trackA);
+    auto db = [&](u8 x) { return (s32)(s16)R16(P7(nds, kMkDbSq + (u32)x * 2)); };
+    s32 r3 = db(track[5]) + db(src[4]) + db(src[5]);
+    s32 r2 = (s16)R16(src + 0x0A) + (s16)R16(track + 6);
+    s32 r0 = (s16)R16(src + 0x0C) + ((s32)(s8)src[6] * ((s32)src[7] << 6) >> 7);
+    s32 r1 = (s8)src[8];
+    if (src[1] != 0x7F) r1 = (r1 * src[1] + 0x40) >> 7;
+    r1 = std::clamp(r1 + (s8)src[9], -127, 127);
+    const s16 pitch = (s16)r3, timer = (s16)r0, vol = (s8)r1, pan = (s16)r2;
+    // push {r4-r11,lr}; sub sp,#4; ...; add sp,#4; pop {r4-r11,lr}.  The pop
+    // restores registers but the nine saved words remain observable in ARM7 WRAM.
+    std::vector<u8> stack(36);
+    for (int i = 0; i < 8; i++) W32(stack.data() + i * 4, cpu->R[4 + i]);
+    W32(stack.data() + 32, cpu->R[14]);
+    struct Changed { u32 a; std::vector<u8> bytes; } changed[32];
+    u32 n = 0, childA = R32(src + 0x3C), exitR0 = (u32)r2 << 16;
+    for (; childA && n < 32; n++)
+    {
+        if ((childA >> 16) != 0x0380) { S.mkProp[2]++; return false; }
+        u8* child = P7w(nds, childA);
+        if (cpu->R[2] && !R32(child + 0x34)) { S.mkProp[2]++; return false; }
+        exitR0 = child[2] == 3 ? child[2] : R32(child + 0x34);
+        changed[n] = {childA, std::vector<u8>(child, child + 0x51)};
+        W16(changed[n].bytes.data() + 6, pan);
+        if (child[2] != 3)
+        {
+            W16(changed[n].bytes.data() + 0x0C, pitch);
+            W16(changed[n].bytes.data() + 0x0E, timer);
+            changed[n].bytes[0x0B] = (u8)vol;
+            changed[n].bytes[4] = src[1];
+            W16(changed[n].bytes.data() + 0x28, R16(src + 0x18));
+            W16(changed[n].bytes.data() + 0x2A, R16(src + 0x1A));
+            W16(changed[n].bytes.data() + 0x2C, R16(src + 0x1C));
+        }
+        childA = R32(child + 0x50);
+    }
+    if (childA) { S.mkProp[2]++; return false; }
+#ifdef LITEV_HLE_DIAG
+    if (g_Check)
+    {
+        g_Pending.regions.clear();
+        for (u32 i = 0; i < n; i++) g_Pending.regions.push_back({changed[i].a, std::move(changed[i].bytes)});
+        g_Pending.regions.push_back({sp - 36, stack});
+        ArmCheck(cpu, "mkprop", &S.mkProp[3]);
+        g_Pending.regs = true;
+        for (int i = 0; i < 16; i++) g_Pending.R[i] = cpu->R[i];
+        g_Pending.R[0] = exitR0; g_Pending.R[1] = r1; g_Pending.R[2] = r2; g_Pending.R[3] = (u32)r3 << 16;
+        g_Pending.cpsr = (cpu->CPSR & 0x0FFFFFFF) | 0x60000000; // final: cmp child_next, #0
+        g_Pending.t0 = nds.ARM7Timestamp + cpu->Cycles;
+        g_Pending.fit[0] = n; // HWFIT diagnostic: linked child count, then guest cycles
+        S.mkProp[3]++;
+        GuestFallback(cpu);
+        return true;
+    }
+#endif
+    // Match guest RAM stores rather than bulk-copying the result: ARM7 JIT blocks can
+    // depend on a WRAM word that is also used as data by this sound driver.
+    auto st8 = [&](u32 a, u8 v) { u8* p = P7w(nds, a); if (*p != v) { nds.JIT.CheckAndInvalidate<1, melonDS::ARMJIT_Memory::memregion_WRAM7>(a & ~3u); *p = v; } };
+    auto st16 = [&](u32 a, u16 v) { u8* p = P7w(nds, a); if (R16(p) != v) { nds.JIT.CheckAndInvalidate<1, melonDS::ARMJIT_Memory::memregion_WRAM7>(a & ~3u); W16(p, v); } };
+    for (u32 i = 0; i < n; i++)
+    {
+        const u32 a = changed[i].a; const u8* b = changed[i].bytes.data();
+        st16(a + 6, R16(b + 6));
+        if (b[2] != 3)
+        {
+            st16(a + 0x0C, R16(b + 0x0C)); st16(a + 0x0E, R16(b + 0x0E));
+            st8(a + 0x0B, b[0x0B]); st8(a + 4, b[4]);
+            st16(a + 0x28, R16(b + 0x28)); st16(a + 0x2A, R16(b + 0x2A)); st16(a + 0x2C, R16(b + 0x2C));
+        }
+    }
+    for (int i = 0; i < 9; i++)
+    {
+        u8* p = P7w(nds, sp - 36 + i * 4); const u32 v = R32(stack.data() + i * 4);
+        if (R32(p) != v) Store32<melonDS::ARMJIT_Memory::memregion_WRAM7>(nds, sp - 36 + i * 4, p, v);
+    }
+    cpu->R[0] = exitR0; cpu->R[1] = r1; cpu->R[2] = r2; cpu->R[3] = (u32)r3 << 16;
+    cpu->CPSR = (cpu->CPSR & 0x0FFFFFFF) | 0x60000000;
+    cpu->Cycles += kMkPropCycles0 + kMkPropCyclesChild * (s32)n;
+    cpu->JumpTo(cpu->R[14]);
+    S.mkProp[1]++;
+    return true;
+}
+}
+#endif
 
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 {

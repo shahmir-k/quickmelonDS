@@ -27,7 +27,9 @@
 // Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material,
 // 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ,
 // 2048 G3D shape (needs 512), 4096 VEC_Normalize, 8192 G3D node (NODEDESC),
-// 16384 MKDS stereo sample effect, 32768 G3D material animation (needs 128), 65536 G3D SBC loop; 8 needs 1)
+// 16384 MKDS stereo sample effect, 32768 G3D material animation (needs 128), 65536 G3D SBC loop,
+// 131072 MKDS packed vertex transform (experimental), 262144 MKDS streaming LZSS (experimental),
+// 524288 MKDS word fill, 1048576 MKDS 32-byte word fill, 2097152 MKDS aligned forward copy (experimental); 8 needs 1)
 // for A/B of single hooks.
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
@@ -105,7 +107,7 @@ namespace melonDS::A9HLE
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
 inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001 || instr == 0xE5942000
                                         || instr == 0xE92D4010 || instr == 0xE92D58F0 || instr == 0xE92D4FF8 || instr == 0xE92D4FF0
-                                        || instr == 0xE5941008; }
+                                        || instr == 0xE5941008 || instr == 0xE92D07F0 || instr == 0xE081C002 || instr == 0xE92D03F0 || instr == 0xE3520000; }
 // Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4} / MIi_FIFOCallback
 // push {r3-r7, lr} / SBC MAT push {r4-r6, lr}); instr: the halfword
 inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8 || instr == 0xB570 || instr == 0xB5F0

@@ -257,7 +257,7 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 19;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr int kKinds = 27;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
 constexpr u32 kAllHooks = 131071;
 struct State
 {
@@ -265,7 +265,7 @@ struct State
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop; 131072 vertex / 262144 LZSS / 524288 fill / 1048576 fill32 / 2097152 copy are default-off experiments
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -302,9 +302,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblankwake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "reserved", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "mkvert", "mklzss", "mkfill", "mkfill32", "mkcopy", "mktex", "mkcache", "pwaffine"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : k == 24 ? 4194304 : k == 25 ? 8388608 : k == 26 ? 16777216 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -555,7 +555,7 @@ struct Mem
     bool logOnly;
     u32 n = 0;
     bool bad = false;
-    Wr log[128];
+    Wr log[1024];
     Mem(melonDS::ARMv5* cpu, bool check) : c(cpu), logOnly(check) {}
 #else
     static constexpr bool logOnly = false;
@@ -593,7 +593,7 @@ struct Mem
 #ifdef LITEV_HLE_DIAG
             if (__builtin_expect(logOnly, 0))
             {
-                if (n < 128) log[n++] = {w.a & ~1u, w.v, 4}; else bad = true;
+                if (n < 1024) log[n++] = {w.a & ~1u, w.v, 4}; else bad = true;
                 continue;
             }
 #endif
@@ -3002,8 +3002,11 @@ __attribute__((noinline)) bool RunFx(melonDS::ARMv5* c, State& s, bool jit)
 // ---- 19. MKDS packed vertex transform -------------------------------------------------------
 // The 229 words from 020224e0 through its ARM return.  The entry opcode is shared with
 // NODEDESC, so require this whole-code fingerprint before ever selecting the MKDS path.
-constexpr u64 kMkVertSig = 0xE8BDABCB6D3929CFull;
+constexpr u64 kMkVertSig = 0xC8C3622D71452378ull;
 constexpr u32 kMkVertWords = 229;
+// Guest timing is exactly 48 + 128 per packed vertex in 50,254 no-IRQ
+// check-mode samples (n=1..20, across all eight MKDS race consoles).
+constexpr s32 kMkVertCyc0 = 48, kMkVertCycN = 128;
 bool MkVertAt(melonDS::ARMv5* c, u32 a)
 {
     if (a & 3) return false;
@@ -3015,6 +3018,833 @@ bool MkVertAt(melonDS::ARMv5* c, u32 a)
         h = (h ^ *p) * 0x100000001b3ull;
     }
     return h == kMkVertSig;
+}
+
+// The MKDS race overlay's packed two-coordinate vertex conversion.  Keep this separate
+// from the ordinary NNS hooks: its entry opcode is shared, its caller supplies three
+// stack arguments, and it deliberately leaves its prologue/local-frame writes behind.
+// It remains bit 19 (off by default) until cycle fitting and check-mode coverage land.
+__attribute__((noinline)) bool RunMkVert(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if ((!jit && !MkVertAt(c, pc)) || CheckPending) return false;
+    const u32 dst = c->R[0], want = c->R[1], desc = c->R[2], mat = c->R[3], sp = c->R[13];
+    Mem m(c, g_Check || g_Dry);
+    // The guest reserves 0x34 bytes after saving r4-r11/lr (9 words).  The callee also
+    // reads [old sp], [old sp+4], and [old sp+8], so validate one contiguous window.
+    Obj frame = m.O(sp - 88, 100), out = m.O(dst, want ? want * 8 : 4);
+    u8* dp = m.P(desc);
+    if (!frame || !out || !dp || m.P(desc + 5) != dp + 5) return false;
+    const u32 n = std::min<u32>(want, R16(dp));
+    u8* src = m.P(R32(dp + 4));
+    if ((n && (!src || m.P(R32(dp + 4) + n * 6 - 1) != src + n * 6 - 1))) return false;
+    Obj mx = mat ? m.O(mat, 16) : Obj{}, tr = frame.r(88) ? m.O(frame.r(88), 8) : Obj{};
+    if ((mat && !mx) || (frame.r(88) && !tr)) return false;
+
+    // push {r4-r11,lr}; the guest's stores are observable to diagnostic comparison.
+    for (int i = 0; i < 8; i++) m.W(frame, 52 + i * 4, c->R[4 + i]);
+    m.W(frame, 84, c->R[14]);
+    const u32 flag = (u32)frame.r16(92) << 25, selector = frame.r(96), translation = frame.r(88);
+    m.W(frame, 96, selector);
+    m.W(frame, 0, 0); m.W(frame, 4, flag); m.W(frame, 8, 0x300); m.W(frame, 12, 0x100); m.W(frame, 16, 1); m.W(frame, 20, 0);
+
+    auto lut = [&](u32 base, s32 row, u32 colBytes, u16& v) {
+        u8* p = m.P(base + row * 8 + colBytes);
+        if (!p || m.P(base + row * 8 + colBytes + 1) != p + 1) return false;
+        // LDRH zero-extends; even the later ASR #1 operates on that u32 value.
+        v = R16(p); return true;
+    };
+    auto packed = [](s32 x, s32 y, u32 old) {
+        // The guest uses ASR for both rounded fixed-point coordinates.
+        const u32 a = 0x000001FFu & (u32)((s32)(x + 0x800) >> 12);
+        return (old & 0xFE00FF00u) | ((u32)((s32)(y + 0x800) >> 12) & 0xFF) | (a << 16);
+    };
+    const s32 m0 = mat ? (s32)mx.r(0) : 0, m4 = mat ? (s32)mx.r(4) : 0;
+    const s32 m8 = mat ? (s32)mx.r(8) : 0, m12 = mat ? (s32)mx.r(12) : 0;
+    // ARM's MLA/SMLAL datapath wraps; never express these with signed C++ additions
+    // or shifts, which would be undefined on an overflowed negative value.
+    auto add = [](s32 a, u32 b) { return (s32)((u32)a + b); };
+    auto mul = [](s32 a, s32 b) { return (u32)((s64)a * b); };
+    auto dot = [&](s32 a, s32 b, s32 d, s32 e) {
+        return (u32)(mul(a, b) - ((u32)b << 12) + mul(d, e));
+    };
+    auto roundedDot = [](s32 a, s32 b, s32 d, s32 e) {
+        const u64 sum = (u64)((s64)a * b) + 0x1000u + (u64)((s64)d * e);
+        return (s32)(sum >> 12);
+    };
+    u32 ipFinal = c->R[12];
+    for (u32 i = 0; i < n; i++)
+    {
+        const u16 a = R16(src + i * 6), b = R16(src + i * 6 + 2), z = R16(src + i * 6 + 4);
+        const u32 old = (u32)a | ((u32)b << 16), at = i * 8;
+        // STRH at +4: the source record supplies only the low halfword.  The
+        // following two output bytes belong to the caller's packed record and
+        // must survive exactly as they do through the guest store.
+        m.W(out, at, old);
+        m.W(out, at + 4, (out.r(at + 4) & 0xFFFF0000u) | z);
+        s32 x = (old >> 16) & 0x1FF, y = old & 0xFF;
+        if (x > 255) x -= 512;
+        if (y > 127) y -= 256;
+        x <<= 12; y <<= 12;
+        m.W(frame, 32, (u32)x); m.W(frame, 36, (u32)y);
+        u32 packedOld = old;
+        // 22678/22680 overwrite sb after the optional first lookup: it is local
+        // +0x10 (= 1) for the selector/0x300 path and local +0x14 (= 0) for
+        // the ordinary/0x100 path.  22744 therefore tests the caller selector,
+        // not the first table U value.
+        bool subtractLookup = selector != 0;
+        if (mat)
+        {
+            // The first table adjustment is conditional on the packed attribute bits.
+            u32 q = old & 0x300;
+            if (q != 0x100 && q != 0x300) q |= old & 0x30000000;
+            if (q == 0x300)
+            {
+                const s32 row = (s32)((old & 0xC000) >> 14);
+                const u32 col = ((old >> 30) & 3) * 2;
+                u16 u, v;
+                if (!lut(0x021530D0, row, col, u) || !lut(0x021530B8, row, col, v)) return false;
+                x = add(x, (u32)u << 11); y = add(y, (u32)v << 11);
+                m.W(frame, 32, (u32)x); m.W(frame, 36, (u32)y);
+            }
+            // smull/adds/adc/smlal followed by (hi << 20) | (lo >> 12).
+            const s32 lx = x, ly = y;
+            x = roundedDot(m8, ly, m0, lx);
+            y = roundedDot(m12, ly, m4, lx);
+            const u32 mode = selector ? 0x300 : 0x100;
+            if (!selector) { m.W(frame, 40, (u32)x); m.W(frame, 44, (u32)y); }
+            m.W(frame, 32, (u32)x); m.W(frame, 36, (u32)y);
+            u32 word = (old & 0xC1FFFCFFu) | mode | flag;
+            const s32 row = (s32)((word & 0xC000) >> 14);
+            const u32 col = ((word >> 30) & 3) * 2;
+            u16 u, v;
+            if (!lut(0x021530D0, row, col, u) || !lut(0x021530B8, row, col, v)) return false;
+            const s32 fu = u >> 1, fv = v >> 1;
+            const u32 xAdjust = dot(m0, fu, m8, fv);
+            x = add(x, xAdjust);
+            y = add(y, (u32)(mul(m4, fu) - ((u32)fv << 12) + mul(m12, fv)));
+            // The final lookup also leaves the matrix terms in the callee's
+            // local frame (r12 = M[1][1] at +0x18, M[1][0] at +0x1c).
+            // These writes are observable to the caller/debugger.
+            m.W(frame, 24, (u32)m12);
+            m.W(frame, 28, (u32)m4);
+            if (subtractLookup) { x = add(x, 0u - ((u32)fu << 12)); y = add(y, 0u - ((u32)fv << 12)); }
+            m.W(out, at, word);
+            packedOld = word;
+            m.W(frame, 32, (u32)x); m.W(frame, 36, (u32)y);
+            // The final LDR into ip is the matrix's +12 word, and nothing after
+            // changes ip before the epilogue restores the other registers.
+            ipFinal = (u32)m12;
+        }
+        if (translation) { x = add(x, tr.r(0)); y = add(y, tr.r(4)); m.W(frame, 32, (u32)x); m.W(frame, 36, (u32)y); }
+        m.W(out, at, packed(x, y, packedOld));
+        m.W(frame, 0, i + 1);
+        // Mem's normal commit queue is intentionally small; a long vertex batch must
+        // not overrun it. In check mode this appends to the diagnostic log.
+        m.Flush();
+    }
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = n; e.R[1] = n; e.R[12] = ipFinal; e.R[13] = sp;
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | Flags(n, n);
+    e.retPc = c->R[14]; e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();
+        if (g_Check) { ArmCheck(c, 19, m, e); g_P.fit[0] = n; g_P.fit[1] = dst; g_P.fit[2] = mat; g_P.fit[3] = translation; }
+        // Check mode must execute the guest body after arming ArmCheck.  Returning
+        // false here makes the dispatcher treat this already-recognised hook as an
+        // undefined ARM instruction instead of taking the normal guest fallback.
+        s.checks[19]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    m.Flush(); s.calls[19]++; s.native[19]++;
+    Return(c, e, kMkVertCyc0 + kMkVertCycN * (s32)n);
+    return true;
+}
+
+// ---- 20. MKDS streaming LZSS ---------------------------------------------------------------
+// This is the race overlay's forward, resumable decoder (0214d464 in the US ROM).  Unlike the
+// NitroSDK backwards decoder above, its state is deliberately retained between calls: a packet
+// may end after a flag byte or after the first byte of a back-reference.  Match the complete body
+// before accepting it--the entry push is common library code--and retain the unusual SWPB write
+// order (the old byte is only placed in a callee-saved scratch register and is then restored).
+constexpr u64 kMkLzSig = 0x4B03CB3837EE0138ull;
+constexpr u32 kMkLzWords = 64;
+constexpr u32 kMkLzInstr = 0xE92D07F0;     // push {r4-r10}
+
+bool MkLzAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a & 3) return false;
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 i = 0; i < kMkLzWords * 4; i++)
+    {
+        const u8* p = CodePtr(c, a + i);
+        if (!p) return false;
+        h = (h ^ *p) * 0x100000001b3ull;
+    }
+    return h == kMkLzSig;
+}
+
+// Native body of 0214d464.  The function's inputs are r0=state, r1=input, r2=input bytes;
+// state[0/4] are output pointer/remaining count, and state[0xb..0xe] retain flag/token state.
+// It is intentionally default-off: diagnostic comparison must first establish a cycle fit as
+// well as the exact architectural result on the race matrix.
+__attribute__((noinline)) bool RunMkLz(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if ((!jit && !MkLzAt(c, pc)) || CheckPending) return false;
+    Mem m(c, g_Check || g_Dry);
+    const u32 st = c->R[0], in0 = c->R[1], inN = c->R[2], sp = c->R[13];
+    u8* q = m.P(st);
+    if (!q || (st & 3) || m.P(st + 15) != q + 15 || (sp & 3)) return false;
+    u32 out0 = R32(q), left = R32(q + 4);
+    if (getenv("LITEV_A9HLE_MKLZTRACE"))
+    {
+        static thread_local int traceN = 0;
+        if (traceN++ < 16) fprintf(stderr, "MKLZTRACE st=%08x out=%08x left=%u in=%08x n=%u sp=%08x flags=%02x/%u phase=%u\\n",
+                                   st, out0, left, in0, inN, sp, q[11], q[12], q[14]);
+    }
+    // A back-reference reaches at most 4096 bytes behind the current output and can write an
+    // 18-byte token after the nominal remaining count reaches zero.  Require one ordinary,
+    // contiguous RAM/DTCM view for every byte the guest can touch; unusual mappings use guest.
+    if (out0 < 4096 || left > 0x00FFFFFFu || inN > 0x00FFFFFFu) return false;
+    const u32 outBase = out0 - 4096, outN = 4096 + left + 18;
+    u8* out = m.P(outBase), *ip = m.P(in0), *stk = m.P(sp - 28);
+    if (!out || !ip || !stk || m.P(outBase + outN - 1) != out + outN - 1
+             || (inN && m.P(in0 + inN - 1) != ip + inN - 1) || m.P(sp - 1) != stk + 27)
+        return false;
+    // The compressed packet and output history must be distinct.  This is true for MKDS assets;
+    // rejecting self-overlap avoids silently changing the guest's load/store interleaving.
+    const u64 ib = in0, ie = ib + inN, ob = outBase, oe = ob + outN;
+    if (ib < oe && ob < ie) return false;
+
+    u32 lastInv = ~0u;
+    auto w8 = [&](u32 a, u8 v) {
+#ifdef LITEV_HLE_DIAG
+        if (m.logOnly) { if (m.n < 1024) m.log[m.n++] = {a, v, 1}; else m.bad = true; return; }
+#endif
+        u8* p = m.P(a);
+        if (*p == v) return;
+        if ((a >> 24) == 0x02 && (a & ~15u) != lastInv)
+        {
+            c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(a);
+            lastInv = a & ~15u;
+        }
+        *p = v;
+    };
+    auto w32 = [&](u32 a, u32 v) { for (u32 i = 0; i < 4; i++) w8(a + i, (u8)(v >> (i * 8))); };
+
+    // The prologue's saved registers are observable stack contents even though the epilogue
+    // restores them.  Write them before the decoder just as the guest does.
+    for (u32 i = 0; i < 7; i++) w32(sp - 28 + i * 4, c->R[4 + i]);
+
+    u32 r1 = in0, r2 = inN, r3 = out0, r4 = left;
+    u32 r5 = q[11], r6 = q[12], r7 = q[13], r8 = q[14];
+    u32 fl = 0, nf = 0, nl = 0, nr = 0, nc = 0;
+    std::vector<u8> shadow;
+#ifdef LITEV_HLE_DIAG
+    if (m.logOnly) shadow.assign(out, out + outN);
+#endif
+    auto outAt = [&](u32 a) -> u8& {
+#ifdef LITEV_HLE_DIAG
+        if (m.logOnly) return shadow[a - outBase];
+#endif
+        return out[a - outBase];
+    };
+    auto put = [&](u8 v) {
+#ifdef LITEV_HLE_DIAG
+        // In check mode retain the decompressed bytes in the shadow and log the final changed
+        // words below.  A packet can expand far beyond its 1 KiB input, so logging each SWPB
+        // byte would exhaust Mem's bounded diagnostic log despite an identical final result.
+        if (m.logOnly) { outAt(r3++) = v; return; }
+#endif
+        w8(r3, v); outAt(r3) = v; r3++;
+    };
+    auto inByte = [&]() { return *m.P(r1++); };
+
+    for (;;)
+    {
+        fl = Flags(r4, 0);                         // cmp r4,#0
+        if ((s32)r4 <= 0) break;
+        if (!r6)
+        {
+            fl = Flags(r2, 0);                     // cmp r2,#0
+            if (!r2) break;
+            r5 = inByte(); r6 = 8; r2--; nf++;      // new flag byte
+            continue;
+        }
+        fl = Flags(r2, 0);                         // cmp r2,#0
+        if (!r2) break;
+        if (!(r5 & 0x80))
+        {
+            const u8 v = inByte(); r4--; r2--; put(v); nl++; // ldrb/sub/sub/swpb/add
+        }
+        else
+        {
+            if (!r8) { r7 = inByte(); r8 = 1; r2--; }
+            fl = Flags(r2, 0);                     // cmp r2,#0 after first ref byte
+            if (!r2) break;
+            const u32 off = (((r7 & 15) << 8) | inByte()) + 1;
+            r8 = 0; r2--; nr++;
+            r7 = 3 + (r7 >> 4);                    // adds r7,r10,r7,asr#4 (always nonzero)
+            fl = (r7 & 0x80000000) | ((r7 == 0) << 30); // C/V from this ADD are immaterial for a positive sum
+            do
+            {
+                const u8 v = outAt(r3 - off); r4--; put(v); nc++;
+                r7--; fl = Flags(r7 + 1, 1);       // subs r7,#1
+            } while ((s32)r7 > 0);
+        }
+        fl = Flags(r4, 0);                         // cmp r4,#0
+        if (!r4) break;
+        r5 <<= 1;
+        fl = Flags(r6, 1); r6--;                   // subs r6,#1
+        // Both the bne path and its fall-through recheck r2 at 0214d490/0214d528.
+    }
+
+#ifdef LITEV_HLE_DIAG
+    if (m.logOnly)
+    {
+        // The guest's byte stores are observable only through their final memory values here:
+        // source/output ranges are proven disjoint above, so there is no intervening alias read.
+        // Coalescing to words leaves room for a normal 1 KiB compressed packet to be compared.
+        const u32 first = out0 & ~3u, last = (r3 - 1) & ~3u;
+        for (u32 a = first; r3 != out0; a += 4)
+        {
+            const u32 off = a - outBase, v = R32(shadow.data() + off);
+            if (v != R32(out + off))
+            {
+                if (m.n < 1024) m.log[m.n++] = {a, v, 4}; else { m.bad = true; break; }
+            }
+            if (a == last) break;
+        }
+        if (m.bad)
+        {
+            if (getenv("LITEV_A9HLE_MKLZTRACE")) fprintf(stderr, "MKLZTRACE diagnostic-log-full produced=%u\\n", r3 - out0);
+            GuestFallback(c); return true;
+        }
+    }
+#endif
+    w32(st, r3); w32(st + 4, r4); w8(st + 11, (u8)r5); w8(st + 12, (u8)r6);
+    w8(st + 13, (u8)r7); w8(st + 14, (u8)r8);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = r4; e.R[1] = r1; e.R[2] = r2; e.R[3] = r3; e.R[13] = sp;
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | fl;
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        if (g_Check) { ArmCheck(c, 20, m, e); g_P.fit[0] = nf; g_P.fit[1] = nl; g_P.fit[2] = nr; g_P.fit[3] = nc; }
+        s.checks[20]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    // Fit from 12,329 IRQ-free interpreter calls across the 8P race: base + flag byte +
+    // literal + reference token + each copied byte.  RMS error 6.9 cycles (mean 46.8k).
+    const s32 cyc = 32 + 16 * (s32)nf + 32 * (s32)nl + 41 * (s32)nr + 18 * (s32)nc;
+    s.calls[20]++; s.native[20]++;
+    Return(c, e, cyc);
+    return true;
+}
+
+// ---- 21. MKDS word fill ---------------------------------------------------------------------
+// `add ip,r1,r2; cmp r1,ip; stmlt r1!,{r0}; blt` is the race overlay's compact forward
+// fill.  It is used to clear temporary graphics/physics buffers; the loop block alone accounts
+// for ~5.4M guest executions in the captured race.  The guest deliberately rounds a non-multiple
+// byte count up to one word, so retain that contract rather than substituting memset(r2).
+constexpr u32 kMkFillInstr = 0xE081C002;
+constexpr u32 kMkFillCode[5] = {0xE081C002, 0xE151000C, 0xB8A10001, 0xBAFFFFFC, 0xE12FFF1E};
+
+bool MkFillAt(melonDS::ARMv5* c, u32 a)
+{
+    return CodeEq(c, a, kMkFillCode, 5, nullptr, 0);
+}
+
+__attribute__((noinline)) bool RunMkFill(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if ((!jit && !MkFillAt(c, pc)) || CheckPending) return false;
+    const u32 d = c->R[1], len = c->R[2], words = (len + 3) >> 2;
+    // The real routine's unsigned pointer arithmetic wraps.  Refuse wrap/unaligned cases and
+    // preserve guest execution there; normal MKDS callers use aligned main-RAM scratch buffers.
+    if ((d & 3) || len > 0x00FFFFFCu || d + words * 4 < d) return false;
+    Mem m(c, g_Check || g_Dry);
+    Obj out = m.O(d, words ? words * 4 : 4);
+    if (!out) return false;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check && words > 1024) return false;  // fixed compare log: let unusually large clears run as ARM
+#endif
+    for (u32 i = 0; i < words; i++)
+    {
+        m.W(out, i * 4, c->R[0]);
+        if ((i % 96) == 95) m.Flush();
+    }
+    m.Flush();
+    const u32 r1 = d + words * 4, ip = d + len;
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[1] = r1; e.R[12] = ip; e.R[13] = c->R[13]; e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | Flags(r1, ip);
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        if (g_Check) { ArmCheck(c, 21, m, e); g_P.fit[0] = words; }
+        s.checks[21]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    // 9,931 IRQ-free interpreter samples: 10 + 10 per stored word (95% within 4 cycles).
+    s.calls[21]++; s.native[21]++;
+    Return(c, e, 10 + 10 * (s32)words);
+    return true;
+}
+
+// ---- 22. MKDS 32-byte-unrolled word fill ---------------------------------------------------
+constexpr u32 kMkFill32Instr = 0xE92D03F0;
+constexpr u32 kMkFill32Code[19] = {0xE92D03F0, 0xE0819002, 0xE1A02CA2, 0xE081C20C, 0xE1A02000, 0xE1A03002,
+    0xE1A04002, 0xE1A05002, 0xE1A06002, 0xE1A07002, 0xE1A08002, 0xE151000C, 0xB8A101FD, 0xBAFFFFFC,
+    0xE1510009, 0xB8A10001, 0xBAFFFFFC, 0xE8BD03F0, 0xE12FFF1E};
+bool MkFill32At(melonDS::ARMv5* c, u32 a) { return CodeEq(c, a, kMkFill32Code, 19, nullptr, 0); }
+
+__attribute__((noinline)) bool RunMkFill32(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if ((!jit && !MkFill32At(c, pc)) || CheckPending) return false;
+    const u32 d = c->R[1], len = c->R[2], words = (len + 3) >> 2, sp = c->R[13];
+    if ((d & 3) || (sp & 3) || len > 0x00FFFFFCu || d + words * 4 < d) return false;
+    Mem m(c, g_Check || g_Dry);
+    Obj out = m.O(d, words ? words * 4 : 4), stk = m.O(sp - 24, 24);
+    if (!out || !stk || (d < sp && d + words * 4 > sp - 24) || (sp < d && sp > d + words * 4)) return false;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check && words > 1018) return false;
+#endif
+    // push {r4-r9}; its dead stack writes are still part of the compared machine state.
+    for (u32 i = 0; i < 6; i++) m.W(stk, i * 4, c->R[4 + i]);
+    for (u32 i = 0; i < words; i++)
+    {
+        m.W(out, i * 4, c->R[0]);
+        if ((i % 90) == 89) m.Flush();
+    }
+    m.Flush();
+    const u32 r1 = d + words * 4, end = d + len, bulk = d + ((len >> 5) << 5);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[1] = r1; e.R[2] = e.R[3] = c->R[0]; e.R[12] = bulk; e.R[13] = sp; e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | Flags(r1, end);
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        if (g_Check) ArmCheck(c, 22, m, e);
+        s.checks[22]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    s.calls[22]++; s.native[22]++;
+    Return(c, e, 0); // default-off pending a measured cycle fit
+    return true;
+}
+
+#if 0 // Rejected standalone MKDS bit reader: correct, but slower than the JIT at tens of millions of calls.
+// ---- 23. MKDS packed-stream bit reader ----------------------------------------------------
+// The texture/attribute converter at 02023d84 calls this 26-word helper for every packed
+// field. Its six-byte state is {next byte*, unused, signed bits remaining, cache byte}.
+// The overlay only asks for 1..8 bits, so a request crosses at most one byte boundary.
+constexpr u32 kMkBitsInstr = 0xE92D4030; // push {r4, r5, lr}
+constexpr u32 kMkBitsCode[26] = {0xE92D4030, 0xE24DD004, 0xE1D020D4, 0xE5D0C005,
+    0xE1A04001, 0xE1520004, 0xA0421004, 0xA1A0513C, 0xA5C01004, 0xAA00000A,
+    0xE5903000, 0xE0441002, 0xE2832001, 0xE5802000, 0xE5D32000, 0xE1A0511C,
+    0xE5C02005, 0xE3A02008, 0xE5C02004, 0xEBFFFFEB, 0xE1805005, 0xE2640008,
+    0xE3A010FF, 0xE0050051, 0xE28DD004, 0xE8BD4030};
+bool MkBitsAt(melonDS::ARMv5* c, u32 a)
+{
+    return CodeEq(c, a, kMkBitsCode, 26, nullptr, 0)
+        && CodePtr(c, a + 26 * 4) && R32(CodePtr(c, a + 26 * 4)) == 0xE12FFF1E;
+}
+
+__attribute__((noinline)) bool RunMkBits(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8, state = c->R[0], want = c->R[1], sp = c->R[13];
+    if ((!jit && !MkBitsAt(c, pc)) || CheckPending || want < 1 || want > 8 || (state & 3) || (sp & 3)) return false;
+    Mem m(c, g_Check || g_Dry);
+    Obj st = m.O(state, 8), outer = m.O(sp - 12, 12);
+    if (!st || !outer) return false;
+    const s32 rem = (s8)st.p[4];
+    const u8 cache = st.p[5];
+    if (rem < 0 || rem > 8) return false;
+
+    // Saved registers remain in memory after pop, so preserve their stores in check mode.
+    m.W(outer, 0, c->R[4]); m.W(outer, 4, c->R[5]); m.W(outer, 8, c->R[14]);
+    u32 result, finalR2 = (u32)rem, finalR3 = c->R[3], finalR12 = cache, flags, stateWord = st.r(4);
+    if (rem >= (s32)want)
+    {
+        const u32 left = (u32)rem - want;
+        result = (u32)cache >> left;
+        stateWord = (stateWord & ~0xFFu) | left;
+        flags = Flags((u32)rem, want);
+    }
+    else
+    {
+        const u32 need = want - (u32)rem;
+        u8* p = m.P(st.r(0));
+        Obj inner = m.O(sp - 28, 12);
+        if (!p || !m.P(st.r(0) + 1) || !inner) return false;
+        // At the recursive BL, r4 is want, r5 is cache << need, LR is 0202484c.
+        m.W(inner, 0, want); m.W(inner, 4, (u32)cache << need); m.W(inner, 8, pc + 0x50);
+        const u32 nextPtr = st.r(0);
+        const u8 next = *p, left = 8 - need;
+        result = ((u32)cache << need) | ((u32)next >> left);
+        stateWord = ((u32)next << 8) | left;
+        finalR2 = 8; finalR3 = nextPtr; finalR12 = next; flags = Flags(8, need);
+        m.W(st, 0, nextPtr + 1);
+    }
+    result &= (1u << want) - 1u;
+    m.W(st, 4, stateWord);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    // The epilogue path sets r1 to the mask byte on every return, while r3/ip retain
+    // the stream pointer / cache loaded by the crossing path.
+    e.R[0] = result; e.R[1] = 0xFF; e.R[2] = finalR2; e.R[3] = finalR3; e.R[12] = finalR12; e.R[13] = sp; e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | flags;
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();
+        if (g_Check) { ArmCheck(c, 23, m, e); g_P.fit[0] = want; g_P.fit[1] = rem; }
+        s.checks[23]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    m.Flush(); s.calls[23]++; s.native[23]++;
+    Return(c, e, 0); // default-off until the guest-cycle fit is captured
+    return true;
+}
+
+#endif
+// ---- 23. MKDS aligned forward copy ---------------------------------------------------------
+// The resident race overlay's 76-word byte-copy routine at 0214d1fc has a simple 32-bit
+// forward loop when both pointers are aligned.  Only non-overlapping, >=32-byte spans take
+// this path; all partial/alignment/overlap cases retain the guest implementation.
+constexpr u64 kMkCopySig = 0xFC289BDD6575648Full;
+constexpr u32 kMkCopyWords = 76, kMkCopyInstr = 0xE3520000;
+bool MkCopyAt(melonDS::ARMv5* c, u32 a)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 i = 0; i < kMkCopyWords * 4; i++)
+    {
+        const u8* p = CodePtr(c, a + i);
+        if (!p) return false;
+        h = (h ^ *p) * 0x100000001b3ull;
+    }
+    return h == kMkCopySig;
+}
+
+__attribute__((noinline)) bool RunMkCopy(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8, src = c->R[0], dst = c->R[1], len = c->R[2];
+    if ((!jit && !MkCopyAt(c, pc)) || CheckPending || (src | dst | len) & 3 || len < 32 || src + len < src || dst + len < dst
+        || !(src + len <= dst || dst + len <= src)) return false;
+    Mem m(c, g_Check || g_Dry);
+    Obj in = m.O(src, len), out = m.O(dst, len);
+    // DTCM follows a distinct, much slower bus path.  Keep it in ARM until it has
+    // its own timing model; the race's main-RAM path is exactly characterised below.
+    if (!in || !out || in.dtcm || out.dtcm) return false;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check && len > 2048) return false;
+#endif
+    u32 last = 0;
+    for (u32 i = 0; i < len; i += 4)
+    {
+        last = in.r(i); m.W(out, i, last);
+        if ((i & 0x15C) == 0x15C) m.Flush();
+    }
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = src + len; e.R[1] = dst + len; e.R[2] = 0; e.R[3] = last; e.R[12] = dst + len;
+    // The word loop exits through `cmp r1, ip` with equality, which leaves C=1.
+    // The following `tst r2,#2` / `tst r2,#1` preserve that carry while setting Z for r2=0.
+    e.retPc = c->R[14]; e.CPSR = (c->CPSR & 0x1FFFFFFFu) | 0x60000000u;
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();
+        if (g_Check) { ArmCheck(c, 23, m, e); g_P.fit[0] = len; g_P.fit[1] = src; g_P.fit[2] = dst; }
+        s.checks[23]++; GuestFallback(c); return true;
+    }
+#endif
+    m.Flush(); s.calls[23]++; s.native[23]++;
+    // IRQ-free interpreter samples of the aligned main-RAM path: 42 + 11 cycles/word.
+    Return(c, e, 42 + 11 * (s32)(len >> 2));
+    return true;
+}
+
+// ---- 24. MKDS packed texture tile converter -------------------------------------------------
+// The resident race overlay's 159-word converter at 02023d84 expands a clipped 4- or 8-bit
+// packed source rectangle into one 8-wide destination tile row.  It used to look like a hot
+// bit-reader because 020247fc is called once per output element; the useful replacement is the
+// outer routine, which owns the clipping, stream position and masked writes.
+constexpr u64 kMkTexSig = 0x9AF03DB76897667Aull;
+constexpr u32 kMkTexWords = 159, kMkTexInstr = 0xE92D4FF0;
+bool MkTexAt(melonDS::ARMv5* c, u32 a)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 i = 0; i < kMkTexWords * 4; i++)
+    {
+        const u8* p = CodePtr(c, a + i);
+        if (!p) return false;
+        h = (h ^ *p) * 0x100000001b3ull;
+    }
+    return h == kMkTexSig;
+}
+
+__attribute__((noinline)) bool RunMkTex(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8, arg = c->R[0], sp0 = c->R[13];
+    if ((!jit && !MkTexAt(c, pc)) || CheckPending || (arg & 3) || (sp0 & 3)) return false;
+    Mem m(c, g_Check || g_Dry);
+    Obj a = m.O(arg, 40);
+    if (!a || !m.P(sp0 - 120)) return false;
+    const u32 dst = a.r(0), src = a.r(4), stride = a.r(24), bits = a.r(28), mode = a.r(32), bias = a.r(36);
+    const s32 x = (s32)a.r(8), y = (s32)a.r(12), w = (s32)a.r(16), h = (s32)a.r(20);
+    if (getenv("LITEV_A9HLE_MKTEXTRACE"))
+    {
+        static thread_local int traceN = 0;
+        if (traceN++ < 24) fprintf(stderr, "MKTEX arg=%08x dst=%08x src=%08x xywh=%d,%d,%d,%d stride=%u bits=%u mode=%u bias=%08x sp=%08x\\n",
+                                   arg, dst, src, x, y, w, h, stride, bits, mode, bias, sp0);
+    }
+    if ((mode != 4 && mode != 8) || bits < 1 || bits > 8 || w < 0 || h < 0 || x > 8 || y > 8) return false;
+    const s32 x0 = x < 0 ? 0 : x, y0 = y < 0 ? 0 : y;
+    const s32 x1 = std::min<s32>(x + w, 8), y1 = std::min<s32>(y + h, 8);
+    if (x1 < x0 || y1 < y0) return false;
+    const s64 first = (s64)(-std::min<s32>(x, 0)) * bits + (s64)(-std::min<s32>(y, 0)) * stride;
+    const s64 last = first + (s64)(y1 - y0) * stride + (s64)(x1 - x0) * bits;
+    if (first < 0 || last < first || last > 0x7FFFFFFF) return false;
+    const u32 in0 = src + (u32)(first >> 3), inN = (u32)((last + 7) >> 3) - (u32)(first >> 3);
+    const u32 outBytes = (u32)(y1 - y0) * (mode == 4 ? 4 : 8);
+    if ((dst & 3) || src + inN < src || !m.P(in0) || (inN && !m.P(in0 + inN - 1))
+        || (outBytes && (!m.P(dst + (u32)y0 * (mode == 4 ? 4 : 8)) || !m.P(dst + (u32)(y1 - 1) * (mode == 4 ? 4 : 8) + (mode == 4 ? 3 : 7))))) return false;
+
+    auto put8 = [&](u32 at, u8 v) {
+#ifdef LITEV_HLE_DIAG
+        if (m.logOnly) { if (m.n < 1024) m.log[m.n++] = {at, v, 1}; else m.bad = true; return; }
+#endif
+        u8* p = m.P(at); if (*p == v) return;
+        if ((at >> 24) == 0x02) c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(at);
+        *p = v;
+    };
+    auto put32 = [&](u32 at, u32 v) { for (u32 i = 0; i < 4; i++) put8(at + i, (u8)(v >> (i * 8))); };
+    // The saved callee registers remain observable on the caller's stack after the pop.
+    for (u32 i = 0; i < 8; i++) put32(sp0 - 36 + i * 4, c->R[4 + i]);
+    put32(sp0 - 4, c->R[14]);
+    const u32 frame = sp0 - 88; // after push {r4-r11,lr}; sub sp,#0x34
+    const u32 wordBytes = mode == 4 ? 4 : 8;
+    put32(frame + 0, (u32)x0);
+    put32(frame + 4, src);
+    put32(frame + 8, stride);
+    put32(frame + 12, dst + (u32)y0 * wordBytes);
+    put32(frame + 16, dst + (u32)y1 * wordBytes);
+    put32(frame + 28, 0);        // the local zero byte pair is backed by this word
+
+    // The converter initializes its local bit-reader with an empty cache, then calls it once
+    // for first&7 (including zero).  That call leaves r2=0 and ip=0, while r3 is untouched.
+    u32 ip = in0, rem = 0, cache = 0, r2 = 0, r3 = c->R[3], r12 = 0;
+    auto get = [&](u32 want, u32 savedR5, u32 returnPc) -> u32 {
+        // Every call leaves its push {r4,r5,lr} frame below the converter's local frame.
+        put32(frame - 12, want); put32(frame - 8, savedR5); put32(frame - 4, returnPc);
+        const u32 oldrem = rem;
+        if (rem >= want) { rem -= want; r2 = oldrem; }
+        else
+        {
+            const u32 need = want - rem, oldCache = cache; r3 = ip; cache = *m.P(ip++); rem = 8;
+            // The one recursive call has its own frame.  It cannot recurse again because the
+            // freshly loaded byte has eight bits and this converter asks for at most eight.
+            put32(frame - 28, want); put32(frame - 24, oldCache << need); put32(frame - 20, 0x0202484C);
+            r2 = 8; const u32 v = ((oldCache & 0xFFu) << need) | (cache >> (8 - need));
+            r12 = cache; rem -= need; put32(frame + 36, ip); put8(frame + 40, (u8)rem); put8(frame + 41, (u8)cache);
+            return v & ((1u << want) - 1u);
+        }
+        r12 = cache; put8(frame + 40, (u8)rem);
+        return (cache >> rem) & ((1u << want) - 1u);
+    };
+    u32 finalR0 = stride, finalR1 = dst + (u32)y0 * wordBytes, fl = Flags(finalR1, finalR1);
+    for (s32 row = y0; row < y1; row++)
+    {
+        // Each destination word builds a fresh local bit-reader at fp, rather than carrying
+        // the stream across rows.  The offset call occurs even for fp&7 == 0.
+        const u32 rowPos = (u32)(first + (s64)(row - y0) * stride);
+        ip = src + (rowPos >> 3); rem = 0; cache = 0; r2 = 0; r12 = 0;
+        const u32 initial = rowPos & 7;
+        const u32 startWord = R32(m.P(dst + (u32)row * wordBytes));
+        put32(frame + 36, ip); put8(frame + 40, 0); put8(frame + 41, 0);
+        (void)get(initial, startWord, 0x02023E98);
+        // The overlay's x start is already a destination bit offset.  Its endpoint, however,
+        // is the clipped coordinate multiplied by the 4/8-bit destination mode.
+        u32 p = dst + (u32)row * wordBytes, bit = (u32)x0;
+        const u32 endBit = (u32)x1 * mode;
+        for (; bit < endBit; bit += mode)
+        {
+            const u32 before = R32(m.P(p));
+            const u32 v = get(bits, before, mode == 4 ? 0x02023EB4 : 0x02023F90);
+            if (mode == 4)
+            {
+                u32 q = R32(m.P(p));
+                if (v) q = (q & ~(0xFu << bit)) | ((v + bias) << bit);
+                put32(p, q);
+            }
+            else
+            {
+                u32 lo = R32(m.P(p)), hi = R32(m.P(p + 4));
+                if (v)
+                {
+                    const u32 z = v + bias;
+                    if (bit < 32) lo = (lo & ~(0xFFu << bit)) | (z << bit);
+                    else hi = (hi & ~(0xFFu << (bit - 32))) | (z << (bit - 32));
+                }
+                put32(p, lo); put32(p + 4, hi);
+            }
+        }
+        finalR1 = p + wordBytes; put32(frame + 12, finalR1); fl = Flags(finalR1, dst + (u32)y1 * wordBytes);
+    }
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = finalR0; e.R[1] = finalR1; e.R[2] = r2; e.R[3] = r3; e.R[12] = r12; e.R[13] = sp0; e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | fl;
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        if (g_Check) { ArmCheck(c, 24, m, e); g_P.fit[0] = dst; g_P.fit[1] = wordBytes; g_P.fit[2] = (u32)y0; g_P.fit[3] = (u32)y1; }
+        s.checks[24]++; GuestFallback(c); return true;
+    }
+#endif
+    s.calls[24]++; s.native[24]++;
+    Return(c, e, 0); // default-off until checker coverage and a guest-cycle fit land
+    return true;
+}
+
+// ---- 25. ARM9 cache clean/invalidate range --------------------------------------------------
+// The resident SDK routine at 0200EE74 drains the write buffer then issues one data-cache
+// clean/invalidate CP15 operation per 32-byte line.  Those data-cache CP15 operations are no-ops
+// in melonDS, leaving a pure register/flag loop.  Keep it default-off until its guest timing is
+// fitted; the exact nine-word fingerprint prevents confusing it with another CP15 wrapper.
+constexpr u32 kMkCacheInstr = 0xE3A0C000;
+constexpr u32 kMkCacheCode[9] = {0xE3A0C000, 0xE0811000, 0xE3C0001F, 0xEE070F9A, 0xEE070F3E,
+                                  0xE2800020, 0xE1500001, 0xBAFFFFFA, 0xE12FFF1E};
+bool MkCacheAt(melonDS::ARMv5* c, u32 a) { return CodeEq(c, a, kMkCacheCode, 9, nullptr, 0); }
+
+__attribute__((noinline)) bool RunMkCache(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8, start = c->R[0], len = c->R[1];
+    if ((!jit && !MkCacheAt(c, pc)) || CheckPending || start + len < start || len > 0x01000000) return false;
+    const u32 end = start + len;
+    u32 p = start & ~31u;
+    u32 lines = 0;
+    while (p < end) { p += 32; lines++; }
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = p; e.R[1] = end; e.R[12] = 0; e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | Flags(p, end);
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        Mem m(c, g_Check || g_Dry);
+        if (g_Check) { ArmCheck(c, 25, m, e); g_P.fit[0] = lines; }
+        s.checks[25]++; GuestFallback(c); return true;
+    }
+#endif
+    s.calls[25]++; s.native[25]++;
+    Return(c, e, 0); // default-off until timing is fitted
+    return true;
+}
+
+// ---- 26. Pokémon White fixed-point affine 2x3 matrix composition ---------------------------
+// This 73-word game routine composes two 2x3 affine matrices in signed 20.12 fixed point:
+//   [a b tx] * [d e ux] = [ad+be, ae+bf, tx*d+ty*e+ux]
+//   [c f ty]   [g h uy]   [cd+fg, ce+fh, tx*g+ty*h+uy]
+// The implementation writes through a stack temporary when dst==right.  The common independent
+// matrix case has no observable stack writes, which is the only case accepted below until alias
+// cases have their own checker coverage.  The fingerprint is of the entire routine, not an SDK
+// name or address, so an unrelated matrix helper cannot be mistaken for it.
+constexpr u64 kPwAffineSig = 0xCE47EAE93D7E80D3ull;
+constexpr u32 kPwAffineWords = 73, kPwAffineInstr = 0xE92D40F8;
+bool PwAffineAt(melonDS::ARMv5* c, u32 a)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 i = 0; i < kPwAffineWords * 4; i++)
+    {
+        const u8* p = CodePtr(c, a + i);
+        if (!p) return false;
+        h = (h ^ *p) * 0x100000001b3ull;
+    }
+    return h == kPwAffineSig;
+}
+
+inline u32 Fix12_2(u32 a, u32 b, u32 c, u32 d)
+{
+    // SMULL/SMLAL is a modulo-2^64 signed accumulation; shifting its bit pattern right 12 and
+    // retaining the low word exactly reproduces the guest's LSR/ORR pair, including negatives.
+    const u64 v = (u64)((s64)(s32)a * (s64)(s32)b) + (u64)((s64)(s32)c * (s64)(s32)d);
+    return (u32)(v >> 12);
+}
+
+__attribute__((noinline)) bool RunPwAffine(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8, left = c->R[0], right = c->R[1], dst = c->R[2];
+    if ((!jit && !PwAffineAt(c, pc)) || CheckPending || (left | right | dst) & 3) return false;
+    // The guest permits dst==right via a 24-byte stack scratch buffer.  Other partial aliases
+    // overwrite an input during the unrolled sequence and remain guest-only for now.
+    const bool rightAlias = dst == right;
+    if ((dst - left < 24) || (left - dst < 24) || (!rightAlias && ((dst - right < 24) || (right - dst < 24)))) return false;
+    Mem m(c, g_Check || g_Dry);
+    const u32 scratch = c->R[13] - 48; // push {r3-r7,lr}; sub sp,#24
+    Obj l = m.O(left, 24), r = m.O(right, 24), o = m.O(dst, 24), tmp = m.O(scratch, 24);
+    if (!l || !r || !o || (rightAlias && !tmp)) return false;
+    u32 a[6], b[6];
+    for (int i = 0; i < 6; i++) { a[i] = l.r(i * 4); b[i] = r.r(i * 4); }
+    const u32 q[6] = {
+        Fix12_2(a[0], b[0], a[1], b[2]), Fix12_2(a[0], b[1], a[1], b[3]),
+        Fix12_2(a[2], b[0], a[3], b[2]), Fix12_2(a[2], b[1], a[3], b[3]),
+        b[4] + Fix12_2(a[4], b[0], a[5], b[2]), b[5] + Fix12_2(a[4], b[1], a[5], b[3]),
+    };
+    for (int i = 0; i < 6; i++) m.W(o, i * 4, q[i]);
+    // dst==right takes the `addeq r2,sp` branch, computes in the local 24-byte buffer,
+    // then copies it back.  Its dead stack bytes are observable to the checker/caller.
+    if (rightAlias) for (int i = 0; i < 6; i++) m.W(tmp, i * 4, q[i]);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    // The direct path leaves r0 at element 5 and r1 at the original right[5].  The alias path
+    // returns through its six-word stack copy, so r0/r1/r2/r3 contain q4/q5/q2/q3 instead.
+    const u64 last = (u64)((s64)(s32)a[4] * (s64)(s32)b[1]) + (u64)((s64)(s32)a[5] * (s64)(s32)b[3]);
+    e.R[0] = rightAlias ? q[4] : q[5]; e.R[1] = rightAlias ? q[5] : b[5];
+    e.R[2] = rightAlias ? q[2] : dst; e.R[3] = rightAlias ? q[3] : (u32)(last >> 32);
+    e.R[12] = rightAlias ? dst + 16 : dst; // ip starts as dst and the alias copy writes four words through ip!
+    e.R[14] = rightAlias ? scratch + 16 : scratch; // lr is repurposed as the temporary-buffer cursor
+    e.R[13] = c->R[13]; e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | Flags(rightAlias ? scratch : dst, scratch);
+    e.CPSR = e.retPc & 1 ? e.CPSR | 0x20 : e.CPSR & ~0x20u;
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        if (g_Check) { ArmCheck(c, 26, m, e); g_P.fit[0] = left; g_P.fit[1] = right; g_P.fit[2] = dst; }
+        s.checks[26]++; GuestFallback(c); return true;
+    }
+#endif
+    m.Flush(); s.calls[26]++; s.native[26]++;
+    Return(c, e, 0); // default-off until independent-path coverage and guest-cycle fitting land
+    return true;
 }
 
 // ---- 9. _ll_sdiv: 64-bit signed divide of the compiler runtime -----------------------------------
@@ -3283,6 +4113,14 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
 #ifdef LITEV_GX_BULK
     if (instr == kNodeInstr)
     {
+        State& s = St(&nds.ARM9);
+        if (s.on && (s.mask & 131072) && MkVertAt(&nds.ARM9, addr))
+        {
+            static thread_local Range mk;
+            mk = {addr, addr + kMkVertWords * 4};
+            r = &mk;
+            return 1;
+        }
         static thread_local Range nd[13];
         u32 fn[4];
         NodeAt(&nds.ARM9, addr, fn);    // (after IsHook != 0) a missing callee: an empty range
@@ -3320,6 +4158,42 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         lz = {addr - kLzHead, addr - kLzHead + 45 * 4};
         r = &lz;
         return 1;
+    }
+    if (instr == kMkLzInstr && MkLzAt(&nds.ARM9, addr))
+    {
+        static thread_local Range lz;
+        lz = {addr, addr + kMkLzWords * 4};
+        r = &lz;
+        return 1;
+    }
+    if (instr == kMkFillInstr && MkFillAt(&nds.ARM9, addr))
+    {
+        static thread_local Range fill;
+        fill = {addr, addr + 5 * 4};
+        r = &fill;
+        return 1;
+    }
+    if (instr == kMkFill32Instr && MkFill32At(&nds.ARM9, addr))
+    {
+        static thread_local Range fill;
+        fill = {addr, addr + 19 * 4};
+        r = &fill;
+        return 1;
+    }
+    if (instr == kMkCopyInstr && MkCopyAt(&nds.ARM9, addr))
+    {
+        static thread_local Range copy;
+        copy = {addr, addr + kMkCopyWords * 4}; r = &copy; return 1;
+    }
+    if (instr == kMkCacheInstr && MkCacheAt(&nds.ARM9, addr))
+    {
+        static thread_local Range cache;
+        cache = {addr, addr + 9 * 4}; r = &cache; return 1;
+    }
+    if (instr == kPwAffineInstr && PwAffineAt(&nds.ARM9, addr))
+    {
+        static thread_local Range affine;
+        affine = {addr, addr + kPwAffineWords * 4}; r = &affine; return 1;
     }
 #ifdef LITEV_GX_BULK
     if (addr == kW2NodeEntry && (instr & 0xFFFF) == 0xB5F0) { r = kW2NodeCode; return 14; }
@@ -3429,6 +4303,7 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
     if (instr == kNodeInstr)
     {
         State& s = St(&nds.ARM9);
+        if (s.on && (s.mask & 131072) && MkVertAt(&nds.ARM9, addr)) return 1;
         u32 fn[4];
         return s.on && (s.mask & 8192) ? NodeAt(&nds.ARM9, addr, fn) : 0;
     }
@@ -3456,6 +4331,44 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         State& s = St(&nds.ARM9);
         return s.on && (s.mask & 64) && LzCodeAt(&nds.ARM9, addr) ? 1 : 0;
     }
+    if (instr == kMkLzInstr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 262144) && MkLzAt(&nds.ARM9, addr) ? 1 : 0;
+    }
+    if (instr == kMkFillInstr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 524288) && MkFillAt(&nds.ARM9, addr) ? 1 : 0;
+    }
+    if (instr == kMkFill32Instr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 1048576) && MkFill32At(&nds.ARM9, addr) ? 1 : 0;
+    }
+    if (instr == kMkCopyInstr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 2097152) && MkCopyAt(&nds.ARM9, addr) ? 1 : 0;
+    }
+    if (instr == kMkTexInstr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 4194304) && MkTexAt(&nds.ARM9, addr) ? 1 : 0;
+    }
+    if (instr == kMkCacheInstr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 8388608) && MkCacheAt(&nds.ARM9, addr) ? 1 : 0;
+    }
+    if (instr == kPwAffineInstr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 16777216) && PwAffineAt(&nds.ARM9, addr) ? 1 : 0;
+    }
+    // Diagnostic oracle for the converter's inlined stream state.  Run() prints the guest
+    // registers then declines the hook, so the original helper still executes unchanged.
+    if (instr == 0xE92D4030 && addr == 0x020247FC && getenv("LITEV_A9HLE_MKTEXBITS")) return 1;
     State& s = Get(&nds.ARM9, addr, instr);
     if (s.status != 1) return 0;
     const int k = Kind(*s.v, addr, instr);
@@ -4456,10 +5369,87 @@ bool Run(melonDS::ARM* cpu, bool jit)
     auto* c = (melonDS::ARMv5*)cpu;
     if (cpu->CPSR & 0x20) return RunThumb(c, jit);
     const u32 pc = cpu->R[15] - 8, in = cpu->CurInstr;
+    if (in == 0xE92D4030 && pc == 0x020247FC && getenv("LITEV_A9HLE_MKTEXBITS"))
+    {
+        static thread_local int n = 0;
+        if (n++ < 64) fprintf(stderr, "MKBITS r0=%08x r1=%u r2=%08x r3=%08x r4=%08x r5=%08x ip=%08x sp=%08x\\n",
+                              c->R[0], c->R[1], c->R[2], c->R[3], c->R[4], c->R[5], c->R[12], c->R[13]);
+        return false;
+    }
     if (in == kLzInstr)
     {
         State& s = St(c);
         return s.on && (s.mask & 64) && RunLz(c, s, jit);
+    }
+    if (in == kMkLzInstr)
+    {
+        State& s = St(c);
+        if (s.on && (s.mask & 262144) && MkLzAt(c, pc))
+        {
+            if (RunMkLz(c, s, jit)) return true;
+            GuestFallback(c);
+            return true;
+        }
+    }
+    if (in == kMkFillInstr)
+    {
+        State& s = St(c);
+        if (s.on && (s.mask & 524288) && MkFillAt(c, pc))
+        {
+            if (RunMkFill(c, s, jit)) return true;
+            GuestFallback(c);
+            return true;
+        }
+    }
+    if (in == kMkFill32Instr)
+    {
+        State& s = St(c);
+        if (s.on && (s.mask & 1048576) && MkFill32At(c, pc))
+        {
+            if (RunMkFill32(c, s, jit)) return true;
+            GuestFallback(c);
+            return true;
+        }
+    }
+    if (in == kMkCopyInstr)
+    {
+        State& s = St(c);
+        if (s.on && (s.mask & 2097152) && MkCopyAt(c, pc))
+        {
+            if (RunMkCopy(c, s, jit)) return true;
+            GuestFallback(c);
+            return true;
+        }
+    }
+    if (in == kMkTexInstr)
+    {
+        State& s = St(c);
+        if (s.on && (s.mask & 4194304) && MkTexAt(c, pc))
+        {
+            if (RunMkTex(c, s, jit)) return true;
+            GuestFallback(c);
+            return true;
+        }
+    }
+    if (in == kMkCacheInstr)
+    {
+        State& s = St(c);
+        if (s.on && (s.mask & 8388608) && MkCacheAt(c, pc))
+        {
+            if (RunMkCache(c, s, jit)) return true;
+            GuestFallback(c);
+            return true;
+        }
+    }
+    if (in == kPwAffineInstr)
+    {
+        State& s = St(c);
+        if (s.on && (s.mask & 16777216) && PwAffineAt(c, pc))
+        {
+            if (RunPwAffine(c, s, jit)) return true;
+            GuestFallback(c);
+            return true;
+        }
     }
 #ifdef LITEV_GX_BULK
     if (in == kSbcInstr)
@@ -4500,6 +5490,16 @@ bool Run(melonDS::ARM* cpu, bool jit)
     if (in == kNodeInstr)
     {
         State& s = St(c);
+        if (s.on && (s.mask & 131072) && MkVertAt(c, pc))
+        {
+            // A fingerprint match identifies this as our MKDS function, but an
+            // individual call may still have an unsafe/unsupported argument
+            // layout (or be in an IRQ check window).  It must then execute the
+            // guest body, never fall through as an undefined instruction.
+            if (RunMkVert(c, s, jit)) return true;
+            GuestFallback(c);
+            return true;
+        }
         return s.on && (s.mask & 8192) && RunNode(c, s, jit);
     }
 #endif
@@ -4609,6 +5609,16 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     if (k == 9 && getenv("LITEV_A9HLE_LLFIT") && !g_P.irq)
         fprintf(stderr, "LLFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3],
                 (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 19 && getenv("LITEV_A9HLE_MKVERTFIT") && !g_P.irq)
+        fprintf(stderr, "MKVERTFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 20 && getenv("LITEV_A9HLE_MKLZFIT") && !g_P.irq)
+        fprintf(stderr, "MKLZFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3],
+                (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 21 && getenv("LITEV_A9HLE_MKFILLFIT") && !g_P.irq)
+        fprintf(stderr, "MKFILLFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 23 && getenv("LITEV_A9HLE_MKCOPYFIT") && !g_P.irq)
+        fprintf(stderr, "MKCOPYFIT %u %08x %08x %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2],
+                (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 6 && getenv("LITEV_A9HLE_LZFIT"))
         fprintf(stderr, "LZFIT %u %u %u %u %llu\n", g_P.lzn[0], g_P.lzn[1], g_P.lzn[2], g_P.lzn[3], (unsigned long long)g_P.lzOwn);
     // expected bytes: native log over the snapshot; compared at every byte either side wrote
@@ -4620,6 +5630,22 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     };
     for (auto& w : g_P.log)
         for (u32 i = 0; i < w.sz; i++) exp[w.a + i] = (u8)(w.v >> (8 * i));
+    if (k == 24 && getenv("LITEV_A9HLE_MKTEXDUMP"))
+    {
+        static thread_local int dumpN = 0;
+        if (dumpN++ == 0)
+        {
+            const u32 base = g_P.fit[0], bytes = g_P.fit[1] * (g_P.fit[3] - g_P.fit[2]);
+            fprintf(stderr, "MKTEXDUMP base=%08x bytes=%u", base, bytes);
+            for (u32 i = 0; i < bytes; i++)
+            {
+                const auto it = exp.find(base + i);
+                const u8 want = it == exp.end() ? old(base + i) : it->second;
+                fprintf(stderr, "%s%02x/%02x", (i & 15) ? " " : " | ", want, *m.P(base + i));
+            }
+            fputc('\n', stderr);
+        }
+    }
     std::unordered_set<u32> addrs;
     for (auto& [a, v] : exp) addrs.insert(a);
     for (auto& a : g_P.acc)
@@ -4704,7 +5730,30 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         nd = 0;   // an IRQ arrived inside the guest round trip: the native path takes it after; counted in irq_during
     if (nd)
     {
-        if (s.diffs[k] < 10) fprintf(stderr, "A9HLE CHECK %s (irq_in_window=%d) %d diffs:%s\n", kName[k], (int)g_P.irq, nd, buf);
+        if (s.diffs[k] < 10)
+        {
+            fprintf(stderr, "A9HLE CHECK %s (irq_in_window=%d) %d diffs:%s\n", kName[k], (int)g_P.irq, nd, buf);
+            if (k == 19)
+            {
+                fprintf(stderr, "A9HLE CHECK mkvert args n=%u dst=%08x mat=%08x tr=%08x\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3]);
+                auto word = [&](u32 a, bool guest) {
+                    u32 v = 0;
+                    for (u32 i = 0; i < 4; i++)
+                    {
+                        u8* p = m.P(a + i);
+                        const auto it = exp.find(a + i);
+                        v |= (u32)(guest ? (p ? *p : 0) : (it != exp.end() ? it->second : old(a + i))) << (i * 8);
+                    }
+                    return v;
+                };
+                const u32 f = e.R[13] - 88;
+                fprintf(stderr, "A9HLE CHECK mkvert frame +18 %08x/%08x +1c %08x/%08x +20 %08x/%08x +24 %08x/%08x +28 %08x/%08x +2c %08x/%08x out %08x/%08x\n",
+                        word(f + 24, true), word(f + 24, false), word(f + 28, true), word(f + 28, false),
+                        word(f + 32, true), word(f + 32, false), word(f + 36, true), word(f + 36, false),
+                        word(f + 40, true), word(f + 40, false), word(f + 44, true), word(f + 44, false),
+                        word(g_P.fit[1], true), word(g_P.fit[1], false));
+            }
+        }
         s.diffs[k]++;
     }
     if (g_P.irq) s.irqDuring[k]++;
