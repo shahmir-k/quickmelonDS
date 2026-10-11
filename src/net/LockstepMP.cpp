@@ -46,6 +46,9 @@ void LockstepMP::SetWake(int inst, NDS& nds)
     nds.MPWakeAt = &WakeAt[inst];
     nds.MPWake = [this, inst] { Wake(inst); };
 #endif
+#ifdef LITEV_MP_POLL_INLINE
+    nds.MPHostPoll = &HostFrameMaybe; nds.MPHostPollCtx = this; nds.MPHostPollInst = inst;
+#endif
 }
 
 #ifdef LITEV_MP_CLOCKWAKE
@@ -364,6 +367,25 @@ int LockstepMP::SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid)
     return len;
 }
 
+#ifdef LITEV_MP_FASTPOLL
+// false: nothing from the host can be visible to `inst` now, so the poll returns 0 without the lock.
+// Nothing queued for us and the host strictly past our time is exactly the case where the locked
+// path returns 0 at once (host frames are queued before the host's clock moves on; the fence after
+// SendCmd/SendAck orders the queue count before that clock). Also called straight from the
+// client's Wi-Fi tick (NDS::MPHostPoll), which then skips the whole receive path.
+bool LockstepMP::HostFrameMaybe(void* self, int inst)
+{
+    LockstepMP& m = *(LockstepMP*)self;
+    const int host = m.HostIDSeen.load(std::memory_order_relaxed);
+    const u64 now = m.Now(inst);
+    if (host < 0 || host == inst || now < kHostDelay) return true;
+    const u64 visible = now - kHostDelay;
+    const u64 t = m.Now(host);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return !((t > visible || (t == visible && host > inst)) && m.FromHostN[inst].load(std::memory_order_relaxed) == 0);
+}
+#endif
+
 int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
 {
 #ifdef LITEV_MP_FASTPOLL
@@ -372,22 +394,10 @@ int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
     // Without the lock: nothing queued for us and the host strictly past our time is exactly the
     // case where the locked path below returns 0 at once (host frames are queued before the host's
     // clock moves on; the fence after SendCmd/SendAck orders the queue count before that clock).
+    if (!HostFrameMaybe(this, inst))
     {
-        int host = HostIDSeen.load(std::memory_order_relaxed);
-        u64 now = Now(inst);
-        if (host >= 0 && host != inst && now >= kHostDelay)
-        {
-            u64 visible = now - kHostDelay;
-            u64 t = Now(host);
-            std::atomic_thread_fence(std::memory_order_acquire);
-            if ((t > visible || (t == visible && host > inst)) && FromHostN[inst].load(std::memory_order_relaxed) == 0)
-            {
-                if (St.On > 0) WS[inst].Calls[1]++;
-                Log(inst, "RecvHostWait", host, visible);
-                Log(inst, "RecvHost", 0, 0);
-                return 0;
-            }
-        }
+        if (St.On > 0) WS[inst].Calls[1]++;
+        return 0;
     }
 #endif
     std::unique_lock<std::mutex> lk(Lock, std::try_to_lock);

@@ -2098,6 +2098,9 @@ void Wifi::USTick()
             }
 #endif
             // TODO: not do this every tick if it fails to receive a frame!
+#ifdef LITEV_MP_POLL_INLINE
+            if (!NDS.MPHostPoll || NDS.MPHostPoll(NDS.MPHostPollCtx, NDS.MPHostPollInst))
+#endif
             CheckRX(2);
         }
     }

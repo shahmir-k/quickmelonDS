@@ -475,6 +475,13 @@ public: // TODO: Encapsulate the rest of these members
     // waiting on this one's clock
     std::atomic<u64>* MPWakeAt = nullptr;
     std::function<void()> MPWake;
+#ifdef LITEV_MP_POLL_INLINE
+    // LockstepMP (SetWake): false = no host frame can be visible now; the client's Wi-Fi tick then
+    // skips its receive path (CheckRX(2), the Platform/MPInterface calls) altogether
+    bool (*MPHostPoll)(void* ctx, int inst) = nullptr;
+    void* MPHostPollCtx = nullptr;
+    int MPHostPollInst = 0;
+#endif
 #endif
     void NocashPrint(u32 cpu, u32 addr, bool appendNewline = true);
 

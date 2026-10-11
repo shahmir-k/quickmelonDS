@@ -94,6 +94,9 @@ public:
     // LITEV_MP_CLOCKWAKE: inst's console (`nds`) wakes the consoles waiting on its clock as soon as
     // it reaches what they wait for; nothing without the flag. After SetClock.
     void SetWake(int inst, NDS& nds);
+#ifdef LITEV_MP_FASTPOLL
+    static bool HostFrameMaybe(void* self, int inst);
+#endif
     // Ends every wait (the session is shutting down).
     void Stop();
 
