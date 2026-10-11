@@ -29,6 +29,7 @@
 #include <cstdio>
 
 #include "MPInterface.h"
+#include "Fiber.h"
 
 namespace melonDS
 {
@@ -279,6 +280,10 @@ private:
     // (Lock held) console `inst` sleeps until woken or kPoll; true = timed out
     bool Sleep(std::unique_lock<std::mutex>& lk, int inst)
     {
+#ifdef LITEV_MP_FIBERS
+        // a console on a fiber: let the next console on this core run, then look again
+        if (Fiber::Active()) { lk.unlock(); Fiber::Yield(); lk.lock(); return false; }
+#endif
 #ifdef LITEV_MP_CLOCKWAKE
         Notified &= (u16)~(1 << inst);
         return CV[inst].wait_for(lk, kPoll) == std::cv_status::timeout && !(Notified & (1 << inst));

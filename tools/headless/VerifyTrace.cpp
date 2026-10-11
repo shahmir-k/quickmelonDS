@@ -40,6 +40,9 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsy
 #include "xxhash/xxhash.h"
 
 #include "PlatformHeadless.h"
+#ifdef LITEV_MP_FIBERS
+#include "Fiber.h"
+#endif
 #ifdef __linux__
 #include <sched.h>
 #endif
@@ -1303,15 +1306,20 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                     {   // per console: CPU, link calls / blocked waits / blocked ms per frame (Packet, Host, Replies)
                         timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
                         double cpu = ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
-                        static thread_local double lastCpu = 0;
+#ifdef LITEV_MP_FIBERS
+                        if (Fiber::Active()) cpu = Fiber::CpuMs();
+#endif
+                        static double lastCpuA[16];
+                        double& lastCpu = lastCpuA[inst & 15];
                         LockstepMP::WaitStats w = lockstepMP->TakeWaitStats(inst);
                         double fr = every;
 #ifdef __APPLE__
                         {   // this console's thread: host instructions per frame (PMU; steadier than CPU time on a busy Mac)
                             uint64_t c[2] = {0, 0};
                             thread_selfcounts(1, c, sizeof(c));
-                            static thread_local uint64_t lastIns = 0;
-                            printf("inst%d ins %d: %.0f K/f\n", inst, f + 1, (c[0] - lastIns) / 1e3 / every);
+                            static uint64_t lastInsA[16];
+                            uint64_t& lastIns = lastInsA[inst & 15];
+                            printf("inst%d ins %d: %.0f K/f\n", inst, f + 1, (c[0] - lastIns) / 1e3 / every);   // (with fibers: the worker's)
                             lastIns = c[0];
                         }
 #endif
@@ -1379,6 +1387,44 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     std::vector<std::thread> threads;
     auto wall0 = std::chrono::steady_clock::now();
     double cpu0 = CpuMs();
+#ifdef LITEV_MP_FIBERS
+    // LITEV_MP_FIBERS=W: consoles 1..n-1 as fibers on W worker threads (round robin), console 0 on its
+    // own thread; LITEV_MP_FIBER_PIN=c0,c1,..: worker w on core cw (Linux)
+    const int fiberWorkers = getenv("LITEV_MP_FIBERS") ? atoi(getenv("LITEV_MP_FIBERS")) : 0;
+    struct FiberArg { std::function<void(int)>* fn; int inst; };
+    std::function<void(int)> runFn = runInstance;
+    std::vector<FiberArg> fiberArgs(n);
+    if (fiberWorkers > 0)
+    {
+        printf("fibers: consoles 1..%d on %d worker threads\n", n - 1, fiberWorkers);
+        Fiber::SetSwapHook([](void** slot) { *slot = NDS::Current; }, [](void* const* slot) { NDS::Current = (NDS*)*slot; });
+        threads.emplace_back(runInstance, 0);
+        for (int w = 0; w < fiberWorkers; w++)
+            threads.emplace_back([&, w] {
+#ifdef __linux__
+                if (const char* pv = getenv("LITEV_MP_FIBER_PIN"))
+                {
+                    int i = 0, c = -1;
+                    for (const char* q = pv; *q; ) { int v = atoi(q); if (i++ == w) { c = v; break; } while (*q && *q != ',') q++; if (*q) q++; }
+                    if (c >= 0) { cpu_set_t set; CPU_ZERO(&set); CPU_SET(c, &set); sched_setaffinity(0, sizeof(set), &set); }
+                }
+#endif
+                std::vector<Fiber::Fiber*> mine;
+                for (int k = 1 + w; k < n; k += fiberWorkers)
+                {
+                    fiberArgs[k] = {&runFn, k};
+                    mine.push_back(Fiber::Create([](void* a) { auto* fa = (FiberArg*)a; (*fa->fn)(fa->inst); Fiber::Finish(); }, &fiberArgs[k]));
+                }
+                for (bool any = true; any; )
+                {
+                    any = false;
+                    for (Fiber::Fiber* f : mine) any |= Fiber::Resume(f);
+                }
+                for (Fiber::Fiber* f : mine) Fiber::Destroy(f);
+            });
+    }
+    else
+#endif
     for (int k = 0; k < n; k++) threads.emplace_back(runInstance, k);
 
     // Poll MP health from the main thread while the instances run, and log the

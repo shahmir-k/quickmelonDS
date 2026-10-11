@@ -7,6 +7,7 @@ add_library(net-utils STATIC
     PacketDispatcher.cpp
     LocalMP.cpp
     LockstepMP.cpp
+    Fiber.cpp
     NetplayInput.cpp
     ../teakra/src/makedsp1/sha256.cpp
     LAN.cpp
