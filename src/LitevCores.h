@@ -99,9 +99,14 @@ private:
 #include <sys/system_properties.h>
 #endif
 #include "Platform.h"
+#include <atomic>
 
 namespace melonDS::LitevTopo
 {
+
+#ifdef LITEV_NP_FLOAT
+inline std::atomic<int>& NetplayFloat() { static std::atomic<int> v{0}; return v; }
+#endif
 
 enum class CoreRole : int
 {
@@ -156,6 +161,13 @@ struct Placement
     std::vector<int> CoresFor(CoreRole r, int idx = -1) const
     {
         if (!pin) return all;
+#ifdef LITEV_NP_FLOAT
+        // Netplay session (NetplayFloat, set by the app): remote consoles float over every core
+        // (>= 1), the local emulator too (>= 2); the kernel balances the 2..8 console threads
+        // better than fixed masks (headless MKDS 8 consoles: 19.8 ms/frame unpinned vs 25.4 pinned)
+        if (r == CoreRole::RemoteConsole && NetplayFloat() >= 1) return all;
+        if (r == CoreRole::Emu && NetplayFloat() >= 2) return all;
+#endif
         switch (r)
         {
         case CoreRole::Emu: return {emu};
