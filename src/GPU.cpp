@@ -178,6 +178,9 @@ void GPU::Reset() noexcept
 
     VRAMMap_ARM7[0] = 0;
     VRAMMap_ARM7[1] = 0;
+#ifdef LITEV_JIT_VWRAM_LOAD
+    UpdateVRAMPtrARM7();
+#endif
 
     memset(VRAMPtr_ABG, 0, sizeof(VRAMPtr_ABG));
     memset(VRAMPtr_AOBJ, 0, sizeof(VRAMPtr_AOBJ));
@@ -278,6 +281,9 @@ void GPU::DoSavestate(Savestate* file) noexcept
 
     file->Var32(&VRAMMap_ARM7[0]);
     file->Var32(&VRAMMap_ARM7[1]);
+#ifdef LITEV_JIT_VWRAM_LOAD
+    UpdateVRAMPtrARM7();
+#endif
 
     if (!file->Saving)
     {
@@ -692,6 +698,9 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
         case 2: // ARM7 VRAM
             oldofs &= 0x1;
             VRAMMap_ARM7[oldofs] &= ~bankmask;
+#ifdef LITEV_JIT_VWRAM_LOAD
+            UpdateVRAMPtrARM7();
+#endif
             break;
 
         case 3: // texture
@@ -729,6 +738,9 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
         case 2: // ARM7 VRAM
             ofs &= 0x1;
             VRAMMap_ARM7[ofs] |= bankmask;
+#ifdef LITEV_JIT_VWRAM_LOAD
+            UpdateVRAMPtrARM7();
+#endif
             memset(VRAMDirty[bank].Data, 0xFF, sizeof(VRAMDirty[bank].Data));
             VRAMSTAT |= (1 << (bank-2));
             NDS.JIT.CheckAndInvalidateWVRAM(ofs);

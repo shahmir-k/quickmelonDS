@@ -94,6 +94,9 @@ public:
     // LITEV_MP_CLOCKWAKE: inst's console (`nds`) wakes the consoles waiting on its clock as soon as
     // it reaches what they wait for; nothing without the flag. After SetClock.
     void SetWake(int inst, NDS& nds);
+#ifdef LITEV_MP_FASTPOLL
+    static bool HostFrameMaybe(void* self, int inst);
+#endif
     // Ends every wait (the session is shutting down).
     void Stop();
 
@@ -215,7 +218,19 @@ private:
     template <typename Pred, typename Need> void WaitFor(std::unique_lock<std::mutex>& lk, Pred pred, Need need, int inst, int kind);
 #ifdef LITEV_MP_CLOCKWAKE
     std::atomic<u64> WakeAt[kMaxInst];      // per console: wake the waiters once its clock reaches this
+#ifdef LITEV_MP_FUTEX
+    // LITEV_MP_FUTEX: each console sleeps on its own sequence word (futex / __ulock), so a console
+    // whose clock passes a waiter's need wakes it with one syscall and without taking Lock (on the
+    // host of an 8-player session: cond_signal + the contended unlock were ~13% of its CPU)
+    std::atomic<u16> WaitersOn[kMaxInst] {};   // who waits on each console's clock
+    std::atomic<u32> SleepSeq[kMaxInst] {};
+    u32 SeqSeen[kMaxInst] {};   // (its own console) SleepSeq before the last look at the clocks
+    static void FutexWait(std::atomic<u32>* a, u32 v, u32 us);
+    static void FutexWake(std::atomic<u32>* a);
+    void WakeOne(int i) { SleepSeq[i].fetch_add(1, std::memory_order_release); FutexWake(&SleepSeq[i]); }
+#else
     u16 WaitersOn[kMaxInst] {};             // (Lock) who waits on each console's clock
+#endif
     std::condition_variable CV[kMaxInst];   // each console sleeps on its own: wakes go to who needs them
     u16 Notified = 0;                       // (Lock) diagnostics: woken since it went to sleep
     void Wake(int inst);
@@ -229,7 +244,11 @@ private:
     void NeedClock(int waiter, int peer, u64 t)
     {
 #ifdef LITEV_MP_CLOCKWAKE
+#ifdef LITEV_MP_FUTEX
+        WaitersOn[peer].fetch_or((u16)(1 << waiter), std::memory_order_relaxed);
+#else
         WaitersOn[peer] |= (u16)(1 << waiter);
+#endif
         u64 cur = WakeAt[peer].load(std::memory_order_relaxed);
         while (t < cur && !WakeAt[peer].compare_exchange_weak(cur, t, std::memory_order_relaxed)) {}
 #endif
@@ -245,16 +264,25 @@ private:
     void WakeLocked(int inst)
     {
         WakeAt[inst].store(UINT64_MAX, std::memory_order_relaxed);
+#ifdef LITEV_MP_FUTEX
+        const u16 w = WaitersOn[inst].exchange(0, std::memory_order_acq_rel);
+        for (int i = 0; i < kMaxInst; i++) if (w & (1 << i)) WakeOne(i);
+#else
         for (int i = 0; i < kMaxInst; i++) if (WaitersOn[inst] & (1 << i)) CV[i].notify_one();
         Notified |= WaitersOn[inst];
         WaitersOn[inst] = 0;
+#endif
     }
 #endif
     // (Lock held) wake: everyone / console `inst` / every console but `inst`
     void NotifyAll()
     {
 #ifdef LITEV_MP_CLOCKWAKE
+#ifdef LITEV_MP_FUTEX
+        for (int i = 0; i < kMaxInst; i++) WakeOne(i);
+#else
         for (auto& cv : CV) cv.notify_one();
+#endif
         Notified = 0xFFFF;
 #endif
         Changed.notify_all();
@@ -262,7 +290,11 @@ private:
     void NotifyOne(int inst)
     {
 #ifdef LITEV_MP_CLOCKWAKE
+#ifdef LITEV_MP_FUTEX
+        WakeOne(inst);
+#else
         CV[inst].notify_one();
+#endif
         Notified |= (u16)(1 << inst);
 #else
         Changed.notify_all();
@@ -271,7 +303,11 @@ private:
     void NotifyOthers(int inst)
     {
 #ifdef LITEV_MP_CLOCKWAKE
+#ifdef LITEV_MP_FUTEX
+        for (int i = 0; i < kMaxInst; i++) if (i != inst && (Members & (1 << i))) WakeOne(i);
+#else
         for (int i = 0; i < kMaxInst; i++) if (i != inst && (Members & (1 << i))) CV[i].notify_one();
+#endif
         Notified |= (u16)(Members & ~(1 << inst));
 #else
         Changed.notify_all();
@@ -284,7 +320,13 @@ private:
         // a console on a fiber: let the next console on this core run, then look again
         if (Fiber::Active()) { lk.unlock(); Fiber::Yield(); lk.lock(); return false; }
 #endif
-#ifdef LITEV_MP_CLOCKWAKE
+#if defined(LITEV_MP_FUTEX)
+        // (SleepSeq was read before the last look at the clocks: a wake since then changed it)
+        lk.unlock();
+        FutexWait(&SleepSeq[inst], SeqSeen[inst], (u32)kPoll.count());
+        lk.lock();
+        return false;
+#elif defined(LITEV_MP_CLOCKWAKE)
         Notified &= (u16)~(1 << inst);
         return CV[inst].wait_for(lk, kPoll) == std::cv_status::timeout && !(Notified & (1 << inst));
 #else

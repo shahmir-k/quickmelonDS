@@ -758,6 +758,16 @@ public:
     u32 VRAMMap_Texture[4] {};
     u32 VRAMMap_TexPal[8] {};
     u32 VRAMMap_ARM7[2] {};
+#ifdef LITEV_JIT_VWRAM_LOAD
+    // the one bank in each ARM7 VRAM slot, else null (none, or C and D both: ORed reads); the
+    // JIT's inline ARM7 VRAM loads read through it
+    u8* VRAMPtr_ARM7[2] {};
+    void UpdateVRAMPtrARM7() noexcept
+    {
+        for (int i = 0; i < 2; i++)
+            VRAMPtr_ARM7[i] = VRAMMap_ARM7[i] == (1<<2) ? VRAM_C : VRAMMap_ARM7[i] == (1<<3) ? VRAM_D : nullptr;
+    }
+#endif
 
     u8* VRAMPtr_ABG[0x20] {};
     u8* VRAMPtr_AOBJ[0x10] {};

@@ -1279,6 +1279,9 @@ void ARMv5::Execute()
 {
     if constexpr (mode == CPUExecuteMode::InterpreterGDB)
         GdbCheckB();
+#ifdef LITEV_NPSCHED_STATS
+    NDS.SchedStats.Exec[0]++;
+#endif
 
     if (Halted)
     {
@@ -1314,6 +1317,9 @@ void ARMv5::Execute()
         }
         else
         {
+#ifdef LITEV_NPSCHED_STATS
+            NDS.SchedStats.HaltedSkip[0]++;
+#endif
             NDS.ARM9Timestamp = NDS.ARM9Target;
             return;
         }
@@ -1356,6 +1362,9 @@ void ARMv5::Execute()
             JitStopToBudget();   // a stop already pending: exit at the first hop
 #endif
 
+#ifdef LITEV_NPSCHED_STATS
+            NDS.SchedStats.Disp[0]++;
+#endif
             if (block)
             {
 #ifdef LITEV_JIT_LAZYFLAGS
@@ -1555,6 +1564,9 @@ void ARMv4::Execute()
 {
     if constexpr (mode == CPUExecuteMode::InterpreterGDB)
         GdbCheckB();
+#ifdef LITEV_NPSCHED_STATS
+    NDS.SchedStats.Exec[1]++;
+#endif
 
     if (Halted)
     {
@@ -1570,6 +1582,9 @@ void ARMv4::Execute()
         }
         else
         {
+#ifdef LITEV_NPSCHED_STATS
+            NDS.SchedStats.HaltedSkip[1]++;
+#endif
             NDS.ARM7Timestamp = NDS.ARM7Target;
             return;
         }
@@ -1610,6 +1625,9 @@ void ARMv4::Execute()
 
 #ifdef LITEV_A7PROF
             const u64 a7t0 = NDS.ARM7Timestamp + Cycles;
+#endif
+#ifdef LITEV_NPSCHED_STATS
+            NDS.SchedStats.Disp[1]++;
 #endif
             if (block)
             {
@@ -1712,7 +1730,7 @@ void ARMv4::Execute()
 #endif
 #ifdef LITEV_A7HLE
                 if (A7HLE::CheckPending) A7HLE::CheckAt(this, R[15] - 8);
-                if ((CurInstr == 0xE92D4FF8 || CurInstr == 0xE92D47F0 || CurInstr == 0xE081C002) && A7HLE::Run(this, false)) {}
+                if ((CurInstr == 0xE92D4FF8 || CurInstr == 0xE92D4FF0 || CurInstr == 0xE92D47F0 || CurInstr == 0xE081C002) && A7HLE::Run(this, false)) {}
                 else
 #endif
                 if (CheckCondition(CurInstr >> 28))
