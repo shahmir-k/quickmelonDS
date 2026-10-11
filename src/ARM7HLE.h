@@ -12,6 +12,8 @@
 // the channels' hardware-busy bits are sampled at entry. Deterministic and version-locked.
 // Runtime: debug.litev.a7hle (prop on Android, env elsewhere; default on), latched per NDS: 0 off, 1 all, else a
 // mask (1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit).
+// ExChannelMain has a variant per driver build: Pokemon B/W/W2 and Mario Kart DS (2005 SDK; the 8-player Netplay
+// benchmark: ~22% of its ARM7 guest instructions in the race).
 //
 // SND_SeqMain (the sequencer: players, tracks, SSEQ bytecode, track->channel parameter update,
 // ~20% of the ARM7's guest instructions) runs natively on a copy of the sound work area, the
@@ -52,7 +54,7 @@ int Deps(u32 addr, u32 instr, Range* out);   // up to 4
 bool Run(melonDS::ARM* cpu, bool jit);
 // interpreter check mode: called before every ARM7 instruction while a check is pending
 #ifdef LITEV_HLE_DIAG
-extern bool CheckPending;
+extern thread_local bool CheckPending;   // (per thread: headless --mp-test runs a console per thread)
 void CheckAt(melonDS::ARM* cpu, u32 pc);
 #else
 constexpr bool CheckPending = false;   // compare mode compiled out (LITEV_HLE_DIAG)
