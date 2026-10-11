@@ -42,6 +42,9 @@ public:
 
     u32 UnitTimings9_16(bool burststart);
     u32 UnitTimings9_32(bool burststart);
+#ifdef LITEV_DMA_BULK
+    template <bool Word> bool Bulk9(bool burststart);
+#endif
     u32 UnitTimings9_32_GXFIFO(bool burststart);
     u32 UnitTimings7_16(bool burststart);
     u32 UnitTimings7_32(bool burststart);
