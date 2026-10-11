@@ -26,7 +26,7 @@
 namespace melonDS::A9HLE
 {
 #ifdef LITEV_HLE_DIAG
-bool CheckPending = false;
+thread_local bool CheckPending = false;
 #endif
 #ifdef LITEV_A9HLE_GXCHECK
 std::vector<u32>* GxTap = nullptr;
@@ -247,15 +247,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 15;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 8191;
+constexpr int kKinds = 17;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 32767;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -290,9 +290,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -639,7 +639,8 @@ struct Pending
     std::vector<std::pair<u32, u32>> io;    // GX async check: the IO writes of the native plan (IME toggles left out)
     Expect fin; u32 finA = 0, finV = 0;     // G3D shape check, stage 2: registers at SHP's return, the SBC pointer word
     bool stage2 = false, small = false;     // G3D shape check: stage 2 pending; the small-list path (no IO, GX words)
-} g_P;
+};
+thread_local Pending g_P;
 #ifdef LITEV_A9HLE_GXCHECK
 std::vector<u32> g_GxMatTap;
 #endif
@@ -2033,6 +2034,659 @@ __attribute__((noinline)) bool RunVec(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
+#ifdef LITEV_GX_BULK
+// ---- 15. NNS G3D NODEDESC (joint matrix) ---------------------------------------------------------------------------
+// NNSi_G3dFuncSbc_NODEDESC: per joint the optional MTX_RESTORE, the joint's SRT (single NSBCA joint animation through
+// NNSi_G3dAnmCalcNsBca: constant / per-frame translation, rotation (pivot-compressed or basis, 2- and 4-frame steps
+// averaged with VEC_Normalize on the divider / sqrt unit), scale; or the model's own node data), the joint scaling rule
+// (basic / Maya SSC), the matrix commands (MTX_MULT_4x3 / 3x3, MTX_TRANS, MTX_SCALE) and the optional MTX_STORE, all
+// through NNS_G3dGeBufferOP_N. PW title: 54 joints a frame, ~440 guest instructions each (46% of the ARM9's); town 23 x 290.
+// Natively at NODEDESC's entry: the JntAnmResult, the render-state writes (sbc, flags, node id, the Maya bit vectors /
+// inverse-scale table), the VEC_Normalize IO stores in order, the GXFIFO words in one BulkWords. Callee frames below sp
+// and the scratch registers r1-r3, r12, lr and the flags are not written (dead after the return, ARM calling convention:
+// the SBC loop calls NODEDESC through its function table). Fallback (guest): render callbacks, a joint result cache,
+// blended / chained animations, interpolated frames, the model-default trans / rotation / scale paths, GE buffering.
+// Position independent: the functions are found at fixed distances from NODEDESC's entry (same object layout in PW and
+// PB, code shifted by 0x18) and checked by a hash of their code words (BL offsets and data-address literals masked: the
+// native code reads those literals); OP_N / MI_CpuSend32 / VEC_Normalize by their exact words. Category B: a fitted
+// cycle estimate.
+constexpr u32 kNodeInstr = 0xE92D4FF0;  // push {r4-r11, lr}
+constexpr u32 kNodeW[3] = {0xE24DD014, 0xE1A0A000, 0xE59A0000};    // sub sp, sp, #0x14 / mov sl, r0 / ldr r0, [sl]
+// (offset from NODEDESC, bytes): PW addresses minus 0x0206C0DC
+enum : s32 { kNdAffc = -0x10E0, kNdEb94 = 0x2AB8, kNdEe78 = 0x2D9C, kNdF22c = 0x3150, kNdF4e0 = 0x3404, kNdF85c = 0x3780,
+             kNdFfb8 = 0x3EDC, kNdC74 = 0x4B98, kNdCf0 = 0x4C14, kNdD30 = 0x4C54, kNdDf4 = 0x4D18 };
+constexpr struct { s32 off; u32 len; } kNodeFn[9] = {
+    {0, 0x460}, {kNdAffc, 0x8C}, {kNdEb94, 0x3C}, {kNdEe78, 0x3B4}, {kNdF22c, 0x158}, {kNdF4e0, 0x1E8}, {kNdF85c, 0x418},
+    {kNdFfb8, 0x16C}, {kNdC74, 0x2D0}};
+constexpr u64 kNodeSig = 0xb607b6e45aa9d124ull;
+constexpr u16 kIdent33T[7] = {0x2100, 0x2200, 0x2300, 0xC00E, 0xC00E, 0xC00E, 0x4770};   // Thumb: 9 zero words to r0
+// ponytail: fitted estimate (check mode without IRQs, PW title / town / gift box / overworld, 23.4k calls, p95 error 6.6%):
+// base + per OP_N + per GX word + per VEC_Normalize + per rotation entry + per animation track + animation path
+// [0] PW / PB (ARM), [1] W2 (Thumb; W2 town, 14k calls, p95 6.0%)
+constexpr s32 kNodeCyc[2][7] = {{248, 68, 20, 212, 190, 57, 129}, {202, 56, 22, 208, 85, 44, 155}};
+
+u32 BlxTarget(melonDS::ARMv5* c, u32 a)
+{
+    const u8* p = CodePtr(c, a);
+    if (!p) return 0;
+    const u32 w = R32(p);
+    return (w >> 25) == 0x7D ? a + 8 + (u32)(((s32)(w << 8)) >> 6) + ((w >> 23) & 2) : 0;
+}
+// functions of 15. (out: OP_N, MI_CpuSend32, VEC_Normalize, the identity helper); 0 no, 1 code verified, 2 differs
+int NodeAt(melonDS::ARMv5* c, u32 e, u32* fn)
+{
+    if (e & 3) return 0;
+    for (int i = 0; i < 3; i++) { const u8* p = CodePtr(c, e + 4 + i * 4); if (!p || R32(p) != kNodeW[i]) return 0; }
+    u64 h = 0xcbf29ce484222325ull;
+    for (auto& f : kNodeFn)
+        for (u32 o = 0; o < f.len; o += 4)
+        {
+            const u8* p = CodePtr(c, e + f.off + o);
+            if (!p) return 2;
+            u32 w = R32(p);
+            if ((w >> 24) == 0xEB || (w >> 25) == 0x7D) w &= 0xFF000000;            // bl / blx offsets
+            else if (w - 0x02000000 < 0x00400000) w = 0;                            // main-RAM address literals
+            for (int b = 0; b < 4; b++) h = (h ^ ((w >> (8 * b)) & 0xFF)) * 0x100000001b3ull;
+        }
+    fn[0] = BlTarget(c, e + 0x70);                  // OP_N (MTX_RESTORE)
+    fn[1] = fn[0] ? BlTarget(c, fn[0] + 53 * 4) : 0;
+    fn[2] = BlTarget(c, e + kNdF85c + 0x158);       // VEC_Normalize
+    fn[3] = BlxTarget(c, e + 0x260);                // MTX_Identity33 (Thumb)
+    if (g_Stats && h != kNodeSig) fprintf(stderr, "A9HLE: G3D node signature %016llx at %08x\n", (unsigned long long)h, e);
+    bool ok = h == kNodeSig && fn[0] && CodeEq(c, fn[0], kOpnCode, 57, kOpnSkip, 5) && fn[1] && CodeEq(c, fn[1], kSend32Code, 6, nullptr, 0)
+              && fn[2] && VecAt(c, fn[2], 69) && fn[3];
+    for (int i = 0; ok && i < 7; i++) { const u8* p = CodePtr(c, fn[3] + i * 2); ok = p && R16(p) == kIdent33T[i]; }
+    return ok ? 1 : 2;
+}
+
+// VEC_Normalize (14.) on values: the divider / sqrt stores in the guest's order, the results through the IO reads
+__attribute__((noinline)) void VecNorm(melonDS::NDS& nds, s32* v, std::vector<std::pair<u32, u32>>* io)
+{
+    const s32 x = v[0], y = v[1], z = v[2];
+    const u64 l2 = (u64)((s64)x * x) + (u64)((s64)y * y) + (u64)((s64)z * z);
+    const u32 lo = (u32)l2, hi = (u32)(l2 >> 32);
+    nds.ARM9Write16(0x04000280, 2);
+    nds.ARM9Write32(0x04000290, 0); nds.ARM9Write32(0x04000294, 0x01000000);
+    nds.ARM9Write32(0x04000298, lo); nds.ARM9Write32(0x0400029C, hi);
+    nds.ARM9Write16(0x040002B0, 1);
+    nds.ARM9Write32(0x040002B8, lo << 2); nds.ARM9Write32(0x040002BC, (hi << 2) | (lo >> 30));
+    if (io)
+    {
+        const std::pair<u32, u32> w[8] = {{0x04000280, 2}, {0x04000290, 0}, {0x04000294, 0x01000000}, {0x04000298, lo}, {0x0400029C, hi},
+                                          {0x040002B0, 1}, {0x040002B8, lo << 2}, {0x040002BC, (hi << 2) | (lo >> 30)}};
+        io->insert(io->end(), w, w + 8);
+    }
+    const u32 sq = nds.ARM9Read32(0x040002B4), dlo = nds.ARM9Read32(0x040002A0), dhi = nds.ARM9Read32(0x040002A4);
+    const u64 f = ((u64)dhi << 32 | dlo) * (u64)(s64)(s32)sq;
+    for (int i = 0; i < 3; i++) v[i] = (s32)((s32)((u32)((f * (u64)(s64)v[i]) >> 32) + 0x1000) >> 13);
+}
+
+struct Node
+{
+    melonDS::ARMv5* c;
+    Mem& m;
+    bool bad = false;
+    u32 gw[64]; u32 ngw = 0, nop = 0, nvec = 0, anm = 0, nrot = 0, ntrk = 0;   // (cycle estimate) anm: animation path
+    std::vector<std::pair<u32, u32>>* io = nullptr;     // check mode: the IO writes
+    // (out of line: ~60 call sites; the native path's size is the in-order A55's budget)
+    __attribute__((noinline)) u32 rd(u32 a, u32 n)
+    {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    }
+    s32 rs16(u32 a) { return (s16)rd(a, 2); }
+    s32 rs32(u32 a) { return (s32)rd(a, 4); }
+    void Op(u32 cmd, const u32* p, u32 n)
+    {
+        if (ngw + 1 + n > 64) { bad = true; return; }
+        gw[ngw++] = cmd;
+        for (u32 i = 0; i < n; i++) gw[ngw++] = p[i];
+        nop++;
+    }
+    void Norm(s32* v) { VecNorm(c->NDS, v, io); nvec++; }
+    static void Cross(s32* r)   // third row = first x second
+    {
+        const s32 a = (s32)((u32)r[1] * (u32)r[5] - (u32)r[2] * (u32)r[4]) >> 12;
+        const s32 b = (s32)((u32)r[2] * (u32)r[3] - (u32)r[0] * (u32)r[5]) >> 12;
+        const s32 d = (s32)((u32)r[0] * (u32)r[4] - (u32)r[1] * (u32)r[3]) >> 12;
+        r[6] = a; r[7] = b; r[8] = d;
+    }
+    // 0206ffb8: rotation matrix entry idx: pivot-compressed (bit 15; returns 0) or basis (two rows; returns 1)
+    int RotMtx(s32* o, u32 piv, u32 bas, u32 idx, u32 tab)
+    {
+        nrot++;
+        if (idx & 0x8000)
+        {
+            for (int i = 0; i < 9; i++) o[i] = 0;
+            const u32 e = piv + (idx & 0x7FFF) * 6;
+            const s32 h = rs16(e), a = rs16(e + 2), b = rs16(e + 4);
+            const u32 pv = h & 0xF;
+            const u32 t0 = rd(tab + pv * 4, 1), t1 = rd(tab + pv * 4 + 1, 1), t2 = rd(tab + pv * 4 + 2, 1), t3 = rd(tab + pv * 4 + 3, 1);
+            if (bad || t0 > 8 || t1 > 8 || t2 > 8 || t3 > 8 || pv > 8) { bad = true; return 0; }
+            o[pv] = (h & 0x10) ? -0x1000 : 0x1000;
+            o[t0] = a; o[t1] = b;
+            o[t2] = (h & 0x20) ? -b : b;
+            o[t3] = (h & 0x40) ? -a : a;
+            return 0;
+        }
+        const u32 p = bas + (idx & 0x7FFF) * 10;
+        const s32 h0 = rs16(p), h1 = rs16(p + 2), h2 = rs16(p + 4), h3 = rs16(p + 6), h4 = rs16(p + 8);
+        o[4] = h4 >> 3; o[0] = h0 >> 3; o[1] = h1 >> 3; o[2] = h2 >> 3; o[3] = h3 >> 3;
+        // the 13-bit fifth value from the low 3 bits of the five halfwords (h4 high)
+        s32 t = (h0 & 7) | (((s32)((u32)(h4 & 7) << 16)) >> 13);
+        t = (h1 & 7) | ((s32)((u32)t << 16) >> 13);
+        t = (h2 & 7) | ((s32)((u32)t << 16) >> 13);
+        t = (h3 & 7) | ((s32)((u32)t << 16) >> 13);
+        t = (s32)((u32)t << 16) >> 16;
+        o[5] = (s32)((u32)t << 19) >> 19;
+        return 1;
+    }
+    // frame index of the step-2 / step-4 animation tracks (0206f22c / 0206f4e0 / 0206f85c): kind 0 = single entry i,
+    // 1 = (i, i + 1) averaged, 2 = 3:1 weighted (i the 3x one, j the other)
+    static int Step(u32 info, s32 f, u32& i, u32& j)
+    {
+        if (!(info & 0xC0000000)) { i = f; return 0; }
+        const u32 last = (info & 0x1FFF0000) >> 16;
+        if (info & 0x40000000)
+        {
+            if (!(f & 1)) { i = (u32)f >> 1; return 0; }
+            if ((u32)f > last) { i = (last >> 1) + 1; return 0; }
+            i = (u32)f >> 1; return 1;
+        }
+        const u32 q = f & 3;
+        if (!q) { i = (u32)f >> 2; return 0; }
+        if ((u32)f > last) { i = q + (last >> 2); return 0; }
+        if (f & 1)
+        {
+            if (f & 2) { j = (u32)f >> 2; i = j + 1; } else { i = (u32)f >> 2; j = i + 1; }
+            return 2;
+        }
+        i = (u32)f >> 2; return 1;
+    }
+    // 0206f22c: one translation component
+    s32 Trans(s32 frame, u32 d, u32 res)
+    {
+        ntrk++;
+        const u32 info = rd(d, 4), base = res + rd(d + 4, 4);
+        const bool h = info & 0x20000000;
+        u32 i, j = 0;
+        switch (Step(info, frame >> 12, i, j))
+        {
+        case 0: return h ? rs16(base + i * 2) : rs32(base + i * 4);
+        case 1: return h ? (rs16(base + i * 2) + rs16(base + i * 2 + 2)) >> 1 : (s32)((u32)(rs32(base + i * 4 + 4) >> 1) + (u32)(rs32(base + i * 4) >> 1));
+        default:
+            if (h) return (3 * rs16(base + i * 2) + rs16(base + j * 2)) >> 2;
+            return (s32)(u32)(((s64)3 * rs32(base + i * 4) + (s64)rs32(base + j * 4)) >> 2);
+        }
+    }
+    // 0206f4e0: one scale component (value, inverse)
+    void Scale(s32 frame, u32 d, u32 res, s32* o)
+    {
+        ntrk++;
+        const u32 info = rd(d, 4), base = res + rd(d + 4, 4);
+        const bool h = info & 0x20000000;
+        u32 i, j = 0;
+        switch (Step(info, frame >> 12, i, j))
+        {
+        case 0:
+            if (h) { o[0] = rs16(base + i * 4); o[1] = rs16(base + i * 4 + 2); }
+            else { o[0] = rs32(base + i * 8); o[1] = rs32(base + i * 8 + 4); }
+            return;
+        case 1:
+            if (h) { o[0] = (rs16(base + i * 4) + rs16(base + i * 4 + 4)) >> 1; o[1] = (rs16(base + i * 4 + 2) + rs16(base + i * 4 + 6)) >> 1; }
+            else { o[0] = (s32)((u32)rs32(base + i * 8) + (u32)rs32(base + i * 8 + 8)) >> 1; o[1] = (s32)((u32)rs32(base + i * 8 + 4) + (u32)rs32(base + i * 8 + 12)) >> 1; }
+            return;
+        default:
+            for (int k = 0; k < 2; k++)
+                o[k] = h ? (3 * rs16(base + i * 4 + k * 2) + rs16(base + j * 4 + k * 2)) >> 2
+                         : (s32)(u32)(((s64)3 * rs32(base + i * 8 + k * 4) + (s64)rs32(base + j * 8 + k * 4)) >> 2);
+        }
+    }
+    // 0206f85c: the rotation track
+    void RotAnim(s32* o, s32 frame, u32 d, u32 res, u32 tab)
+    {
+        const u32 info = rd(d, 4), idxs = res + rd(d + 4, 4), piv = res + rd(res + 0xC, 4), bas = res + rd(res + 0x10, 4);
+        u32 i, j = 0;
+        const int k = Step(info, frame >> 12, i, j);
+        if (bad) return;
+        if (k == 0)
+        {
+            if (RotMtx(o, piv, bas, rd(idxs + i * 2, 2), tab)) Cross(o);
+            else Norm(o + 6);
+            return;
+        }
+        s32 t[9];
+        if (k == 1) j = i + 1;
+        int any = RotMtx(o, piv, bas, rd(idxs + i * 2, 2), tab);
+        any |= RotMtx(t, piv, bas, rd(idxs + j * 2, 2), tab);
+        const s32 w = k == 2 ? 3 : 1;
+        for (int n = 0; n < 6; n++) o[n] = o[n] * w + t[n];
+        Norm(o); Norm(o + 3);
+        if (any) { Cross(o); return; }
+        for (int n = 6; n < 9; n++) o[n] = o[n] * w + t[n];
+        Norm(o + 6);
+    }
+};
+
+// result: the JntAnmResult (0x58 bytes: +0 flags, +4 scale, +0x10 inverse scale (Maya), +0x28 rotation, +0x4C trans)
+// the build's functions (pointer values as stored: Thumb ones | 1) and the literal words the native code reads
+struct NodeVar { u32 blend, anm, sclB, sclM, sndB, sndM, rsLit, rotTab, pivTab, mayaTab, ge; };
+NodeVar NodeVarPW(melonDS::ARMv5* c, u32 E, u32 opn)
+{
+    return {E + kNdAffc, E + kNdEb94, E + kNdCf0, E + kNdDf4, E + kNdC74, E + kNdD30, E + kNdEe78 + 0x3B0, E + kNdFfb8 + 0x15C,
+            E + 0x450, E + kNdDf4 + 0x144, R32(CodePtr(c, opn + 55 * 4))};
+}
+// W2 (TWL SDK build: the same NNS code in Thumb, the blend function in ARM)
+constexpr u32 kW2NodeEntry = 0x02066A10;
+constexpr NodeVar kW2Node = {0x02065D38, 0x020687DD, 0x02069FC1, 0x0206A071, 0x02069F6D, 0x02069FE9, 0x02068C88, 0x02069728,
+                             0x02066D34, 0x0206A150, 0x021469B4};
+constexpr Range kW2NodeCode[14] = {
+    {0x02066A10, 0x02066D44}, {0x02065D38, 0x02065DC4}, {0x020687DC, 0x02068800}, {0x020689DC, 0x02068C8C}, {0x02068C8C, 0x02068D7C},
+    {0x02068E94, 0x02068FDC}, {0x02069108, 0x020693BC}, {0x0206962C, 0x02069738}, {0x02069F6C, 0x0206A154}, {0x02067D48, 0x02067DD0},
+    {0x020786B0, 0x020786C8}, {0x02074280, 0x02074280 + 69 * 4}, {0x020790B0, 0x020790BE}, {0x0208D638, 0x0208D658}};
+constexpr u64 kW2NodeSig = 0xe20a5192f58b6b94ull;
+int W2NodeAt(melonDS::ARMv5* c)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    for (const Range& r : kW2NodeCode)
+        for (u32 a = r.a; a < r.b; a++) { const u8* p = CodePtr(c, a); if (!p) return 0; h = (h ^ *p) * 0x100000001b3ull; }
+    if (g_Stats && h != kW2NodeSig) fprintf(stderr, "A9HLE: W2 G3D node signature %016llx\n", (unsigned long long)h);
+    return h == kW2NodeSig ? 1 : 2;
+}
+
+bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, const NodeVar& v)
+{
+    Mem& m = q.m;
+    const u32 rs = c->R[0], opt = c->R[1];
+    Obj RS = m.O(rs, 0x184);
+    if (!RS) return false;
+    u32 flag = RS.r(8);
+    if (flag & 0x400) return false;
+    const u32 sbc = RS.r(0), idx = q.rd(sbc + 1, 1);
+    // render callback (timings 1-3), joint result cache
+    const u32 cbT = RS.r(0x24) ? RS.p[0x92] : 0;
+    const u32 ro = RS.r(4);
+    if ((cbT >= 1 && cbT <= 3) || q.rd(ro + 0x34, 4) || q.bad) return false;
+    flag |= 0x10;
+    const bool send = !(flag & 0x100);
+    // OP_N straight to GXFIFO: no buffering, no GE buffer or an empty one
+    if (send)
+    {
+        const u32 ge = v.ge, gb = q.rd(ge, 4);
+        if (q.rd(ge + 4, 4) || (gb && q.rd(gb, 4)) || q.bad) return false;
+    }
+    const u32 send1 = RS.r(0xEC), scl = RS.r(0xE8);
+    const u32 rsg = q.rd(R32(CodePtr(c, v.rsLit)), 4);     // NNS_G3dRS
+    if (q.bad || rsg != rs || (send && send1 != v.sndB && send1 != v.sndM) || (scl != v.sclB && scl != v.sclM)) return false;
+    u32 r4 = 4;
+    if (opt == 0x40 || opt == 0x60)
+    {
+        r4++;
+        const u32 w = q.rd(sbc + (opt == 0x40 ? 4 : 5), 1);
+        if (send) q.Op(0x14, &w, 1);
+    }
+    s32 R[0x16];
+    for (int i = 0; i < 0x16; i++) R[i] = (s32)RS.r(0x12C + i * 4);
+    s32* rot = R + 10; s32* tr = R + 19;
+    s32 sc[6];                  // scale + inverse (the guest's stack)
+    u32 fl = 0, sbits = 0;      // flags; the scale function's r3 (bit 2: scale one) / data
+    bool fromRes = true;
+    // the joint animation (out of line: the in-order A55's code budget)
+    auto bca = [&](u32 anm, u32 map, u32 fa) __attribute__((noinline)) -> bool
+    {
+        if (fa != v.anm) return false;
+        fromRes = false;
+        q.anm = 1;
+        // 0206eb94: frame clamp; 0206ee78: NNSi_G3dAnmCalcNsBca
+        const u32 jr = q.rd(anm + 8, 4);
+        s32 frame = (s32)q.rd(anm, 4);
+        const s32 nf = (s32)q.rd(jr + 4, 2) << 12;
+        if (frame >= nf) frame = nf - 1; else if (frame < 0) frame = 0;
+        const u32 off = q.rd(jr + 0x14 + (map & 0xFF) * 2, 2), info = q.rd(jr + off, 4);
+        u32 d = jr + off + 4;
+        if (q.bad) return false;
+        if (info & 1) { fl = 7; sbits = 4; }
+        else
+        {
+            if (((frame & 0xFFF) && (q.rd(jr + 8, 4) & 1)) || ((info & 6) && !(info & 2)) || ((info & 0xC0) && !(info & 0x40))
+                || ((info & 0x600) && !(info & 0x200)) || q.bad)
+                return false;   // interpolated frame; the model-default trans / rotation / scale paths
+            if (info & 6) fl |= 4;
+            else
+                for (int k = 0; k < 3; k++)
+                {
+                    if (info & (8 << k)) { tr[k] = q.rs32(d); d += 4; }
+                    else { tr[k] = q.Trans(frame, d, jr); d += 8; }
+                }
+            const u32 tab = R32(CodePtr(c, v.rotTab));
+            if (info & 0xC0) fl |= 2;
+            else if (info & 0x100)
+            {
+                if (q.RotMtx(rot, jr + q.rd(jr + 0xC, 4), jr + q.rd(jr + 0x10, 4), q.rd(d, 4), tab)) q.Cross(rot);
+                d += 4;
+            }
+            else { q.RotAnim(rot, frame, d, jr, tab); d += 8; }
+            if (info & 0x600) fl |= 1;
+            else
+                for (int k = 0; k < 3; k++)
+                {
+                    if (info & (0x800 << k)) { sc[k] = q.rs32(d + k * 8); sc[3 + k] = q.rs32(d + k * 8 + 4); }
+                    else { s32 o[2]; q.Scale(frame, d + k * 8, jr, o); sc[k] = o[0]; sc[3 + k] = o[1]; }
+                }
+            sbits = fl & 1 ? 4 : 0;
+        }
+        return true;
+    };
+    const u32 anm = q.rd(ro + 0x10, 4);
+    if (anm)
+    {
+        if (q.rd(ro + 0x14, 4) != v.blend || q.rd(anm + 0x10, 4)) return false;   // blend function; one animation
+        const u32 nmap = q.rd(anm + 0x19, 1), map = idx < nmap ? q.rd(anm + 0x1A + idx * 2, 2) : 0;
+        const u32 fa = q.rd(anm + 0xC, 4);
+        if (q.bad) return false;
+        if ((map & 0x300) == 0x100 && fa)
+        {
+            if (!bca(anm, map, fa)) return false;
+        }
+    }
+    // the model's node data (out of line)
+    auto res = [&]() __attribute__((noinline)) -> bool
+    {
+        // the model's node data (rs + 0xD4: the NODE resource dictionary)
+        const u32 nd = RS.r(0xD4);
+        if (!nd || idx >= q.rd(nd + 1, 1)) return false;
+        const u32 o6 = q.rd(nd + 6, 2), esz = q.rd(nd + o6, 2);
+        const u32 r7 = nd + q.rd(nd + o6 + 4 + esz * idx, 4);
+        const u32 h = q.rd(r7, 2);
+        u32 d = r7 + 4;
+        if (q.bad) return false;
+        if (h & 1) fl |= 4;
+        else { for (int k = 0; k < 3; k++) tr[k] = q.rs32(d + k * 4); d += 12; }
+        if (h & 2) fl |= 2;
+        else if (h & 8)
+        {
+            const u32 fp = (h & 0xF0) >> 4, tab = R32(CodePtr(c, v.pivTab));
+            s32 a = q.rs16(d), b = q.rs16(d + 2);
+            const u32 t0 = q.rd(tab + fp * 4, 1), t1 = q.rd(tab + fp * 4 + 1, 1), t2 = q.rd(tab + fp * 4 + 2, 1), t3 = q.rd(tab + fp * 4 + 3, 1);
+            if (q.bad || fp > 8 || t0 > 8 || t1 > 8 || t2 > 8 || t3 > 8) return false;
+            for (int i = 0; i < 9; i++) rot[i] = 0;
+            rot[fp] = (h & 0x100) ? -0x1000 : 0x1000;
+            rot[t0] = a; rot[t1] = b;
+            if (h & 0x200) b = -b;
+            rot[t2] = b;
+            if (h & 0x400) a = -a;
+            rot[t3] = a;
+            d += 4;
+        }
+        else
+        {
+            rot[0] = q.rs16(r7 + 2);
+            for (int k = 0; k < 8; k++) rot[1 + k] = q.rs16(d + k * 2);
+            d += 16;
+        }
+        sbits = h;
+        if (!(h & 4)) for (int k = 0; k < 6; k++) sc[k] = q.rs32(d + k * 4);
+        return true;
+    };
+    if (fromRes && !res()) return false;
+    if (q.bad) return false;
+    // the joint scaling rule
+    if (scl == v.sclB)
+    {
+        if (sbits & 4) fl |= 1;
+        else { R[1] = sc[0]; R[2] = sc[1]; R[3] = sc[2]; }
+        fl |= 0x18;
+    }
+    else
+    {
+        // Maya SSC: the node's flags byte (sbc + 3), the render state's bit vectors at +0xC4, the inverse-scale table
+        const u32 b3 = q.rd(sbc + 3, 1), tb = R32(CodePtr(c, v.mayaTab));
+        if (sbits & 4)
+        {
+            fl |= 1;
+            if (b3 & 2) { const u32 b1 = q.rd(sbc + 1, 1); m.W(RS, 0xC4 + (b1 >> 5) * 4, RS.r(0xC4 + (b1 >> 5) * 4) | 1u << (b1 & 31)); }
+        }
+        else
+        {
+            R[1] = sc[0]; R[2] = sc[1]; R[3] = sc[2];
+            if (b3 & 2)
+            {
+                const u32 b1 = q.rd(sbc + 1, 1);
+                m.W(RS, 0xC4 + (b1 >> 5) * 4, RS.r(0xC4 + (b1 >> 5) * 4) & ~(1u << (b1 & 31)));
+                Obj t = m.O(tb + b1 * 0x18, 12);
+                if (!t) return false;
+                m.W(t, 0, sc[3]); m.W(t, 4, sc[4]); m.W(t, 8, sc[5]);
+            }
+        }
+        if (b3 & 1)
+        {
+            const u32 b2 = q.rd(sbc + 2, 1);
+            fl |= 0x20;
+            // (the clear above may have changed this word: read the queued value)
+            u32 bits = RS.r(0xC4 + (b2 >> 5) * 4);
+            for (u32 i = 0; i < m.np; i++) if (m.pw[i].p == RS.p + 0xC4 + (b2 >> 5) * 4) bits = m.pw[i].v;
+            if (bits & (1u << (b2 & 31))) fl |= 8;
+            else
+            {
+                const u32 a = tb + b2 * 0x18;
+                if ((b3 & 2) && b2 == q.rd(sbc + 1, 1)) { R[4] = sc[3]; R[5] = sc[4]; R[6] = sc[5]; }   // just written
+                else { R[4] = q.rs32(a); R[5] = q.rs32(a + 4); R[6] = q.rs32(a + 8); }
+            }
+        }
+        fl |= 0x10;
+    }
+    R[0] = (s32)fl;
+    // the matrix commands
+    if (send)
+    {
+        const u32* Ru = (const u32*)R;
+        if (send1 == v.sndB)
+        {
+            if (!(fl & 4)) { if (!(fl & 2)) q.Op(0x19, Ru + 10, 12); else q.Op(0x1C, Ru + 19, 3); }
+            else if (!(fl & 2)) q.Op(0x1A, Ru + 10, 9);
+        }
+        else
+        {
+            bool t = !(fl & 4);
+            if ((fl & 0x20) && !(fl & 8)) { if (t) { q.Op(0x1C, Ru + 19, 3); t = false; } q.Op(0x1B, Ru + 4, 3); }
+            if (!(fl & 2)) q.Op(t ? 0x19 : 0x1A, Ru + 10, t ? 12 : 9);
+            else if (t) q.Op(0x1C, Ru + 19, 3);
+        }
+        if (!(fl & 1)) q.Op(0x1B, Ru + 1, 3);
+    }
+    if (opt == 0x20 || opt == 0x60)
+    {
+        r4++;
+        const u32 w = q.rd(sbc + 4, 1);
+        if (send) q.Op(0x13, &w, 1);
+    }
+    if (q.bad) return false;
+    for (int i = 0; i < 0x16; i++) m.W(RS, 0x12C + i * 4, (u32)R[i]);
+    m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFF0000u) | idx << 16);
+    m.W(RS, 8, flag);
+    m.W(RS, 0xB4, 0);
+    m.W(RS, 0, sbc + r4);
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = sbc + r4;
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & ~0x20u) | ((e.retPc & 1) << 5);
+    return true;
+}
+
+__attribute__((noinline)) bool RunNode(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const bool t = c->CPSR & 0x20;
+    const u32 pc = c->R[15] - (t ? 4 : 8);
+    u32 fn[4];
+    if (t) { if (pc != kW2NodeEntry || (!jit && W2NodeAt(c) != 1)) return false; fn[0] = 1; }
+    else if (jit) fn[0] = BlTarget(c, pc + 0x70);
+    else if (NodeAt(c, pc, fn) != 1) return false;
+    s.calls[15]++;
+    melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
+    Mem m(c, g_Check || g_Dry);
+    Node q{c, m};
+#ifdef LITEV_HLE_DIAG
+    std::vector<std::pair<u32, u32>> io;
+    if (g_Check) q.io = &io;
+#endif
+    Expect e;
+    // GX: the geometry engine takes the words now (FIFO empty); the IO page passes the protection unit (VEC_Normalize)
+    bool ok = !CheckPending && fn[0] && gx.GeometryEnabled && gx.BulkReady() && (c->PU_Map[0x04000280 >> 12] & 0x03) == 0x03
+              && NodeNative(c, q, e, t ? kW2Node : NodeVarPW(c, pc, fn[0]));
+#ifdef LITEV_HLE_DIAG
+    if (ok && (g_Check || g_Dry))
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 15, m, e);
+            g_P.gx.assign(q.gw, q.gw + q.ngw);
+            g_P.io = io;
+            g_P.fit[0] = q.nop; g_P.fit[1] = q.ngw; g_P.fit[2] = q.nvec | q.nrot << 8 | q.ntrk << 16; g_P.fit[3] = q.anm;
+#ifdef LITEV_A9HLE_GXCHECK
+            if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
+#endif
+        }
+        s.checks[15]++;
+        ok = false;
+    }
+#endif
+    if (!ok)
+    {
+        s.fallback[15] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    m.Flush();
+    if (q.ngw) gx.BulkWords(q.gw, q.ngw);
+    s.native[15]++;
+    const s32* k = kNodeCyc[t];
+    Return(c, e, k[0] + k[1] * (s32)q.nop + k[2] * (s32)q.ngw + k[3] * (s32)q.nvec + k[4] * (s32)q.nrot + k[5] * (s32)q.ntrk + k[6] * (s32)q.anm);
+    return true;
+}
+#endif
+
+// ---- 16. stereo sample effect over two s16 buffers (Mario Kart DS: its SND capture effect callback) ------------------
+// f(L, R, bytes, state): from the end down to index 2, d = L[k-2] - R[k-2]; L[k] += d, R[k] -= d, saturated to s16 (the side
+// that can overflow); then L/R[1], L/R[0] with the previous call's two saved differences (state + 0x18 / 0x1C), and the
+// clamped differences of the last two samples saved for the next call. ~548 samples a call, about once a frame from an
+// IRQ: ~10.7k guest instructions a frame (26% of MKDS's ARM9 guest work in the race) on every console of a Netplay
+// session. Natively: the buffers, the state, the stack frame, every register and the flags as the guest leaves them.
+// Position independent (exact code words). Category B: a fitted cycle estimate.
+constexpr u32 kFxCode[105] = {
+    0xE92D47F0, 0xE24DD008, 0xE1A050A2, 0xE3A04000, 0xE3A02902, 0xE59F8184, 0xE28D7000, 0xE2629000, 0xE080E085, 0xE0812085,
+    0xE08EA084, 0xE0826084, 0xE15AC0F4, 0xE156A0F4, 0xE3A06902, 0xE2666000, 0xE04CA00A, 0xE15A0006, 0xB1A0A009, 0xBA000001,
+    0xE15A0008, 0xC1A0A008, 0xE1A06084, 0xE2844001, 0xE187A0B6, 0xE3540002, 0xBAFFFFEE, 0xE2454001, 0xE080E084, 0xE2802004,
+    0xE15E0002, 0xE081C084, 0x3A00001D, 0xE3A04902, 0xE59F6110, 0xE2645000, 0xE15E90F4, 0xE15C80F4, 0xE1DE70F0, 0xE1DC40F0,
+    0xE0598008, 0xE0877008, 0xE0448008, 0x4A000006, 0xE1570006, 0xB1CE70B0, 0xA1CE60B0, 0xE1580005, 0xC1CC80B0, 0xD1CC50B0,
+    0xEA000007, 0xE3A04902, 0xE2644000, 0xE1570004, 0xC1CE70B0, 0xD1CE50B0, 0xE1580006, 0xB1CC80B0, 0xA1CC60B0, 0xE24EE002,
+    0xE15E0002, 0xE24CC002, 0x2AFFFFE4, 0xE3A04902, 0xE59F6098, 0xE3A02001, 0xE264C000, 0xE1A05082, 0xE0834102, 0xE19050F5,
+    0xE5944018, 0xE0854004, 0xE154000C, 0xB1A0400C, 0xBA000001, 0xE1540006, 0xC1A04006, 0xE1A05082, 0xE18040B5, 0xE0834102,
+    0xE19150F5, 0xE5944018, 0xE0455004, 0xE155000C, 0xB1A0500C, 0xBA000001, 0xE1550006, 0xC1A05006, 0xE1A04082, 0xE18150B4,
+    0xE2522001, 0x5AFFFFE6, 0xE3A04000, 0xE28D2000, 0xE1A00084, 0xE19210F0, 0xE0830104, 0xE2844001, 0xE5801018, 0xE3540002,
+    0xBAFFFFF8, 0xE28DD008, 0xE8BD47F0, 0xE12FFF1E, 0x00007FFF};
+// ponytail: fitted estimate (check mode, MKDS boot + 8-console race, 34k calls, all of 512 samples: exact to 1e-6 there):
+// base + per sample + per sample with a negative difference
+constexpr s32 kFxCyc0 = 214, kFxCycN = 39, kFxCycNeg = 3;
+constexpr u32 kFxMax = 4096;    // samples (stack buffers)
+
+bool FxAt(melonDS::ARMv5* c, u32 a, int n)
+{
+    if (a & 3) return false;
+    for (int i = 0; i < n; i++) { const u8* p = CodePtr(c, a + i * 4); if (!p || R32(p) != kFxCode[i]) return false; }
+    return true;
+}
+inline s32 Sat16(s32 v) { return v < -0x8000 ? -0x8000 : v > 0x7FFF ? 0x7FFF : v; }
+
+__attribute__((noinline)) bool RunFx(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && !FxAt(c, pc, 105)) return false;
+    s.calls[16]++;
+    const u32 l0 = c->R[0], r0 = c->R[1], n = c->R[2] >> 1, st = c->R[3], sp = c->R[13];
+    Mem m(c, g_Check || g_Dry);
+    Obj L = m.O(l0 & ~3u, ((l0 & 3) + n * 2 + 3) & ~3u), R = m.O(r0 & ~3u, ((r0 & 3) + n * 2 + 3) & ~3u);
+    Obj S = m.O(st + 0x18, 8), K = m.O(sp - 40, 40);
+    // halfword buffers in main RAM / DTCM, not overlapping; at least 3 samples (the guest reads before the buffers else)
+#ifdef LITEV_HLE_DIAG
+    // LITEV_A9HLE_FX_FROM=<frame>: guest code before that frame (A/B in a scene reached by a timing-sensitive script)
+    static const u32 from = getenv("LITEV_A9HLE_FX_FROM") ? (u32)atoi(getenv("LITEV_A9HLE_FX_FROM")) : 0;
+    const bool late = c->NDS.NumFrames >= from;
+#else
+    constexpr bool late = true;
+#endif
+    const bool ok = late && !CheckPending && n >= 3 && n <= kFxMax && !(l0 & 1) && !(r0 & 1) && L && R && S && K
+                    && (l0 + n * 2 <= r0 || r0 + n * 2 <= l0);
+    if (!ok)
+    {
+        s.fallback[16] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    u8* lp = L.p + (l0 & 3); u8* rp = R.p + (r0 & 3);
+    s16 a[kFxMax], b[kFxMax];
+    memcpy(a, lp, n * 2); memcpy(b, rp, n * 2);
+    s16 t[2];
+    for (int i = 0; i < 2; i++) t[i] = (s16)Sat16((s32)a[n - 2 + i] - (s32)b[n - 2 + i]);
+    u32 neg = 0;
+    for (u32 k = n - 1; k >= 2; k--)
+    {
+        const s32 d = (s32)((u32)a[k - 2] - (u32)b[k - 2]);
+        const s32 x = (s32)((u32)a[k] + (u32)d), y = (s32)((u32)b[k] - (u32)d);
+        if (d >= 0) { a[k] = (s16)(x < 0x7FFF ? x : 0x7FFF); b[k] = (s16)(y > -0x8000 ? y : -0x8000); }
+        else { a[k] = (s16)(x > -0x8000 ? x : -0x8000); b[k] = (s16)(y < 0x7FFF ? y : 0x7FFF); neg++; }
+    }
+    for (int k = 1; k >= 0; k--)
+    {
+        const s32 v = (s32)S.r(k * 4);
+        a[k] = (s16)Sat16((s32)((u32)a[k] + (u32)v));
+        b[k] = (s16)Sat16((s32)((u32)b[k] - (u32)v));
+    }
+    // stack: push {r4-r10, lr}, the two saved differences at sp - 40
+    for (int i = 0; i < 7; i++) m.W(K, 8 + i * 4, c->R[4 + i]);
+    m.W(K, 36, c->R[14]);
+    m.W(K, 0, (u32)(u16)t[0] | (u32)(u16)t[1] << 16);
+    m.W(S, 0, (u32)(s32)t[0]); m.W(S, 4, (u32)(s32)t[1]);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = st + 4; e.R[1] = (u32)(s32)t[1]; e.R[2] = sp - 40; e.R[12] = 0xFFFF8000;
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFDF) | 0x60000000 | ((e.retPc & 1) << 5);    // cmp r4, #2 with r4 = 2
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 16, m, e);
+            for (u32 k = 0; k < n; k++) { g_P.log.push_back({l0 + k * 2, (u16)a[k], 2}); g_P.log.push_back({r0 + k * 2, (u16)b[k], 2}); }
+            g_P.fit[0] = n; g_P.fit[1] = neg;
+        }
+        s.checks[16]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    // the buffers: changed halfwords, the JIT invalidation check once per 16-byte granule written
+    auto put = [&](u8* p, u32 ga, const s16* v, bool dtcm)
+    {
+        u32 lastG = ~0u;
+        for (u32 k = 0; k < n; k++)
+        {
+            if (R16(p + k * 2) == (u16)v[k]) continue;
+            const u32 g = (ga + k * 2) >> 4;
+            if (g != lastG && !dtcm) { c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(ga + k * 2); lastG = g; }
+            memcpy(p + k * 2, &v[k], 2);
+        }
+    };
+    put(lp, l0, a, L.dtcm); put(rp, r0, b, R.dtcm);
+    m.Flush();
+    s.native[16]++;
+    Return(c, e, kFxCyc0 + kFxCycN * (s32)(n - 2) + kFxCycNeg * (s32)neg);
+    return true;
+}
+
 // ---- 9. _ll_sdiv: 64-bit signed divide of the compiler runtime -----------------------------------
 // r1:r0 / r3:r2 by shift-and-subtract (~750 guest instructions a call; PW: 2-3 calls a frame from one
 // caller in 3D scenes). Natively: the quotient, r3:r2 = |divisor| normalized (shifted left until bit
@@ -2286,6 +2940,26 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return 3;
     }
 #endif
+#ifdef LITEV_GX_BULK
+    if (instr == kNodeInstr)
+    {
+        static thread_local Range nd[13];
+        u32 fn[4];
+        NodeAt(&nds.ARM9, addr, fn);    // (after IsHook != 0) a missing callee: an empty range
+        for (int i = 0; i < 9; i++) nd[i] = {addr + kNodeFn[i].off, addr + kNodeFn[i].off + kNodeFn[i].len};
+        nd[9] = {fn[0], fn[0] ? fn[0] + 57 * 4 : 0}; nd[10] = {fn[1], fn[1] ? fn[1] + 24 : 0};
+        nd[11] = {fn[2], fn[2] ? fn[2] + 69 * 4 : 0}; nd[12] = {fn[3], fn[3] ? fn[3] + 14 : 0};
+        r = nd;
+        return 13;
+    }
+#endif
+    if (instr == kSetInstr && FxAt(&nds.ARM9, addr, 3))
+    {
+        static thread_local Range fx;
+        fx = {addr, addr + 105 * 4};
+        r = &fx;
+        return 1;
+    }
     if (instr == kVecInstr)
     {
         static thread_local Range vn;
@@ -2307,6 +2981,9 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         r = &lz;
         return 1;
     }
+#ifdef LITEV_GX_BULK
+    if (addr == kW2NodeEntry && (instr & 0xFFFF) == 0xB5F0) { r = kW2NodeCode; return 14; }
+#endif
     const Variant& v = *Active(&nds.ARM9)->v;     // after IsHook != 0
     if (addr == v.wake)
     {
@@ -2344,6 +3021,13 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
     if (thumb)
     {
         if (!MaybeHookT(instr)) return 0;
+#ifdef LITEV_GX_BULK
+        if (addr == kW2NodeEntry && (instr & 0xFFFF) == 0xB5F0)
+        {
+            State& s = St(&nds.ARM9);
+            return s.on && (s.mask & 8192) ? W2NodeAt(&nds.ARM9) : 0;
+        }
+#endif
         State& s = Get(&nds.ARM9, addr, instr & 0xFFFF, true);
         if (s.status != 1) return 0;
         const int k = Kind(*s.v, addr, instr & 0xFFFF, true);
@@ -2376,6 +3060,19 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return s.on && (s.mask & 128) ? MatAt(&nds.ARM9, addr, def, opn, snd) : 0;
     }
 #endif
+#ifdef LITEV_GX_BULK
+    if (instr == kNodeInstr)
+    {
+        State& s = St(&nds.ARM9);
+        u32 fn[4];
+        return s.on && (s.mask & 8192) ? NodeAt(&nds.ARM9, addr, fn) : 0;
+    }
+#endif
+    if (instr == kSetInstr && FxAt(&nds.ARM9, addr, 3))
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 16384) ? (FxAt(&nds.ARM9, addr, 105) ? 1 : 2) : 0;
+    }
     if (instr == kVecInstr)
     {
         State& s = St(&nds.ARM9);
@@ -3153,6 +3850,13 @@ __attribute__((noinline)) bool RunOs(melonDS::ARMv5* c, State& s, int k, bool ji
 __attribute__((noinline)) bool RunThumb(melonDS::ARMv5* c, bool jit)
 {
     const u32 pc = c->R[15] - 4, in = c->CurInstr & 0xFFFF;
+#ifdef LITEV_GX_BULK
+    if (pc == kW2NodeEntry && in == 0xB5F0)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 8192) && RunNode(c, s, jit);
+    }
+#endif
     State& s = Get(c, pc, in, true);
     if (s.status != 1) return false;
     const int k = Kind(*s.v, pc, in, true);
@@ -3202,6 +3906,18 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 4096) && RunVec(c, s, jit);
     }
+    if (in == kSetInstr && FxAt(c, pc, 3))
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 16384) && RunFx(c, s, jit);
+    }
+#ifdef LITEV_GX_BULK
+    if (in == kNodeInstr)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 8192) && RunNode(c, s, jit);
+    }
+#endif
     State& s = Get(c, pc, in);
     if (s.status != 1) return false;
     const int k = Kind(*s.v, pc, in);
@@ -3277,7 +3993,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         g_State[&c->NDS].diffs[g_P.kind]++;
         return;
     }
-    if (!atVec && (pc != (e.retPc & ~1u) || cpu->CPSR != e.CPSR)) return;
+    if (!atVec && (pc != (e.retPc & ~1u) || ((cpu->CPSR ^ e.CPSR) & (g_P.kind == 15 ? 0x0FFFFFFFu : ~0u)))) return;
     if (g_P.kind == 10 || g_P.kind == 13) gR[1] = e.R[1];     // GX async: r1 = the IF value read (not modelled)
     if (g_P.kind == 6 && (cpu->R[2] != e.R[2] || cpu->R[3] != e.R[3] || cpu->R[6] != e.R[6])) return;   // LZ: same progress
     melonDS::NDS& nds = c->NDS;
@@ -3296,6 +4012,10 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         fprintf(stderr, "ASYNCFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 13 && getenv("LITEV_A9HLE_SHPFIT") && !g_P.irq)
         fprintf(stderr, "SHPFIT %d %u %llu\n", (int)g_P.small, g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 16 && getenv("LITEV_A9HLE_FXFIT") && !g_P.irq)
+        fprintf(stderr, "FXFIT %u %u %llu\n", g_P.fit[0], g_P.fit[1], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 15 && getenv("LITEV_A9HLE_NODEFIT") && !g_P.irq)
+        fprintf(stderr, "NODEFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 8 && getenv("LITEV_A9HLE_MATFIT") && !g_P.irq)
         fprintf(stderr, "MATFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 9 && getenv("LITEV_A9HLE_LLFIT") && !g_P.irq)
@@ -3324,6 +4044,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     {
         u8* p = m.P(a);
         if (!p || (k == 6 && (a < g_P.lzLo || a >= g_P.lzHi))) continue;
+        if (k == 15 && a - (e.R[13] - 0x400) < 0x400) continue;     // G3D node: callee frames below sp (dead)
         auto it = exp.find(a);
         u8 want = it != exp.end() ? it->second : old(a);
         if (*p != want)
@@ -3333,7 +4054,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         }
     }
     for (int i = 0; i < 15; i++)
-        if (gR[i] != e.R[i])
+        if (gR[i] != e.R[i] && !(k == 15 && (i == 1 || i == 2 || i == 3 || i == 12 || i == 14)))   // G3D node: scratch
         {
             if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " r%d guest %08x native %08x;", i, gR[i], e.R[i]);
             nd++;
@@ -3347,11 +4068,11 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             if (gs[i] != e.SVC[i]) { if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " svc[%d] guest %08x native %08x;", i, gs[i], e.SVC[i]); nd++; }
         }
     }
-    if (k == 10 || k == 11 || (k == 13 && !g_P.small))
+    if (k == 10 || k == 11 || (k == 13 && !g_P.small) || k == 15)
     {
         std::vector<std::pair<u32, u32>> io;
         for (auto& a : g_P.acc)
-            if (a.Write && (a.Addr >> 24) == 0x04 && a.Addr != 0x04000208)
+            if (a.Write && (a.Addr >> 24) == 0x04 && a.Addr != 0x04000208 && !(k == 15 && a.Addr - 0x04000400 < 0x40))
                 io.push_back({a.Addr, a.Addr == 0x04000600 ? a.Val & 0xC0008000u : a.Val});
         if (io != g_P.io)
         {
@@ -3360,7 +4081,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             nd++;
         }
     }
-    if (k == 8 || (k == 13 && g_P.small))
+    if (k == 8 || (k == 13 && g_P.small) || k == 15)
     {
         // GXFIFO words: the guest's stores to GXFIFO, then what reached BulkWords (MI_CpuSend32 under GX_CPUSEND)
         std::vector<u32> gw;

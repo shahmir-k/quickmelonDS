@@ -18,7 +18,7 @@
 namespace melonDS::A7HLE
 {
 #ifdef LITEV_HLE_DIAG
-bool CheckPending = false;
+thread_local bool CheckPending = false;
 #endif
 namespace
 {
@@ -27,16 +27,34 @@ namespace
 // [0x0380021C,0x03800F48) (ExChannelMain + IsChannelActive, CalcTimer, CalcChannelVolume,
 // SinIdx, envelope + literal pools), [0x03801418,0x038014D4) (UpdateLfo, GetLfoValue) and the
 // shared-WRAM Thumb SVC stubs [0x037FB574,0x037FB598) (GetPitchTable / GetVolumeTable).
-constexpr u32 kEntry = 0x03800A5C;
-constexpr u32 kEntryInstr = 0xE92D4FF8;            // push {r3-r11, lr}
-constexpr u32 kR1a = 0x0380021C, kR1b = 0x03800F48;
-constexpr u32 kR2a = 0x03801418, kR2b = 0x038014D4;
-constexpr u32 kStubA = 0x037FB574, kStubB = 0x037FB598;
-constexpr u64 kSig = 0xd732d69f87473043ull;
-constexpr u32 kChannels = 0x03809FBC, kChanSize = 0x54;
-constexpr u32 kDbSqTable = 0x03808E48;              // SNDi_DecibelSquareTable (s16)
-constexpr u32 kSinTable = 0x03808E24;               // LFO sine table (s8)
+constexpr u32 kChannels = 0x03809FBC, kChanSize = 0x54;     // (PW: the SND hardware commit's)
+constexpr u32 kDbSqTable = 0x03808E48;              // SNDi_DecibelSquareTable (s16) (PW: the sequencer's)
 constexpr u32 kTwlFlag = 0x03FFFFC8;
+
+// SND_ExChannelMain per game build. Mario Kart DS (2005 NitroSDK, older compiler: envelope / sweep / LFO in their own
+// functions, the driver in shared WRAM 0x037Fxxxx): the same SNDExChannel layout and the same arithmetic except no
+// DSi-BIOS check and no "volume > -0x8000" gate on a volume LFO. Ranges: every byte the native version replaces
+// (functions, literal pools, BIOS SVC stubs; MKDS: ExChannelMain + helpers [0x037FBBD8,0x037FD128), the Thumb SVC
+// stubs, the 64/32-bit divides of the sweep).
+struct Range3 { u32 a, b; };
+struct ExVar
+{
+    const char* name;
+    u32 entry, instr;
+    Range3 code[3];
+    u64 sig;
+    u32 chans, dbSq, sin;
+    bool twl, lfoVolGate;
+    s32 cyc0, cycCh;        // ponytail: fixed estimate per call: base + per active channel (check-mode guest averages)
+};
+constexpr ExVar kEx[] = {
+    {"PW/PB/W2", 0x03800A5C, 0xE92D4FF8 /* push {r3-r11, lr} */,
+     {{0x0380021C, 0x03800F48}, {0x03801418, 0x038014D4}, {0x037FB574, 0x037FB598}}, 0xd732d69f87473043ull,
+     0x03809FBC, 0x03808E48, 0x03808E24, true, true, 200, 480},
+    {"MKDS", 0x037FCE24, 0xE92D4FF0 /* push {r4-r11, lr} */,
+     {{0x037FBBD8, 0x037FD128}, {0x03801210, 0x0380121C}, {0x0380697C, 0x03806D38}}, 0x74d99b93607adcfdull,
+     0x03807ECC, 0x03806F40, 0x03806F1C, false, false, 394, 507},
+};
 
 // FreeBIOS ARM7 tables used by SVC 0x1B GetPitchTable (u16 x 768) and 0x1C GetVolumeTable
 // (u8 x 724). A loaded BIOS must contain the same bytes (the real tables) or the HLE stays off.
@@ -47,8 +65,8 @@ struct State
     int status = 0;                 // 0 unprobed, 1 active, -1 off
     bool on = true;
     int copyOn = -1;                // MI_CpuCopy32 hook, latched separately (no signature probe)
-    std::vector<u8> code;           // snapshot of R1+R2 (per-call memcmp)
-    u32 stub[9] = {};
+    const ExVar* v = nullptr;       // the matching build
+    std::vector<u8> code;           // snapshot of its ranges (per-call memcmp)
     u16 pitch[768] = {};
     u8 vol[724] = {};
     u64 copies = 0, calls = 0, native = 0, fallbacks = 0, checks = 0, checkDiffs = 0;
@@ -60,6 +78,9 @@ std::unordered_map<const melonDS::NDS*, State> g_State;
 #ifdef LITEV_HLE_DIAG
 bool g_Check = getenv("LITEV_A7HLE_CHECK") && atoi(getenv("LITEV_A7HLE_CHECK"));
 bool g_CommitCheck = getenv("LITEV_A7HLE_COMMITCHECK") && atoi(getenv("LITEV_A7HLE_COMMITCHECK"));
+// LITEV_A7HLE_FROM=<frame>: ExChannelMain runs the guest code before that frame (an A/B in a scene reached by a
+// timing-sensitive input script, e.g. the MKDS 8-console race)
+u32 g_From = getenv("LITEV_A7HLE_FROM") ? (u32)atoi(getenv("LITEV_A7HLE_FROM")) : 0;
 #else
 constexpr bool g_Check = false, g_CommitCheck = false;   // compare mode compiled out
 #endif
@@ -67,6 +88,12 @@ bool g_Stats = getenv("LITEV_A7HLE_STATS") && atoi(getenv("LITEV_A7HLE_STATS"));
 
 
 inline u8* W7(melonDS::NDS& nds, u32 a) { return &nds.ARM7WRAM[a & (ARM7WRAMSize - 1)]; }
+// host pointer of an ARM7 WRAM / shared WRAM (0x03000000-0x037FFFFF as the ARM7 sees it) byte
+inline const u8* P7(melonDS::NDS& nds, u32 a)
+{
+    if (a >= 0x03800000 || !nds.SWRAM_ARM7.Mem) return W7(nds, a);
+    return &nds.SWRAM_ARM7.Mem[a & nds.SWRAM_ARM7.Mask];
+}
 inline u16 R16(const u8* p) { u16 v; memcpy(&v, p, 2); return v; }
 inline u32 R32(const u8* p) { u32 v; memcpy(&v, p, 4); return v; }
 inline void W16(u8* p, u16 v) { memcpy(p, &v, 2); }
@@ -93,28 +120,23 @@ bool ReadOn(u32 bit)
     return (m == 1 ? 15u : m) & bit;
 }
 
-bool StubsMatch(melonDS::NDS& nds, const State& s)
-{
-    for (u32 i = 0; i < 9; i++)
-        if (nds.ARM7Read32(kStubA + i * 4) != s.stub[i]) return false;
-    return true;
-}
-
 void Probe(melonDS::NDS& nds, State& s)
 {
     s.status = -1;
     s.on = ReadOn(1);
     if (!s.on) return;
     std::vector<u8> code;
-    for (u32 a = kR1a; a < kR1b; a++) code.push_back(*W7(nds, a));
-    for (u32 a = kR2a; a < kR2b; a++) code.push_back(*W7(nds, a));
-    u8 stubBytes[kStubB - kStubA];
-    for (u32 i = 0; i < 9; i++) { s.stub[i] = nds.ARM7Read32(kStubA + i * 4); memcpy(stubBytes + i * 4, &s.stub[i], 4); }
-    u64 h = 0xcbf29ce484222325ull;
-    auto mix = [&](const u8* p, size_t n) { for (size_t i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull; };
-    mix(code.data(), code.size());
-    mix(stubBytes, sizeof(stubBytes));
-    if (h != kSig) return;
+    for (const ExVar& v : kEx)
+    {
+        code.clear();
+        for (const Range3& r : v.code)
+            for (u32 a = r.a; a < r.b; a++) code.push_back(*P7(nds, a));
+        u64 h = 0xcbf29ce484222325ull;
+        for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
+        if (g_Stats) fprintf(stderr, "A7HLE: ExChannelMain %s signature %016llx\n", v.name, (unsigned long long)h);
+        if (h == v.sig) { s.v = &v; break; }
+    }
+    if (!s.v) return;
 
     // BIOS tables: take FreeBIOS's, require the loaded ARM7 BIOS to hold the same bytes.
     auto fb = FreeBIOSGetNtrArm7();
@@ -133,7 +155,6 @@ State& Get(melonDS::NDS& nds)
     static State* lastS = nullptr;
     if (&nds == last) return *lastS;
     State& s = g_State[&nds];                      // map nodes are stable
-    if (s.status == 0) Probe(nds, s);
     last = &nds; lastS = &s;
     return s;
 }
@@ -182,9 +203,9 @@ u16 CalcChannelVolume(const State& s, s32 v)
     return (u16)(r | (div << 8));
 }
 
-s32 SinIdx(melonDS::NDS& nds, s32 x)
+s32 SinIdx(melonDS::NDS& nds, const ExVar& v, s32 x)
 {
-    auto t = [&](s32 i) { return (s32)(s8)*W7(nds, kSinTable + i); };
+    auto t = [&](s32 i) { return (s32)(s8)*W7(nds, v.sin + i); };
     if (x < 0x20) return t(x);
     if (x < 0x40) return t(0x40 - x);
     if (x < 0x60) return (s32)(s8)(-t(x - 0x40));
@@ -195,7 +216,8 @@ s32 SinIdx(melonDS::NDS& nds, s32 x)
 // to run instead (a channel callback would be called, or an unsupported path).
 bool ExChannelMain(melonDS::NDS& nds, const State& s, u8* chans, bool step)
 {
-    if ((*W7(nds, kTwlFlag) & 0x04) && !(*W7(nds, kTwlFlag) & 0x20)) return false;   // DSi-BIOS workaround path
+    const ExVar& v = *s.v;
+    if (v.twl && (*W7(nds, kTwlFlag) & 0x04) && !(*W7(nds, kTwlFlag) & 0x20)) return false;   // DSi-BIOS workaround path
     for (int i = 0; i < 16; i++)
     {
         u8* c = chans + i * kChanSize;
@@ -213,7 +235,7 @@ bool ExChannelMain(melonDS::NDS& nds, const State& s, u8* chans, bool step)
             continue;
         }
 
-        s32 vol = (s16)R16(W7(nds, kDbSqTable + c[9] * 2));
+        s32 vol = (s16)R16(W7(nds, v.dbSq + c[9] * 2));
         s32 pitch = ((s32)c[8] - (s32)c[5]) << 6;
 
         // envelope
@@ -229,7 +251,7 @@ bool ExChannelMain(melonDS::NDS& nds, const State& s, u8* chans, bool step)
                 break;
             case 1:
             {
-                s32 sus = (s32)(s16)R16(W7(nds, kDbSqTable + c[0x1D] * 2)) << 7;
+                s32 sus = (s32)(s16)R16(W7(nds, v.dbSq + c[0x1D] * 2)) << 7;
                 att -= R16(c + 0x1E);
                 W32(c + 0x10, (u32)att);
                 if (att <= sus) { W32(c + 0x10, (u32)sus); att = sus; c[2] = 2; }
@@ -265,7 +287,7 @@ bool ExChannelMain(melonDS::NDS& nds, const State& s, u8* chans, bool step)
         u8* lfo = c + 0x28;
         s32 lfoRaw = 0;
         if (lfo[2] && R16(lfo + 6) >= R16(lfo + 4))
-            lfoRaw = SinIdx(nds, R16(lfo + 8) >> 8) * (s32)lfo[2] * (s32)lfo[3];
+            lfoRaw = SinIdx(nds, v, R16(lfo + 8) >> 8) * (s32)lfo[2] * (s32)lfo[3];
         s32 lfoVal = lfoRaw;
         if (lfoRaw)
         {
@@ -294,7 +316,7 @@ bool ExChannelMain(melonDS::NDS& nds, const State& s, u8* chans, bool step)
         switch (lfo[0])
         {
         case 0: pitch += lfoVal; break;
-        case 1: if (vol > -0x8000) vol += lfoVal; break;
+        case 1: if (!v.lfoVolGate || vol > -0x8000) vol += lfoVal; break;
         case 2: pan += lfoVal; break;
         default: break;
         }
@@ -329,9 +351,13 @@ bool ExChannelMain(melonDS::NDS& nds, const State& s, u8* chans, bool step)
 
 bool CodeIntact(melonDS::NDS& nds, const State& s)
 {
-    return memcmp(W7(nds, kR1a), s.code.data(), kR1b - kR1a) == 0
-        && memcmp(W7(nds, kR2a), s.code.data() + (kR1b - kR1a), kR2b - kR2a) == 0
-        && StubsMatch(nds, s);
+    const u8* c = s.code.data();
+    for (const Range3& r : s.v->code)
+    {
+        for (u32 a = r.a; a < r.b; a++, c++)
+            if (*P7(nds, a) != *c) return false;
+    }
+    return true;
 }
 
 
@@ -930,6 +956,8 @@ struct Seq
 struct Pending
 {
     u32 ret = 0;
+    const melonDS::ARM* cpu = nullptr;      // the console being compared (headless --mp-test runs several)
+    int busy = -1;              // exchannel: SOUNDxCNT busy bits at entry (the native call samples them there)
     const char* name = "";
     u64* diffs = nullptr;
     std::vector<std::pair<u32, std::vector<u8>>> regions;   // address, expected bytes
@@ -938,12 +966,15 @@ struct Pending
     u32 R[16] = {}, cpsr = 0;
     u64 t0 = 0; u32 fit[3] = {};            // guest cycles of the call (fit of the cycle estimates)
     std::vector<std::pair<int, u32>> spu;   // SPU state: (channel * 4 + what (0 Cnt & 0xFFFF, 1 pan byte, 2 Cnt bit 31, 3 timer), value)
-} g_Pending;
-u64 g_IrqDiffs = 0;             // differences with an IRQ in the guest window (the native call takes it after)
+};
+thread_local Pending g_Pending;
+u64 g_IrqDiffs = 0;
+u64 g_BusyDiffs = 0;            // exchannel differences where a channel's busy bit changed inside the guest call             // differences with an IRQ in the guest window (the native call takes it after)
 
 void ArmCheck(melonDS::ARM* cpu, const char* name, u64* diffs)
 {
     g_Pending.ret = cpu->R[14] & ~1u;
+    g_Pending.cpu = cpu;
     g_Pending.name = name;
     g_Pending.diffs = diffs;
     g_Pending.irq = false;
@@ -969,6 +1000,7 @@ struct StatsDump
             fprintf(stderr, "A7HLE hwcommit: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu\n", s.hw,
                     (unsigned long long)s.hwN[0], (unsigned long long)s.hwN[1], (unsigned long long)s.hwN[2], (unsigned long long)s.hwN[3], (unsigned long long)s.hwN[4]);
 #ifdef LITEV_HLE_DIAG
+        if (g_BusyDiffs) fprintf(stderr, "A7HLE check: %llu exchannel differences with a channel stopping inside the guest call (busy bits sampled at entry; not counted)\n", (unsigned long long)g_BusyDiffs);
         if (g_IrqDiffs) fprintf(stderr, "A7HLE check: %llu differences with an IRQ inside the guest call (not counted above)\n", (unsigned long long)g_IrqDiffs);
 #endif
     }
@@ -1276,16 +1308,18 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
         SeqState& s = GetSeq(nds);
         return s.status != 1 ? 0 : SeqCodeIntact(nds, s) ? 1 : 2;
     }
-    if (addr != kEntry || instr != kEntryInstr) return 0;
+    if (!((addr == kEx[0].entry && instr == kEx[0].instr) || (addr == kEx[1].entry && instr == kEx[1].instr))) return 0;
     State& s = Get(nds);
-    return !(s.status == 1 && s.on) ? 0 : CodeIntact(nds, s) ? 1 : 2;
+    if (s.status == 0) Probe(nds, s);              // (at its entry: the driver is loaded)
+    return !(s.status == 1 && s.on && addr == s.v->entry) ? 0 : CodeIntact(nds, s) ? 1 : 2;
 }
 int Deps(u32 addr, u32 instr, Range* out)
 {
     if (instr == kCopy32[0]) { out[0] = {addr, addr + 24}; return 1; }
     if (addr == kHwEntry) { out[0] = {kHwRa, kHwRb}; out[1] = {kHwRc, kHwRd}; return 2; }
     if (addr == kSeqEntry) { out[0] = {kSeqRa, kSeqRb}; out[1] = {kRndA, kRndB}; return 2; }
-    out[0] = {kR1a, kR1b}; out[1] = {kR2a, kR2b}; out[2] = {kStubA, kStubB};
+    const ExVar& v = addr == kEx[1].entry ? kEx[1] : kEx[0];
+    for (int i = 0; i < 3; i++) out[i] = {v.code[i].a, v.code[i].b};
     return 3;
 }
 
@@ -1303,20 +1337,30 @@ bool Run(melonDS::ARM* cpu, bool jit)
     }
     if (pc == kSeqEntry && cpu->CurInstr == kSeqEntryInstr) return RunSeq(cpu, jit);
     if (pc == kHwEntry && cpu->CurInstr == kHwInstr) return RunHw(cpu, jit);
-    if (pc != kEntry || cpu->CurInstr != kEntryInstr) return false;
+    if (!((pc == kEx[0].entry && cpu->CurInstr == kEx[0].instr) || (pc == kEx[1].entry && cpu->CurInstr == kEx[1].instr))) return false;
     State& s = Get(nds);
-    if (s.status != 1 || !s.on) return false;
+    if (s.status == 0) Probe(nds, s);
+    if (s.status != 1 || !s.on || pc != s.v->entry) return false;
     s.calls++;
 
     u8 chans[16 * kChanSize];
-    memcpy(chans, W7(nds, kChannels), sizeof(chans));
+    const u32 chA = s.v->chans;
+    memcpy(chans, W7(nds, chA), sizeof(chans));
     bool ok = (jit || CodeIntact(nds, s)) && ExChannelMain(nds, s, chans, cpu->R[0] != 0);
+#ifdef LITEV_HLE_DIAG
+    ok = ok && nds.NumFrames >= g_From;
+#endif
 #ifdef LITEV_HLE_DIAG
     if (ok && g_Check)
     {
         // run the guest too; compare at its return
-        g_Pending.regions.assign(1, {kChannels, std::vector<u8>(chans, chans + sizeof(chans))});
+        g_Pending.regions.assign(1, {chA, std::vector<u8>(chans, chans + sizeof(chans))});
         ArmCheck(cpu, "exchannel", &s.checkDiffs);
+        g_Pending.t0 = nds.ARM7Timestamp + cpu->Cycles; g_Pending.fit[0] = 0;
+        for (int i = 0; i < 16; i++) g_Pending.fit[0] += chans[i * kChanSize + 3] & 1;
+        g_Pending.fit[1] = ~0u;     // (exchannel fit line)
+        g_Pending.busy = 0;
+        for (int i = 0; i < 16; i++) g_Pending.busy |= (nds.ARM7Read8(0x04000403 + i * 16) >> 7) << i;
         s.checks++;
         ok = false;
     }
@@ -1331,13 +1375,13 @@ bool Run(melonDS::ARM* cpu, bool jit)
     }
     s.native++;
     // changed words only, as the guest's stores leave them (kChannels and the size are word aligned)
-    u8* dst = W7(nds, kChannels);
+    u8* dst = W7(nds, chA);
     for (u32 i = 0; i < sizeof(chans); i += 4)
-        if (R32(dst + i) != R32(chans + i)) Store32<melonDS::ARMJIT_Memory::memregion_WRAM7>(nds, kChannels + i, dst + i, R32(chans + i));
+        if (R32(dst + i) != R32(chans + i)) Store32<melonDS::ARMJIT_Memory::memregion_WRAM7>(nds, chA + i, dst + i, R32(chans + i));
     // ponytail: fixed cycle estimate (guest: ~7.3k cycles/tick for ~14 active channels on PW)
     int active = 0;
     for (int i = 0; i < 16; i++) active += chans[i * kChanSize + 3] & 1;
-    cpu->Cycles += 200 + 480 * active;
+    cpu->Cycles += s.v->cyc0 + s.v->cycCh * active;
     cpu->JumpTo(cpu->R[14]);
     return true;
 }
@@ -1345,6 +1389,7 @@ bool Run(melonDS::ARM* cpu, bool jit)
 #ifdef LITEV_HLE_DIAG
 void CheckAt(melonDS::ARM* cpu, u32 pc)
 {
+    if (cpu != g_Pending.cpu) return;
     if ((cpu->CPSR & 0x1F) == 0x12) { g_Pending.irq = true; return; }
     if (pc != g_Pending.ret) return;
     CheckPending = false;
@@ -1356,11 +1401,14 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             u8 got = nds.ARM7Read8(addr + i);
             if (got == exp[i]) continue;
             if (!diff && *g_Pending.diffs < 10)
-                fprintf(stderr, "A7HLE CHECK %s diffs:", g_Pending.name);
+                fprintf(stderr, "A7HLE CHECK %s (cpu %p) diffs:", g_Pending.name, (const void*)cpu);
             if (*g_Pending.diffs < 10)
                 fprintf(stderr, " %08x guest %02x native %02x;", addr + i, got, exp[i]);
             diff = true;
         }
+    if (g_Pending.fit[1] == ~0u && !g_Pending.irq && getenv("LITEV_A7HLE_HWFIT"))
+        fprintf(stderr, "EXFIT %u %llu\n", g_Pending.fit[0], (unsigned long long)(nds.ARM7Timestamp + cpu->Cycles - g_Pending.t0));
+    g_Pending.fit[1] = 0;
     if (g_Pending.regs && !g_Pending.irq && getenv("LITEV_A7HLE_HWFIT"))
         fprintf(stderr, "HWFIT %u %u %u %llu\n", g_Pending.fit[0], g_Pending.fit[1], g_Pending.fit[2], (unsigned long long)(nds.ARM7Timestamp + cpu->Cycles - g_Pending.t0));
     if (g_Pending.regs)
@@ -1392,6 +1440,15 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
                 diff = true;
             }
         }
+    }
+    int busyNow = -1;
+    if (g_Pending.busy >= 0)
+    {
+        busyNow = 0;
+        for (int i = 0; i < 16; i++) busyNow |= (nds.ARM7Read8(0x04000403 + i * 16) >> 7) << i;
+        // a channel that stopped inside the guest call: the native call sampled it at entry (documented category B)
+        if (diff && busyNow != g_Pending.busy) { g_BusyDiffs++; g_Pending.busy = -1; return; }
+        g_Pending.busy = -1;
     }
     if (diff)
     {
