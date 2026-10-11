@@ -115,9 +115,10 @@ inline void Store32(melonDS::NDS& nds, u32 a, u8* p, u32 v)
     W32(p, v);
 }
 
-// debug.litev.a7hle: 0 off, 1 (or unset) all but 16, else a mask: 1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit,
-// 16 SeqMain / SND commit on Mario Kart DS's driver too (default off: with them the Mac 8-console LockstepMP race (fixed harness,
-// liteDS-main 5b2f7c6a) ends in "Communication error" on 5 of 7 remote consoles; the hooks' results are compare-mode exact)
+// debug.litev.a7hle: 0 off, 1 (or unset) all, else a mask: 1 ExChannelMain, 2 SeqMain, 4 MI_CpuCopy32, 8 SND hardware commit,
+// 16 SeqMain / SND commit on Mario Kart DS's driver too (on since hle11: with the MP fix 2d74a617 the 8-console LockstepMP race
+// keeps all 8 consoles on 14 input sets + 4 clock skews; it sends fewer frames than with them off because fewer host frames fail
+// (failed-client retries 42% -> 27%), the successful exchanges and the race clock stay equal)
 bool ReadOn(u32 bit)
 {
 #if defined(__ANDROID__)
@@ -127,7 +128,7 @@ bool ReadOn(u32 bit)
     const char* e = getenv("debug.litev.a7hle");
 #endif
     const u32 m = e ? (u32)strtoul(e, nullptr, 0) : 1;
-    return (m == 1 ? 15u : m) & bit;
+    return (m == 1 ? 31u : m) & bit;
 }
 
 void Probe(melonDS::NDS& nds, State& s)

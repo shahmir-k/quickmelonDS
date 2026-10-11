@@ -1243,6 +1243,15 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_NP_SPEED
                 auto runT0 = std::chrono::steady_clock::now();
 #endif
+                // test hook (as the single-console LITEV_POKE32): "frame:addr:value,..." ARM9 bus writes on every console
+                if (static const char* pk = getenv("LITEV_MP_POKE32"); pk)
+                    for (const char* q = pk; *q; )
+                    {
+                        unsigned long pf = strtoul(q, (char**)&q, 0); q += (*q == ':');
+                        unsigned long pa = strtoul(q, (char**)&q, 0); q += (*q == ':');
+                        unsigned long pv = strtoul(q, (char**)&q, 0); q += (*q == ',');
+                        if ((int)pf == f) { bi.nds->ARM9Write32((u32)pa, (u32)pv); fprintf(stderr, "inst%d poke32 frame %d %08lx = %08lx\n", inst, f, pa, pv); }
+                    }
                 // the frame's scanlines: the app paces by them (a game that rewinds VCOUNT, as the Wi-Fi
                 // client of a DS multiplayer session does to follow the host, runs longer frames)
                 const u32 lines = bi.nds->RunFrame();
