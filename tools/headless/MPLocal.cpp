@@ -46,6 +46,7 @@ void MPInterface::Set(MPInterfaceType type)
     else
         Current = std::make_unique<HeadlessDummyMP>();
     CurrentType = type;
+    LinkDelaysRegularFrames = type == MPInterface_Netplay;   // as src/net/MPInterface.cpp
 }
 
 }
