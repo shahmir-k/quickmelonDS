@@ -1091,7 +1091,12 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             if (record) record->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
             else
 #endif
-            lockstepMP->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
+            {
+                // diagnostic LITEV_MP_CLOCKSKEW=<console>:<cycles>: that console's link clock runs ahead
+                u64 sk = 0; const char* e = getenv("LITEV_MP_CLOCKSKEW");
+                if (e && atoi(e) == k) sk = strtoull(strchr(e, ':') + 1, nullptr, 0);
+                lockstepMP->SetClock(k, [nd, sk] { return nd->GetSysTimestamp() + sk; });
+            }
             lockstepMP->SetWake(k, *nd);
         }
         b[k].udata->instanceID = k;
