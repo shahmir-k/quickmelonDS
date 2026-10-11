@@ -59,6 +59,7 @@ constexpr ExVar kEx[] = {
 // (u8 x 724). A loaded BIOS must contain the same bytes (the real tables) or the HLE stays off.
 constexpr u32 kFreePitch = 0x169C, kFreeVol = 0x1CB0;
 
+struct HwVar;
 struct State
 {
     int status = 0;                 // 0 unprobed, 1 active, -1 off
@@ -71,6 +72,7 @@ struct State
     u64 copies = 0, calls = 0, native = 0, fallbacks = 0, checks = 0, checkDiffs = 0;
     int hw = 0;                     // SND hardware commit: 0 unprobed, 1 on, -1 off
     std::vector<u8> hwCode;
+    const HwVar* hv = nullptr;      // the matching build
     u64 hwN[6] = {};                // calls, native, fallback, checks, check diffs, charged cycles (diag)
 };
 std::unordered_map<const melonDS::NDS*, State> g_State;
@@ -1008,7 +1010,7 @@ struct Pending
     bool deferred = false;      // compared at the next hook entry (LITEV_A7HLE_DEFER): memory + SPU only
     u32 R[16] = {}, cpsr = 0;
     u64 t0 = 0; u32 fit[6] = {};            // guest cycles of the call (fit of the cycle estimates)
-    std::vector<std::pair<int, u32>> spu;   // SPU state: (channel * 4 + what (0 Cnt & 0xFFFF, 1 pan byte, 2 Cnt bit 31, 3 timer), value)
+    std::vector<std::pair<int, u32>> spu;   // SPU state: (channel * 8 + what (0 Cnt & 0xFFFF, 1 pan byte, 2 Cnt bit 31, 3 timer, 4 Cnt byte 0), value)
 };
 thread_local Pending g_Pending;
 u64 g_IrqDiffs = 0;
@@ -1178,20 +1180,39 @@ __attribute__((noinline)) bool RunSeq(melonDS::ARM* cpu, bool jit)
 }
 }
 
-// ---- SND hardware commit (PW/PB/W2 0x03800870) ---------------------------------------------------
+// ---- SND hardware commit (PW/PB/W2 0x03800870, MKDS 0x037FD130) ------------------------------------------------
 // After a sound tick the driver commits each channel's pending hardware updates (the SNDExChannel flag bits 3-7
 // of byte 3: start, stop, timer, volume, pan) with one helper call per update (SOUNDxCNT / SOUNDxTMR stores), then
 // sets the start bits and clears the flags: ~550 guest instructions a call (3.2 calls a frame, 12-15% of the ARM7's
-// guest instructions on PW). Natively when no channel starts (the three start paths stay guest code) and the
-// master-effect adjustment is off ([0x03809A5C] <= 0): the same SOUND register stores in the same order, the
-// volume / pan shadow bytes, the flag bytes, the stack frames below sp and the guest's final registers / flags.
+// guest instructions on PW). Natively when no channel starts (the three start paths stay guest code): the same SOUND
+// register stores in the same order, the volume / pan shadow bytes, the flag bytes, the stack frames below sp and
+// the guest's final registers / flags. PW: only with the master-effect adjustment off ([fx] <= 0). MKDS (2005 driver,
+// shared WRAM; its effect level is > 0 in the race): the effect (0x037FBA94: volume scaled by pan for channels other
+// than 1 and 3 when the pan is < 0x18 or > 0x68) natively, its helpers' registers and frames.
 // Category B: a fixed cycle estimate (check-mode fit).
-constexpr u32 kHwEntry = 0x03800870, kHwInstr = 0xE92D47F0;       // push {r4-r10, lr}
-constexpr u32 kHwRa = 0x038000EC, kHwRb = 0x0380021C, kHwRc = 0x03800870, kHwRd = 0x03800A5C;   // helpers, the function
-constexpr u64 kHwSig = 0x24e4d4770c4a81dcull;
-constexpr u32 kHwFx = 0x03809A5C, kHwVol = 0x03809A70, kHwPan = 0x03809A60, kHwPanOvr = 0x0380935C;
-// ponytail: fixed estimate, check-mode fit: base + per channel with updates + per volume / pan / stop / timer store
-constexpr s32 kHwCyc0 = 482, kHwCycCh = 42, kHwCycVol = 40, kHwCycOther = 13;   // 6.9k calls, within 1.5%
+namespace
+{
+struct HwVar
+{
+    const char* name;
+    u32 entry, instr;
+    Range3 code[2];                 // helpers, the function (literal pools included)
+    u64 sig;
+    u32 chans, fx, vol, pan, panOvr;    // channels, master effect level, volume / pan shadow bytes, pan override
+    bool mk;                        // 2005 driver: effect natively, its helpers' registers / frames
+    u32 retVol, retPan;             // return addresses the volume / pan helpers push
+    s32 cyc0, cycCh, cycVol, cycOther, cycFx;   // ponytail: fixed estimate (check-mode fit): base + per channel with updates
+                                    // + per volume / other store + per effect scaling (MKDS)
+};
+constexpr HwVar kHwV[] = {
+    {"PW/PB/W2", 0x03800870, 0xE92D47F0 /* push {r4-r10, lr} */, {{0x038000EC, 0x0380021C}, {0x03800870, 0x03800A5C}},
+     0x24e4d4770c4a81dcull, 0x03809FBC, 0x03809A5C, 0x03809A70, 0x03809A60, 0x0380935C, false, 0x038009D0, 0x038009F0,
+     482, 42, 40, 13, 0},   // 6.9k calls, within 1.5%
+    {"MKDS", 0x037FD130, 0xE92D47F0 /* push {r4-r10, lr} */, {{0x037FBA94, 0x037FBD38}, {0x037FD130, 0x037FD31C}},
+     0x52806648b3d4f885ull, 0x03807ECC, 0x0380796C, 0x03807980, 0x03807970, 0x0380759C, true, 0x037FD290, 0x037FD2B0,
+     482, 39, 66, 15, 18},  // 88k calls (8-console menus), p95 0.4%
+};
+}
 int HwProbe(melonDS::NDS& nds)
 {
     State& s = Get(nds);
@@ -1199,32 +1220,47 @@ int HwProbe(melonDS::NDS& nds)
     s.hw = -1;
     if (!ReadOn(8)) return s.hw;
     std::vector<u8> code;
-    for (u32 a = kHwRa; a < kHwRb; a++) code.push_back(*W7(nds, a));
-    for (u32 a = kHwRc; a < kHwRd; a++) code.push_back(*W7(nds, a));
-    u64 h = 0xcbf29ce484222325ull;
-    for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
-    if (g_Stats) fprintf(stderr, "A7HLE: SND hw commit signature %016llx\n", (unsigned long long)h);
-    if (h != kHwSig) return s.hw;
+    for (const HwVar& v : kHwV)
+    {
+        code.clear();
+        for (const Range3& r : v.code)
+            for (u32 a = r.a; a < r.b; a++) code.push_back(*P7(nds, a));
+        u64 h = 0xcbf29ce484222325ull;
+        for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
+        if (g_Stats) fprintf(stderr, "A7HLE: SND hw commit %s signature %016llx\n", v.name, (unsigned long long)h);
+        if (h == v.sig) { s.hv = &v; break; }
+    }
+    if (!s.hv) return s.hw;
     s.hwCode = std::move(code);
     return s.hw = 1;
 }
 bool HwIntact(melonDS::NDS& nds)
 {
     const State& s = Get(nds);
-    return memcmp(W7(nds, kHwRa), s.hwCode.data(), kHwRb - kHwRa) == 0
-        && memcmp(W7(nds, kHwRc), s.hwCode.data() + (kHwRb - kHwRa), kHwRd - kHwRc) == 0;
+    const u8* c = s.hwCode.data();
+    for (const Range3& r : s.hv->code)
+        for (u32 a = r.a; a < r.b; a++, c++)
+            if (*P7(nds, a) != *c) return false;
+    return true;
 }
 
 __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
 {
     melonDS::NDS& nds = cpu->NDS;
     if (HwProbe(nds) != 1) return false;
-    u64* g_Hw = Get(nds).hwN;
+    State& S = Get(nds);
+    const HwVar& V = *S.hv;
+    if (cpu->R[15] - 8 != V.entry) return false;
+    u64* g_Hw = S.hwN;
     g_Hw[0]++;
     const u32 sp = cpu->R[13];
-    u8* ch = W7(nds, kChannels);
-    bool ok = !CheckPending && (jit || HwIntact(nds)) && (s32)R32(W7(nds, kHwFx)) <= 0
+    u8* ch = W7(nds, V.chans);
+    const s32 fx = (s32)R32(W7(nds, V.fx));
+    bool ok = !CheckPending && (jit || HwIntact(nds)) && (V.mk || fx <= 0)
               && (sp >> 16) == 0x0380 && ((sp - 72) >> 16) == 0x0380 && !(sp & 3);
+#ifdef LITEV_HLE_DIAG
+    ok = ok && nds.NumFrames >= g_From;
+#endif
     u32 any = 0;
     for (int i = 0; ok && i < 16; i++)
     {
@@ -1244,11 +1280,20 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
     u32 nst = 0;
     for (int i = 0; i < 7; i++) st[nst++] = {sp - 32 + i * 4, cpu->R[4 + i]};
     st[nst++] = {sp - 4, cpu->R[14]};
-    struct Io { u32 a, v; u8 sz; } io[4 * 16];
-    u32 nio = 0, nvol = 0, nother = 0, nch = 0;
+    struct Io { u32 a, v; u8 sz; } io[5 * 16];
+    u32 nio = 0, nvol = 0, nother = 0, nch = 0, nfx = 0;
     u8 flags[16], vol[16], pan[16];
     bool vset[16] = {}, pset[16] = {};
-    const s32 ovr = (s32)R32(W7(nds, kHwPanOvr));
+    const s32 ovr = (s32)R32(W7(nds, V.panOvr));
+    // MKDS 0x037FBA94: the effect's volume for pan p (r2 / r12 as it leaves them)
+    auto fxVol = [&](u32 v, s32 p) -> u32
+    {
+        if (p < 0x18) { nfx++; r2 = 0x7FFF - (u32)fx; return (u32)((s32)(v * ((u32)(p + 0x28) * (u32)fx + (r2 << 6))) >> 21); }
+        if (p <= 0x68) return v;
+        nfx++;
+        ip = (u32)fx; r2 = 0u - (u32)fx;
+        return (u32)((s32)(v * ((u32)(p - 0x28) * r2 + (((u32)fx + 0x7FFF) << 6))) >> 21);
+    };
     for (int i = 0; i < 16; i++)
     {
         u8* c = ch + i * kChanSize;
@@ -1261,7 +1306,8 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
             // stop: SOUNDxCNT &= ~0x80000000 (32-bit read and store)
             const u32 cnt = nds.ARM7Read32(hw);
             io[nio++] = {hw, cnt & ~0x80000000u, 4};
-            r1 = cnt & ~0x80000000u; r2 = cnt; r3 = i << 4;
+            if (V.mk) { r2 = cnt & ~0x80000000u; ip = hw; }
+            else { r1 = cnt & ~0x80000000u; r2 = cnt; r3 = i << 4; }
             nother++;
         }
         if (f & 4)
@@ -1272,22 +1318,44 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
         }
         if (f & 8)
         {
-            // volume: shadow byte, SOUNDxCNT low halfword (push {r3, r4, r5, lr} at sp - 72)
+            // volume: shadow byte, SOUNDxCNT low halfword (PW: push {r3, r4, r5, lr} at sp - 72; MKDS: push {r4, r5, lr}
+            // at sp - 68, the effect for pan = SOUNDxCNT byte 2)
             const u32 v = R16(c + 0x24);
             vol[i] = v & 0xFF; vset[i] = true;
-            r1 = (v & 0xFF) | ((v >> 8) << 8); r2 = v >> 8; ip = kHwVol;
-            io[nio++] = {hw, r1 & 0xFFFF, 2};
-            st[nst++] = {sp - 72, r3}; st[nst++] = {sp - 68, 2}; st[nst++] = {sp - 64, 1}; st[nst++] = {sp - 60, 0x038009D0};
+            if (V.mk)
+            {
+                u32 lo = v & 0xFF;
+                r2 = v >> 8;
+                if (fx > 0 && ((r2 = 1u << i) & 0xFFF5)) { r2 = nds.ARM7Read8(hw + 2); lo = fxVol(lo, (s32)r2); }
+                io[nio++] = {hw, (lo | ((v >> 8) << 8)) & 0xFFFF, 2};
+            }
+            else
+            {
+                r1 = (v & 0xFF) | ((v >> 8) << 8); r2 = v >> 8; ip = V.vol;
+                io[nio++] = {hw, r1 & 0xFFFF, 2};
+                st[nst++] = {sp - 72, r3};
+            }
+            st[nst++] = {sp - 68, 2}; st[nst++] = {sp - 64, 1}; st[nst++] = {sp - 60, V.retVol};
             nvol++;
         }
         if (f & 0x10)
         {
-            // pan: shadow byte, the override if >= 0, SOUNDxCNT byte 2 (push {r4, lr} at sp - 64)
+            // pan: shadow byte, the override if >= 0, SOUNDxCNT byte 2 (push {r4, lr} at sp - 64); MKDS: the effect's
+            // volume for the new pan into SOUNDxCNT byte 0
             pan[i] = c[0x23]; pset[i] = true;
             r1 = ovr >= 0 ? (u32)ovr : c[0x23];
             io[nio++] = {hw + 2, r1 & 0xFF, 1};
-            r2 = R32(W7(nds, kHwFx)); r3 = kHwFx;
-            st[nst++] = {sp - 64, 2}; st[nst++] = {sp - 60, 0x038009F0};
+            if (V.mk)
+            {
+                r2 = (u32)fx;
+                if (fx > 0 && (r2 = (1u << i) & 0xFFF5))
+                {
+                    r2 = V.vol;
+                    io[nio++] = {hw, fxVol(vset[i] ? vol[i] : *W7(nds, V.vol + i), (s32)r1) & 0xFF, 1};
+                }
+            }
+            else { r2 = (u32)fx; r3 = V.fx; }
+            st[nst++] = {sp - 64, 2}; st[nst++] = {sp - 60, V.retPan};
             nother++;
         }
     }
@@ -1299,11 +1367,11 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
         g_Pending.regions.clear();
         for (int i = 0; i < 16; i++)
         {
-            if (flags[i] >> 3) g_Pending.regions.push_back({kChannels + i * kChanSize + 3, {(u8)(flags[i] & 7)}});
-            if (vset[i]) g_Pending.regions.push_back({kHwVol + i, {vol[i]}});
-            if (pset[i]) g_Pending.regions.push_back({kHwPan + i, {pan[i]}});
+            if (flags[i] >> 3) g_Pending.regions.push_back({V.chans + i * kChanSize + 3, {(u8)(flags[i] & 7)}});
+            if (vset[i]) g_Pending.regions.push_back({V.vol + i, {vol[i]}});
+            if (pset[i]) g_Pending.regions.push_back({V.pan + i, {pan[i]}});
         }
-        for (u32 k = 0; k < nst; k++)
+        for (u32 k = 0; k < nst && !g_Defer; k++)
         {
             bool later = false;     // a later push to the same slot: compare the last one only
             for (u32 j = k + 1; j < nst; j++) later |= st[j].a == st[k].a;
@@ -1313,14 +1381,22 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
         }
         ArmCheck(cpu, "hwcommit", &g_Hw[4]);
         g_Pending.regs = true;
-        g_Pending.t0 = nds.ARM7Timestamp + cpu->Cycles; g_Pending.fit[0] = nch; g_Pending.fit[1] = nvol; g_Pending.fit[2] = nother;
+        g_Pending.t0 = nds.ARM7Timestamp + cpu->Cycles; g_Pending.fit[0] = nch; g_Pending.fit[1] = nvol; g_Pending.fit[2] = nother; g_Pending.fit[3] = nfx;
         for (int i = 0; i < 16; i++) g_Pending.R[i] = cpu->R[i];
-        g_Pending.R[0] = r0; g_Pending.R[1] = 0x54; g_Pending.R[2] = r2; g_Pending.R[3] = kChannels; g_Pending.R[12] = ip;
+        g_Pending.R[0] = r0; g_Pending.R[1] = 0x54; g_Pending.R[2] = r2; g_Pending.R[3] = V.chans; g_Pending.R[12] = ip;
         g_Pending.cpsr = 0x60000000;    // cmp r4, #16 (16)
         for (u32 k = 0; k < nio; k++)
         {
             const int c = (io[k].a >> 4) & 15, o = io[k].a & 15;
-            g_Pending.spu.push_back({c * 4 + (o == 8 ? 3 : o == 2 ? 1 : io[k].sz == 4 ? 2 : 0), io[k].v});
+            if (o == 0 && io[k].sz == 1)    // byte 0 after a halfword store to the same channel: one expectation
+            {
+                bool merged = false;
+                for (auto& [w, v] : g_Pending.spu)
+                    if (w == c * 8) { v = (v & 0xFF00) | io[k].v; merged = true; }
+                if (!merged) g_Pending.spu.push_back({c * 8 + 4, io[k].v});
+                continue;
+            }
+            g_Pending.spu.push_back({c * 8 + (o == 8 ? 3 : o == 2 ? 1 : io[k].sz == 4 ? 2 : 0), io[k].v});
         }
         g_Hw[3]++;
         GuestFallback(cpu);
@@ -1336,18 +1412,23 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
     auto st8 = [&](u32 a, u8 v) { u8* p = W7(nds, a); if (*p != v) { nds.JIT.CheckAndInvalidate<1, melonDS::ARMJIT_Memory::memregion_WRAM7>(a & ~3u); *p = v; } };
     for (int i = 0; i < 16; i++)
     {
-        if (flags[i] >> 3) st8(kChannels + i * kChanSize + 3, flags[i] & 7);
-        if (vset[i]) st8(kHwVol + i, vol[i]);
-        if (pset[i]) st8(kHwPan + i, pan[i]);
+        if (flags[i] >> 3) st8(V.chans + i * kChanSize + 3, flags[i] & 7);
+        if (vset[i]) st8(V.vol + i, vol[i]);
+        if (pset[i]) st8(V.pan + i, pan[i]);
     }
     for (u32 k = 0; k < nst; k++)
     {
         u8* p = W7(nds, st[k].a);
         if (R32(p) != st[k].v) Store32<melonDS::ARMJIT_Memory::memregion_WRAM7>(nds, st[k].a, p, st[k].v);
     }
-    cpu->R[0] = r0; cpu->R[1] = 0x54; cpu->R[2] = r2; cpu->R[3] = kChannels; cpu->R[12] = ip;
+    cpu->R[0] = r0; cpu->R[1] = 0x54; cpu->R[2] = r2; cpu->R[3] = V.chans; cpu->R[12] = ip;
     cpu->CPSR = (cpu->CPSR & 0x0FFFFFFF) | 0x60000000;
-    cpu->Cycles += kHwCyc0 + kHwCycCh * (s32)nch + kHwCycVol * (s32)nvol + kHwCycOther * (s32)nother;
+    const s32 cyc = V.cyc0 + V.cycCh * (s32)nch + V.cycVol * (s32)nvol + V.cycOther * (s32)nother + V.cycFx * (s32)nfx;
+    cpu->Cycles += cyc;
+#ifdef LITEV_HLE_DIAG
+    g_Hw[5] += cyc;
+    cpu->Cycles += g_CycAdj;
+#endif
     g_Hw[1]++;
     (void)any;
     cpu->JumpTo(cpu->R[14]);
@@ -1356,7 +1437,8 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
 
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 {
-    if (addr == kHwEntry && instr == kHwInstr) return HwProbe(nds) != 1 ? 0 : HwIntact(nds) ? 1 : 2;
+    if ((addr == kHwV[0].entry && instr == kHwV[0].instr) || (addr == kHwV[1].entry && instr == kHwV[1].instr))
+        return HwProbe(nds) != 1 || addr != Get(nds).hv->entry ? 0 : HwIntact(nds) ? 1 : 2;
     if (instr == kCopy32[0]) return CopyOn(nds) && IsCopy32(nds, addr) ? 1 : 0;
     if ((addr == kSeqV[0].entry && instr == kSeqV[0].instr) || (addr == kSeqV[1].entry && instr == kSeqV[1].instr))
     {
@@ -1371,7 +1453,8 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 int Deps(u32 addr, u32 instr, Range* out)
 {
     if (instr == kCopy32[0]) { out[0] = {addr, addr + 24}; return 1; }
-    if (addr == kHwEntry) { out[0] = {kHwRa, kHwRb}; out[1] = {kHwRc, kHwRd}; return 2; }
+    for (const HwVar& v : kHwV)
+        if (addr == v.entry) { out[0] = {v.code[0].a, v.code[0].b}; out[1] = {v.code[1].a, v.code[1].b}; return 2; }
     for (const SeqVar& v : kSeqV)
         if (addr == v.entry)
         {
@@ -1401,7 +1484,8 @@ bool Run(melonDS::ARM* cpu, bool jit)
     }
     if ((pc == kSeqV[0].entry && cpu->CurInstr == kSeqV[0].instr) || (pc == kSeqV[1].entry && cpu->CurInstr == kSeqV[1].instr))
         return RunSeq(cpu, jit);
-    if (pc == kHwEntry && cpu->CurInstr == kHwInstr) return RunHw(cpu, jit);
+    if ((pc == kHwV[0].entry && cpu->CurInstr == kHwV[0].instr) || (pc == kHwV[1].entry && cpu->CurInstr == kHwV[1].instr))
+        return RunHw(cpu, jit);
     if (!((pc == kEx[0].entry && cpu->CurInstr == kEx[0].instr) || (pc == kEx[1].entry && cpu->CurInstr == kEx[1].instr))) return false;
     State& s = Get(nds);
     if (s.status == 0) Probe(nds, s);
@@ -1499,14 +1583,15 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         }
         for (auto& [w, v] : g_Pending.spu)
         {
-            if ((w & 3) == 3) continue;     // SOUNDxTMR is write-only (the timer path ran 0 times in the PW profiles)
-            const u32 cnt = nds.ARM7Read32(0x04000400 + (w >> 2) * 16);
-            const u32 got = (w & 3) == 0 ? cnt & 0xFFFF : (w & 3) == 1 ? (cnt >> 16) & 0xFF : cnt & 0x80000000;
-            const u32 want = (w & 3) == 2 ? 0 : (w & 3) == 1 ? v & 0x7F : v;
-            if (((w & 3) == 1 ? got & 0x7F : got) != want)
+            const int k = w & 7;            // (channel * 8 + what: 0 Cnt & 0xFFFF, 1 pan byte, 2 Cnt bit 31, 3 timer, 4 Cnt byte 0)
+            if (k == 3 || (k == 2 && g_Pending.deferred)) continue;           // SOUNDxTMR is write-only (the timer path ran 0 times in the PW profiles)
+            const u32 cnt = nds.ARM7Read32(0x04000400 + (w >> 3) * 16);
+            const u32 got = k == 0 ? cnt & 0xFFFF : k == 1 ? (cnt >> 16) & 0x7F : k == 4 ? cnt & 0x7F : cnt & 0x80000000;
+            const u32 want = k == 2 ? 0 : k == 1 || k == 4 ? v & 0x7F : v;
+            if (got != want)
             {
                 if (!diff && *g_Pending.diffs < 10) fprintf(stderr, "A7HLE CHECK %s diffs:", g_Pending.name);
-                if (*g_Pending.diffs < 10) fprintf(stderr, " spu ch%d/%d guest %x native %x;", w >> 2, w & 3, got, want);
+                if (*g_Pending.diffs < 10) fprintf(stderr, " spu ch%d/%d guest %x native %x;", w >> 3, k, got, want);
                 diff = true;
             }
         }
