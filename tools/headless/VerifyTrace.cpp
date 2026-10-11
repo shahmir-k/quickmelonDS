@@ -16,6 +16,7 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsy
 #endif
 #include <map>
 #include <sys/resource.h>
+#include <pthread.h>
 
 #include <cstdio>
 #include <cstring>
@@ -1125,6 +1126,9 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     auto runInstance = [&](int inst)
     {
         BuiltNDS& bi = b[inst];
+#ifdef __linux__
+        { char nm[16]; snprintf(nm, sizeof nm, "inst%d", inst); pthread_setname_np(pthread_self(), nm); }  // per-console perf/simpleperf attribution
+#endif
         // LITEV_MP_NICE0 / LITEV_MP_NICE1: nice of console 0's thread / every other console's (the
         // app: EmulatorThread -10, NetplayRemote -16)
         if (const char* nv = getenv(inst ? "LITEV_MP_NICE1" : "LITEV_MP_NICE0"))
