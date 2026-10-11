@@ -128,6 +128,9 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
         cpu9->RegionCodeCycles = compileTimeCodeCycles;
         if (setupRegion)
             cpu9->SetupCodeMem(R15);
+#ifdef LITEV_FAST_TIMING
+        if (LITEV_FT) cycles = FastTiming.R9;   // fast timing: a constant refill
+#endif
     }
     else
     {
@@ -172,6 +175,9 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
 
         cpu7->CodeRegion = R15 >> 24;
         cpu7->CodeCycles = addr >> 15;
+#ifdef LITEV_FAST_TIMING
+        if (LITEV_FT) cycles = FastTiming.R7;
+#endif
     }
 
 #ifdef LITEV_JIT_LINK
@@ -225,11 +231,14 @@ void* Compiler::Gen_JumpTo9(int kind)
 
     STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARMv5, RegionCodeCycles));
 
+    if (!LITEV_FT)   // fast timing: the refill is a constant, no fetch-cost lookup
+    {
     CMP(W1, 0xFF);
     MOVI2R(W3, kCodeCacheTiming);
     CSEL(W1, W3, W1, CC_EQ);
     CMP(W0, W2);
     CSINC(W1, W1, WZR, CC_HS);
+    }
 
     FixupBranch switchToThumb;
     if (kind == 0)
@@ -256,8 +265,14 @@ void* Compiler::Gen_JumpTo9(int kind)
         ADD(W0, W0, 4);
         STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARMv5, R[15]));
 
+#ifdef LITEV_FAST_TIMING
+        if (LITEV_FT) ADD(RCycles, RCycles, FastTiming.R9);
+        else
+#endif
+        {
         ADD(W1, W1, W1);
         ADD(RCycles, RCycles, W1);
+        }
         RET();
     }
 
@@ -280,10 +295,16 @@ void* Compiler::Gen_JumpTo9(int kind)
         ADD(W0, W0, 2);
         STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARMv5, R[15]));
 
+#ifdef LITEV_FAST_TIMING
+        if (LITEV_FT) ADD(RCycles, RCycles, FastTiming.R9);
+        else
+#endif
+        {
         ADD(W2, W1, W1);
         TSTI2R(W0, 0x2);
         CSEL(W1, W1, W2, CC_EQ);
         ADD(RCycles, RCycles, W1);
+        }
         RET();
     }
 
@@ -308,10 +329,16 @@ void* Compiler::Gen_JumpTo7(int kind)
     
     if (kind == 0 || kind == 1)
     {
+#ifdef LITEV_FAST_TIMING
+        if (LITEV_FT) ADD(RCycles, RCycles, FastTiming.R7);
+        else
+#endif
+        {
         UBFX(W2, W3, 0, 8);
         UBFX(W3, W3, 8, 8);
         ADD(W2, W3, W2);
         ADD(RCycles, RCycles, W2);
+        }
 
         ANDI2R(W0, W0, ~3);
 
@@ -348,10 +375,16 @@ void* Compiler::Gen_JumpTo7(int kind)
 #endif
         }
 
+#ifdef LITEV_FAST_TIMING
+        if (LITEV_FT) ADD(RCycles, RCycles, FastTiming.R7);
+        else
+#endif
+        {
         UBFX(W2, W3, 16, 8);
         UBFX(W3, W3, 24, 8);
         ADD(W2, W3, W2);
         ADD(RCycles, RCycles, W2);
+        }
 
         ANDI2R(W0, W0, ~1);
 

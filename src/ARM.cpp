@@ -1,5 +1,8 @@
 /*
     Copyright 2016-2026 melonDS team
+    LITEV_FAST_TIMING parts adapted from DSperate (https://github.com/beebono/DSperate, commit f5fa35e,
+    src/core/cpu/timing_mode.h, src/core/cpu/cpu_mem.h, src/core/cpu/cpu_cycles.h):
+    Copyright (C) 2026 DSperate contributors, GPL-3.0-or-later.
 
     This file is part of melonDS.
 
@@ -40,10 +43,40 @@
 #endif
 #endif
 
+#ifdef LITEV_FAST_TIMING
+#include <cstdio>
+#include <cstdlib>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#endif
+
 namespace melonDS
 {
 using Platform::Log;
 using Platform::LogLevel;
+
+#ifdef LITEV_FAST_TIMING
+// FastTiming.h. Constants: DSperate src/core/cpu/timing_mode.h (FastTiming {0, 5, 2, 4, 2}).
+static const char* FastTimingProp(const char* name, char* buf)
+{
+#if defined(__ANDROID__)
+    return __system_property_get(name, buf) > 0 ? buf : nullptr;
+#else
+    (void)buf;
+    return getenv(name);
+#endif
+}
+const FastTimingCfg FastTiming = [] {
+    FastTimingCfg f{true, 0, 5, 2, 4, 2};
+    char b[100] = {0};
+    if (const char* e = FastTimingProp("debug.litev.fasttiming", b)) f.On = atoi(e) != 0;
+    char k[100] = {0};
+    if (const char* e = FastTimingProp("debug.litev.fastk", k))
+        sscanf(e, "%d,%d,%d,%d,%d", &f.D9S, &f.D9, &f.D7, &f.R9, &f.R7);
+    return f;
+}();
+#endif
 
 #if defined(LITEV_SHADOW_ASSERT)
 // liteDS-v2 Unit 2 shadow-mode equivalence check.
@@ -952,6 +985,9 @@ void ARMv5::JumpTo(u32 addr, bool restorecpsr)
     u32 newregion = addr >> 24;
 
     RegionCodeCycles = MemTimings[addr >> 12][0];
+#ifdef LITEV_FAST_TIMING
+    const s32 cyc0 = Cycles;
+#endif
 
     if (addr & 0x1)
     {
@@ -992,6 +1028,9 @@ void ARMv5::JumpTo(u32 addr, bool restorecpsr)
 
         CPSR &= ~0x20;
     }
+#ifdef LITEV_FAST_TIMING
+    if (LITEV_FT) Cycles = cyc0 + FastTiming.R9;   // fast timing: a constant refill
+#endif
 
     if (!(PU_Map[addr>>12] & 0x04))
     {
@@ -1002,6 +1041,11 @@ void ARMv5::JumpTo(u32 addr, bool restorecpsr)
     NDS.MonitorARM9Jump(addr);
 }
 
+#ifdef LITEV_FAST_TIMING
+#define FT_R7 FastTiming.R7
+#else
+#define FT_R7 0
+#endif
 void ARMv4::JumpTo(u32 addr, bool restorecpsr)
 {
     if (restorecpsr)
@@ -1027,7 +1071,7 @@ void ARMv4::JumpTo(u32 addr, bool restorecpsr)
 
         NextInstr[0] = CodeRead16(addr);
         NextInstr[1] = CodeRead16(addr+2);
-        Cycles += NDS.ARM7MemTimings[CodeCycles][0] + NDS.ARM7MemTimings[CodeCycles][1];
+        Cycles += LITEV_FT ? FT_R7 : NDS.ARM7MemTimings[CodeCycles][0] + NDS.ARM7MemTimings[CodeCycles][1];
 
         CPSR |= 0x20;
     }
@@ -1040,7 +1084,7 @@ void ARMv4::JumpTo(u32 addr, bool restorecpsr)
 
         NextInstr[0] = CodeRead32(addr);
         NextInstr[1] = CodeRead32(addr+4);
-        Cycles += NDS.ARM7MemTimings[CodeCycles][2] + NDS.ARM7MemTimings[CodeCycles][3];
+        Cycles += LITEV_FT ? FT_R7 : NDS.ARM7MemTimings[CodeCycles][2] + NDS.ARM7MemTimings[CodeCycles][3];
 
         CPSR &= ~0x20;
     }
@@ -2032,11 +2076,18 @@ u32 ARMv5::ReadMem(u32 addr, int size)
 }
 #endif
 
+#ifdef LITEV_FAST_TIMING
+// fast timing (FastTiming.h; DSperate timing_mode.h fast_data): a constant per ARM7 access
+#define FT7(x) (LITEV_FT ? FastTiming.D7 : (x))
+#else
+#define FT7(x) (x)
+#endif
+
 void ARMv4::DataRead8(u32 addr, u32* val)
 {
     *val = BusRead8(addr);
     DataRegion = addr;
-    DataCycles = NDS.ARM7MemTimings[addr >> 15][0];
+    DataCycles = FT7(NDS.ARM7MemTimings[addr >> 15][0]);
 }
 
 void ARMv4::DataRead16(u32 addr, u32* val)
@@ -2045,7 +2096,7 @@ void ARMv4::DataRead16(u32 addr, u32* val)
 
     *val = BusRead16(addr);
     DataRegion = addr;
-    DataCycles = NDS.ARM7MemTimings[addr >> 15][0];
+    DataCycles = FT7(NDS.ARM7MemTimings[addr >> 15][0]);
 }
 
 void ARMv4::DataRead32(u32 addr, u32* val)
@@ -2054,7 +2105,7 @@ void ARMv4::DataRead32(u32 addr, u32* val)
 
     *val = BusRead32(addr);
     DataRegion = addr;
-    DataCycles = NDS.ARM7MemTimings[addr >> 15][2];
+    DataCycles = FT7(NDS.ARM7MemTimings[addr >> 15][2]);
 }
 
 void ARMv4::DataRead32S(u32 addr, u32* val)
@@ -2062,14 +2113,14 @@ void ARMv4::DataRead32S(u32 addr, u32* val)
     addr &= ~3;
 
     *val = BusRead32(addr);
-    DataCycles += NDS.ARM7MemTimings[addr >> 15][3];
+    DataCycles += FT7(NDS.ARM7MemTimings[addr >> 15][3]);
 }
 
 void ARMv4::DataWrite8(u32 addr, u8 val)
 {
     BusWrite8(addr, val);
     DataRegion = addr;
-    DataCycles = NDS.ARM7MemTimings[addr >> 15][0];
+    DataCycles = FT7(NDS.ARM7MemTimings[addr >> 15][0]);
 }
 
 void ARMv4::DataWrite16(u32 addr, u16 val)
@@ -2078,7 +2129,7 @@ void ARMv4::DataWrite16(u32 addr, u16 val)
 
     BusWrite16(addr, val);
     DataRegion = addr;
-    DataCycles = NDS.ARM7MemTimings[addr >> 15][0];
+    DataCycles = FT7(NDS.ARM7MemTimings[addr >> 15][0]);
 }
 
 void ARMv4::DataWrite32(u32 addr, u32 val)
@@ -2087,7 +2138,7 @@ void ARMv4::DataWrite32(u32 addr, u32 val)
 
     BusWrite32(addr, val);
     DataRegion = addr;
-    DataCycles = NDS.ARM7MemTimings[addr >> 15][2];
+    DataCycles = FT7(NDS.ARM7MemTimings[addr >> 15][2]);
 }
 
 void ARMv4::DataWrite32S(u32 addr, u32 val)
@@ -2095,7 +2146,7 @@ void ARMv4::DataWrite32S(u32 addr, u32 val)
     addr &= ~3;
 
     BusWrite32(addr, val);
-    DataCycles += NDS.ARM7MemTimings[addr >> 15][3];
+    DataCycles += FT7(NDS.ARM7MemTimings[addr >> 15][3]);
 }
 
 
@@ -2116,6 +2167,8 @@ void ARMv4::AddCycles_CDI()
     // LDR/LDM cycles.
     s32 numC = NDS.ARM7MemTimings[CodeCycles][(CPSR&0x20)?0:2];
     s32 numD = DataCycles;
+
+    if (LITEV_FT) { Cycles += numC + numD; return; }   // fast timing: no overlap, no region rules
 
     if ((DataRegion >> 24) == 0x02) // mainRAM
     {
@@ -2143,6 +2196,8 @@ void ARMv4::AddCycles_CD()
     // TODO: max gain should be 5c when writing to mainRAM
     s32 numC = NDS.ARM7MemTimings[CodeCycles][(CPSR&0x20)?0:2];
     s32 numD = DataCycles;
+
+    if (LITEV_FT) { Cycles += numC + numD; return; }   // fast timing: no overlap, no region rules
 
     if ((DataRegion >> 24) == 0x02)
     {

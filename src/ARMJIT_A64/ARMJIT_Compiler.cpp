@@ -3121,7 +3121,8 @@ void Compiler::Comp_AddCycles_CDI()
         s32 numC = NDS.ARM7MemTimings[CurInstr.CodeCycles][Thumb ? 0 : 2];
         s32 numD = CurInstr.DataCycles;
 
-        if ((CurInstr.DataRegion >> 24) == 0x02) // mainRAM
+        if (LITEV_FT) cycles = numC + numD;   // fast timing: no overlap, no region rules
+        else if ((CurInstr.DataRegion >> 24) == 0x02) // mainRAM
         {
             if (CodeRegion == 0x02)
                 cycles = numC + numD;
@@ -3157,7 +3158,7 @@ void Compiler::Comp_AddCycles_CD()
         s32 numD = CurInstr.DataCycles;
 
         //if (DataRegion != CodeRegion)
-            cycles = std::max(numC + numD - 6, std::max(numC, numD));
+            cycles = LITEV_FT ? numC + numD : std::max(numC + numD - 6, std::max(numC, numD));
 
         IrregularCycles = cycles != numC;
     }
@@ -3166,7 +3167,8 @@ void Compiler::Comp_AddCycles_CD()
         s32 numC = NDS.ARM7MemTimings[CurInstr.CodeCycles][Thumb ? 0 : 2];
         s32 numD = CurInstr.DataCycles;
 
-        if ((CurInstr.DataRegion >> 24) == 0x02)
+        if (LITEV_FT) cycles += numC + numD;   // fast timing
+        else if ((CurInstr.DataRegion >> 24) == 0x02)
         {
             if (CodeRegion == 0x02)
                 cycles += numC + numD;

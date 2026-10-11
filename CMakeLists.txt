@@ -778,6 +778,15 @@ if (LITEV_GX_BULK)
     add_compile_definitions(LITEV_GX_BULK=1)
 endif()
 
+# FAST_TIMING: DSperate's fast CPU timing model (src/FastTiming.h; GPL-3.0-or-later, DSperate commit
+# f5fa35e, src/core/cpu/timing_mode.h): a constant cost per data access (ARM9 by base register),
+# no fetch/data overlap, constant pipeline refills; code fetch stays exact. Category B.
+# Runtime off: debug.litev.fasttiming=0 (headless: the same name as an environment variable).
+option(LITEV_FAST_TIMING "DSperate fast CPU timing model (category B; runtime debug.litev.fasttiming)" OFF)
+if (LITEV_FAST_TIMING)
+    add_compile_definitions(LITEV_FAST_TIMING=1)
+endif()
+
 # GX_CPUSEND: NitroSDK MI_CpuSend32 to GXFIFO (a display list sent by the CPU, one slow IO store
 # per word) runs through the bulk geometry path (LITEV_GX_BULK). Hooked by code signature at JIT
 # compile; category B (fixed cycle estimate, the FIFO never fills). Runtime off: debug.litev.gxsend=0.
