@@ -1009,6 +1009,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         for (int k = 0; k < n; k++) b[k].nds->GPU.GPU3D.TimingModel = b[k].nds->GPU.GPU3D.TimingFixed = true;
 #endif
 #endif
+#ifdef LITEV_NP_SCHED
+    if (getenv("LITEV_MP_NPSCHED"))   // Netplay timing model; bit k = console k (Netplay sets every console)
+        for (int k = 0; k < n; k++) b[k].nds->NPSched = (strtoul(getenv("LITEV_MP_NPSCHED"), nullptr, 0) >> k) & 1;
+#endif
 #ifdef LITEV_A7PROF
     if (getenv("LITEV_PROF_INST")) A7Prof::Target = b[atoi(getenv("LITEV_PROF_INST"))].nds.get();
 #endif
@@ -1101,11 +1105,16 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             if (record) record->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
             else
 #endif
+            {
+                // diagnostic LITEV_MP_CLOCKSKEW=<console>:<cycles>: that console's link clock runs ahead
+                u64 sk = 0; const char* e = getenv("LITEV_MP_CLOCKSKEW");
+                if (e && atoi(e) == k) sk = strtoull(strchr(e, ':') + 1, nullptr, 0);
 #ifdef LITEV_MP_FASTPOLL
-            lockstepMP->SetClockSource(k, nd->SysTimestampPtr());
-#else
-            lockstepMP->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
+                if (!sk) lockstepMP->SetClockSource(k, nd->SysTimestampPtr());
+                else
 #endif
+                lockstepMP->SetClock(k, [nd, sk] { return nd->GetSysTimestamp() + sk; });
+            }
             lockstepMP->SetWake(k, *nd);
         }
         b[k].udata->instanceID = k;
@@ -1305,6 +1314,17 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                                (unsigned long long)XXH3_64bits(bi.nds->ARM9.R, sizeof(bi.nds->ARM9.R)),
                                (unsigned long long)XXH3_64bits(bi.nds->ARM7.R, sizeof(bi.nds->ARM7.R)));
                     }
+#ifdef LITEV_NPSCHED_STATS
+                    {
+                        auto& st = bi.nds->SchedStats; double fr = every;
+                        printf("inst%d sched %d: iter %.0f both-halted %.0f a9-only %.0f | a9 exec %.0f halted %.0f jit %.0f | a7 exec %.0f halted %.0f jit %.0f | ev", inst, f + 1, st.Iter / fr, st.Both / fr, st.A9Only / fr,
+                               st.Exec[0] / fr, st.HaltedSkip[0] / fr, st.Disp[0] / fr, st.Exec[1] / fr, st.HaltedSkip[1] / fr, st.Disp[1] / fr);
+                        for (int e = 0; e < Event_MAX; e++) if (st.Ev[e]) printf(" %d:%.1f", e, st.Ev[e] / fr);
+                        for (int c = 0; c < 2; c++) { printf(" | irq%d", c ? 7 : 9); for (int q = 0; q < 32; q++) if (st.Irq[c][q]) printf(" %d:%.1f", q, st.Irq[c][q] / fr); }
+                        printf("\n");
+                        st = {};
+                    }
+#endif
                     if (lockstepMP && getenv("LITEV_MP_STATS"))
                     {   // per console: CPU, link calls / blocked waits / blocked ms per frame (Packet, Host, Replies)
                         timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
