@@ -1306,6 +1306,13 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
                 cpu->DataRead32(literalAddr, &literalValues[numLiterals]);
                 literalLoadAddrs[numLiterals++] = translatedAddr;
             }
+            else if (thumb)
+            {
+                // invalidated literal: T_Comp_LoadPCRel loads through r15, which the decoder left
+                // out of a Thumb LDR [pc]'s sources (literal optimisation on): an unloaded r15
+                // gave a garbage address (Pokemon White battle ARM9 data abort at 021EF632)
+                instrs[i].Info.SrcRegs |= 1 << 15;
+            }
         }
         else if (instrs[i].Info.SpecialKind == ARMInstrInfo::special_WriteMem)
             writeAddrs[numWriteAddrs++] = instrs[i].DataRegion;
