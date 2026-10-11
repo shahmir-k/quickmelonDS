@@ -20,6 +20,13 @@
 #define GPU_H
 
 #include <memory>
+#if defined(LITEV_SOFT2D_DEPTH2)   // mid-frame 2D write journal hooks (see GPU::S2DJ)
+#define LITEV_S2DJ_PRE(T, rd)  T _j0 = 0; if (S2DJOn) _j0 = rd<T>(addr);
+#define LITEV_S2DJ_POST(T, rd, kind, mask) if (S2DJOn) S2DJLog<T>(kind, addr & (mask), _j0, rd<T>(addr));
+#else
+#define LITEV_S2DJ_PRE(T, rd)
+#define LITEV_S2DJ_POST(T, rd, kind, mask)
+#endif
 
 #include "GPU2D.h"
 #include "GPU3D.h"
@@ -309,6 +316,7 @@ public:
     template<typename T>
     void WriteVRAM_ABG(u32 addr, T val)
     {
+        LITEV_S2DJ_PRE(T, ReadVRAM_ABG)
         u32 mask = VRAMMap_ABG[(addr >> 14) & 0x1F];
 
         if (mask & (1<<0))
@@ -346,6 +354,7 @@ public:
             VRAMDirty[6][(addr & 0x3FFF) / VRAMDirtyGranularity] = true;
             *(T*)&VRAM_G[addr & 0x3FFF] = val;
         }
+        LITEV_S2DJ_POST(T, ReadVRAM_ABG, 2, 0x7FFFF)
     }
 
 
@@ -370,6 +379,7 @@ public:
     template<typename T>
     void WriteVRAM_AOBJ(u32 addr, T val)
     {
+        LITEV_S2DJ_PRE(T, ReadVRAM_AOBJ)
         u32 mask = VRAMMap_AOBJ[(addr >> 14) & 0xF];
 
         if (mask & (1<<0))
@@ -397,6 +407,7 @@ public:
             VRAMDirty[6][(addr & 0x3FFF) / VRAMDirtyGranularity] = true;
             *(T*)&VRAM_G[addr & 0x3FFF] = val;
         }
+        LITEV_S2DJ_POST(T, ReadVRAM_AOBJ, 4, 0x3FFFF)
     }
 
 
@@ -419,6 +430,7 @@ public:
     template<typename T>
     void WriteVRAM_BBG(u32 addr, T val)
     {
+        LITEV_S2DJ_PRE(T, ReadVRAM_BBG)
         u32 mask = VRAMMap_BBG[(addr >> 14) & 0x7];
 
         if (mask & (1<<2))
@@ -436,6 +448,7 @@ public:
             VRAMDirty[8][(addr & 0x3FFF) / VRAMDirtyGranularity] = true;
             *(T*)&VRAM_I[addr & 0x3FFF] = val;
         }
+        LITEV_S2DJ_POST(T, ReadVRAM_BBG, 3, 0x1FFFF)
     }
 
 
@@ -457,6 +470,7 @@ public:
     template<typename T>
     void WriteVRAM_BOBJ(u32 addr, T val)
     {
+        LITEV_S2DJ_PRE(T, ReadVRAM_BOBJ)
         u32 mask = VRAMMap_BOBJ[(addr >> 14) & 0x7];
 
         if (mask & (1<<3))
@@ -469,6 +483,7 @@ public:
             VRAMDirty[8][(addr & 0x3FFF) / VRAMDirtyGranularity] = true;
             *(T*)&VRAM_I[addr & 0x3FFF] = val;
         }
+        LITEV_S2DJ_POST(T, ReadVRAM_BOBJ, 5, 0x1FFFF)
     }
 
     template<typename T>
@@ -549,6 +564,9 @@ public:
     void WritePalette(u32 addr, T val)
     {
         addr &= 0x7FF;
+#if defined(LITEV_SOFT2D_DEPTH2)
+        if (S2DJOn) S2DJLog<T>(0, addr, *(T*)&Palette[addr], val);
+#endif
 
         *(T*)&Palette[addr] = val;
         if (addr & 0x3FE)
@@ -567,6 +585,9 @@ public:
     void WriteOAM(u32 addr, T val)
     {
         addr &= 0x7FF;
+#if defined(LITEV_SOFT2D_DEPTH2)
+        if (S2DJOn) S2DJLog<T>(1, addr, *(T*)&OAM[addr], val);
+#endif
 
         *(T*)&OAM[addr] = val;
         OAMDirty |= 1 << (addr / 1024);
@@ -732,6 +753,27 @@ public:
 
     alignas(u64) u8 Palette[2*1024] {};
     alignas(u64) u8 OAM[2*1024] {};
+#if defined(LITEV_SOFT2D_DEPTH2)
+    // Mid-frame 2D write journal (LITEV_SOFT2D_THREADED fix). The deferred 2D raster reads palette,
+    // OAM and the flat BG/OBJ VRAM as they were at VBlank, so writes made while lines were being
+    // displayed were lost. Every palette/OAM/engine-window VRAM store that changes a value is logged
+    // (old + new) in time order; each line's snapshot records the journal position, and the 2D
+    // render rewinds its copies to the frame's start and replays the journal up to each line's
+    // position (SoftRenderer::S2DJSeek). Silent stores are dropped. On overflow, or across a
+    // savestate load / reset, the frame falls back to the VBlank state (the old behaviour).
+    // Inspired by DSperate's palette+OAM journal with a silent-store filter (src/core/gpu/gpu.cpp).
+    struct S2DJEntry { u32 off; u32 oldv; u32 newv; u8 kind; u8 size; };   // kind: 0 pal 1 OAM 2 ABG 3 BBG 4 AOBJ 5 BOBJ
+    static constexpr u32 S2DJCap = 32768;
+    bool S2DJOn = false, S2DJOverflow = true;
+    u32 S2DJN = 0;
+    std::unique_ptr<S2DJEntry[]> S2DJ;
+    template<typename T> void S2DJLog(u8 kind, u32 off, T oldv, T newv) noexcept
+    {
+        if (oldv == newv) return;
+        if (S2DJN >= S2DJCap) { S2DJOverflow = true; return; }
+        S2DJ[S2DJN++] = {off, (u32)oldv, (u32)newv, kind, (u8)sizeof(T)};
+    }
+#endif
 
     alignas(u64) u8 VRAM_A[128*1024] {};
     alignas(u64) u8 VRAM_B[128*1024] {};

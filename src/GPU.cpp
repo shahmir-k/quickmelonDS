@@ -132,6 +132,9 @@ void GPU::ResetVRAMCache() noexcept
 
 void GPU::Reset() noexcept
 {
+#if defined(LITEV_SOFT2D_DEPTH2)
+    S2DJOverflow = true; S2DJN = 0;   // the journal no longer describes the frame: VBlank state this frame
+#endif
     ScreensEnabled = false;
     ScreenSwap = false;
 
@@ -213,6 +216,9 @@ void GPU::Stop() noexcept
 
 void GPU::DoSavestate(Savestate* file) noexcept
 {
+#if defined(LITEV_SOFT2D_DEPTH2)
+    S2DJOverflow = true; S2DJN = 0;   // the journal no longer describes the frame: VBlank state this frame
+#endif
     file->Section("GPUG");
 
     Rend->PreSavestate();

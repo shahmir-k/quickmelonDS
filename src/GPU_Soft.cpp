@@ -154,6 +154,13 @@ SoftRenderer::~SoftRenderer()
 {
 #ifdef LITEV_SOFT2D_THREADED
     StopAsyncThread();
+#ifdef LITEV_SOFT2D_DEPTH2
+    GPU.S2DJOn = false;   // another renderer reads the live state
+    if (getenv("LITEV_S2DJ_STATS"))
+        fprintf(stderr, "S2DJ stats: frames=%llu journaled_frames=%llu entries=%llu max=%llu overflow_frames=%llu\n",
+                (unsigned long long)S2DJStat[0], (unsigned long long)S2DJStat[1], (unsigned long long)S2DJStat[2],
+                (unsigned long long)S2DJStat[3], (unsigned long long)S2DJStat[4]);
+#endif
     if (HybridCheck)
         fprintf(stderr, "hybrid_check: lines=%llu bad_px=%llu\n",
                 (unsigned long long)HybCheckLines.load(), (unsigned long long)HybCheckBad.load());
@@ -311,6 +318,9 @@ void SoftRenderer::DrawScanline(u32 line)
         static_cast<SoftRenderer2D*>(Rend2D_A.get())->SnapshotLineState(line);
         static_cast<SoftRenderer2D*>(Rend2D_B.get())->SnapshotLineState(line);
         SnapshotCompositeLine(line);
+#ifdef LITEV_SOFT2D_DEPTH2
+        FrameSnap[line].JMarkLine = GPU.S2DJN;
+#endif
         S2DDeferActive = true;
         return;
     }
@@ -389,6 +399,9 @@ void SoftRenderer::DrawSprites(u32 line)
     {
         static_cast<SoftRenderer2D*>(Rend2D_A.get())->SnapshotSprState(line);
         static_cast<SoftRenderer2D*>(Rend2D_B.get())->SnapshotSprState(line);
+#ifdef LITEV_SOFT2D_DEPTH2
+        FrameSnap[line].JMarkSpr = GPU.S2DJN;
+#endif
         return;
     }
 #endif
@@ -469,6 +482,12 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
     auto& fsR = FrameSnapR[_ss];
     const u8* const palSnap = PaletteSnap[_ss];
     const u8* const oamSnap = OAMSnap[_ss];
+    // mid-frame write journal: rewind the VBlank copies to the frame start, then replay each
+    // line up to its BG / sprite snapshot position (AsyncRenderFrame keeps such frames on one band)
+    const int jn = S2DJFrameN[_ss];
+    if (jn > 0 && y0 == 0) { S2DJPos = (u32)jn; S2DJSeek(_ss, 0); }
+#define S2DJ_SPR()  if (jn > 0) S2DJSeek(_ss, f.JMarkSpr)
+#define S2DJ_LINE() if (jn > 0) S2DJSeek(_ss, f.JMarkLine)
 #else
     auto* rA = static_cast<SoftRenderer2D*>(S2DBands[bi].rend[0].get());
     auto* rB = static_cast<SoftRenderer2D*>(S2DBands[bi].rend[1].get());
@@ -524,16 +543,16 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             u32* descB = &fb[((f.ScreenSwap ? 1 : 0) * 192 + line) * HybStride];
             rA->CurOAM = oamSnap; rA->CurPalette = palSnap;
 #ifdef LITEV_SOFT2D_DEPTH2
-            rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
-            rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, descA);
+            S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
+            S2DJ_LINE(); rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, descA);
 #else
             rA->DrawSpritesDeferred(mainA->SprSnapR[line], line);
             rA->DrawScanlineDeferred(mainA->LineSnapR[line], line, descA);
 #endif
             rB->CurOAM = oamSnap; rB->CurPalette = palSnap;
 #ifdef LITEV_SOFT2D_DEPTH2
-            rB->DrawSpritesDeferred(mainB->SprSnapR[_ss][line], line);
-            rB->DrawScanlineDeferred(mainB->LineSnapR[_ss][line], line, descB);
+            S2DJ_SPR(); rB->DrawSpritesDeferred(mainB->SprSnapR[_ss][line], line);
+            S2DJ_LINE(); rB->DrawScanlineDeferred(mainB->LineSnapR[_ss][line], line, descB);
 #else
             rB->DrawSpritesDeferred(mainB->SprSnapR[line], line);
             rB->DrawScanlineDeferred(mainB->LineSnapR[line], line, descB);
@@ -550,8 +569,8 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             rA->Cur3DLine = l3d; rA->CurOAM = oamSnap; rA->CurPalette = palSnap;
             rA->HybridDesc = true;
 #ifdef LITEV_SOFT2D_DEPTH2
-            rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
-            rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, desc);
+            S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
+            S2DJ_LINE(); rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, desc);
 #else
             rA->DrawSpritesDeferred(mainA->SprSnapR[line], line);
             rA->DrawScanlineDeferred(mainA->LineSnapR[line], line, desc);
@@ -560,8 +579,8 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             const bool has3D = rA->LastLineHas3D;
             u32 ref[256];
 #ifdef LITEV_SOFT2D_DEPTH2
-            rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
-            rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, ref);
+            S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
+            S2DJ_LINE(); rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, ref);
 #else
             rA->DrawSpritesDeferred(mainA->SprSnapR[line], line);
             rA->DrawScanlineDeferred(mainA->LineSnapR[line], line, ref);
@@ -582,13 +601,13 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         rA->CurOAM = oamSnap;
         rA->CurPalette = palSnap;
 #ifdef LITEV_SOFT2D_DEPTH2
-        rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
+        S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
         if (pipeTraceOn)
         {
             const u64 sh = rA->PipeTraceSpriteHash();
             pipeSpriteTopHash = litevPipeFnv1a(&sh, sizeof(sh), pipeSpriteTopHash);
         }
-        rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, BandOut2D[0][line]);
+        S2DJ_LINE(); rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, BandOut2D[0][line]);
 #else
         rA->DrawSpritesDeferred(mainA->SprSnapR[line], line);
         rA->DrawScanlineDeferred(mainA->LineSnapR[line], line, BandOut2D[0][line]);
@@ -602,8 +621,8 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         rB->CurOAM = oamSnap;
         rB->CurPalette = palSnap;
 #ifdef LITEV_SOFT2D_DEPTH2
-        rB->DrawSpritesDeferred(mainB->SprSnapR[_ss][line], line);
-        rB->DrawScanlineDeferred(mainB->LineSnapR[_ss][line], line, BandOut2D[1][line]);
+        S2DJ_SPR(); rB->DrawSpritesDeferred(mainB->SprSnapR[_ss][line], line);
+        S2DJ_LINE(); rB->DrawScanlineDeferred(mainB->LineSnapR[_ss][line], line, BandOut2D[1][line]);
 #else
         rB->DrawSpritesDeferred(mainB->SprSnapR[line], line);
         rB->DrawScanlineDeferred(mainB->LineSnapR[line], line, BandOut2D[1][line]);
@@ -654,8 +673,26 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
 #ifndef LITEV_SOFT2D_HYB_BANDS
     if (Hybrid && y1 == 192) HybridStage(AsyncTargetBuf);
 #endif
+#ifdef LITEV_SOFT2D_DEPTH2
+    if (jn > 0 && y1 == 192) S2DJSeek(_ss, (u32)jn);   // back to the VBlank state (the shadow's invariant)
+#undef S2DJ_SPR
+#undef S2DJ_LINE
+#endif
     LSP_ADD(S2DBand[bi], LSP_NOW() - _lspB0);
 }
+
+
+#ifdef LITEV_SOFT2D_DEPTH2
+// Move the render's palette/OAM copies and flat BG/OBJ shadow of slot s to journal position `to`.
+void SoftRenderer::S2DJSeek(int s, u32 to) noexcept
+{
+    const GPU::S2DJEntry* e = S2DJFrame[s].data();
+    u8* const base[6] = {PaletteSnap[s], OAMSnap[s], GPU.VRAMFlat_ABGShadow[s], GPU.VRAMFlat_BBGShadow[s],
+                         GPU.VRAMFlat_AOBJShadow[s], GPU.VRAMFlat_BOBJShadow[s]};
+    for (; S2DJPos < to; S2DJPos++) memcpy(base[e[S2DJPos].kind] + e[S2DJPos].off, &e[S2DJPos].newv, e[S2DJPos].size);
+    while (S2DJPos > to) { S2DJPos--; memcpy(base[e[S2DJPos].kind] + e[S2DJPos].off, &e[S2DJPos].oldv, e[S2DJPos].size); }
+}
+#endif
 
 // The banded raster+composite+capture+expand for one frame. Runs entirely on the
 // persistent async render thread (spawning short-lived band helpers for the other
@@ -692,6 +729,9 @@ void SoftRenderer::AsyncRenderFrame()
 #endif
         for (int y = 0; y < 192 && n > 1; y++)
             if (fs[y].Valid && fs[y].CaptureEnable) n = 1;
+#ifdef LITEV_SOFT2D_DEPTH2
+        if (S2DJFrameN[AsyncSnapSlot] > 0) n = 1;   // the journal replay mutates the shared shadow in line order
+#endif
     }
     if (n == 1)
         RenderBand(0, 0, 192);
@@ -1038,6 +1078,21 @@ void SoftRenderer::VBlank()
     static_cast<SoftRenderer2D*>(Rend2D_B.get())->CopyLineSnaps(SnapParity);
     memcpy(PaletteSnap[SnapParity], GPU.Palette, sizeof(PaletteSnap[SnapParity]));
     memcpy(OAMSnap[SnapParity], GPU.OAM, sizeof(OAMSnap[SnapParity]));
+    // this frame's mid-frame write journal (see GPU::S2DJ): the render rewinds the VBlank copies
+    // above and the flat shadow below to the frame start and replays it line by line
+    if (!GPU.S2DJOn)
+    {
+        GPU.S2DJ = std::make_unique<GPU::S2DJEntry[]>(GPU::S2DJCap);
+        GPU.S2DJOn = true;
+        GPU.S2DJOverflow = true;   // the first frame was not journaled from its start
+    }
+    S2DJFrameN[SnapParity] = GPU.S2DJOverflow ? -1 : (int)GPU.S2DJN;
+    S2DJStat[0]++; S2DJStat[4] += GPU.S2DJOverflow;
+    if (S2DJFrameN[SnapParity] > 0) { S2DJStat[1]++; S2DJStat[2] += GPU.S2DJN; S2DJStat[3] = std::max<u64>(S2DJStat[3], GPU.S2DJN); }
+    if (S2DJFrameN[SnapParity] > 0)
+        S2DJFrame[SnapParity].assign(GPU.S2DJ.get(), GPU.S2DJ.get() + GPU.S2DJN);
+    GPU.S2DJN = 0;
+    GPU.S2DJOverflow = false;
     if (AccurateBackend)
         for (int y = 0; y < 192; y++)
             memcpy(Snap3D[SnapParity][y], Rend3D->GetLine(y), sizeof(Snap3D[0][0]));
