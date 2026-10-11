@@ -801,6 +801,12 @@ int main(int argc, char** argv)
                 printf(" %.0f", (melonDS::JitCompileTicks[p] - last[p]) * us);
                 last[p] = melonDS::JitCompileTicks[p];
             }
+            {   // LITEV_JIT_BGEMIT: emission on the worker / stolen by the emulator thread
+                static u64 lw, ls;
+                u64 w = melonDS::JitWorkerTicks.load(), st = melonDS::JitStealTicks.load();
+                printf(" %.0f %.0f", (w - lw) * us, (st - ls) * us);
+                lw = w; ls = st;
+            }
             printf("\n");
         }
 #endif

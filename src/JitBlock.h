@@ -28,6 +28,7 @@
 namespace melonDS
 {
 typedef void (*JitBlockEntry)();
+struct JitEmitJob;
 
 #ifdef LITEV_JIT_LINK
 // liteDS-v2 Unit 4 (direct block linking). Offsets are into the JIT RX region,
@@ -72,6 +73,11 @@ public:
     u16 NumLiterals;
 
     JitBlockEntry EntryPoint;
+#ifdef LITEV_JIT_BGEMIT
+    // emitted in the background: EntryPoint is the block's entry stub, Job holds the code
+    JitEmitJob* Job = nullptr;
+    ~JitBlock();
+#endif
 
 #ifdef LITEV_JIT_LINK
     // Outgoing static exits (taken + fall-through of each followed conditional branch).

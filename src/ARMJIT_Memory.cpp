@@ -1288,6 +1288,146 @@ u32 ARMJIT_Memory::LocaliseAddress(int region, u32 num, u32 addr) const noexcept
     }
 }
 
+#ifdef LITEV_JIT_BGEMIT
+// The classification state, captured (JitEmitJob, background emission) or live.
+JitMemCtx ARMJIT_Memory::MemCtx() const noexcept
+{
+    JitMemCtx x{};
+    x.ITCMSize = NDS.ARM9.ITCMSize; x.DTCMMask = NDS.ARM9.DTCMMask; x.DTCMBase = NDS.ARM9.DTCMBase;
+    x.SWRAM9 = NDS.SWRAM_ARM9.Mem != nullptr; x.SWRAM7 = NDS.SWRAM_ARM7.Mem != nullptr;
+    x.ConsoleType = NDS.ConsoleType;
+    if (NDS.ConsoleType == 1)
+    {
+        auto& dsi = static_cast<DSi&>(NDS);
+        x.SCFG_BIOS = dsi.SCFG_BIOS;
+        memcpy(x.NWRAMStart, dsi.NWRAMStart, sizeof(x.NWRAMStart));
+        memcpy(x.NWRAMEnd, dsi.NWRAMEnd, sizeof(x.NWRAMEnd));
+    }
+    return x;
+}
+
+int ARMJIT_Memory::ClassifyAddress9(u32 addr) const noexcept { return ClassifyAddress9(MemCtx(), addr); }
+int ARMJIT_Memory::ClassifyAddress7(u32 addr) const noexcept { return ClassifyAddress7(MemCtx(), addr); }
+
+int ARMJIT_Memory::ClassifyAddress9(const JitMemCtx& x, u32 addr) noexcept
+{
+    if (addr < x.ITCMSize)
+    {
+        return memregion_ITCM;
+    }
+    else if ((addr & x.DTCMMask) == x.DTCMBase)
+    {
+        return memregion_DTCM;
+    }
+    else
+    {
+        if (x.ConsoleType == 1)
+        {
+            auto& dsi = x;
+            if (addr >= 0xFFFF0000 && !(x.SCFG_BIOS & (1<<1)))
+            {
+                if ((addr >= 0xFFFF8000) && (x.SCFG_BIOS & (1<<0)))
+                    return memregion_Other;
+
+                return memregion_BIOS9DSi;
+            }
+        }
+
+        if ((addr & 0xFFFFF000) == 0xFFFF0000)
+        {
+            return memregion_BIOS9;
+        }
+
+        switch (addr & 0xFF000000)
+        {
+        case 0x02000000:
+            return memregion_MainRAM;
+        case 0x03000000:
+            if (x.ConsoleType == 1)
+            {
+                auto& dsi = x;
+                if (addr >= dsi.NWRAMStart[0][0] && addr < dsi.NWRAMEnd[0][0])
+                    return memregion_NewSharedWRAM_A;
+                if (addr >= dsi.NWRAMStart[0][1] && addr < dsi.NWRAMEnd[0][1])
+                    return memregion_NewSharedWRAM_B;
+                if (addr >= dsi.NWRAMStart[0][2] && addr < dsi.NWRAMEnd[0][2])
+                    return memregion_NewSharedWRAM_C;
+            }
+
+            if (x.SWRAM9)
+                return memregion_SharedWRAM;
+            return memregion_Other;
+        case 0x04000000:
+            return memregion_IO9;
+        case 0x06000000:
+            return memregion_VRAM;
+        case 0x0C000000:
+            return (x.ConsoleType==1) ? memregion_MainRAM : memregion_Other;
+        default:
+            return memregion_Other;
+        }
+    }
+}
+
+int ARMJIT_Memory::ClassifyAddress7(const JitMemCtx& x, u32 addr) noexcept
+{
+    if (x.ConsoleType == 1)
+    {
+        auto& dsi = x;
+        if (addr < 0x00010000 && !(x.SCFG_BIOS & (1<<9)))
+        {
+            if (addr >= 0x00008000 && x.SCFG_BIOS & (1<<8))
+                return memregion_Other;
+
+            return memregion_BIOS7DSi;
+        }
+    }
+
+    if (addr < 0x00004000)
+    {
+        return memregion_BIOS7;
+    }
+    else
+    {
+        switch (addr & 0xFF800000)
+        {
+        case 0x02000000:
+        case 0x02800000:
+            return memregion_MainRAM;
+        case 0x03000000:
+            if (x.ConsoleType == 1)
+            {
+                auto& dsi = x;
+                if (addr >= dsi.NWRAMStart[1][0] && addr < dsi.NWRAMEnd[1][0])
+                    return memregion_NewSharedWRAM_A;
+                if (addr >= dsi.NWRAMStart[1][1] && addr < dsi.NWRAMEnd[1][1])
+                    return memregion_NewSharedWRAM_B;
+                if (addr >= dsi.NWRAMStart[1][2] && addr < dsi.NWRAMEnd[1][2])
+                    return memregion_NewSharedWRAM_C;
+            }
+
+            if (x.SWRAM7)
+                return memregion_SharedWRAM;
+            return memregion_WRAM7;
+        case 0x03800000:
+            return memregion_WRAM7;
+        case 0x04000000:
+            return memregion_IO7;
+        case 0x04800000:
+            return memregion_Wifi;
+        case 0x06000000:
+        case 0x06800000:
+            return memregion_VWRAM;
+        case 0x0C000000:
+        case 0x0C800000:
+            return (x.ConsoleType==1) ? memregion_MainRAM : memregion_Other;
+        default:
+            return memregion_Other;
+        }
+    }
+}
+
+#else
 int ARMJIT_Memory::ClassifyAddress9(u32 addr) const noexcept
 {
     if (addr < NDS.ARM9.ITCMSize)
@@ -1405,6 +1545,8 @@ int ARMJIT_Memory::ClassifyAddress7(u32 addr) const noexcept
         }
     }
 }
+
+#endif
 
 /*void WifiWrite32(u32 addr, u32 val)
 {

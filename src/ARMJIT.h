@@ -22,6 +22,10 @@
 #include <algorithm>
 #include <optional>
 #include <memory>
+#include <deque>
+#include <vector>
+#include <thread>
+#include <condition_variable>
 #include "types.h"
 #include "MemConstants.h"
 #include "Args.h"
@@ -147,6 +151,7 @@ public:
     // them), and purge its outgoing sites from targets' Incoming / from pending.
     // Must run before the block leaves JitBlocks / RetireJitBlock.
     void UnlinkBlock(JitBlock* block) noexcept;
+    void LinkBlockOutgoing(JitBlock* block) noexcept;
   #if defined(LITEV_SHADOW_ASSERT)
     // Walk every live block's incoming/outgoing sites and assert each currently
     // holds a `B` to either the dispatcher or a live block entry. Shadow-only.
@@ -154,6 +159,29 @@ public:
   #endif
 #endif
 
+
+#ifdef LITEV_JIT_BGEMIT
+    // Background emission (see JitEmitJob). Jobs live for one block-cache epoch, by id.
+    int BgMode = 0;
+    std::vector<std::unique_ptr<JitEmitJob>> Jobs;
+    std::deque<JitEmitJob*> EmitQueue;        // FIFO: the stream layout is the decode order
+    u64 QueueBound = 0, QueueFarBound = 0;    // sum of the queued jobs' code bounds
+    std::vector<JitEmitJob*> DoneList;        // emitted, not finalized yet
+    std::condition_variable_any QueueCv, DoneCv;
+    std::thread Worker;
+    bool WorkerStop = false, WorkerBusy = false;
+    u64 BgBoundMisses = 0;
+    void EmitJob(JitEmitJob& j, bool onWorker);   // EmitLock held
+    void WaitJob(JitEmitJob& j);
+    void DrainEmits();
+    void FinalizeJob(JitEmitJob& j);
+    void ProcessDone();
+    void CheckCodeSpace(int count);
+    void WorkerLoop();
+    u32 EntryOff(JitBlock* block) noexcept;
+public:
+    JitBlockEntry PendingResolve(u32 id) noexcept;
+#endif
 
     AddressRange CodeIndexITCM[ITCMPhysicalSize / 512] {};
     AddressRange CodeIndexMainRAM[MainRAMMaxSize / 512] {};

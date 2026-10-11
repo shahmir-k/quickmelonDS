@@ -64,6 +64,9 @@ static bool StoreRepromoteOn()   // debug.litev.storerepromote (default on), env
 // Called by the fault handler for a fault on a code-protected page, before RewriteMemAccess.
 void Compiler::NoteProtectFault(u8* pc)
 {
+#ifdef LITEV_JIT_BGEMIT
+    std::lock_guard<std::recursive_mutex> lk(EmitLock);
+#endif
     if (!StoreRepromoteOn())
         return;
     auto it = LoadStorePatches.find(pc - GetRXBase());
@@ -92,6 +95,9 @@ void Compiler::NoteProtectFault(u8* pc)
 // fastmem site is in: a store to a page that holds code faults and is rewritten again.
 void Compiler::RepromoteStores()
 {
+#ifdef LITEV_JIT_BGEMIT
+    std::lock_guard<std::recursive_mutex> lk(EmitLock);
+#endif
     u32 frame = NDS.NumFrames;
     if (frame < SlowStoreNextRetry)
         return;
@@ -128,6 +134,9 @@ bool Compiler::IsJITFault(const u8* pc)
 
 u8* Compiler::RewriteMemAccess(u8* pc)
 {
+#ifdef LITEV_JIT_BGEMIT
+    std::lock_guard<std::recursive_mutex> lk(EmitLock);
+#endif
     ptrdiff_t pcOffset = pc - GetRXBase();
 
     auto it = LoadStorePatches.find(pcOffset);
@@ -201,6 +210,88 @@ static bool UserStmFastOn()   // debug.litev.userstmfast (default on), env LITEV
 }
 #endif
 
+int Compiler::ClassifyData9(u32 addr)
+{
+#ifdef LITEV_JIT_BGEMIT
+    if (CurJob) return ARMJIT_Memory::ClassifyAddress9(CurJob->Ctx, addr);
+    if (VerifyJob && ARMJIT_Memory::ClassifyAddress9(VerifyJob->Ctx, addr) != NDS.JIT.Memory.ClassifyAddress9(addr))
+        VerifyFail("classify9", addr, ARMJIT_Memory::ClassifyAddress9(VerifyJob->Ctx, addr), NDS.JIT.Memory.ClassifyAddress9(addr));
+#endif
+    return NDS.JIT.Memory.ClassifyAddress9(addr);
+}
+
+int Compiler::ClassifyData7(u32 addr)
+{
+#ifdef LITEV_JIT_BGEMIT
+    if (CurJob) return ARMJIT_Memory::ClassifyAddress7(CurJob->Ctx, addr);
+    if (VerifyJob && ARMJIT_Memory::ClassifyAddress7(VerifyJob->Ctx, addr) != NDS.JIT.Memory.ClassifyAddress7(addr))
+        VerifyFail("classify7", addr, ARMJIT_Memory::ClassifyAddress7(VerifyJob->Ctx, addr), NDS.JIT.Memory.ClassifyAddress7(addr));
+#endif
+    return NDS.JIT.Memory.ClassifyAddress7(addr);
+}
+
+#ifdef LITEV_JIT_BGEMIT
+// The literal read Comp_MemLoadLiteral makes at compile time (through the CPU: it sets the
+// CPU's DataRegion/DataCycles like any data read).
+u32 Compiler::LiteralRead(ARM* cpu, int size, bool signExtend, u32 addr, u32 r15)
+{
+    u32 val;
+    // make sure arm7 bios is accessible
+    u32 tmpR15 = cpu->R[15];
+    cpu->R[15] = r15;
+    if (size == 32)
+    {
+        cpu->DataRead32(addr & ~0x3, &val);
+        val = melonDS::ROR(val, (addr & 0x3) << 3);
+    }
+    else if (size == 16)
+    {
+        cpu->DataRead16(addr & ~0x1, &val);
+        if (signExtend)
+            val = ((s32)val << 16) >> 16;
+    }
+    else
+    {
+        cpu->DataRead8(addr, &val);
+        if (signExtend)
+            val = ((s32)val << 24) >> 24;
+    }
+    cpu->R[15] = tmpR15;
+    return val;
+}
+
+bool Compiler::Comp_MemLoadLiteral(int size, bool signExtend, int rd, u32 addr)
+{
+    u32 val;
+    if (CurJob)
+    {
+        JitEmitJob::Snap* sn = CurJob->Find(JitEmitJob::SnapLit, CurIdx, addr);
+        if (!sn || sn->B != (u32)size) EmitSnapMissing("literal", addr);
+        if (sn->State != 1)
+            return false;
+        Comp_AddCycles_CDI();
+        val = sn->A;
+    }
+    else
+    {
+        u32 localAddr = NDS.JIT.LocaliseCodeAddress(Num, addr);
+        bool invalid = NDS.JIT.InvalidLiterals.Find(localAddr) != -1;
+        JitEmitJob::Snap* sn = nullptr;
+        if (VerifyJob)
+        {
+            sn = VerifyJob->Find(JitEmitJob::SnapLit, CurIdx, addr);
+            if (!sn || sn->B != (u32)size || sn->State != (invalid ? 2 : 1))
+                VerifyFail("literal state", addr, sn ? sn->State : ~0u, invalid ? 2 : 1);
+            sn->Used = 1;
+        }
+        if (invalid)
+            return false;
+        Comp_AddCycles_CDI();
+        val = LiteralRead(CurCPU, size, signExtend, addr, R15);
+        if (sn && sn->A != val)
+            VerifyFail("literal value", addr, sn->A, val);
+    }
+#else
 bool Compiler::Comp_MemLoadLiteral(int size, bool signExtend, int rd, u32 addr)
 {
     u32 localAddr = NDS.JIT.LocaliseCodeAddress(Num, addr);
@@ -236,6 +327,7 @@ bool Compiler::Comp_MemLoadLiteral(int size, bool signExtend, int rd, u32 addr)
     }
     CurCPU->R[15] = tmpR15;
 
+#endif
     MOVI2R(MapReg(rd), val);
 
     if (Thumb || CurInstr.Cond() == 0xE)
@@ -326,8 +418,8 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
         MOV(rnMapped, W0);
 
     u32 expectedTarget = Num == 0
-        ? NDS.JIT.Memory.ClassifyAddress9(addrIsStatic ? staticAddress : CurInstr.DataRegion)
-        : NDS.JIT.Memory.ClassifyAddress7(addrIsStatic ? staticAddress : CurInstr.DataRegion);
+        ? ClassifyData9(addrIsStatic ? staticAddress : CurInstr.DataRegion)
+        : ClassifyData7(addrIsStatic ? staticAddress : CurInstr.DataRegion);
 
     if (NDS.JIT.FastMemoryEnabled() && ((!Thumb && CurInstr.Cond() != 0xE && !CondMemGuess(addrIsStatic)) || NDS.JIT.Memory.IsFastmemCompatible(expectedTarget)))
     {
@@ -775,8 +867,8 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         Comp_AddCycles_CDI();
 
     int expectedTarget = Num == 0
-        ? NDS.JIT.Memory.ClassifyAddress9(CurInstr.DataRegion)
-        : NDS.JIT.Memory.ClassifyAddress7(CurInstr.DataRegion);
+        ? ClassifyData9(CurInstr.DataRegion)
+        : ClassifyData7(CurInstr.DataRegion);
 
 #ifdef LITEV_JIT_USERSTM_FASTMEM
     const bool userFast = usermode && store && UserStmFastOn();
