@@ -10,6 +10,7 @@
     LocalMP itself only needs Platform mutex/semaphore (already in core).
 */
 
+#include <cstdlib>
 #include "MPInterface.h"
 #include "LocalMP.h"
 #include "LockstepMP.h"
@@ -47,6 +48,7 @@ void MPInterface::Set(MPInterfaceType type)
         Current = std::make_unique<HeadlessDummyMP>();
     CurrentType = type;
     LinkDelaysRegularFrames = type == MPInterface_Netplay;   // as src/net/MPInterface.cpp
+    if (getenv("LITEV_MP_NOGUARD")) LinkDelaysRegularFrames = false;   // diagnostic: without the Wifi-side guard
 }
 
 }

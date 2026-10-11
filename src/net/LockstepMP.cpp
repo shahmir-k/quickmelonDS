@@ -37,11 +37,13 @@ void LockstepMP::Begin(int inst)
     std::lock_guard<std::mutex> lk(Lock);
     Connected |= (1 << inst);
     BeginTime[inst] = Now(inst);
+    ClientHost[inst] = -1;
     NotifyAll();
 }
 
 void LockstepMP::SetWake(int inst, NDS& nds)
 {
+    Console[inst] = &nds;
 #ifdef LITEV_MP_CLOCKWAKE
     nds.MPWakeAt = &WakeAt[inst];
     nds.MPWake = [this, inst] { Wake(inst); };
@@ -239,6 +241,8 @@ void LockstepMP::TxNote(int inst, u32 type, const u8* data, int len, u64 timesta
         if (!f[inst]) { char p[512]; snprintf(p, sizeof(p), "%s/tx%d.txt", txlog, inst); f[inst] = fopen(p, "w"); }
         if (f[inst]) fprintf(f[inst], "%u t%u len %d now %llu ts %llu data %016llx\n", TxN[inst], type, len, (unsigned long long)Now(inst),
                              (unsigned long long)timestamp, (unsigned long long)XXH3_64bits(data, len));
+        // CMD: reply time, client mask; ACK: cmd count, clients that failed (both at 0xC+0x18/0x1A)
+        if (f[inst] && len >= 0x28 && (type == 1 || type == 3)) fprintf(f[inst], "  w %04x %04x\n", *(const u16*)&data[0x24], *(const u16*)&data[0x26]);
     }
 }
 
@@ -263,11 +267,33 @@ int LockstepMP::RecvPacket(int inst, u8* data, u64* timestamp)
     u64 visible = now - kDelay;
     Log(inst, "RecvPacketWait", 0, visible);
 
-    // everything a peer sent up to `visible` must exist before we look
-    WaitFor(lk, [&] { return PeersReached(inst, visible); }, [&] {
+    // An MP client (polling as one, NDS::MPClientRX, with a host it took a CMD/ACK from) gets its
+    // host's regular frames (beacons) the way it gets the host's CMDs and ACKs: on time, not kDelay
+    // late. A beacon kDelay late lands in a later exchange, where real hardware never has one (the
+    // host sends its beacons, CMDs and ACKs one after the other on one radio): the client was
+    // receiving it when the ACK or the next CMD came, took that late, and Mario Kart DS dropped the
+    // client from the session ("Communication error", 8 consoles, depending on input timing). And
+    // host frames go first: while one is visible and not taken yet, no regular frame is.
+    // Deterministic: ClientHost is this console's own history, and the wait (host strictly past
+    // our time, ties by id) is RecvHostPacket's, which the client already does on every tick.
+    const int host = (Console[inst] && Console[inst]->MPClientRX) ? ClientHost[inst] : -1;
+    const bool onTime = host >= 0 && host != inst && (Members & (1 << host)) && now >= kHostDelay;
+    const u64 hvis = onTime ? now - kHostDelay : 0;
+    auto hostPast = [&] { u64 t = Now(host); return t > hvis || (t == hvis && host > inst); };
+    auto hostShows = [&](const Packet& p) { return p.Time < hvis || (p.Time == hvis && p.Sender < inst); };
+    auto hostPending = [&] {
+        for (const Packet& p : FromHost[inst])
+            if (p.Time >= BeginTime[inst] && hostShows(p)) return true;
+        return false;
+    };
+
+    // everything a peer sent up to `visible` (the host: up to `hvis`) must exist before we look
+    WaitFor(lk, [&] { return onTime ? hostPending() || (PeersReached(inst, visible) && hostPast()) : PeersReached(inst, visible); }, [&] {
         for (int i = 0; i < kMaxInst; i++)
             if (i != inst && (Members & (1 << i)) && Now(i) <= visible) NeedClock(inst, i, visible + 1);
+        if (onTime) NeedClock(inst, host, host > inst ? hvis : hvis + 1);
     }, inst, 0);
+    if (onTime && hostPending()) { Log(inst, "RecvPacketHostFirst", 0, 0); return 0; }
 
     // earliest visible frame by (send time, sender), first-sent among equals
     std::deque<Packet>& q = Regular[inst];
@@ -275,7 +301,8 @@ int LockstepMP::RecvPacket(int inst, u8* data, u64* timestamp)
     while (!q.empty() && q.front().Time < BeginTime[inst]) q.pop_front(); // sent before our Begin
     for (int i = 0; i < (int)q.size(); i++)
     {
-        if (q[i].Time > visible || q[i].Time < BeginTime[inst]) continue;
+        if (q[i].Time < BeginTime[inst]) continue;
+        if (onTime && q[i].Sender == host ? !hostShows(q[i]) : q[i].Time > visible) continue;
         if (best < 0 || q[i].Time < q[best].Time || (q[i].Time == q[best].Time && q[i].Sender < q[best].Sender))
             best = i;
     }
@@ -449,6 +476,7 @@ int LockstepMP::RecvHostPacket(int inst, u8* data, u64* timestamp)
 
     Packet p = std::move(FromHost[inst].front());
     FromHost[inst].pop_front();
+    ClientHost[inst] = p.Sender;
     FromHostChanged(inst);
     if (St.On > 0 && p.Type == 1 && St.T0 && !St.T1) St.T1 = NowNs();
     int len = (int)p.Data.size();

@@ -483,6 +483,9 @@ public: // TODO: Encapsulate the rest of these members
     int MPHostPollInst = 0;
 #endif
 #endif
+    // LockstepMP: set by the Wi-Fi tick right before it polls for a regular frame: the console
+    // polls as an MP client (it then gets the host's frames on time, see LockstepMP::RecvPacket)
+    bool MPClientRX = false;
     void NocashPrint(u32 cpu, u32 addr, bool appendNewline = true);
 
     void MonitorARM9Jump(u32 addr);
