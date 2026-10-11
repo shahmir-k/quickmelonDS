@@ -315,6 +315,20 @@ int LockstepMP::RecvPacket(int inst, u8* data, u64* timestamp)
     // or a client that syncs its wifi clock to it (association response) ends up permanently that
     // far behind the host, and every MP exchange is then late by as much.
     if (timestamp) *timestamp = p.Timestamp + (now - p.Time) * 1000000 / 33513982;
+#ifdef LITEV_MP_BEACON_TSF
+    // Same for a beacon's TSF field (802.11 header + 0, the host's USCOUNTER at its send): the client
+    // copies it into its own USCOUNTER, so a stale field left the client's TSF permanently behind the
+    // host's by the delivery delay (Shrek race: ~4.4 ms). A DS multiplayer client aligns its frame start
+    // to the host's (TSF of the host's VBlank, sent in the beacon) and can only do so by repeating
+    // scanlines (VCOUNT rewinds): it chased that 4.4 ms forever, ~+0.9% cycles per frame.
+    if (timestamp && len >= 12 + 24 + 8 && (data[12] & 0xFC) == 0x80)
+    {
+        u64 tsf;
+        memcpy(&tsf, data + 12 + 24, 8);
+        tsf += (now - p.Time) * 1000000 / 33513982;
+        memcpy(data + 12 + 24, &tsf, 8);
+    }
+#endif
     Log(inst, "RecvPacket", len, p.Time);
     q.erase(q.begin() + best);
     return len;
