@@ -1678,6 +1678,47 @@ void SPU::RunQuiet(u32 cycles, u32 n)
 }
 #endif
 
+#ifdef LITEV_SPU_CAPTURE_CHMAJOR
+// Can this batch run its channels before its captures? True unless a capture flush in the next n
+// ticks (at most 2 x 16 bytes from the capture's write offset, or anywhere in a buffer it wraps)
+// could overlap a channel's FIFO reads (at most 64 bytes from its read offset, plus the loop start).
+u32 SPU::CaptureInterleaved() const
+{
+    // windows in main RAM (offsets within its 4 MB); anything else, or a window that wraps it: all
+    // channels stay interleaved with the captures (0xFFFF)
+    const u32 mask = NDS.MainRAMMask;
+    auto win = [&](u32 addr, u32 len, u32& a, u32& b) {
+        if ((addr >> 24) != 0x02) return false;
+        a = addr & mask; b = a + len;
+        return b <= mask + 1;
+    };
+    u32 w0[2], w1[2]; int nw = 0;
+    for (const SPUCaptureUnit& c : Capture)
+    {
+        if (!(c.Cnt & 0x80)) continue;
+        const u32 len = c.Length ? c.Length : 4;
+        const bool ok = (c.FIFOWriteOffset + 32 > len) ? win(c.DstAddr, len, w0[nw], w1[nw])
+                                                         : win(c.DstAddr + c.FIFOWriteOffset, 32, w0[nw], w1[nw]);
+        if (!ok) return 0xFFFF;
+        nw++;
+    }
+    u32 late = 0;
+    for (const SPUChannel& ch : Channels)
+    {
+        if (!(ch.Cnt & (1u<<31))) continue;
+        if (((ch.Cnt >> 29) & 0x3) == 3) continue;   // PSG/noise read nothing
+        const u32 total = ch.LoopPos + ch.Length;
+        u32 r0, r1;
+        const bool ok = (ch.KeyOn || ch.FIFOReadOffset + 64 > total) ? win(ch.SrcAddr, total + 64, r0, r1)
+                                                                    : win(ch.SrcAddr + ch.FIFOReadOffset, 64, r0, r1);
+        bool hit = !ok;
+        for (int j = 0; j < nw && !hit; j++) hit = r0 < w1[j] && w0[j] < r1;
+        if (hit) late |= 1u << ch.Num;
+    }
+    return late;
+}
+#endif
+
 void SPU::MixSamples(u32 spucycles)
 {
     LITE_PROFILE_SCOPE(spuTimer, melonDS::LiteProfile::g_Frame.SPUMixNs);
@@ -1734,17 +1775,28 @@ void SPU::MixSamples(u32 spucycles)
 #if !defined(__ANDROID__) && defined(LITEV_SPU_FAST_ADPCM)
     if (chMajor) SPUFastVerify(*this, NDS, Channels, true, mixcyc, nticks);
 #endif
-    if (chMajor)
+#ifdef LITEV_SPU_CAPTURE_CHMAJOR
+    // Sound capture on: the channels still run channel-major (exact per-sample decoding, no fast
+    // ADPCM) when no capture write of this batch can land where a channel reads during it (then the
+    // capture writes that come after the channel reads here changed nothing they read).
+    // channels whose reads may meet a capture write in this batch stay interleaved with the captures
+    const bool capMajor = !chMajor && (Cnt & (1<<15)) && NDS.ConsoleType == 0 && ((Capture[0].Cnt | Capture[1].Cnt) & 0x80);
+    const u32 capLate = capMajor ? CaptureInterleaved() : 0;
+#else
+    constexpr bool capMajor = false;
+    constexpr u32 capLate = 0;
+#endif
+    if (chMajor || capMajor)
     {
         for (int i = 0; i < 16; i++)
         {
             SPUChannel& ch = Channels[i];
-            if (!(ch.Cnt & (1u<<31)))
+            if (!(ch.Cnt & (1u<<31)) || (capLate & (1u << i)))
             {
                 for (u32 b = 0; b < nticks; b++) chmajor[b][i] = 0;
                 continue;
             }
-            ch.DoRunN(mixcyc, chmajor, i, nticks);
+            ch.DoRunN(mixcyc, chmajor, i, nticks, !capMajor);
         }
     }
 #if !defined(__ANDROID__) && defined(LITEV_SPU_FAST_ADPCM)
@@ -1776,7 +1828,15 @@ void SPU::MixSamples(u32 spucycles)
 #endif
         s32 cv[16];
 #if defined(LITEV_SPU_CHMAJOR) && defined(LITEV_SPU_BATCH)
-        if (chMajor) memcpy(cv, chmajor[_spubatch], sizeof(cv));
+        if (chMajor || capMajor)
+        {
+            memcpy(cv, chmajor[_spubatch], sizeof(cv));
+            for (u32 late = capLate; late; late &= late - 1)
+            {
+                const int i = __builtin_ctz(late);
+                cv[i] = Channels[i].DoRun(mixcyc, !quiet);   // (in step with the captures, as before)
+            }
+        }
         else
 #endif
         for (int i = 0; i < 16; i++) cv[i] = Channels[i].DoRun(mixcyc, !quiet);
