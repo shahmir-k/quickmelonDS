@@ -2126,7 +2126,8 @@ struct Node
     bool bad = false;
     u32 gw[64]; u32 ngw = 0, nop = 0, nvec = 0, anm = 0, nrot = 0, ntrk = 0;   // (cycle estimate) anm: animation path
     std::vector<std::pair<u32, u32>>* io = nullptr;     // check mode: the IO writes
-    u32 rd(u32 a, u32 n)
+    // (out of line: ~60 call sites; the native path's size is the in-order A55's budget)
+    __attribute__((noinline)) u32 rd(u32 a, u32 n)
     {
         const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
         if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
@@ -2304,6 +2305,52 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
     s32 sc[6];                  // scale + inverse (the guest's stack)
     u32 fl = 0, sbits = 0;      // flags; the scale function's r3 (bit 2: scale one) / data
     bool fromRes = true;
+    // the joint animation (out of line: the in-order A55's code budget)
+    auto bca = [&](u32 anm, u32 map, u32 fa) __attribute__((noinline)) -> bool
+    {
+        if (fa != E + kNdEb94) return false;
+        fromRes = false;
+        q.anm = 1;
+        // 0206eb94: frame clamp; 0206ee78: NNSi_G3dAnmCalcNsBca
+        const u32 jr = q.rd(anm + 8, 4);
+        s32 frame = (s32)q.rd(anm, 4);
+        const s32 nf = (s32)q.rd(jr + 4, 2) << 12;
+        if (frame >= nf) frame = nf - 1; else if (frame < 0) frame = 0;
+        const u32 off = q.rd(jr + 0x14 + (map & 0xFF) * 2, 2), info = q.rd(jr + off, 4);
+        u32 d = jr + off + 4;
+        if (q.bad) return false;
+        if (info & 1) { fl = 7; sbits = 4; }
+        else
+        {
+            if (((frame & 0xFFF) && (q.rd(jr + 8, 4) & 1)) || ((info & 6) && !(info & 2)) || ((info & 0xC0) && !(info & 0x40))
+                || ((info & 0x600) && !(info & 0x200)) || q.bad)
+                return false;   // interpolated frame; the model-default trans / rotation / scale paths
+            if (info & 6) fl |= 4;
+            else
+                for (int k = 0; k < 3; k++)
+                {
+                    if (info & (8 << k)) { tr[k] = q.rs32(d); d += 4; }
+                    else { tr[k] = q.Trans(frame, d, jr); d += 8; }
+                }
+            const u32 tab = R32(CodePtr(c, E + kNdFfb8 + 0x15C));
+            if (info & 0xC0) fl |= 2;
+            else if (info & 0x100)
+            {
+                if (q.RotMtx(rot, jr + q.rd(jr + 0xC, 4), jr + q.rd(jr + 0x10, 4), q.rd(d, 4), tab)) q.Cross(rot);
+                d += 4;
+            }
+            else { q.RotAnim(rot, frame, d, jr, tab); d += 8; }
+            if (info & 0x600) fl |= 1;
+            else
+                for (int k = 0; k < 3; k++)
+                {
+                    if (info & (0x800 << k)) { sc[k] = q.rs32(d + k * 8); sc[3 + k] = q.rs32(d + k * 8 + 4); }
+                    else { s32 o[2]; q.Scale(frame, d + k * 8, jr, o); sc[k] = o[0]; sc[3 + k] = o[1]; }
+                }
+            sbits = fl & 1 ? 4 : 0;
+        }
+        return true;
+    };
     const u32 anm = q.rd(ro + 0x10, 4);
     if (anm)
     {
@@ -2313,50 +2360,11 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
         if (q.bad) return false;
         if ((map & 0x300) == 0x100 && fa)
         {
-            if (fa != E + kNdEb94) return false;
-            fromRes = false;
-            q.anm = 1;
-            // 0206eb94: frame clamp; 0206ee78: NNSi_G3dAnmCalcNsBca
-            const u32 jr = q.rd(anm + 8, 4);
-            s32 frame = (s32)q.rd(anm, 4);
-            const s32 nf = (s32)q.rd(jr + 4, 2) << 12;
-            if (frame >= nf) frame = nf - 1; else if (frame < 0) frame = 0;
-            const u32 off = q.rd(jr + 0x14 + (map & 0xFF) * 2, 2), info = q.rd(jr + off, 4);
-            u32 d = jr + off + 4;
-            if (q.bad) return false;
-            if (info & 1) { fl = 7; sbits = 4; }
-            else
-            {
-                if (((frame & 0xFFF) && (q.rd(jr + 8, 4) & 1)) || ((info & 6) && !(info & 2)) || ((info & 0xC0) && !(info & 0x40))
-                    || ((info & 0x600) && !(info & 0x200)) || q.bad)
-                    return false;   // interpolated frame; the model-default trans / rotation / scale paths
-                if (info & 6) fl |= 4;
-                else
-                    for (int k = 0; k < 3; k++)
-                    {
-                        if (info & (8 << k)) { tr[k] = q.rs32(d); d += 4; }
-                        else { tr[k] = q.Trans(frame, d, jr); d += 8; }
-                    }
-                const u32 tab = R32(CodePtr(c, E + kNdFfb8 + 0x15C));
-                if (info & 0xC0) fl |= 2;
-                else if (info & 0x100)
-                {
-                    if (q.RotMtx(rot, jr + q.rd(jr + 0xC, 4), jr + q.rd(jr + 0x10, 4), q.rd(d, 4), tab)) q.Cross(rot);
-                    d += 4;
-                }
-                else { q.RotAnim(rot, frame, d, jr, tab); d += 8; }
-                if (info & 0x600) fl |= 1;
-                else
-                    for (int k = 0; k < 3; k++)
-                    {
-                        if (info & (0x800 << k)) { sc[k] = q.rs32(d + k * 8); sc[3 + k] = q.rs32(d + k * 8 + 4); }
-                        else { s32 o[2]; q.Scale(frame, d + k * 8, jr, o); sc[k] = o[0]; sc[3 + k] = o[1]; }
-                    }
-                sbits = fl & 1 ? 4 : 0;
-            }
+            if (!bca(anm, map, fa)) return false;
         }
     }
-    if (fromRes)
+    // the model's node data (out of line)
+    auto res = [&]() __attribute__((noinline)) -> bool
     {
         // the model's node data (rs + 0xD4: the NODE resource dictionary)
         const u32 nd = RS.r(0xD4);
@@ -2392,7 +2400,9 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
         }
         sbits = h;
         if (!(h & 4)) for (int k = 0; k < 6; k++) sc[k] = q.rs32(d + k * 4);
-    }
+        return true;
+    };
+    if (fromRes && !res()) return false;
     if (q.bad) return false;
     // the joint scaling rule
     if (scl == E + kNdCf0)
