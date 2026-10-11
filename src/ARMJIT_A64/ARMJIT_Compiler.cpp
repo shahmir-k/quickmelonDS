@@ -1467,14 +1467,22 @@ void* Compiler::Gen_Dispatcher(u32 num)
         FixupBranch wbSkip = CBZ(W9);
         MOVP2R(X2, (void*)ICacheTable[num]);
         ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICacheEntryShift));
+        // The epoch covers both ways: demote slot0 only if it is from the live epoch. A stale
+        // slot0 (its block may be invalidated since) would otherwise come back to life under
+        // the new stamp, and the guest would run a dead block's code (another JIT state than
+        // the one a savestate rebuilds, and the old code if the guest rewrote it). Stale: slot1
+        // gets key ~0, which no (even) instruction address matches.
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, ICacheEpoch));
+        CMP(W3, W5);
         LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key0));
-        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));   // key1 = old key0
+        CSINV(W3, W3, WZR, CC_EQ);
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));   // key1 = old key0 (or none)
         LDR(INDEX_UNSIGNED, X4, X2, offsetof(ICacheEntry, ptr0));
         STR(INDEX_UNSIGNED, X4, X2, offsetof(ICacheEntry, ptr1));   // ptr1 = old ptr0
         STR(INDEX_UNSIGNED, W0, X2, offsetof(ICacheEntry, key0));   // key0 = instrAddr
         STR(INDEX_UNSIGNED, X6, X2, offsetof(ICacheEntry, ptr0));   // ptr0 = host entry
-        LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, ICacheEpoch));
-        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        STR(INDEX_UNSIGNED, W5, X2, offsetof(ICacheEntry, epoch));
         SetJumpTarget(wbSkip);
     }
 #ifdef LITEV_JIT_RAS
@@ -1483,10 +1491,16 @@ void* Compiler::Gen_Dispatcher(u32 num)
         FixupBranch rasSkip = CBZ(W10);
         MOVP2R(X2, (void*)ICacheTable[num]);
         ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICacheEntryShift));
+        // (same rule: re-stamping a stale entry must not revive its slot1)
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, ICacheEpoch));
+        CMP(W3, W5);
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));
+        CSINV(W3, W3, WZR, CC_EQ);
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));
         STR(INDEX_UNSIGNED, W0, X2, offsetof(ICacheEntry, key0));
         STR(INDEX_UNSIGNED, X6, X2, offsetof(ICacheEntry, ptr0));
-        LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, ICacheEpoch));
-        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        STR(INDEX_UNSIGNED, W5, X2, offsetof(ICacheEntry, epoch));
         SetJumpTarget(rasSkip);
     }
 #endif
@@ -2430,16 +2444,8 @@ bool Compiler::R15LiteralLoadFolds(CompileFunc comp)
 
 JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[], int instrsCount, bool hasMemInstr)
 {
-    if (JitMemMainSize - GetCodeOffset() < 1024 * 16)
-    {
-        Log(LogLevel::Debug, "JIT near memory full, resetting...\n");
-        NDS.JIT.ResetBlockCache();
-    }
-    if ((JitMemMainSize +  JitMemSecondarySize) - OtherCodeRegion < 1024 * 8)
-    {
-        Log(LogLevel::Debug, "JIT far memory full, resetting...\n");
-        NDS.JIT.ResetBlockCache();
-    }
+    // (the cache-full reset happens in ARMJIT::CompileBlock, see NearlyFull)
+    const ptrdiff_t near0 = GetCodeOffset(), far0 = OtherCodeRegion;
 
     JitBlockEntry res = (JitBlockEntry)GetRXPtr();
 #ifdef LITEV_BLOCKPROF
@@ -2913,7 +2919,30 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     }
 #endif
 
+    if (CountLogical)
+    {
+        LogicalNear += GetCodeOffset() - near0;
+        LogicalFar += OtherCodeRegion - far0;
+    }
     return res;
+}
+
+bool Compiler::NearlyFull()
+{
+    // Host room (as before): a block needs at most a few KB near and far. The near region also
+    // holds runtime stubs (DIRECTPATCH guards, at most 2 x ICacheSites small ones) and, after a
+    // savestate load, the blocks compiled from its profiles, neither counted below.
+    if (JitMemMainSize - GetCodeOffset() < 1024 * 16 || (JitMemMainSize + JitMemSecondarySize) - OtherCodeRegion < 1024 * 8)
+    {
+        Log(LogLevel::Debug, "JIT memory full, resetting...\n");
+        return true;
+    }
+    // The deterministic limit, kept below the host one by that headroom so the host check
+    // never fires first. ponytail: a console that loaded a state and then compiled most of its
+    // profiles plus nearly a full cache of new code can still hit the host check first (a reset
+    // at a different moment than its peers); grow the reserve or compact the cache if a long
+    // Netplay session after a state transfer ever gets there.
+    return LogicalNear > (u64)JitMemMainSize - 6 * 1024 * 1024 || LogicalFar > (u64)JitMemSecondarySize - 1024 * 1024;
 }
 
 #ifdef LITEV_JIT_ICACHE
@@ -2947,6 +2976,7 @@ void Compiler::ICacheReset()
 
 void Compiler::Reset()
 {
+    LogicalNear = LogicalFar = 0;
     LoadStorePatches.clear();
 #ifdef LITEV_JIT_STORE_REPROMOTE
     SlowStoreSites.clear();   // the code they point into is gone

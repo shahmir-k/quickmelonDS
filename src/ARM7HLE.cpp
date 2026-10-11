@@ -1,6 +1,8 @@
 // LITEV_A7HLE: see ARM7HLE.h.
 #ifdef LITEV_A7HLE
 #include "ARM7HLE.h"
+#include "Savestate.h"
+#include <iterator>
 #include "ARM.h"
 #include "NDS.h"
 #include "ARMInterpreter.h"
@@ -447,10 +449,9 @@ SeqState& GetSeq(melonDS::NDS& nds)
 {
     static const melonDS::NDS* last = nullptr;
     static SeqState* lastS = nullptr;
-    if (&nds == last) return *lastS;
-    SeqState& s = g_Seq[&nds];
-    last = &nds; lastS = &s;
-    if (s.status != 0) return s;
+    if (&nds != last) { last = &nds; lastS = &g_Seq[&nds]; }
+    SeqState& s = *lastS;
+    if (s.status != 0) return s;   // (0 again after a savestate load reset it: probe again)
     s.status = -1;
     if (!ReadOn(2)) return s;
     std::vector<u8> code;
@@ -1453,6 +1454,46 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
     (void)any;
     cpu->JumpTo(cpu->R[14]);
     return true;
+}
+
+void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
+{
+    State& s = g_State[&nds];       // (nodes stay put: Get/GetSeq cache them)
+    SeqState& q = g_Seq[&nds];
+    if (!f->Saving)
+    {
+        s = State{};                // as a new console (stats start empty), then what the saving one had
+        q = SeqState{};
+        if (!f->HasSection("A7HL")) return;
+    }
+    f->Section("A7HL");
+    // (only this build's layout and hooks: another build's state loads as a new console)
+    static const u64 build = [] { u64 h = 0xcbf29ce484222325ull; for (char ch : __DATE__ " " __TIME__) h = (h ^ (u8)ch) * 0x100000001b3ull; return h; }();
+    u64 b = build;
+    f->Var64(&b);
+    if (b != build) return;
+    auto idx = [&](auto* p, auto& tab) -> s32 { for (size_t i = 0; i < std::size(tab); i++) if (p == &tab[i]) return (s32)i; return -1; };
+    s32 v = idx(s.v, kEx), hv = idx(s.hv, kHwV), qv = idx(q.v, kSeqV);
+    f->Var32((u32*)&v); f->Var32((u32*)&hv); f->Var32((u32*)&qv);
+    if (!f->Saving)
+    {
+        if (v >= (s32)std::size(kEx) || hv >= (s32)std::size(kHwV) || qv >= (s32)std::size(kSeqV)) { f->Error = true; return; }
+        s.v = v >= 0 ? &kEx[v] : nullptr; s.hv = hv >= 0 ? &kHwV[hv] : nullptr; q.v = qv >= 0 ? &kSeqV[qv] : nullptr;
+    }
+    f->Var32((u32*)&s.status);
+    f->VarBool(&s.on);
+    f->Var32((u32*)&s.copyOn);
+    f->Var32((u32*)&s.hw);
+    f->VarArray(s.pitch, sizeof(s.pitch));
+    f->VarArray(s.vol, sizeof(s.vol));
+    f->Var32((u32*)&q.status);
+    for (std::vector<u8>* c : {&s.code, &s.hwCode, &q.code})
+    {
+        u32 n = c->size();
+        f->Var32(&n);
+        if (!f->Saving) c->resize(n);
+        f->VarArray(c->data(), n);
+    }
 }
 
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)

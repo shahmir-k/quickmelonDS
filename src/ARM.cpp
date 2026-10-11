@@ -327,6 +327,64 @@ void ARMv5::Idle2Reset()
     Idle2->Frames = 0;
 }
 
+u64 ARMv5::Idle2SavestateSize() const
+{
+    u64 n = 64;
+    if (Idle2)
+        for (const Idle2SiteInfo& s : Idle2->Sites) n += 128 + s.Inputs.size() * 9;
+    return n;
+}
+
+void ARMv5::Idle2DoSavestate(Savestate* file)
+{
+    u32 n = file->Saving && Idle2 ? (u32)Idle2->Sites.size() : 0;
+    u64 frames = file->Saving && Idle2 ? Idle2->Frames : 0;
+    file->Var32(&n);
+    file->Var64(&frames);
+    if (!file->Saving)
+    {
+        Idle2Reset();
+        if (!n) return;
+        if (n > Idle2State::MaxSites) { file->Error = true; return; }
+        if (!Idle2)
+        {
+            Idle2 = new Idle2State();
+            memset(Idle2->Enable, 1, sizeof(Idle2->Enable));
+        }
+        Idle2->Sites.resize(n);
+        Idle2->Frames = frames;
+    }
+    if (!n) return;
+    std::vector<u32> keys(n);
+    if (file->Saving)
+        for (auto& kv : Idle2->Index) keys[kv.second] = kv.first;
+    file->VarArray(keys.data(), n * 4);
+    file->VarArray(Idle2->Enable, n);
+    for (u32 i = 0; i < n; i++)
+    {
+        Idle2SiteInfo& s = Idle2->Sites[i];
+        if (!file->Saving) Idle2->Index.emplace(keys[i], i);
+        file->VarBool(&s.Memo);
+        file->Var8(&s.Tries);
+        file->Var8(&s.Backoff);
+        file->Var8(&s.Hits);
+        file->Var32(&s.DisabledUntil);
+        file->Var16(&s.Live);
+        file->Var32(&s.Head);
+        file->Var32(&s.CPSR);
+        file->VarArray(s.Regs, sizeof(s.Regs));
+        u32 ni = s.Inputs.size();
+        file->Var32(&ni);
+        if (!file->Saving) s.Inputs.resize(ni);
+        for (Idle2Input& in : s.Inputs)
+        {
+            file->Var32(&in.Addr);
+            file->Var32(&in.Val);
+            file->Var8(&in.Size);
+        }
+    }
+}
+
 void ARMv5::Idle2Frame()
 {
     if (!Idle2)
@@ -448,7 +506,10 @@ bool ARMv5::Idle2AtBlock()
 #endif
             return true;
     }
-    return NDS.JIT.LookUpBlock(0, FastBlockLookup, a - FastBlockLookupStart, a) != nullptr;
+    // the JIT's block set, not its lookup table: a block loaded from a savestate is not in the
+    // table until it first runs (and of two mirrors only the last run is), so asking the table
+    // made how far this interprets depend on the host's cache history
+    return NDS.JIT.HasBlock(0, a);
 }
 
 // Interpret two iterations of the loop starting at `head` (the CPU is there now) and
@@ -878,7 +939,12 @@ void ARM::DoSavestate(Savestate* file)
         // hack, the JIT doesn't really pipeline
         // but we still want JIT save states to be
         // loaded while running the interpreter
+        // (the fetches must not change how this console runs on: keep its code-fetch fields)
+        const u32 codeRegion = CodeRegion;
+        const s32 codeCycles = CodeCycles;
+        const MemRegion codeMem = CodeMem;
         FillPipeline();
+        CodeRegion = codeRegion; CodeCycles = codeCycles; CodeMem = codeMem;
     }
 #endif
     file->VarArray(NextInstr, 2*sizeof(u32));
@@ -1365,6 +1431,8 @@ void ARMv5::Execute()
 #ifdef LITEV_NPSCHED_STATS
             NDS.SchedStats.Disp[0]++;
 #endif
+            if (!block)
+                block = NDS.JIT.CompileBlock(this);   // null: it ran the block (interpreted)
             if (block)
             {
 #ifdef LITEV_JIT_LAZYFLAGS
@@ -1390,8 +1458,6 @@ void ARMv5::Execute()
                 CPSR = (CPSR & 0x0FFFFFFF) | (JitNZCV & 0xF0000000);
 #endif
             }
-            else
-                NDS.JIT.CompileBlock(this);
 #ifdef LITEV_A7PROF
             if (&NDS == A7Prof::Target) A7Prof::g9.Jit(block != nullptr, (NDS.ARM9Timestamp - a9t0) >> NDS.ARM9ClockShift);
 #endif
@@ -1629,6 +1695,8 @@ void ARMv4::Execute()
 #ifdef LITEV_NPSCHED_STATS
             NDS.SchedStats.Disp[1]++;
 #endif
+            if (!block)
+                block = NDS.JIT.CompileBlock(this);   // null: it ran the block (interpreted)
             if (block)
             {
 #ifdef LITEV_JIT_LAZYFLAGS
@@ -1645,8 +1713,6 @@ void ARMv4::Execute()
                 CPSR = (CPSR & 0x0FFFFFFF) | (JitNZCV & 0xF0000000);
 #endif
             }
-            else
-                NDS.JIT.CompileBlock(this);
 
 #ifdef LITEV_A7PROF
             if (&NDS == A7Prof::Target) A7Prof::g.Jit(block != nullptr, NDS.ARM7Timestamp + Cycles - a7t0);

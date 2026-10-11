@@ -21,6 +21,8 @@
 #include <string.h>
 #include <inttypes.h>
 #include "NDS.h"
+#include "ARM9HLE.h"
+#include "ARM7HLE.h"
 #include "ARM7Prof.h"
 #include "ARM.h"
 #include "NDSCart.h"
@@ -829,15 +831,25 @@ bool NDS::DoSavestate(Savestate* file)
 
         SPU.SetPowerCnt(PowerControl7 & 0x0001);
         Wifi.SetPowerCnt(PowerControl7 & 0x0002);
+    }
 
+#ifdef LITEV_A9HLE
+    A9HLE::DoSavestate(*this, file);
+#endif
+#ifdef LITEV_A7HLE
+    A7HLE::DoSavestate(*this, file);
+#endif
 #ifdef JIT_ENABLED
-        JIT.Reset();
+    // last: loading rebuilds the block cache against the memory, CPU and HLE state loaded above
+    JIT.DoSavestate(file);
 #endif
 #ifdef LITEV_JIT_REGION_CACHE
+    if (!file->Saving)
+    {
         ARM9.JitRegionCacheClear();
         ARM7.JitRegionCacheClear();
-#endif
     }
+#endif
 
     file->Finish();
 

@@ -21,6 +21,7 @@
 
 #include "types.h"
 #include "TinyVector.h"
+#include <vector>
 #ifdef LITEV_JIT_POOL_ALLOC
 #include "JitPool.h"
 #endif
@@ -48,6 +49,20 @@ constexpr int MaxOutgoingLinks = 8;
 struct LinkSite { u32 SourceBlockAddr; u32 PatchOffset; };
 #endif
 
+// One compiled instruction as the JIT compiled it (FetchedInstr's fields, packed with no
+// padding so a savestate holding it is byte-reproducible). CompileBlock interprets a block's
+// first execution and bakes what it saw into the code (cycle counts of the memory accesses it
+// made, the conditional branches it followed, an early end when an IRQ was raised), so the
+// guest's timing depends on these values: a savestate carries them (ARMJIT::DoSavestate).
+struct __attribute__((packed)) JitProfileInstr
+{
+    u32 Instr, Addr, DataRegion;
+    u16 CodeCycles;
+    u8 BranchFlags, SetFlags, DataCycles, DataExecuted;
+    u16 DstRegs, SrcRegs, NotStrictlyNeeded, Kind;
+    u8 SpecialKind, ReadFlags, WriteFlags, EndBlock;
+};
+
 class JitBlock
 {
 public:
@@ -71,7 +86,12 @@ public:
     u16 NumAddresses;
     u16 NumLiterals;
 
-    JitBlockEntry EntryPoint;
+    JitBlockEntry EntryPoint;   // null: loaded from a savestate, compiled from Profile when first run
+
+    // the block as compiled (see JitProfileInstr)
+    std::vector<JitProfileInstr> Profile;
+    u32 A9HookAt = 0;
+    u8 Thumb = 0, HasMemInstr = 0;
 
 #ifdef LITEV_JIT_LINK
     // Outgoing static exits (taken + fall-through of each followed conditional branch).

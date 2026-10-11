@@ -39,7 +39,7 @@
 #ifdef LITEV_A7HLE
 #include "types.h"
 
-namespace melonDS { class ARM; class NDS; }
+namespace melonDS { class ARM; class NDS; class Savestate; }
 
 namespace melonDS::A7HLE
 {
@@ -55,6 +55,9 @@ int Deps(u32 addr, u32 instr, Range* out);   // up to 4
 // jit: reached from a JIT-compiled hook (code verified at compile); else compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).
 bool Run(melonDS::ARM* cpu, bool jit);
+// Savestate section "A7HL": the per-console probe results and code snapshots (what a hook block
+// compiled from a savestate's profile was verified against), so another process runs on the same way
+void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* file);
 // interpreter check mode: called before every ARM7 instruction while a check is pending
 #ifdef LITEV_HLE_DIAG
 extern thread_local bool CheckPending;   // (per thread: headless --mp-test runs a console per thread)

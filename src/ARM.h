@@ -508,6 +508,8 @@ public:
     bool Idle2Handle();              // at a candidate back-edge: true = skip to ARM9Target
     void Idle2Frame();
     void Idle2Reset();
+    void Idle2DoSavestate(Savestate* file);   // the sites' proofs and back-offs (in the JIT's section)
+    u64 Idle2SavestateSize() const;
     int Idle2Trace(u32 head, struct Idle2SiteInfo& s);
     u32 Idle2Peek(u32 addr, int size);
     bool Idle2Step();
