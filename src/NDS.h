@@ -264,6 +264,14 @@ public: // TODO: Encapsulate the rest of these members
     int CurCPU;
 
     SchedEvent SchedList[Event_MAX] {};
+#ifdef LITEV_NP_SCHED
+    // Netplay session timing model on (every console of the session, local too): see LITEV_NP_SCHED
+    bool NPSched = false;
+#endif
+#ifdef LITEV_NPSCHED_STATS
+    // diagnostic: per frame window, read and reset by the headless harness
+    struct SchedStatsT { u64 Iter = 0, Both = 0, A9Only = 0, Exec[2] = {}, HaltedSkip[2] = {}, Disp[2] = {}, Ev[Event_MAX] = {}, Irq[2][32] = {}; } SchedStats;
+#endif
     u8 ARM9MemTimings[0x40000][8];
     u32 ARM9Regions[0x40000];
     u8 ARM7MemTimings[0x20000][4];
@@ -467,6 +475,13 @@ public: // TODO: Encapsulate the rest of these members
     // waiting on this one's clock
     std::atomic<u64>* MPWakeAt = nullptr;
     std::function<void()> MPWake;
+#ifdef LITEV_MP_POLL_INLINE
+    // LockstepMP (SetWake): false = no host frame can be visible now; the client's Wi-Fi tick then
+    // skips its receive path (CheckRX(2), the Platform/MPInterface calls) altogether
+    bool (*MPHostPoll)(void* ctx, int inst) = nullptr;
+    void* MPHostPollCtx = nullptr;
+    int MPHostPollInst = 0;
+#endif
 #endif
     void NocashPrint(u32 cpu, u32 addr, bool appendNewline = true);
 
@@ -547,6 +562,19 @@ protected:
     // ~1957 scheduler iterations/frame.
     u64 CachedTimerDeadline;
     bool TimerDeadlineDirty;
+#endif
+#ifdef LITEV_SCHED_LEAN
+    // LITEV_SCHED_LEAN (exact): timers are linear between overflows and EVENT_SLICES ends a slice at the
+    // next overflow, so the per-slice RunTimers is only needed once a timer is due (or its state is
+    // read/written, which calls RunTimers itself). The earliest scheduled event time is cached
+    // (ScheduleEvent lowers it, RunSystem recomputes it; anything else that edits SchedList marks it dirty).
+    void RunTimersDue(u32 cpu)
+    {
+        u64 t = cpu ? ARM7Timestamp : (ARM9Timestamp >> ARM9ClockShift);
+        if (TimerDeadlineDirty || t >= CachedTimerDeadline) RunTimers(cpu);
+    }
+    u64 NextEventTs = 0;
+    bool NextEventDirty = true;
 #endif
     DMA DMAs[8];
 #ifdef LITEV_DMA_ARMED_MASK

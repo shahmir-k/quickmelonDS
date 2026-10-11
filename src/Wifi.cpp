@@ -2064,7 +2064,12 @@ void Wifi::USTimer(u32 param)
     // every tick, and the ticks of a batch all poll at the batch's start time, so a CMD that came
     // during one was taken up to (N-1)*8us late (Mario Kart DS with 8 consoles: the host dropped
     // AID 7 and the session ended in a communication error).
-    while (ticks < LITEV_WIFI_BATCH_N && ComStatus == 0 && !IOPORT(W_TXBusy) && USUntilPowerOn >= 0 && !IsMPClient);
+    while (ticks < LITEV_WIFI_BATCH_N && ComStatus == 0 && !IOPORT(W_TXBusy) && USUntilPowerOn >= 0 && (!IsMPClient
+#ifdef LITEV_NP_SCHED
+           // Netplay model: a client's ticks before its next poll (NextSync) and reception start only count time
+           || (NDS.NPSched && USTimestamp + kTimerInterval < NextSync && (!RXTimestamp || USTimestamp + kTimerInterval < RXTimestamp))
+#endif
+           ));
 #else
     while (false);
 #endif
@@ -2093,6 +2098,9 @@ void Wifi::USTick()
             }
 #endif
             // TODO: not do this every tick if it fails to receive a frame!
+#ifdef LITEV_MP_POLL_INLINE
+            if (!NDS.MPHostPoll || NDS.MPHostPoll(NDS.MPHostPollCtx, NDS.MPHostPollInst))
+#endif
             CheckRX(2);
         }
     }

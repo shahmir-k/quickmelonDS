@@ -450,7 +450,45 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
         }
 #endif
 
+#ifdef LITEV_JIT_VWRAM_LOAD
+        // ARM7 load from VRAM mapped as ARM7 memory (0x06000000-0x06FFFFFF): read the slot's one
+        // bank directly (GPU::VRAMPtr_ARM7) instead of SlowRead7 -> ARM7Read -> ReadVRAM_ARM7.
+        // Same value: an unmapped slot or both banks (ORed reads) take the helper. Stores keep the
+        // helper (JIT invalidation of code in VRAM).
+        const bool vwramFast = (Num == 1) && (NDS.ConsoleType == 0) && !func && !(flags & memop_Store)
+            && (expectedTarget == ARMJIT_Memory::memregion_VWRAM);
+        FixupBranch vwramDone;
+        if (vwramFast)
+        {
+            FixupBranch vwMiss[2];
+            // (scratch: W1-W3 only; W4-W7 can hold guest registers on the ARM7)
+            ANDI2R(W1, W0, 0xFF000000);
+            MOVI2R(W2, 0x06000000);
+            CMP(W1, W2);
+            vwMiss[0] = B(CC_NEQ);
+            UBFX(W1, W0, 17, 1);
+            MOVP2R(X2, &NDS.GPU.VRAMPtr_ARM7[0]);
+            LDR(X2, X2, ArithOption(X1, true));
+            vwMiss[1] = CBZ(X2);
+            ANDI2R(W3, W0, 0x1FFFF & ~(u32)(size / 8 - 1));
+            LDRGeneric(size, flags & memop_SignExtend, rdMapped, X3, X2);
+            if (size == 32)
+            {
+                UBFIZ(W0, W0, 3, 2);
+                RORV(rdMapped, rdMapped, W0);
+            }
+            vwramDone = B();
+            SetJumpTarget(vwMiss[0]);
+            SetJumpTarget(vwMiss[1]);
+        }
+#endif
+
+#ifdef LITEV_JIT_VWRAM_LOAD
+        // (no register unloading: the fast path joins after PopRegs with the registers still loaded)
+        PushRegs(false, false, !mainramFast && !vwramFast);
+#else
         PushRegs(false, false, !mainramFast);
+#endif
 
         if (func)
         {
@@ -565,6 +603,10 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
 #ifdef LITEV_MEM_MAINRAM_LOAD
         if (mainramFast)
             SetJumpTarget(mainramDone);
+#endif
+#ifdef LITEV_JIT_VWRAM_LOAD
+        if (vwramFast)
+            SetJumpTarget(vwramDone);
 #endif
     }
 

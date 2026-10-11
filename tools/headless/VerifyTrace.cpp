@@ -1009,6 +1009,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         for (int k = 0; k < n; k++) b[k].nds->GPU.GPU3D.TimingModel = b[k].nds->GPU.GPU3D.TimingFixed = true;
 #endif
 #endif
+#ifdef LITEV_NP_SCHED
+    if (getenv("LITEV_MP_NPSCHED"))   // Netplay timing model; bit k = console k (Netplay sets every console)
+        for (int k = 0; k < n; k++) b[k].nds->NPSched = (strtoul(getenv("LITEV_MP_NPSCHED"), nullptr, 0) >> k) & 1;
+#endif
 #ifdef LITEV_A7PROF
     if (getenv("LITEV_PROF_INST")) A7Prof::Target = b[atoi(getenv("LITEV_PROF_INST"))].nds.get();
 #endif
@@ -1101,11 +1105,16 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             if (record) record->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
             else
 #endif
+            {
+                // diagnostic LITEV_MP_CLOCKSKEW=<console>:<cycles>: that console's link clock runs ahead
+                u64 sk = 0; const char* e = getenv("LITEV_MP_CLOCKSKEW");
+                if (e && atoi(e) == k) sk = strtoull(strchr(e, ':') + 1, nullptr, 0);
 #ifdef LITEV_MP_FASTPOLL
-            lockstepMP->SetClockSource(k, nd->SysTimestampPtr());
-#else
-            lockstepMP->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
+                if (!sk) lockstepMP->SetClockSource(k, nd->SysTimestampPtr());
+                else
 #endif
+                lockstepMP->SetClock(k, [nd, sk] { return nd->GetSysTimestamp() + sk; });
+            }
             lockstepMP->SetWake(k, *nd);
         }
         b[k].udata->instanceID = k;
@@ -1139,6 +1148,11 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     auto runInstance = [&](int inst)
     {
         BuiltNDS& bi = b[inst];
+        // LITEV_MP_PREROLL=K:N: console K runs N frames (no input) before its frame 0, in every process: its
+        // frame count then trails the others' by N at the same emulated time (on the RG DS the consoles' frame
+        // counts sat >30 apart in a linked race, which deadlocked the first LITEV_NP_SPEED)
+        if (const char* pr = getenv("LITEV_MP_PREROLL"); pr && atoi(pr) == inst && strchr(pr, ':'))
+            for (int k = atoi(strchr(pr, ':') + 1); k > 0; k--) bi.nds->RunFrame();
 #ifdef __linux__
         // LITEV_MP_PIN=c0,c1,...: console k's thread on core ck (list shorter than the consoles: round robin
         // over the entries after the first, which is console 0's)
@@ -1237,10 +1251,12 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                 if (net && np && inst == net->LocalPlayer() && f < frames)
                 {
                     u32 who = 0;
-                    int code = net->SpeedAt(f, &who);
+                    int from = -1;
+                    int code = net->SpeedAt(f, &who, &from);
                     if (code != lastCode)
-                    {
-                        printf("inst%d npspeed switch frame %d: %s requested by 0x%x\n", inst, f, SpeedName(code).c_str(), who);
+                    {   // nominal frame (input frame + lag) is the same on every device; applied later if inputs were late
+                        int nominal = from + NetplayInput::kSpeedLag;
+                        printf("inst%d npspeed switch frame %d: %s requested by 0x%x (applied at %d, %d late)\n", inst, nominal, SpeedName(code).c_str(), who, f, f - nominal);
                         lastCode = code;
                     }
                     float m = NetplaySpeed::Multiplier(code);
@@ -1305,6 +1321,17 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                                (unsigned long long)XXH3_64bits(bi.nds->ARM9.R, sizeof(bi.nds->ARM9.R)),
                                (unsigned long long)XXH3_64bits(bi.nds->ARM7.R, sizeof(bi.nds->ARM7.R)));
                     }
+#ifdef LITEV_NPSCHED_STATS
+                    {
+                        auto& st = bi.nds->SchedStats; double fr = every;
+                        printf("inst%d sched %d: iter %.0f both-halted %.0f a9-only %.0f | a9 exec %.0f halted %.0f jit %.0f | a7 exec %.0f halted %.0f jit %.0f | ev", inst, f + 1, st.Iter / fr, st.Both / fr, st.A9Only / fr,
+                               st.Exec[0] / fr, st.HaltedSkip[0] / fr, st.Disp[0] / fr, st.Exec[1] / fr, st.HaltedSkip[1] / fr, st.Disp[1] / fr);
+                        for (int e = 0; e < Event_MAX; e++) if (st.Ev[e]) printf(" %d:%.1f", e, st.Ev[e] / fr);
+                        for (int c = 0; c < 2; c++) { printf(" | irq%d", c ? 7 : 9); for (int q = 0; q < 32; q++) if (st.Irq[c][q]) printf(" %d:%.1f", q, st.Irq[c][q] / fr); }
+                        printf("\n");
+                        st = {};
+                    }
+#endif
                     if (lockstepMP && getenv("LITEV_MP_STATS"))
                     {   // per console: CPU, link calls / blocked waits / blocked ms per frame (Packet, Host, Replies)
                         timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
@@ -1339,7 +1366,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                         static thread_local double lastCpu = 0, lastWait = 0;
                         if (inst == net->LocalPlayer())
                         {
-                            double w = net->PeerWaitMs();
+                            double w = net->StallMs();   // the other players' consoles waiting for their input
                             printf("inst%d npspeed %d: speed %s fps %.1f | run %.2f cpu %.2f ms/f | wait for peers %.2f ms/f | sleep %.2f ms/f | delay %d\n", inst, f + 1,
                                    SpeedName(lastCode).c_str(), every * 1000.0 / std::chrono::duration<double, std::milli>(now - lastT).count(),
                                    runMs / every, (cpu - lastCpu) / every, (w - lastWait) / every, sleepMs / every, net->CurrentDelay());

@@ -170,7 +170,7 @@ public:
     {
         for (int b = 0; b < n; b++) dst[b][col] = Run<type>(cycles, true);
     }
-    void DoRunN(u32 cycles, s32 (*dst)[16], int col, int n)
+    void DoRunN(u32 cycles, s32 (*dst)[16], int col, int n, bool fast = true)
     {
         switch ((Cnt >> 29) & 0x3)
         {
@@ -178,8 +178,9 @@ public:
         case 1: RunN<1>(cycles, dst, col, n); return;
         case 2:
 #ifdef LITEV_SPU_FAST_ADPCM
-            if (RunADPCMFast(cycles, dst, col, n)) return;
+            if (fast && RunADPCMFast(cycles, dst, col, n)) return;
 #endif
+            (void)fast;
             RunN<2>(cycles, dst, col, n); return;
         case 3:
             if (Num >= 14) { RunN<4>(cycles, dst, col, n); return; }
@@ -412,6 +413,9 @@ private:
     bool AnyStale = false;
     void MaterializeAll() { for (SPUChannel& ch : Channels) ch.Materialize(); AnyStale = false; }
     void RunQuiet(u32 cycles, u32 n);
+#endif
+#ifdef LITEV_SPU_CAPTURE_CHMAJOR
+    u32 CaptureInterleaved() const;   // channels that must step in turn with sound capture
 #endif
 };
 
