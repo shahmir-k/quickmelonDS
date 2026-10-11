@@ -2583,6 +2583,14 @@ bool Compiler::R15LiteralLoadFolds(CompileFunc comp)
 }
 #endif
 
+#ifdef LITEV_JIT_WAITLOOP
+// headless A/B in one binary: LITEV_JIT_WAITLOOP_OFF=1 compiles the loop as before
+static bool WaitLoopOn()
+{
+    static const bool on = !getenv("LITEV_JIT_WAITLOOP_OFF");
+    return on;
+}
+#endif
 
 #ifdef LITEV_JIT_BGEMIT
 // A block's entry stub (16 bytes in the stub arena): B +4 | MOVZ W17,id | MOVK W17,id>>16 | B thunk.
@@ -2899,6 +2907,47 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
     if (hasMemInstr && !JitQOn(jitq_MemBasePin))   // pinned: ARM_Dispatch set x26 for the slice
         MOVP2R(RMemBase, Num == 0 ? NDS.JIT.Memory.FastMem9Start : NDS.JIT.Memory.FastMem7Start);
+
+#if defined(LITEV_JIT_WAITLOOP) && defined(LITEV_JIT_GLOBALREG) && defined(LITEV_JIT_BUDGET_REG) && defined(LITEV_JIT_EXIT_PROTO)
+    // ARM7 BIOS WaitByLoop (SWI 3) fast-forward. Based on DSperate's wait-loop fast-forward
+    // (src/core/cpu/wait_loop.cpp, src/core/cpu/jit/a64/translate.cpp; https://github.com/beebono/DSperate,
+    // GPL-3.0-or-later, f5fa35e). FreeBIOS's loop `subs r0, r0, #1; bgt self` (ARM, 0x115C) compiles to a
+    // block of its own. An iteration touches only r0 and the flags and costs the same c cycles, and the
+    // next one runs only if r0 stays > 0 and the budget stays > 0 after the hop (EmitLinkExit: subs RBudget,
+    // RBudget, RCycles; b.le). So at the head, the k iterations that would certainly continue
+    // (k <= r0 - 1 and k*c < RBudget - RCycles) are skipped in one step: r0 -= k, RBudget -= k*c. The block
+    // then runs the rest itself, so the state, the cycle count and the slice end are exactly what running
+    // them leaves. The flags are dead (the subs rewrites NZCV). The retail BIOS's Thumb loop (0x2F08) is
+    // not handled: the headless gates run FreeBIOS only, so its cost could not be checked.
+    if (Num == 1 && !Thumb && instrsCount == 2 && WaitLoopOn()
+        && instrs[0].Addr == 0x115C && instrs[0].Instr == 0xE2500001 && instrs[1].Instr == 0xCAFFFFFD
+        && !(instrs[1].BranchFlags & (branch_FollowCondTaken | branch_FollowCondNotTaken)))
+    {
+        // c = what the taken path charges, as this compiler emits it: the subs (Comp_AddCycles_C), the
+        // refill (Comp_JumpTo, N32 + S32), and the block-final conditional branch's not-taken cycles,
+        // which the in-place path adds to ConstantCycles and so charges on both edges (S32).
+        const u32 cc = instrs[0].CodeCycles;
+        // (A7T: the timing rows LITEV_JIT_BGEMIT captured for this block, as Comp_AddCycles_C/Comp_JumpTo read them)
+        const u32 c = A7T(cc, 3) + A7T(instrs[1].Addr >> 15, 2) + A7T(instrs[1].Addr >> 15, 3) + A7T(instrs[1].CodeCycles, 3);
+        const ARM64Reg r0 = W19;   // GlobalRegPins: guest r0
+        CMP(r0, 2);
+        FixupBranch few = B(CC_LT);                 // signed: bgt needs r0 - 1 > 0
+        SUB(W16, RBudget, RCycles);
+        SUB(W16, W16, 1);                           // what the hops may spend and stay > 0
+        MOVI2R(W17, c);
+        CMP(W16, W17);
+        FixupBranch poor = B(CC_LT);
+        UDIV(W16, W16, W17);                        // iterations the budget covers
+        SUB(W17, r0, 1);                            // iterations that branch back
+        CMP(W16, W17);
+        CSEL(W16, W16, W17, CC_LO);                 // k
+        SUB(r0, r0, W16);
+        MOVI2R(W17, c);
+        MSUB(RBudget, W16, W17, RBudget);
+        SetJumpTarget(few);
+        SetJumpTarget(poor);
+    }
+#endif
 
     for (int i = 0; i < instrsCount; i++)
     {

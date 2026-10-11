@@ -1386,6 +1386,15 @@ u32 NDS::RunFrame()
         JIT.JITCompiler.RepromoteStores();   // frame boundary: no JIT code is running
 #endif
 
+#if defined(LITEV_JIT_SILENT_STATS) && defined(JIT_ENABLED)
+    // census: code-hit stores per frame, changed vs same value (LITEV_JIT_SILENT_STORE sizing)
+    if (JIT.SilentStats[0] | JIT.SilentStats[1] | JIT.SilentStats[2])
+    {
+        printf("silentstore %p f%u changed=%llu silent=%llu other=%llu\n", (void*)this, NumFrames,
+            (unsigned long long)JIT.SilentStats[0], (unsigned long long)JIT.SilentStats[1], (unsigned long long)JIT.SilentStats[2]);
+        JIT.SilentStats[0] = JIT.SilentStats[1] = JIT.SilentStats[2] = 0;
+    }
+#endif
     // In the context of TASes, frame count is traditionally the primary measure of emulated time,
     // so it needs to be tracked even if NDS is powered off.
     NumFrames++;
@@ -2621,14 +2630,14 @@ void NDS::ARM9Write8(u32 addr, u8 val)
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
-        JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr);
+        JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr, (u8*)&MainRAM[addr & MainRAMMask], (u8)val);
         *(u8*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
     case 0x03000000:
         if (SWRAM_ARM9.Mem)
         {
-            JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_SharedWRAM>(addr);
+            JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_SharedWRAM>(addr, (u8*)&SWRAM_ARM9.Mem[addr & SWRAM_ARM9.Mask], (u8)val);
             *(u8*)&SWRAM_ARM9.Mem[addr & SWRAM_ARM9.Mask] = val;
         }
         return;
@@ -2665,14 +2674,14 @@ void NDS::ARM9Write16(u32 addr, u16 val)
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
-        JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr);
+        JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr, (u16*)&MainRAM[addr & MainRAMMask], (u16)val);
         *(u16*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
     case 0x03000000:
         if (SWRAM_ARM9.Mem)
         {
-            JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_SharedWRAM>(addr);
+            JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_SharedWRAM>(addr, (u16*)&SWRAM_ARM9.Mem[addr & SWRAM_ARM9.Mask], (u16)val);
             *(u16*)&SWRAM_ARM9.Mem[addr & SWRAM_ARM9.Mask] = val;
         }
         return;
@@ -2728,14 +2737,14 @@ void NDS::ARM9Write32(u32 addr, u32 val)
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
-        JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr);
+        JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(addr, (u32*)&MainRAM[addr & MainRAMMask], (u32)val);
         *(u32*)&MainRAM[addr & MainRAMMask] = val;
         return ;
 
     case 0x03000000:
         if (SWRAM_ARM9.Mem)
         {
-            JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_SharedWRAM>(addr);
+            JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_SharedWRAM>(addr, (u32*)&SWRAM_ARM9.Mem[addr & SWRAM_ARM9.Mask], (u32)val);
             *(u32*)&SWRAM_ARM9.Mem[addr & SWRAM_ARM9.Mask] = val;
         }
         return;
@@ -3023,26 +3032,26 @@ void NDS::ARM7Write8(u32 addr, u8 val)
     {
     case 0x02000000:
     case 0x02800000:
-        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr);
+        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr, (u8*)&MainRAM[addr & MainRAMMask], (u8)val);
         *(u8*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
     case 0x03000000:
         if (SWRAM_ARM7.Mem)
         {
-            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_SharedWRAM>(addr);
+            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_SharedWRAM>(addr, (u8*)&SWRAM_ARM7.Mem[addr & SWRAM_ARM7.Mask], (u8)val);
             *(u8*)&SWRAM_ARM7.Mem[addr & SWRAM_ARM7.Mask] = val;
             return;
         }
         else
         {
-            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr);
+            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr, (u8*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)], (u8)val);
             *(u8*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)] = val;
             return;
         }
 
     case 0x03800000:
-        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr);
+        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr, (u8*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)], (u8)val);
         *(u8*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)] = val;
         return;
 
@@ -3082,26 +3091,26 @@ void NDS::ARM7Write16(u32 addr, u16 val)
     {
     case 0x02000000:
     case 0x02800000:
-        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr);
+        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr, (u16*)&MainRAM[addr & MainRAMMask], (u16)val);
         *(u16*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
     case 0x03000000:
         if (SWRAM_ARM7.Mem)
         {
-            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_SharedWRAM>(addr);
+            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_SharedWRAM>(addr, (u16*)&SWRAM_ARM7.Mem[addr & SWRAM_ARM7.Mask], (u16)val);
             *(u16*)&SWRAM_ARM7.Mem[addr & SWRAM_ARM7.Mask] = val;
             return;
         }
         else
         {
-            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr);
+            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr, (u16*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)], (u16)val);
             *(u16*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)] = val;
             return;
         }
 
     case 0x03800000:
-        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr);
+        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr, (u16*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)], (u16)val);
         *(u16*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)] = val;
         return;
 
@@ -3152,26 +3161,26 @@ void NDS::ARM7Write32(u32 addr, u32 val)
     {
     case 0x02000000:
     case 0x02800000:
-        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr);
+        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr, (u32*)&MainRAM[addr & MainRAMMask], (u32)val);
         *(u32*)&MainRAM[addr & MainRAMMask] = val;
         return;
 
     case 0x03000000:
         if (SWRAM_ARM7.Mem)
         {
-            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_SharedWRAM>(addr);
+            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_SharedWRAM>(addr, (u32*)&SWRAM_ARM7.Mem[addr & SWRAM_ARM7.Mask], (u32)val);
             *(u32*)&SWRAM_ARM7.Mem[addr & SWRAM_ARM7.Mask] = val;
             return;
         }
         else
         {
-            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr);
+            JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr, (u32*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)], (u32)val);
             *(u32*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)] = val;
             return;
         }
 
     case 0x03800000:
-        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr);
+        JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_WRAM7>(addr, (u32*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)], (u32)val);
         *(u32*)&ARM7WRAM[addr & (ARM7WRAMSize - 1)] = val;
         return;
 

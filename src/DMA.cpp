@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <algorithm>
 #include "NDS.h"
 #include "DSi.h"
 #include "DMA.h"
@@ -46,6 +47,25 @@ static bool litevDmaPropDefaultOn(const char* name) {
 
 namespace melonDS
 {
+#ifdef LITEV_DMA_STATS
+// diag census: DMA units by (cpu, width, gxfifo, src/dst top byte, src/dst increment), printed at exit
+static struct DmaStats
+{
+    unsigned long long N[1 << 17] = {};
+    ~DmaStats()
+    {
+        for (u32 k = 0; k < (1u << 17); k++)
+            if (N[k]) fprintf(stderr, "dmastat arm%d w%d gx%d src%x dst%x sinc%d dinc%d units=%llu\n", (k >> 16) & 1 ? 7 : 9,
+                (k >> 15) & 1 ? 32 : 16, (k >> 14) & 1, (k >> 10) & 0xF, (k >> 6) & 0xF, (int)((k >> 3) & 7) - 2, (int)(k & 7) - 2, N[k]);
+    }
+} DmaStat;
+#define DMA_STATS_BEGIN const u32 _st0 = IterCount, _stk = (CPU << 16) | ((Cnt >> 26 & 1) << 15) | ((u32)IsGXFIFODMA << 14) \
+    | ((CurSrcAddr >> 24 & 0xF) << 10) | ((CurDstAddr >> 24 & 0xF) << 6) | ((u32)(SrcAddrInc + 2) << 3) | (u32)(DstAddrInc + 2);
+#define DMA_STATS_END DmaStat.N[_stk] += _st0 - IterCount;
+#else
+#define DMA_STATS_BEGIN
+#define DMA_STATS_END
+#endif
 using Platform::Log;
 using Platform::LogLevel;
 
@@ -640,11 +660,107 @@ u32 DMA::UnitTimings7_32(bool burststart)
     }
 }
 
+#ifdef LITEV_DMA_BULK
+// Exact bulk general DMA (ARM9, DS mode): a run of units from incrementing main RAM to incrementing
+// main RAM / palette / OAM / VRAM inside one 16 KB timing block of each side, so the region pair and
+// its timings hold for the whole run. Per unit it charges exactly what UnitTimings9_* returns there
+// (main->main: a constant; otherwise the main-RAM burst table, re-selected through UnitTimings9_* at
+// each wrap), and writes what NDS::ARM9Write* writes there, without the per-unit address decode of
+// ARM9Read/ARM9Write and UnitTimings. It stops after the unit that reaches ARM9Target, as Run9 does.
+// Inspired by DSperate's exact bulk DMA runs (src/core/dma/dma.cpp, https://github.com/beebono/DSperate,
+// GPL-3.0-or-later, f5fa35e). ponytail: the burst cost is walked per unit (a table load and an add),
+// not summed in closed form; the copy dominates.
+static bool DmaBulkOn()
+{
+    static const bool on = !getenv("LITEV_DMA_BULK_OFF");
+    return on;
+}
+
+template <bool Word>
+bool DMA::Bulk9(bool burststart)
+{
+    constexpr u32 sz = Word ? 4 : 2;
+    const u32 dr = CurDstAddr >> 24;
+    if (NDS.ConsoleType != 0 || SrcAddrInc != 1 || DstAddrInc != 1 || (CurSrcAddr >> 24) != 0x02
+        || !(dr == 0x02 || dr == 0x05 || dr == 0x06 || dr == 0x07))
+        return false;
+    u32 n = std::min({IterCount, (0x4000 - (CurSrcAddr & 0x3FFF)) / sz, (0x4000 - (CurDstAddr & 0x3FFF)) / sz});
+    if (!n)
+        return false;
+    // main -> main: UnitTimings9_* return a constant (18 / 16) and leave the burst table alone;
+    // main -> other: they walk the main-RAM burst table (src_rgn MainRAM, SrcAddrInc > 0)
+    const bool constCost = dr == 0x02;
+    if (NDS.ARM9Regions[CurSrcAddr >> 14] != Mem9_MainRAM || (NDS.ARM9Regions[CurDstAddr >> 14] == Mem9_MainRAM) != constCost)
+        return false;
+    u32 cc = 0;
+    const u64 target = NDS.ARM9Target;
+    const u32 shift = NDS.ARM9ClockShift;
+    u64 ts = NDS.ARM9Timestamp;
+    u32 s = CurSrcAddr, d = CurDstAddr, done = 0;
+    do
+    {
+        u32 t;
+        if (cc)
+            t = cc;
+        else if (burststart || constCost || MRAMBurstTable[MRAMBurstCount] == 0)
+        {
+            CurSrcAddr = s; CurDstAddr = d;   // UnitTimings9_* read them
+            t = Word ? UnitTimings9_32(burststart) : UnitTimings9_16(burststart);
+            burststart = false;
+            if (constCost) cc = t;
+        }
+        else
+            t = MRAMBurstTable[MRAMBurstCount++];
+        ts += (u64)t << shift;
+
+        const u32 v = Word ? *(u32*)&NDS.MainRAM[s & NDS.MainRAMMask] : *(u16*)&NDS.MainRAM[s & NDS.MainRAMMask];
+        switch (dr)
+        {
+        case 0x02:
+            if (Word)
+            {
+                u32* p = (u32*)&NDS.MainRAM[d & NDS.MainRAMMask];
+                NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(d, (const u32*)p, v);
+                *p = v;
+            }
+            else
+            {
+                u16* p = (u16*)&NDS.MainRAM[d & NDS.MainRAMMask];
+                NDS.JIT.CheckAndInvalidate<0, ARMJIT_Memory::memregion_MainRAM>(d, (const u16*)p, (u16)v);
+                *p = (u16)v;
+            }
+            break;
+        case 0x05:
+            if (NDS.PowerControl9 & ((d & 0x400) ? (1<<9) : (1<<1)))
+            {
+                if (Word) NDS.GPU.WritePalette<u32>(d, v); else NDS.GPU.WritePalette<u16>(d, (u16)v);
+            }
+            break;
+        case 0x07:
+            if (NDS.PowerControl9 & ((d & 0x400) ? (1<<9) : (1<<1)))
+            {
+                if (Word) NDS.GPU.WriteOAM<u32>(d, v); else NDS.GPU.WriteOAM<u16>(d, (u16)v);
+            }
+            break;
+        default:   // VRAM: mapping-dependent, through the bus write
+            if (Word) NDS.ARM9Write32(d, v); else NDS.ARM9Write16(d, (u16)v);
+            break;
+        }
+        s += sz; d += sz; done++;
+    } while (done < n && ts < target);
+    NDS.ARM9Timestamp = ts;
+    CurSrcAddr = s; CurDstAddr = d;
+    IterCount -= done; RemCount -= done;
+    return true;
+}
+#endif
+
 void DMA::Run9()
 {
     if (NDS.ARM9Timestamp >= NDS.ARM9Target) return;
 
     Executing = true;
+    DMA_STATS_BEGIN
 
     // add NS penalty for first accesses in burst
     bool burststart = (Running == 2);
@@ -654,6 +770,14 @@ void DMA::Run9()
     {
         while (IterCount > 0 && !Stall)
         {
+#ifdef LITEV_DMA_BULK
+            if (DmaBulkOn() && Bulk9<false>(burststart))
+            {
+                burststart = false;
+                if (NDS.ARM9Timestamp >= NDS.ARM9Target) break;
+                continue;
+            }
+#endif
             NDS.ARM9Timestamp += (UnitTimings9_16(burststart) << NDS.ARM9ClockShift);
             burststart = false;
 
@@ -840,6 +964,14 @@ gxfifo_done: ;
     {
         while (IterCount > 0 && !Stall)
         {
+#ifdef LITEV_DMA_BULK
+            if (DmaBulkOn() && Bulk9<true>(burststart))
+            {
+                burststart = false;
+                if (NDS.ARM9Timestamp >= NDS.ARM9Target) break;
+                continue;
+            }
+#endif
             NDS.ARM9Timestamp += (UnitTimings9_32(burststart) << NDS.ARM9ClockShift);
             burststart = false;
 
@@ -854,6 +986,7 @@ gxfifo_done: ;
         }
     }
 
+    DMA_STATS_END
     Executing = false;
     Stall = false;
 
@@ -893,6 +1026,7 @@ void DMA::Run7()
     if (NDS.ARM7Timestamp >= NDS.ARM7Target) return;
 
     Executing = true;
+    DMA_STATS_BEGIN
 
     // add NS penalty for first accesses in burst
     bool burststart = (Running == 2);
@@ -933,6 +1067,7 @@ void DMA::Run7()
         }
     }
 
+    DMA_STATS_END
     Executing = false;
     Stall = false;
 
