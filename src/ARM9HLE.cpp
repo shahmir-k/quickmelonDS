@@ -3203,19 +3203,20 @@ __attribute__((noinline)) bool RunCx(melonDS::ARMv5* c, State& s, bool jit)
 // one BulkWords, every memory byte (render state, the result, the three functions' frames) and register / flag as the guest
 // leaves them. Exact bytes of the four functions with their literal pools (FNV). Category B: a fitted cycle estimate.
 constexpr u32 kMkMatSbc = 0x01FF86B4, kMkMatDef = 0x01FF8738, kMkMatInstr = 0xE92D4070;   // push {r4-r6, lr}
-constexpr Range kMkMatCode[3] = {{0x01FF86B4, 0x01FF8B08}, {0x01FF9048, 0x01FF9144}, {0x0214D044, 0x0214D05C}};
-constexpr u64 kMkMatSig = 0x8c1125aa907d3f20ull;
+constexpr Range kMkMatCode[4] = {{0x01FF86B4, 0x01FF8B08}, {0x01FF9048, 0x01FF9144}, {0x0214D044, 0x0214D05C}, {0x01FF9300, 0x01FF94D4}};
+constexpr u64 kMkMatSig = 0x3aed0e6a8aedb200ull;   // (the last range: the texture matrix table, send and per-flags functions 6, 7)
 constexpr u32 kMkMatTab = 0x0216187C, kMkGCache = 0x021704E4, kMkGlb = 0x0217027C, kMkMask = 0x02152BEC;
 constexpr u32 kMkGeBuf = 0x021731E4, kMkGeFlag = 0x021731E8;
+constexpr u32 kMkTexMtx = 0x01FF9320, kMkTexTab = 0x01FF9300;   // the texture matrix send, its per-flags function table
 // fitted estimate (check mode, MKDS 8-console race, 646k calls: exact for every one): the send path, + the material
 // animation bit test, + the empty GE buffer test
-constexpr s32 kMkMatCyc = 372, kMkMatCycAnm = 11, kMkMatCycGe = 10;   // (+ the empty GE buffer test)
+constexpr s32 kMkMatCyc = 372, kMkMatCycAnm = 11, kMkMatCycGe = 10, kMkTexCyc = 430;   // + the texture matrix (scale)   // (+ the empty GE buffer test)
 
 int MkMatAt(melonDS::ARMv5* c, u32 a)
 {
     if (a != kMkMatSbc) return 0;
     std::vector<u8> b;
-    CodeBytes(c, b, kMkMatCode, 0, 3);
+    CodeBytes(c, b, kMkMatCode, 0, 4);
     return Fnv(b) == kMkMatSig ? 1 : 2;
 }
 
@@ -3233,11 +3234,12 @@ __attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
     };
     const u32 rs = c->R[0], opt = c->R[1], sp = c->R[13];
     melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
-    Obj RS = m.O(rs, 0x100), st = m.O(sp - 88, 88);
+    Obj RS = m.O(rs, 0x100), st = m.O(sp - 176, 176);   // (texture matrix path: down to sp - 176)
     bool ok = !CheckPending && RS && st;
     u32 flag = 0, sbc = 0, idx = 0, res = 0, md = 0, cbT = 0, ro = 0, r7 = 0, h = 0, v4 = 0, v8 = 0, vc = 0, v10 = 0, v14 = 0;
     u32 geb = 0, g9c = 0, m10 = 0, anm = 0, bits = 0, bo = 0, bit = 0, r0f = 0;
-    bool send = false, setBit = false;
+    bool send = false, setBit = false, tm = false;   // tm: TEXMTX_USE (texture matrix sent by 0x01FF9320)
+    u32 tmS = 0, tmT = 0, tmFn = 0;
     Obj R7;
     if (ok)
     {
@@ -3262,10 +3264,22 @@ __attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
         ok = cbT != 3 && !rd(ro + 0x38, 4) && !bad && !((opt == 0x20 || opt == 0x40) && (bits & bit));
         setBit = opt == 0x40;
         r7 = setBit ? kMkGCache + idx * 0x38 : rs + 0xF4;
-        R7 = m.O(r7, 0x18);
+        R7 = m.O(r7, 0x38);
         h = rd(md + 0x1E, 2);
         anm = rd(ro + 8, 4);
-        ok = ok && R7 && !bad && !(h & 1) && !(anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit)) && !bad;
+        ok = ok && R7 && !bad && !(anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit)) && !bad;
+        tm = h & 1;
+        if (ok && tm)
+        {
+            // TEXMTX_USE with a scale, no rotation, no translation (the race's case: flags 6), magnification 1: the texture
+            // matrix function [rs + 0xF0] = 0x01FF9320 and its per-flags function from its table (flags 7, identity: never
+            // seen, the guest runs it)
+            ok = !(h & 2) && (h & 4) && (h & 8) && rd(md + 0x24, 4) == 0x1000 && rd(md + 0x28, 4) == 0x1000 && RS.r(0xF0) == kMkTexMtx && !bad;
+            tmFn = R32(CodePtr(c, kMkTexTab + (((h & 2) ? 1u : 0u) | 6u) * 4));
+            ok = ok && tmFn == ((h & 2) ? kMkTexMtx + 0x14C : kMkTexMtx + 0x170);
+            if (!(h & 2)) { tmS = rd(md + 0x2C, 4); tmT = rd(md + 0x30, 4); }
+            ok = ok && !bad;
+        }
     }
     if (ok)
     {
@@ -3281,7 +3295,7 @@ __attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
         if (send && r0f) vc &= ~0x1F0000u;
         // (an invisible material or NOGECMD: never seen in the race; the guest runs them)
         ok = ok && send && !((flag | 8) & 0x100)
-             && !rd(kMkGeFlag, 4) && !bad && (!(geb = rd(kMkGeBuf, 4)) || !rd(geb, 4)) && !bad /* no GE buffer or an empty one: straight to GXFIFO */ && (g_Check || g_Dry || (gx.GeometryEnabled && (gx.BulkReady() || gx.FifoLevel() + 8 <= 256)));
+             && !rd(kMkGeFlag, 4) && !bad && (!(geb = rd(kMkGeBuf, 4)) || !rd(geb, 4)) && !bad /* no GE buffer or an empty one: straight to GXFIFO */ && (g_Check || g_Dry || (gx.GeometryEnabled && (gx.BulkReady() || gx.FifoLevel() + 32 <= 256)));
     }
     if (!ok)
     {
@@ -3291,27 +3305,49 @@ __attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
     }
     // frames: SBC MAT push {r4-r6, lr} (sp - 16) | MAT_InternalDefault push {r4-r8, lr} (sp - 40) + locals (sp - 72) |
     // OP_N push {r4-r6, lr} (sp - 88)
-    m.W(st, 72, c->R[4]); m.W(st, 76, c->R[5]); m.W(st, 80, c->R[6]); m.W(st, 84, c->R[14]);
-    m.W(st, 48, rs); m.W(st, 52, res + 4); m.W(st, 56, res); m.W(st, 60, c->R[7]); m.W(st, 64, c->R[8]); m.W(st, 68, kMkMatSbc + 0x6C);
-    {
-        m.W(st, 16, 0x00293130); m.W(st, 20, v4); m.W(st, 24, v8); m.W(st, 28, vc); m.W(st, 32, 0x2B2A); m.W(st, 36, v10); m.W(st, 40, v14);
-        m.W(st, 0, cbT); m.W(st, 4, r7); m.W(st, 8, rs); m.W(st, 12, kMkMatDef + 0x360);
-    }
+    m.W(st, 88 + 72, c->R[4]); m.W(st, 88 + 76, c->R[5]); m.W(st, 88 + 80, c->R[6]); m.W(st, 88 + 84, c->R[14]);
+    m.W(st, 88 + 48, rs); m.W(st, 88 + 52, res + 4); m.W(st, 88 + 56, res); m.W(st, 88 + 60, c->R[7]); m.W(st, 88 + 64, c->R[8]);
+    m.W(st, 88 + 68, kMkMatSbc + 0x6C);
+    m.W(st, 88 + 16, 0x00293130); m.W(st, 88 + 20, v4); m.W(st, 88 + 24, v8); m.W(st, 88 + 28, vc); m.W(st, 88 + 32, 0x2B2A);
+    m.W(st, 88 + 36, v10); m.W(st, 88 + 40, v14);
+    m.W(st, 88 + 0, cbT); m.W(st, 88 + 4, r7); m.W(st, 88 + 8, rs); m.W(st, 88 + 12, kMkMatDef + 0x360);
     // render state, the result
     m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFF00u) | idx << 8);
     m.W(RS, 8, (flag | 8) & ~2u);
     m.W(RS, 0xB0, r7);
     if (setBit) m.W(RS, bo, bits | bit);
     m.W(RS, 0, sbc + 2);
-    const u32 res6[6] = {r0f, v4, v8, vc, v10, v14};
+    const u32 flags0 = tm ? (r0f | ((h & 2) ? 1 : 0) | 2 | 4 | 8) : r0f;
+    const u32 res6[6] = {flags0, v4, v8, vc, v10, v14};
     for (int i = 0; i < 6; i++) m.W(R7, i * 4, res6[i]);
+    u32 tw[19] = {};
+    if (tm)
+    {
+        if (!(h & 2)) { m.W(R7, 0x18, tmS); m.W(R7, 0x1C, tmT); }
+        const u32 ow = rd(md + 0x20, 2), oh = rd(md + 0x22, 2);
+        m.W(R7, 0x2C, ow | oh << 16); m.W(R7, 0x30, 0x1000); m.W(R7, 0x34, 0x1000);
+        // 0x01FF9320: push {r4, lr}; sub sp, #0x50; the matrix (defaults + the per-flags function); OP_N(0x00101610, 18 words)
+        const u32 m0 = (h & 2) ? 0x1000 : tmS, m5 = (h & 2) ? 0x1000 : tmT;
+        const u32 m13 = (h & 2) ? 0 : (u32)(((0x2000 - (tmT << 1)) * oh) << 3);
+        const u32 M[16] = {m0, 0, 0, 0, 0, m5, 0, 0, 0, 0, 0, 0, 0, m13, 0, 0x1000};
+        // frames (st = sp - 176): OP_N push (0..15) | the locals (16..95: cmd, 3, M, 2; 96..99 = the first OP_N's r5 slot,
+        // kept) | push {r4, lr} (96 - 8 + 8: sp - 80 = 96, sp - 76 = 100)
+        m.W(st, 0, r7); m.W(st, 4, r7); m.W(st, 8, rs); m.W(st, 12, kMkTexMtx + 0x134);
+        m.W(st, 16, 0x00101610); m.W(st, 20, 3);
+        for (int i = 0; i < 16; i++) m.W(st, 24 + i * 4, M[i]);
+        m.W(st, 88, 2);
+        m.W(st, 96, cbT); m.W(st, 100, kMkMatDef + 0x378);
+        tw[0] = 0x00101610; tw[1] = 3; for (int i = 0; i < 16; i++) tw[2 + i] = M[i]; tw[18] = 2;
+    }
     Expect e;
     for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
     e.R[0] = sbc + 2;
-    e.R[1] = 0x04000400; e.R[2] = v14; e.R[3] = kMkGeBuf; e.R[12] = sp - 72 + 28;   // MI_CpuSend32's, OP_N's r3
+    e.R[1] = 0x04000400; e.R[2] = tm ? 2 : v14; e.R[3] = kMkGeBuf; e.R[12] = tm ? sp - 160 + 76 : sp - 72 + 28;   // MI_CpuSend32's, OP_N's r3
     e.retPc = c->R[14];
     e.CPSR = (c->CPSR & 0x0FFFFFDF) | Flags(cbT, 3) | ((e.retPc & 1) << 5);
-    const u32 gw[7] = {0x00293130, v4, v8, vc, 0x2B2A, v10, v14};
+    u32 gw[26] = {0x00293130, v4, v8, vc, 0x2B2A, v10, v14};
+    const u32 ngw = tm ? 26 : 7;
+    if (tm) for (int i = 0; i < 19; i++) gw[7 + i] = tw[i];
 #ifdef LITEV_HLE_DIAG
     if (g_Check || g_Dry)
     {
@@ -3319,8 +3355,8 @@ __attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
         if (g_Check)
         {
             ArmCheck(c, 21, m, e);
-            g_P.gx.assign(gw, gw + 7);
-            g_P.fit[0] = 1; g_P.fit[1] = anm != 0; g_P.fit[2] = opt; g_P.fit[3] = geb != 0;
+            g_P.gx.assign(gw, gw + ngw);
+            g_P.fit[0] = 1; g_P.fit[1] = anm != 0; g_P.fit[2] = opt; g_P.fit[3] = (geb != 0) | (tm ? ((h & 2) ? 4 : 2) : 0);
 #ifdef LITEV_A9HLE_GXCHECK
             if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
 #endif
@@ -3333,10 +3369,10 @@ __attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
 #endif
     m.Flush();
     // the FIFO empty: at once (as GX_CPUSEND sends); else (a buffer swap pending) into the FIFO as the guest's stores do
-    if (gx.BulkReady()) gx.BulkWords(gw, 7);
+    if (gx.BulkReady()) gx.BulkWords(gw, ngw);
     else for (u32 w : gw) c->NDS.ARM9Write32(0x04000400, w);
     s.native[21]++;
-    Return(c, e, kMkMatCyc + (anm ? kMkMatCycAnm : 0) + (geb ? kMkMatCycGe : 0));
+    Return(c, e, kMkMatCyc + (anm ? kMkMatCycAnm : 0) + (geb ? kMkMatCycGe : 0) + (tm ? kMkTexCyc + (geb ? kMkMatCycGe : 0) : 0));
     return true;
 }
 
@@ -3746,7 +3782,7 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     if (instr == kMkMatInstr && addr == kMkMatSbc)
     {
         r = kMkMatCode;
-        return 3;
+        return 4;
     }
     if (instr == kCxInstr && CxAt(&nds.ARM9, addr))
     {
