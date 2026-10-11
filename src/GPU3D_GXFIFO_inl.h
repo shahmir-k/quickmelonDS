@@ -36,6 +36,10 @@ extern const u8 CmdNumParams[256];
 
 __attribute__((always_inline)) inline void GPU3D::CmdFIFOWrite_Inline(const CmdFIFOEntry& entry) noexcept
 {
+#ifdef LITEV_GX_UNTIMED
+    // untimed: the engine takes the queue now instead of the FIFO filling (not behind a swap)
+    if (FifoLevel() >= 256 && GXUntimedOn && !FlushRequest) RunUntimed();
+#endif
 #ifdef LITEV_GXFIFO_UNIFIED
     if (FifoN == 0 && PipeN < 4)
     {
