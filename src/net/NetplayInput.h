@@ -118,21 +118,22 @@ public:
     // the slowest peer's round trip (90th percentile, last 2 s, ms), -1 = no measurement yet
     double PeerRttMs() const { return RttMaxUs.load() / 1000.0; }
 #ifdef LITEV_NP_SPEED
-    // The session speed at frame `frame`: the fastest any player requests at applied frame
-    // frame - kSpeedLag (any player may fast-forward the session; nobody vetoes). Waits until every
-    // player's input for that frame is here. The lag keeps this wait off the consoles' critical path:
-    // without it the local console at frame F waited for a peer's input at F while that peer's
-    // console waited (Wi-Fi link, in cycles a few frames apart) for our replica, which needed our
-    // next input = a deadlock (Mac 2P Shrek, frame 2204, delay 2). Now it only waits for a device
-    // more than kSpeedLag + delay frames behind: the auto-throttle.
-    // requesters: bit p = player p asks for more than 1x there. Called by one thread, frames ascending.
+    // The session speed for local frame `frame`, NEVER waiting: the fastest request (any player may
+    // fast-forward the session; nobody vetoes) at input frame frame - kSpeedLag, decided from the inputs
+    // already here. If some player's input for that frame has not arrived, the speed decided last stays
+    // (a device behind applies a switch late; pacing only, emulation is untouched).
+    // History: v1 waited until every input for frame - kSpeedLag was here. On the RG DS (2P Shrek race) and
+    // on the Mac with LITEV_MP_PREROLL=1:45 the consoles' frame counts sit more than kSpeedLag + delay apart
+    // at the same emulated time, so the local console waited for an input the peer's console could only
+    // produce after our replica got our next input: deadlock.
+    // requesters: bit p = player p asks for more than 1x; inputFrame: the input frame where the speed
+    // returned took effect (+ kSpeedLag = the nominal switch frame, equal on every device). Called by one
+    // thread, frames ascending.
     static constexpr int kSpeedLag = 30;
-    int SpeedAt(int frame, u32* requesters = nullptr);
+    int SpeedAt(int frame, u32* requesters = nullptr, int* inputFrame = nullptr);
     // The frontend's frame period (us) now: the adaptive delay turns the round trip into frames with
     // it (fast-forward = more frames of delay for the same network). Default 60 fps.
     void SetFramePeriodUs(int us) { FramePeriodUs = std::max(us, 500); }
-    // time SpeedAt waited for the other players' inputs (ms)
-    double PeerWaitMs() const { return PeerWaitUs.load() / 1000.0; }
 #endif
     int LocalPlayer() const { return Local; }
 
@@ -207,7 +208,8 @@ private:
     int SpeedLast[kMaxPlayers] {};                 // the code at the newest frame recorded
     int LocalUpTo = -1;                            // our own inputs are recorded up to this applied frame
     std::atomic<int> FramePeriodUs {16667};
-    std::atomic<u64> PeerWaitUs {0};
+    int SpeedCursor = -1, SpeedCode = 0, SpeedFrom = -1;   // decided up to this input frame: code, since
+    u32 SpeedWho = 0;
     void NoteSpeed(int player, int frame, const NetplayFrameInput& in);   // frames ascending, under Lock
 #endif
 #ifdef LITEV_NP_ADAPTIVE_DELAY
