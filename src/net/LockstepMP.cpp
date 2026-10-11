@@ -51,9 +51,37 @@ void LockstepMP::SetWake(int inst, NDS& nds)
 #ifdef LITEV_MP_CLOCKWAKE
 void LockstepMP::Wake(int inst)
 {
+#ifdef LITEV_MP_FUTEX
+    WakeLocked(inst);   // (no Lock: WaitersOn / SleepSeq are atomic)
+#else
     std::lock_guard<std::mutex> lk(Lock);
     WakeLocked(inst);
+#endif
 }
+
+#ifdef LITEV_MP_FUTEX
+}
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <ctime>
+void melonDS::LockstepMP::FutexWait(std::atomic<u32>* a, u32 v, u32 us)
+{
+    timespec ts{(time_t)(us / 1000000), (long)(us % 1000000) * 1000};
+    syscall(SYS_futex, (u32*)a, FUTEX_WAIT_PRIVATE, v, &ts, nullptr, 0);
+}
+void melonDS::LockstepMP::FutexWake(std::atomic<u32>* a) { syscall(SYS_futex, (u32*)a, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0); }
+#elif defined(__APPLE__)
+extern "C" int __ulock_wait(uint32_t op, void* addr, uint64_t value, uint32_t timeout_us);
+extern "C" int __ulock_wake(uint32_t op, void* addr, uint64_t wake_value);
+void melonDS::LockstepMP::FutexWait(std::atomic<u32>* a, u32 v, u32 us) { __ulock_wait(1 /*UL_COMPARE_AND_WAIT*/, (void*)a, v, us); }
+void melonDS::LockstepMP::FutexWake(std::atomic<u32>* a) { __ulock_wake(1, (void*)a, 0); }
+#else
+#error "LITEV_MP_FUTEX: Linux/Android or macOS"
+#endif
+namespace melonDS {
+#endif
 #endif
 
 void LockstepMP::Stop()
@@ -153,6 +181,9 @@ template <typename Pred, typename Need> void LockstepMP::WaitFor(std::unique_loc
     while (!pred() && !Stopped)
     {
 #ifdef LITEV_MP_CLOCKWAKE
+#ifdef LITEV_MP_FUTEX
+        SeqSeen[inst] = SleepSeq[inst].load(std::memory_order_acquire);
+#endif
         need();
         WakeOwn(inst);
         // the registration before a last look at the clocks (a peer stores its clock, then loads WakeAt)
