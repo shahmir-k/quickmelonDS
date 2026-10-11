@@ -2722,6 +2722,9 @@ gxfifo_threaded_top:
         ExecParamCount++;
         if (ExecParamCount != 1) { cyc = 1; goto gxs_add; }
     }
+#ifdef LITEV_GX_UNTIMED
+    if (GXUntimedOn) goto gxs_dispatch;   // untimed: no pipeline delays
+#endif
     {
         const u32 pre = kPre[cmd];
         if (pre & SUB)
@@ -2748,6 +2751,9 @@ gxfifo_threaded_top:
         }
     }
 gxs_add:
+#ifdef LITEV_GX_UNTIMED
+    if (!GXUntimedOn)
+#endif
     AddCycles(cyc);
 gxs_dispatch:
     if (np <= 1) goto *gxsFast[cmd];
@@ -3124,6 +3130,9 @@ gxs_72: // vec test
     goto gxs_end;
 
 gxs_post:   // a handler's trailing AddCycles
+#ifdef LITEV_GX_UNTIMED
+    if (!GXUntimedOn)
+#endif
     AddCycles(cyc);
 gxs_end: ;
 #ifdef LITEV_REMOTE_GX_MODEL
@@ -4406,6 +4415,9 @@ void GPU3D::BulkWords(const u32* words, u32 n) noexcept
 
     if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
     if (NumTestCommands == 0)    GXStat &= ~(1<<0);
+#ifdef LITEV_GX_UNTIMED
+    if (GXUntimedOn) RunUntimed();   // the commands left behind a swap stay queued; else no busy time
+#endif
     CheckFIFODMA();
     CheckFIFOIRQ();
 }
@@ -4518,8 +4530,59 @@ void GPU3D::FinishWork(s32 cycles) noexcept
     GXStat &= ~(1<<27);
 }
 
+#ifdef LITEV_GX_UNTIMED
+const bool GXUntimedOn = [] {
+#if defined(__ANDROID__)
+    return litevGxPropDefault("debug.litev.gxuntimed", 1) != 0;
+#else
+    const char* e = getenv("debug.litev.gxuntimed");
+    return e ? atoi(e) != 0 : true;
+#endif
+}();
+
+// No pending engine time (outside the post-swap window, which the swap command sets):
+// the busy bit drops as soon as the queued commands have run.
+void GPU3D::ZeroTiming() noexcept
+{
+    CycleCount = 0;
+    VertexPipeline = NormalPipeline = PolygonPipeline = 0;
+    VertexSlotCounter = 0; VertexSlotsFree = 1;
+    GXStat &= ~(1<<27);
+    if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
+    if (NumTestCommands == 0)    GXStat &= ~(1<<0);
+}
+
+// Untimed geometry engine: everything queued runs now, at no guest time. Called where the timed
+// engine would advance (slice end, GXSTAT reads), on result reads and when the FIFO would fill.
+// A SWAP_BUFFERS still holds the engine until VBlank and keeps its 325-cycle busy window after.
+void GPU3D::RunUntimed() noexcept
+{
+    const u64 now = NDS.ARM9Timestamp >> NDS.ARM9ClockShift;
+    const s32 elapsed = (s32)(now - Timestamp);
+    Timestamp = now;
+    if (CycleCount == 0 && PipeEmpty()) return;   // idle (ZeroTiming already ran)
+    if (!GeometryEnabled || FlushRequest) return;
+    if (CycleCount > 0 && (CycleCount -= elapsed) > 0) return;   // post-swap busy window
+    if (!PipeEmpty())
+    {
+        if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
+        if (NumTestCommands == 0)    GXStat &= ~(1<<0);
+        CycleCount = -0x40000000;   // the threaded executor drains until the pipe is empty or a swap
+#ifdef LITEV_GXFIFO_THREADED
+        ExecuteCommand();
+#else
+        while (CycleCount <= 0 && !PipeEmpty()) ExecuteCommand();
+#endif
+    }
+    if (!FlushRequest) ZeroTiming();
+}
+#endif
+
 void GPU3D::Run() noexcept
 {
+#ifdef LITEV_GX_UNTIMED
+    if (GXUntimedOn) { RunUntimed(); return; }
+#endif
     if (!GeometryEnabled || FlushRequest ||
         (PipeEmpty() && !(GXStat & (1<<27))))
     {
@@ -4774,6 +4837,9 @@ void GPU3D::WriteToGXFIFO(u32 val) noexcept
 
 u8 GPU3D::Read8(u32 addr) noexcept
 {
+#ifdef LITEV_GX_UNTIMED
+    if (GXUntimedOn) RunUntimed();   // every observation sees all written commands done
+#endif
 #ifdef LITEV_REMOTE_GX_SINK
     if (addr >= 0x04000604 && addr < 0x040006A4) SinkUse("result read", addr);
 #endif
@@ -4816,6 +4882,9 @@ u8 GPU3D::Read8(u32 addr) noexcept
 
 u16 GPU3D::Read16(u32 addr) noexcept
 {
+#ifdef LITEV_GX_UNTIMED
+    if (GXUntimedOn) RunUntimed();   // every observation sees all written commands done
+#endif
 #ifdef LITEV_REMOTE_GX_SINK
     if (addr >= 0x04000604 && addr < 0x040006A4) SinkUse("result read", addr);
 #endif
@@ -4863,6 +4932,9 @@ u16 GPU3D::Read16(u32 addr) noexcept
 
 u32 GPU3D::Read32(u32 addr) noexcept
 {
+#ifdef LITEV_GX_UNTIMED
+    if (GXUntimedOn) RunUntimed();   // every observation sees all written commands done
+#endif
 #ifdef LITEV_REMOTE_GX_SINK
     if (addr >= 0x04000604 && addr < 0x040006A4) SinkUse("result read", addr);
 #endif

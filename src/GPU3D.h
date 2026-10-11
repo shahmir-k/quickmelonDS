@@ -29,6 +29,12 @@
 
 namespace melonDS
 {
+#ifdef LITEV_GX_UNTIMED
+// LITEV_GX_UNTIMED (category B; inspired by DSperate's untimed geometry engine, src/core/gpu/gpu3d.cpp,
+// and DraStic's GXFIFO command timing x0): geometry commands cost no guest time. Runtime switch
+// debug.litev.gxuntimed (headless: the same name as an environment variable), default on.
+extern const bool GXUntimedOn;
+#endif
 class GPU;
 
 struct Vertex
@@ -102,6 +108,10 @@ public:
 
     s32 CyclesToRunFor() const noexcept;
     void Run() noexcept;
+#ifdef LITEV_GX_UNTIMED
+    void RunUntimed() noexcept;
+    void ZeroTiming() noexcept;
+#endif
     void CheckFIFOIRQ() noexcept;
     void CheckFIFODMA() noexcept;
 
