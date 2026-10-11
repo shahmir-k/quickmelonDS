@@ -1206,11 +1206,17 @@ void GPU::StartFrame() noexcept
 #ifdef LITEV_FF_SKIP_PRESENT
     SkipDisplay = SkipThisFrame;
 #endif
-    // a display capture latches at line 0 and writes the drawn picture to VRAM (guest state): draw
-    // every frame that captures. Its 3D is rendered at the previous frame's VCount 215 and its
-    // line-0 sprites at line 262, which also run when a capture is armed by then (StartHBlank);
-    // if it was armed later, do both now (the bank swapped at 192 is still the one 215 renders).
-    if ((CaptureCnt & (1u << 31)) && SkipThisFrame && !LITEV_HEADLESS(Headless))
+    // a display capture latches at line 0 and writes the drawn picture to VRAM (guest state). Draw a
+    // capture frame the schedule skips if it starts a capture run (one-shot: a battle swipe, a fade
+    // source, then shown for many frames) or if the next frame is drawn (it shows this capture).
+    // The other frames of a continuous run (PW menus/title capture every frame) are overwritten
+    // before anything shows them: skipped. A run's end can't be predicted (the bit is set at line
+    // 0 of each frame), so the last capture before it can be up to FrameskipTarget frames old.
+    // Its 3D is rendered at the previous frame's VCount 215 and its line-0 sprites at line 262
+    // under the same rule (CaptureDraw); if it was armed later, do both now.
+    const bool capRunStart = !CaptureLast;
+    CaptureLast = (CaptureCnt & (1u << 31)) != 0;
+    if (CaptureLast && SkipThisFrame && !LITEV_HEADLESS(Headless) && (capRunStart || FrameskipCounter == 0))
     {
         SkipThisFrame = false;
         if (!Tail3DDone
@@ -1294,7 +1300,7 @@ void GPU::StartHBlank(u32 line) noexcept
     else if (VCount == 215)
     {
 #ifdef LITEV_AGGRESSIVE_SKIP
-        Tail3DDone = (!SkipThisFrame || CaptureArmed()) && !(DiagNoDraw & 2);
+        Tail3DDone = (!SkipThisFrame || CaptureDraw()) && !(DiagNoDraw & 2);
         if (Tail3DDone
 #ifdef LITEV_FF_HEADLESS3D
             && !GPU3D.RenderStale   // the render list wasn't prepared (fast-forward unwatched frames)
@@ -1314,7 +1320,7 @@ void GPU::StartHBlank(u32 line) noexcept
 #endif
         // sprites are pre-rendered one scanline in advance
 #ifdef LITEV_AGGRESSIVE_SKIP
-        TailSprDone = (!SkipThisFrame || CaptureArmed())
+        TailSprDone = (!SkipThisFrame || CaptureDraw())
 #ifdef LITEV_SKIP_REPEAT_FRAMES
             && !NextSkipRepeat
 #endif

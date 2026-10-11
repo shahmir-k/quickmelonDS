@@ -635,10 +635,13 @@ public:
     bool SkipDisplay = false;
 #endif
     static constexpr int LITEV_FRAMESKIP_MAX = 9;
-    // the next frame's display capture is armed (it latches at line 0): its 3D (VCount 215) and
-    // line-0 sprites (line 262) are drawn on a skipped frame too; Tail*Done = they were
-    bool CaptureArmed() const noexcept { return (CaptureCnt & (1u << 31)) && !LITEV_HEADLESS(Headless); }
-    bool Tail3DDone = true, TailSprDone = true;
+    // the next frame's display capture is armed (it latches at line 0) and will be drawn (GPU::
+    // StartFrame): it starts a capture run, or it or the frame after is drawn by the schedule. Its 3D
+    // (VCount 215) and line-0 sprites (line 262) are then drawn on a skipped frame too; Tail*Done =
+    // they were. CaptureLast = the current frame latched a capture.
+    bool CaptureDraw() const noexcept
+    { return (CaptureCnt & (1u << 31)) && !LITEV_HEADLESS(Headless) && (!CaptureLast || FrameskipCounter <= 1); }
+    bool Tail3DDone = true, TailSprDone = true, CaptureLast = false;
 
     // Netplay: a console nobody looks at (another player's) draws nothing. Rendering does not
     // feed back into emulation, except through display capture, so once the game has used
