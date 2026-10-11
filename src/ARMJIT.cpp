@@ -17,6 +17,13 @@
 */
 
 #include "ARMJIT.h"
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sched.h>
+#include <unistd.h>
+#endif
 #include "ARM7HLE.h"
 #include "ARM9HLE.h"
 #include "ARMJIT_Memory.h"
@@ -29,6 +36,7 @@
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 #define XXH_STATIC_LINKING_ONLY
 #include "xxhash/xxhash.h"
@@ -387,6 +395,21 @@ INSTANTIATE_SLOWMEM(1)
 
 ARMJIT::~ARMJIT() noexcept
 {
+#ifdef LITEV_JIT_BGEMIT
+    if (BgMode && getenv("LITEV_JITBG_STATS"))
+        fprintf(stderr, "JITBG mode %d: resolves %llu waits %llu steals %llu bound-misses %llu\n", BgMode,
+                (unsigned long long)StatResolves, (unsigned long long)StatWaits, (unsigned long long)StatSteals,
+                (unsigned long long)BgBoundMisses);
+    if (Worker.joinable())
+    {
+        {
+            std::lock_guard<std::mutex> l(SleepLock);
+            WorkerStop = true;
+        }
+        SleepCv.notify_all();
+        Worker.join();
+    }
+#endif
     JitEnableWrite();
     ResetBlockCache();
 }
@@ -746,7 +769,263 @@ ARMJIT::ARMJIT(melonDS::NDS& nds, std::optional<JITArgs> jit) noexcept :
         LiteralOptimizations(jit.has_value() ? jit->LiteralOptimizations : false),
         BranchOptimizations(jit.has_value() ? jit->BranchOptimizations : false),
         FastMemory((jit.has_value() ? jit->FastMemory : false) && ARMJIT_Memory::IsFastMemSupported())
-{}
+{
+#ifdef LITEV_JIT_BGEMIT
+    BgMode = JITCompiler.BgLayout ? JitBgMode() : 0;
+    if (BgMode)
+        Ring.reset(new JitEmitJob*[RingSize]);
+    if (BgMode == 2)
+        Worker = std::thread([this] { WorkerLoop(); });
+#endif
+}
+
+
+#ifdef LITEV_JIT_BGEMIT
+// LITEV_JIT_BGEMIT: env LITEV_JITBG / prop debug.litev.jitbg. 0 = off (the base build's inline
+// emission), 1 = deferred (no worker: the emulator thread emits queued blocks when one is first
+// needed), 2 = worker thread (default), 3 = verify (inline base emission, every captured value
+// compared; diagnosis).
+int JitBgMode()
+{
+    static const int mode = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return __system_property_get("debug.litev.jitbg", b) > 0 ? atoi(b) : 2;
+#else
+        const char* e = getenv("LITEV_JITBG");
+        return e ? atoi(e) : 2;
+#endif
+    }();
+    return mode;
+}
+
+JitBlock::~JitBlock()
+{
+    if (Job) Job->Block = nullptr;
+}
+
+u32 ARMJIT::EntryOff(JitBlock* block) noexcept
+{
+    return block->RealOff ? block->RealOff : JITCompiler.SubEntryOffset(block->EntryPoint);
+}
+
+// EmitLock held. Emits one captured block at the stream's end (the queue's front).
+void ARMJIT::EmitJob(JitEmitJob& j, bool onWorker)
+{
+#ifdef LITEV_JIT_COMPILE_STATS
+    u64 t0 = JitTicks();
+#endif
+    ptrdiff_t at = JITCompiler.GetCodeOffset(), farAt = JITCompiler.OtherCodeRegion;
+    JitEnableWrite();
+    JITCompiler.CurJob = &j;
+    j.Entry = JITCompiler.CompileBlock(j.Cpu, j.Thumb, j.Instrs, j.Count, j.HasMem);
+    JITCompiler.CurJob = nullptr;
+    JitEnableExecute();
+#ifdef LITEV_JIT_LINK
+    j.NumLinkExits = JITCompiler.NumLinkExits;
+    for (int k = 0; k < JITCompiler.NumLinkExits; k++)
+        j.LinkExits[k] = JITCompiler.LinkExits[k];
+#endif
+    if ((u64)(JITCompiler.GetCodeOffset() - at) > j.Bound || (u64)(JITCompiler.OtherCodeRegion - farAt) > j.FarBound)
+    {
+        if (!BgBoundMisses++)
+            Log(LogLevel::Error, "LITEV_JIT_BGEMIT: block %08x emitted %d+%d bytes, bound %u+%u\n", j.Instrs[0].Addr,
+                (int)(JITCompiler.GetCodeOffset() - at), (int)(JITCompiler.OtherCodeRegion - farAt), j.Bound, j.FarBound);
+    }
+#ifdef LITEV_JIT_COMPILE_STATS
+    (onWorker ? JitWorkerTicks : JitStealTicks) += JitTicks() - t0;
+#else
+    (void)onWorker;
+#endif
+    j.Done.store(1, std::memory_order_release);
+}
+
+// EmitLock held: emits the queue's front, if any (queue order = stream order).
+bool ARMJIT::EmitFront(bool onWorker)
+{
+    u32 h = Head.load(std::memory_order_relaxed);
+    if (h == Tail.load(std::memory_order_acquire))
+        return false;
+    EmitJob(*Ring[h], onWorker);
+    PublishedUsed.store(JITCompiler.GetCodeOffset(), std::memory_order_relaxed);
+    PublishedFar.store(JITCompiler.OtherCodeRegion, std::memory_order_relaxed);
+    Head.store(h + 1, std::memory_order_release);
+    if (onWorker && EmuWaiting.load())
+    {
+        std::lock_guard<std::mutex> l(SleepLock);
+        DoneCv.notify_all();
+    }
+    return true;
+}
+
+void ARMJIT::WorkerLoop()
+{
+#if defined(__linux__) || defined(__ANDROID__)
+    pthread_setname_np(pthread_self(), "jitemit");
+#elif defined(__APPLE__)
+    pthread_setname_np("jitemit");
+#endif
+#if defined(__ANDROID__)
+    {
+        // keep off the emulator's core: debug.litev.jitbgcpu = CPU mask (default: every CPU but the
+        // last, where the app pins the emulator thread on the RG DS); 0 = no pinning
+        long n = sysconf(_SC_NPROCESSORS_CONF);
+        unsigned mask = n > 1 && n < 32 ? ((1u << n) - 1) & ~(1u << (n - 1)) : 0;
+        char b[16] = {0};
+        if (__system_property_get("debug.litev.jitbgcpu", b) > 0)
+            mask = (unsigned)strtoul(b, nullptr, 0);
+        if (mask)
+        {
+            cpu_set_t set; CPU_ZERO(&set);
+            for (int c = 0; c < 32; c++) if (mask & (1u << c)) CPU_SET(c, &set);
+            sched_setaffinity(0, sizeof(set), &set);
+        }
+    }
+#endif
+    while (!WorkerStop.load())
+    {
+        if (Head.load() != Tail.load())
+        {
+            std::unique_lock<std::recursive_mutex> e(JITCompiler.EmitLock, std::try_to_lock);
+            if (e.owns_lock())
+                while (EmitFront(true)) {}
+            else
+                std::this_thread::yield();
+            continue;
+        }
+        std::unique_lock<std::mutex> l(SleepLock);
+        WorkerSleeping.store(true);
+        if (Head.load() == Tail.load() && !WorkerStop.load())
+            SleepCv.wait(l);
+        WorkerSleeping.store(false);
+    }
+}
+
+// The emulator thread needs j's code: emit queued blocks itself (in queue order) until j is done,
+// or wait while the worker is emitting.
+void ARMJIT::WaitJob(JitEmitJob& j)
+{
+    static const bool noSteal = getenv("LITEV_JITBG_NOSTEAL") != nullptr;   // diagnosis: emulator-thread cost alone
+    if (!j.Done.load(std::memory_order_acquire))
+        StatWaits++;
+    while (!j.Done.load(std::memory_order_acquire))
+    {
+        if (noSteal && BgMode == 2)
+        {
+            // sleep until the worker has emitted it (counts no emulator-thread instructions)
+            std::unique_lock<std::mutex> l(SleepLock);
+            EmuWaiting.store(true);
+            if (!j.Done.load())
+                DoneCv.wait_for(l, std::chrono::milliseconds(1));
+            EmuWaiting.store(false);
+            continue;
+        }
+        std::unique_lock<std::recursive_mutex> e(JITCompiler.EmitLock, std::try_to_lock);
+        if (e.owns_lock())
+        {
+            while (!j.Done.load(std::memory_order_relaxed) && EmitFront(false))
+                StatSteals++;
+        }
+        else
+            std::this_thread::yield();
+    }
+}
+
+// Everything queued is emitted when this returns.
+void ARMJIT::DrainEmits()
+{
+    std::lock_guard<std::recursive_mutex> e(JITCompiler.EmitLock);
+    while (EmitFront(false)) {}
+}
+
+// Emulator thread: point the block's entry stub (and its lookup entry) at the code, link its exits.
+void ARMJIT::FinalizeJob(JitEmitJob& j)
+{
+    if (j.Finalized)
+        return;
+    j.Finalized = true;
+    const u32 realOff = JITCompiler.SubEntryOffset(j.Entry);
+    JitEnableWrite();
+    JITCompiler.PatchEntryStub(j.StubOff, realOff);
+    JitEnableExecute();
+    JitBlock* block = j.Block;
+    FreeJobs.push_back(&j);   // nothing reads it after this (its stub now jumps to the code)
+    if (!block)
+        return;
+    j.Block = nullptr;
+    block->Job = nullptr;
+    block->RealOff = realOff;
+#ifdef LITEV_JIT_LINK
+    block->NumOutgoing = j.NumLinkExits;
+    for (int k = 0; k < j.NumLinkExits; k++)
+        block->Outgoing[k] = j.LinkExits[k];
+#endif
+    auto& map = block->Num == 0 ? JitBlocks9 : JitBlocks7;
+    auto it = map.find(block->StartAddr);
+    if (it == map.end() || it->second != block)
+        return;   // retired: a restore links it
+    u64* entry = &FastBlockLookupRegions[block->StartAddrLocal >> 27][(block->StartAddrLocal & 0x7FFFFFF) / 2];
+    u64 tag = ((u64)block->StartAddr | block->Num) << 32;
+    if (*entry == (tag | j.StubOff))
+        *entry = tag | realOff;
+#ifdef LITEV_JIT_LINK
+    LinkBlockOutgoing(block);
+#endif
+}
+
+void ARMJIT::ProcessDone()
+{
+    u32 h = Head.load(std::memory_order_acquire);
+    if (Finalized == h)
+        return;
+#if defined(__aarch64__)
+    asm volatile("isb" ::: "memory");   // code another core wrote is about to run here
+#endif
+    for (; Finalized < h; Finalized++)
+        if (Ring[Finalized]->Id == Finalized)   // (else finalized already, by PendingResolve, and reused)
+            FinalizeJob(*Ring[Finalized]);
+}
+
+// Called from a block's entry stub (JIT context) when its code isn't linked in yet.
+JitBlockEntry ARMJIT::PendingResolve(u32 id) noexcept
+{
+    StatResolves++;
+    JitEmitJob& j = *Ring[id];
+    WaitJob(j);
+#if defined(__aarch64__)
+    asm volatile("isb" ::: "memory");
+#endif
+    FinalizeJob(j);
+    return j.Entry;
+}
+
+// The base build resets the block cache when fewer than 16 KB (8 KB far) are left before it emits
+// a block. Same rule here, at the same point (this block's compile), on the stream as the
+// emitter lays it out (queue order). Only when the queued blocks' code bounds don't rule it out
+// does it wait for them to be emitted, so the decision never depends on the worker's progress.
+void ARMJIT::CheckCodeSpace(int count)
+{
+    const s64 bound = 1024 + 512 * count;
+    const s64 mainEnd = JITCompiler.JitMemMainSize, farEnd = (s64)JITCompiler.JitMemMainSize + JITCompiler.JitMemSecondarySize;
+    bool reset = JITCompiler.StubArenaEnd - JITCompiler.StubCursor < 16;
+    // the stream's end after job e-1 (or later: only more conservative), plus bounds of jobs e..
+    u32 e = Head.load(std::memory_order_acquire), t = Tail.load(std::memory_order_relaxed);
+    s64 used = PublishedUsed.load(std::memory_order_relaxed), far = PublishedFar.load(std::memory_order_relaxed);
+    u64 qb = e < t ? EnqBound - Ring[e]->BoundPrefix : 0, qf = e < t ? EnqFarBound - Ring[e]->FarBoundPrefix : 0;
+    bool sure = mainEnd - used - (s64)qb - bound >= 1024 * 16 && farEnd - far - (s64)qf - 1536 * 32 >= 1024 * 8;
+    if (!reset && !sure)
+    {
+        std::lock_guard<std::recursive_mutex> l(JITCompiler.EmitLock);
+        while (EmitFront(false)) {}
+        reset = mainEnd - JITCompiler.GetCodeOffset() < 1024 * 16 || farEnd - JITCompiler.OtherCodeRegion < 1024 * 8;
+    }
+    if (reset)
+    {
+        Log(LogLevel::Debug, "JIT memory full, resetting...\n");
+        ResetBlockCache();
+    }
+}
+#endif
 
 void ARMJIT::RetireJitBlock(JitBlock* block) noexcept
 {
@@ -778,8 +1057,54 @@ static inline void LiteV_UpdatePendingPeak(size_t p9, size_t p7) noexcept
 #endif
 }
 
+#ifdef LITEV_JIT_BGEMIT
+// part (a) of LinkBlock: this block's own exits (a background-emitted block gets them when its
+// code is finalized)
+void ARMJIT::LinkBlockOutgoing(JitBlock* block) noexcept
+{
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    struct PatchBatch { Compiler& c; PatchBatch(Compiler& c) : c(c) { c.BeginPatchBatch(); } ~PatchBatch() { c.EndPatchBatch(); } } patchBatch(JITCompiler);
+#endif
+    auto& blocks  = block->Num == 0 ? JitBlocks9    : JitBlocks7;
+    auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
+    JitEnableWrite();
+    // (a) resolve this block's own outgoing links: target compiled -> patch now and
+    //     register in the target's incoming list; else park in pending.
+    for (int i = 0; i < block->NumOutgoing; i++)
+    {
+        const OutgoingLink& link = block->Outgoing[i];
+        auto it = blocks.find(link.TargetAddr);
+        if (it != blocks.end() && it->second->EntryPoint)   // (none yet: loaded from a savestate)
+        {
+            JitBlock* target = it->second;
+            u32 targetOff = EntryOff(target);
+            JITCompiler.PatchLinkSite(link.PatchOffset, targetOff);
+            target->Incoming.Add(LinkSite{block->StartAddr, link.PatchOffset});
+            LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
+        }
+        else
+        {
+#ifdef LITEV_JIT_FLATMAPS
+            pending.insert(link.TargetAddr, LinkSite{block->StartAddr, link.PatchOffset});
+#else
+            pending.insert({link.TargetAddr, LinkSite{block->StartAddr, link.PatchOffset}});
+#endif
+        }
+    }
+    JitEnableExecute();
+}
+#endif
+
 void ARMJIT::LinkBlock(JitBlock* block) noexcept
 {
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    struct PatchBatch { Compiler& c; PatchBatch(Compiler& c) : c(c) { c.BeginPatchBatch(); } ~PatchBatch() { c.EndPatchBatch(); } } patchBatch(JITCompiler);
+#endif
+#ifdef LITEV_JIT_BGEMIT
+    LinkBlockOutgoing(block);
+    auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
+    JitEnableWrite();
+#else
     auto& blocks  = block->Num == 0 ? JitBlocks9    : JitBlocks7;
     auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
 
@@ -808,9 +1133,14 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
 #endif
         }
     }
+#endif
 
     // (b) drain pending links waiting on THIS block's start address.
+#ifdef LITEV_JIT_BGEMIT
+    u32 entryOff = EntryOff(block);
+#else
     u32 entryOff = JITCompiler.SubEntryOffset(block->EntryPoint);
+#endif
 #ifdef LITEV_JIT_FLATMAPS
     pending.drain(block->StartAddr, [&](const LinkSite& site)
     {
@@ -837,6 +1167,9 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
 
 void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
 {
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    struct PatchBatch { Compiler& c; PatchBatch(Compiler& c) : c(c) { c.BeginPatchBatch(); } ~PatchBatch() { c.EndPatchBatch(); } } patchBatch(JITCompiler);
+#endif
     auto& blocks  = block->Num == 0 ? JitBlocks9    : JitBlocks7;
     auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
 
@@ -1007,6 +1340,7 @@ u64 JitCompileCount = 0;   // blocks compiled so far (headless LITEV_FRAME_MS)
 #ifdef LITEV_JIT_COMPILE_STATS
 // time per compile phase in timer ticks (JitTicks(); JitTicksPerSec), see JitPhase
 u64 JitCompileTicks[JitPhase_Count] = {};
+std::atomic<u64> JitWorkerTicks{0}, JitStealTicks{0};   // LITEV_JIT_BGEMIT emission: worker / emulator thread
 #define JIT_PHASE(p) do { u64 t_ = JitTicks(); JitCompileTicks[p] += t_ - jitT; jitT = t_; } while (0)
 #else
 #define JIT_PHASE(p) do {} while (0)
@@ -1018,6 +1352,10 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
 #ifdef LITEV_JIT_COMPILE_STATS
     u64 jitT = JitTicks();
 #endif
+#ifdef LITEV_JIT_BGEMIT
+    if (BgMode)
+        ProcessDone();   // link in what the worker finished
+#endif
     bool thumb = cpu->CPSR & 0x20;
 
     u32 blockAddr = cpu->R[15] - (thumb ? 2 : 4);
@@ -1028,6 +1366,10 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
         ResetBlockCache();
         JitEnableExecute();
     }
+#ifdef LITEV_JIT_BGEMIT
+    else if (BgMode)
+        CheckCodeSpace(MaxBlockSize);   // host room for a block compiled from a savestate's profile below
+#endif
 
     u32 localAddr = LocaliseCodeAddress(cpu->Num, blockAddr);
     if (!localAddr)
@@ -1055,7 +1397,11 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
 
             u64* entry = &FastBlockLookupRegions[localAddr >> 27][(localAddr & 0x7FFFFFF) / 2];
             *entry = ((u64)blockAddr | cpu->Num) << 32;
+#ifdef LITEV_JIT_BGEMIT
+            *entry |= EntryOff(block);
+#else
             *entry |= JITCompiler.SubEntryOffset(block->EntryPoint);
+#endif
 #ifdef LITEV_JIT_LINK
             if (fromState)
                 LinkBlock(block);
@@ -1526,6 +1872,10 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
     {
         if (prevBlock)
             delete prevBlock;
+#ifdef LITEV_JIT_BGEMIT
+        if (BgMode)
+            CheckCodeSpace(i);   // the base build's code-full reset, decided here
+#endif
 
         block = new JitBlock(cpu->Num, i, numAddressRanges, numLiterals);
         block->LiteralHash = literalHash;
@@ -1565,6 +1915,82 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
         block->A9HookAt = a9HookAt;
 #endif
 
+        JITCompiler.LogicalSize += 256 + 64 * (u64)i;   // (decided here: a background emission runs later)
+
+#ifdef LITEV_JIT_BGEMIT
+        if (BgMode)
+        {
+            // capture what the emission reads (and make its CPU-field changes, as the base build
+            // does here), give the block an entry stub, queue the emission
+            if (FreeJobs.empty())
+            {
+                JobStore.emplace_back(new JitEmitJob);   // default-init: no 4 KB zeroing
+                FreeJobs.push_back(JobStore.back().get());
+            }
+            JitEmitJob& job = *FreeJobs.back();
+            FreeJobs.pop_back();
+            job.Id = NextJobId++;
+            job.Done.store(0, std::memory_order_relaxed);
+            job.Finalized = false;
+            job.Entry = nullptr;
+            job.NumLinkExits = 0;
+            job.Thumb = thumb;
+            job.HasMem = hasMemoryInstr;
+            job.Count = i;
+            memcpy(job.Instrs, instrs, i * sizeof(FetchedInstr));
+            JITCompiler.CaptureEmitInputs(cpu, job);
+            job.StubOff = JITCompiler.WriteEntryStub(job.Id, cpu->Num);
+            assert(job.StubOff);   // CheckCodeSpace reset the cache when the arena was full
+            job.Block = block;
+            block->Job = &job;
+            block->EntryPoint = JITCompiler.AddEntryOffset(job.StubOff);
+            if (BgMode == 3)
+            {
+                // verify: the base build's emission, inline, comparing every read with the capture
+                std::lock_guard<std::recursive_mutex> lk(JITCompiler.EmitLock);
+                JITCompiler.VerifyJob = &job;
+                JitEnableWrite();
+                job.Entry = JITCompiler.CompileBlock(cpu, thumb, instrs, i, hasMemoryInstr);
+                JitEnableExecute();
+                JITCompiler.VerifyJob = nullptr;
+                for (int k = 0; k < job.NumSnaps; k++)
+                    if (!job.Snaps[k].Used)
+                    {
+                        fprintf(stderr, "LITEV_JITBG_VERIFY: frame %u: captured %d at %08x never read (block %08x num %d)\n", NDS.NumFrames,
+                                job.Snaps[k].Kind, job.Snaps[k].Addr, blockAddr, cpu->Num);
+                        for (int q = 0; q < job.NumSnaps; q++)
+                            fprintf(stderr, "  snap kind %d idx %u a2 %08x state %d used %d\n", job.Snaps[q].Kind, job.Snaps[q].Addr, job.Snaps[q].A2, job.Snaps[q].State, job.Snaps[q].Used);
+                        for (int q = 0; q < i; q++)
+                            fprintf(stderr, "  %08x %08x kind %d bf %02x\n", instrs[q].Addr, instrs[q].Instr, instrs[q].Info.Kind, instrs[q].BranchFlags);
+                        abort();
+                    }
+#ifdef LITEV_JIT_LINK
+                job.NumLinkExits = JITCompiler.NumLinkExits;
+                for (int k = 0; k < JITCompiler.NumLinkExits; k++)
+                    job.LinkExits[k] = JITCompiler.LinkExits[k];
+#endif
+                job.Done.store(1);
+            }
+            job.BoundPrefix = EnqBound; job.FarBoundPrefix = EnqFarBound;
+            EnqBound += job.Bound; EnqFarBound += job.FarBound;
+            Ring[job.Id] = &job;
+            Tail.store(job.Id + 1);
+            if (BgMode == 3)
+                Head.store(job.Id + 1);   // verify: emitted already
+            if (BgMode == 2 && WorkerSleeping.load())
+            {
+                std::lock_guard<std::mutex> l(SleepLock);
+                SleepCv.notify_one();
+            }
+            JIT_PHASE(JitPhase_Emit);
+#ifdef LITEV_JIT_LINK
+            block->NumOutgoing = 0;
+            block->Incoming.Clear();
+#endif
+        }
+        else
+#endif
+        {
         JitEnableWrite();
         block->EntryPoint = JITCompiler.CompileBlock(cpu, thumb, instrs, i, hasMemoryInstr);
         JitEnableExecute();
@@ -1578,6 +2004,7 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
             block->Outgoing[j] = JITCompiler.LinkExits[j];
         block->Incoming.Clear();
 #endif
+        }
 
         JIT_DEBUGPRINT("block start %p\n", block->EntryPoint);
     }
@@ -1620,7 +2047,11 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
 
     u64* entry = &FastBlockLookupRegions[(localAddr >> 27)][(localAddr & 0x7FFFFFF) / 2];
     *entry = ((u64)blockAddr | cpu->Num) << 32;
+#ifdef LITEV_JIT_BGEMIT
+    *entry |= EntryOff(block);
+#else
     *entry |= JITCompiler.SubEntryOffset(block->EntryPoint);
+#endif
 
     JIT_PHASE(JitPhase_Insert);
 #ifdef LITEV_JIT_LINK
@@ -1629,6 +2060,10 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
     LinkBlock(block);
 #endif
     JIT_PHASE(JitPhase_Link);
+#ifdef LITEV_JIT_BGEMIT
+    if (BgMode == 3)
+        ProcessDone();
+#endif
     return nullptr;
 }
 
@@ -1881,6 +2316,15 @@ template void ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWR
 void ARMJIT::ResetBlockCache() noexcept
 {
     Log(LogLevel::Debug, "Resetting JIT block cache...\n");
+#ifdef LITEV_JIT_BGEMIT
+    // nothing may still be emitting into the code memory being wiped
+    if (BgMode)
+    {
+        DrainEmits();
+        JitEnableWrite();   // (Apple: emitting left this thread in execute mode; callers expect write)
+    }
+    std::lock_guard<std::recursive_mutex> bglk(JITCompiler.EmitLock);
+#endif
 #ifdef LITEV_JIT_IDLE2
     NDS.ARM9.Idle2Reset(); // wait-loop proofs live exactly as long as the compiled blocks
 #endif
@@ -1937,6 +2381,22 @@ void ARMJIT::ResetBlockCache() noexcept
 #endif
 
     JITCompiler.Reset();
+#ifdef LITEV_JIT_BGEMIT
+    // every block is gone (their destructors detached their jobs); the stubs are wiped
+    PublishedUsed.store(JITCompiler.GetCodeOffset());
+    PublishedFar.store(JITCompiler.OtherCodeRegion);
+    Head.store(0); Tail.store(0);
+    Finalized = 0;
+    EnqBound = EnqFarBound = 0;
+    NextJobId = 0;
+    FreeJobs.clear();
+    for (auto& jp : JobStore)
+    {
+        jp->Block = nullptr;
+        jp->Id = ~0u;
+        FreeJobs.push_back(jp.get());
+    }
+#endif
 
 #if defined(LITEV_JIT_LINK) && defined(LITEV_SHADOW_ASSERT)
     if (!PendingLinks9.empty() || !PendingLinks7.empty()
@@ -2006,11 +2466,26 @@ void ARMJIT::CompileFromProfile(JitBlock* block) noexcept
     const MemRegion codeMem = cpu->CodeMem;
     const s32 regionCodeCycles = NDS.ARM9.RegionCodeCycles;
 
-    JITCompiler.CountLogical = false;
+#ifdef LITEV_JIT_BGEMIT
+    // inline, after the queued blocks (the stream's order); the same code a background emission
+    // of these inputs gives (a block from a savestate needs its code now: it is about to run)
+    std::unique_lock<std::recursive_mutex> emitLock(JITCompiler.EmitLock, std::defer_lock);
+    if (BgMode)
+    {
+        emitLock.lock();
+        while (EmitFront(false)) {}
+    }
+#endif
     JitEnableWrite();
     block->EntryPoint = JITCompiler.CompileBlock(cpu, block->Thumb, instrs, n, block->HasMemInstr);
     JitEnableExecute();
-    JITCompiler.CountLogical = true;
+#ifdef LITEV_JIT_BGEMIT
+    if (BgMode)
+    {
+        PublishedUsed.store(JITCompiler.GetCodeOffset(), std::memory_order_relaxed);
+        PublishedFar.store(JITCompiler.OtherCodeRegion, std::memory_order_relaxed);
+    }
+#endif
 
     cpu->R[15] = r15; cpu->CodeRegion = codeRegion; cpu->CodeCycles = codeCycles; cpu->CodeMem = codeMem;
     cpu->DataRegion = dataRegion; cpu->DataCycles = dataCycles;

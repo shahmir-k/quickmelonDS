@@ -405,7 +405,11 @@ bool Compiler::CP15InlineOK()
 {
     if (!Cp15InlineOn || Num != 0 || Thumb || NDS.ConsoleType != 0)
         return false;
+#ifdef LITEV_JIT_BGEMIT
+    if (((CurJob ? CurJob->CPSR : CurCPU->CPSR) & 0x1F) == 0x10)
+#else
     if ((CurCPU->CPSR & 0x1F) == 0x10)
+#endif
         return false;
     u32 instr = CurInstr.Instr;
     if (((instr >> 8) & 0xF) != 15)
@@ -905,6 +909,21 @@ Compiler::Compiler(melonDS::NDS& nds) : Arm64Gen::ARM64XEmitter(), NDS(nds)
 
     JitMemMainSize -= GetCodeOffset();
     JitMemMainSize -= JitMemSecondarySize;
+#ifdef LITEV_JIT_BGEMIT
+    // background emission: two arenas after the far region, written only by the emulator
+    // thread: block entry stubs and DirectPatch guard stubs (they used to be appended to the
+    // block stream; the stream is now the emitter's alone, so its layout is deterministic)
+    BgLayout = JitBgMode() != 0;
+    if (BgLayout)
+    {
+        const u32 stubArena = 2 * 1024 * 1024, dpArena = 2 * 1024 * 1024;
+        JitMemMainSize -= stubArena + dpArena;
+        StubArenaStart = JitMemMainSize + JitMemSecondarySize;
+        StubArenaEnd = StubArenaStart + stubArena;
+        DPArenaStart = StubArenaEnd;
+        DPArenaEnd = DPArenaStart + dpArena;
+    }
+#endif
 
     SetCodeBase((u8*)GetRWPtr(), (u8*)GetRXPtr());
 }
@@ -1757,7 +1776,7 @@ void Compiler::EmitTailStubs()
 void Compiler::SaveCompState(CompState& s)
 {
     s.RegCache = RegCache;
-    s.CurInstr = CurInstr; s.R15 = R15; s.CodeRegion = CodeRegion; s.ConstantCycles = ConstantCycles;
+    s.CurInstr = CurInstr; s.CurIdx = CurIdx; s.R15 = R15; s.CodeRegion = CodeRegion; s.ConstantCycles = ConstantCycles;
     s.Exit = Exit; s.IrregularCycles = IrregularCycles; s.CPSRDirty = CPSRDirty;
 #ifdef LITEV_JIT_CYCLE_BATCH
     s.PendingCycles = PendingCycles; s.DeferCycles = DeferCycles;
@@ -1786,7 +1805,7 @@ void Compiler::SaveCompState(CompState& s)
 void Compiler::LoadCompState(const CompState& s)
 {
     RegCache = s.RegCache;
-    CurInstr = s.CurInstr; R15 = s.R15; CodeRegion = s.CodeRegion; ConstantCycles = s.ConstantCycles;
+    CurInstr = s.CurInstr; CurIdx = s.CurIdx; R15 = s.R15; CodeRegion = s.CodeRegion; ConstantCycles = s.ConstantCycles;
     Exit = s.Exit; IrregularCycles = s.IrregularCycles; CPSRDirty = s.CPSRDirty;
 #ifdef LITEV_JIT_CYCLE_BATCH
     PendingCycles = s.PendingCycles; DeferCycles = s.DeferCycles;
@@ -1814,6 +1833,9 @@ void Compiler::LoadCompState(const CompState& s)
 
 void Compiler::SaveCpuJumpFields(CpuJumpFields& f)
 {
+#ifdef LITEV_JIT_BGEMIT
+    if (CurJob) return;   // a captured block's emission never touches the CPU
+#endif
     f.CodeRegion = CurCPU->CodeRegion; f.CodeCycles = CurCPU->CodeCycles;
     f.RegionCodeCycles = Num == 0 ? ((ARMv5*)CurCPU)->RegionCodeCycles : 0;
     f.CodeMem = CurCPU->CodeMem; f.R15 = CurCPU->R[15];
@@ -1821,6 +1843,9 @@ void Compiler::SaveCpuJumpFields(CpuJumpFields& f)
 
 void Compiler::LoadCpuJumpFields(const CpuJumpFields& f)
 {
+#ifdef LITEV_JIT_BGEMIT
+    if (CurJob) return;
+#endif
     CurCPU->CodeRegion = f.CodeRegion; CurCPU->CodeCycles = f.CodeCycles;
     if (Num == 0)
         ((ARMv5*)CurCPU)->RegionCodeCycles = f.RegionCodeCycles;
@@ -2072,11 +2097,55 @@ void Compiler::PatchLinkSite(u32 rxOffset, u32 targetRxOffset)
     assert(delta >= -(1 << 27) && delta < (1 << 27));
     u32 instr = 0x14000000u | ((u32)((delta >> 2)) & 0x03FFFFFFu);
 
+#ifdef LITEV_JIT_BGEMIT
+    u8* rwbase = BgLayout ? RWBase : GetWriteableRWPtr() - GetCodeOffset();   // (the cursor may be moving)
+#else
     u8* rwbase = GetWriteableRWPtr() - GetCodeOffset();   // m_rwbase
+#endif
     *(u32*)(rwbase + rxOffset) = instr;
 
     u8* rxptr = GetRXBase() + rxOffset;
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    if (PatchBatchDepth)
+    {
+        if (NumPatchAddrs == MaxPatchAddrs)
+            FlushPatchBatch();
+        PatchAddrs[NumPatchAddrs++] = rxptr;
+        return;
+    }
+#endif
     __builtin___clear_cache((char*)rxptr, (char*)rxptr + 4);
+}
+#endif
+
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+// One cache-maintenance sequence for all the link sites a link/unlink patched: a line clean
+// and invalidate per site, but the barriers (DSB, DSB, ISB) once, not per 4-byte patch.
+// Nothing runs the patched code before the batch ends (the emulator thread is in C++).
+void Compiler::FlushPatchBatch()
+{
+    if (!NumPatchAddrs)
+        return;
+#if defined(__aarch64__) && !defined(__APPLE__) && !defined(_WIN32)
+    u64 ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    const u64 dsize = 4 << ((ctr >> 16) & 0xf), isize = 4 << (ctr & 0xf);
+    if (!((ctr >> 28) & 1))   // IDC clear: clean the data lines
+        for (int i = 0; i < NumPatchAddrs; i++)
+            __asm__ volatile("dc civac, %0" : : "r"((u64)PatchAddrs[i] & ~(dsize - 1)) : "memory");
+    __asm__ volatile("dsb ish" : : : "memory");
+    if (!((ctr >> 29) & 1))   // DIC clear: invalidate the instruction lines
+    {
+        for (int i = 0; i < NumPatchAddrs; i++)
+            __asm__ volatile("ic ivau, %0" : : "r"((u64)PatchAddrs[i] & ~(isize - 1)) : "memory");
+        __asm__ volatile("dsb ish" : : : "memory");
+    }
+    __asm__ volatile("isb" : : : "memory");
+#else
+    for (int i = 0; i < NumPatchAddrs; i++)
+        __builtin___clear_cache((char*)PatchAddrs[i], (char*)PatchAddrs[i] + 4);
+#endif
+    NumPatchAddrs = 0;
 }
 #endif
 
@@ -2089,7 +2158,11 @@ void Compiler::DirectPatchWriteBranch(u32 rxOffset, u32 targetRxOffset)
     assert(delta >= -(1 << 27) && delta < (1 << 27));
     u32 instr = 0x14000000u | ((u32)((delta >> 2)) & 0x03FFFFFFu);
 
+#ifdef LITEV_JIT_BGEMIT
+    u8* rwbase = BgLayout ? RWBase : GetWriteableRWPtr() - GetCodeOffset();   // (the cursor may be moving)
+#else
     u8* rwbase = GetWriteableRWPtr() - GetCodeOffset();   // m_rwbase
+#endif
     *(u32*)(rwbase + rxOffset) = instr;
 
     u8* rxptr = GetRXBase() + rxOffset;
@@ -2122,16 +2195,33 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
     // again, so the stubs filled the code memory (Sims 3: 20 of 29 MB by 3.4 min) and reset the
     // block cache at a moment that depended on this host history (a savestate starts it over).
     constexpr u32 kStubBytes = 128;
-    const ptrdiff_t high = GetCodeOffset();
     const bool reuse = e.stubOff != 0;
-    if (!reuse && (ptrdiff_t)JitMemMainSize - high < 4096) { e.hitCount = 0; return; }
+#ifdef LITEV_JIT_BGEMIT
+    // its own arena (the block stream belongs to the emitter, which may be another thread)
+    // host-only: when the emitter is busy, promote later
+    std::unique_lock<std::recursive_mutex> lk(EmitLock, std::try_to_lock);
+    if (!lk.owns_lock()) { e.hitCount = 0; return; }
+    if (BgLayout && !reuse && DPArenaEnd - DPCursor < (ptrdiff_t)kStubBytes) { e.hitCount = 0; return; }
+#endif
+    const ptrdiff_t high = GetCodeOffset();
+    if (!reuse && (ptrdiff_t)JitMemMainSize - high < 4096
+#ifdef LITEV_JIT_BGEMIT
+        && !BgLayout
+#endif
+        ) { e.hitCount = 0; return; }
 
     NDS.JIT.JitEnableWrite();
 
     if (reuse)
         SetCodePtrUnsafe(e.stubOff);
     else
+    {
+#ifdef LITEV_JIT_BGEMIT
+        if (BgLayout)
+            SetCodePtrUnsafe(DPCursor);
+#endif
         AlignCode16();
+    }
     u32 stubOff = (u32)((u8*)GetRXPtr() - GetRXBase());
 
     void* dispatcher = DispatcherEntry[num];
@@ -2226,6 +2316,13 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
 
     assert(GetCodeOffset() - (ptrdiff_t)stubOff <= (ptrdiff_t)kStubBytes);
     FlushIcacheSection(GetRXBase() + stubOff, GetRXBase() + stubOff + kStubBytes);
+#ifdef LITEV_JIT_BGEMIT
+    if (BgLayout && !reuse)
+        DPCursor = (ptrdiff_t)stubOff + kStubBytes;
+    if (BgLayout)
+        SetCodePtrUnsafe(high);
+    else
+#endif
     SetCodePtrUnsafe(reuse ? high : (ptrdiff_t)stubOff + kStubBytes);
 
     // --- patch the exit-site B -> the stub, then flip back to executable ---
@@ -2270,6 +2367,9 @@ void Compiler::DirectPatchDemote(u32 num, u32 site)
 // (single-block invalidations ~4/3400f); over-reverting is harmless (sites re-promote).
 void Compiler::DirectPatchRevertAll()
 {
+#ifdef LITEV_JIT_BGEMIT
+    std::lock_guard<std::recursive_mutex> lk(EmitLock);
+#endif
     bool any = false;
     NDS.JIT.JitEnableWrite();
     for (u32 num = 0; num < 2; num++)
@@ -2335,7 +2435,29 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
         // Candidate wait-loop back-edge: while the site's enable byte is set, exit to C++
         // with IdleLoop = 2 (ARMv5::Idle2Handle proves/skips the loop), exactly like the
         // classic idle branch below.
+#ifdef LITEV_JIT_BGEMIT
+        // registered when the block was captured (program order, like the base build's emission)
+        u8* en;
+        if (CurJob)
+        {
+            JitEmitJob::Snap* sn = EmitSnap(JitEmitJob::SnapIdle2, CurIdx);
+            if (!sn) EmitSnapMissing("idle2", CurInstr.Addr);
+            en = sn->P;
+        }
+        else
+        {
+            en = ((ARMv5*)CurCPU)->Idle2EnableByte(CurInstr.Addr | (Thumb ? 1 : 0));
+            if (VerifyJob)
+            {
+                JitEmitJob::Snap* sn = VerifyJob->Find(JitEmitJob::SnapIdle2, CurIdx);
+                if (!sn || sn->P != en) VerifyFail("idle2", CurInstr.Addr, 0, 0);
+                sn->Used = 1;
+            }
+        }
+        if (en)
+#else
         if (u8* en = ((ARMv5*)CurCPU)->Idle2EnableByte(CurInstr.Addr | (Thumb ? 1 : 0)))
+#endif
         {
             MOVP2R(X16, en);
             LDRB(INDEX_UNSIGNED, W17, X16, 0);
@@ -2449,8 +2571,251 @@ bool Compiler::R15LiteralLoadFolds(CompileFunc comp)
         imm = (in & 0xF) | ((in >> 4) & 0xF0);
     }
     u32 addr = R15 + imm * ((in & (1 << 23)) ? 1 : -1);
+#ifdef LITEV_JIT_BGEMIT
+    if (CurJob)
+    {
+        JitEmitJob::Snap* sn = CurJob->Find(JitEmitJob::SnapLit, CurIdx, addr);
+        if (!sn) EmitSnapMissing("r15 literal", addr);
+        return sn->State == 1;
+    }
+#endif
     return NDS.JIT.InvalidLiterals.Find(NDS.JIT.LocaliseCodeAddress(Num, addr)) == -1;
 }
+#endif
+
+
+#ifdef LITEV_JIT_BGEMIT
+// A block's entry stub (16 bytes in the stub arena): B +4 | MOVZ W17,id | MOVK W17,id>>16 | B thunk.
+// The first word becomes B <code> once the code exists (the emulator thread patches it, then runs
+// it); until then the thunk asks ARMJIT::PendingResolve for the code, waiting for it if needed.
+u32 Compiler::WriteEntryStub(u32 jobId, u32 num)
+{
+    // written for every id at the cache reset (WriteAllEntryStubs): stub k belongs to job k
+    (void)num;
+    if (StubArenaEnd - StubCursor < 16)
+        return 0;
+    u32 off = (u32)StubCursor;
+    assert(off == StubArenaStart + 16 * jobId);
+    StubCursor += 16;
+    return off;
+}
+
+void Compiler::WriteAllEntryStubs()
+{
+    u32 thunkOff = (u32)((u8*)PendingThunk[0] - GetRXBase());
+    for (u32 off = StubArenaStart, id = 0; off + 16 <= StubArenaEnd; off += 16, id++)
+    {
+        u32* w = (u32*)(RWBase + off);
+        w[0] = 0x14000001u;
+        w[1] = 0x52800000u | ((id & 0xFFFF) << 5) | 17;
+        w[2] = 0x72A00000u | ((id >> 16) << 5) | 17;
+        w[3] = 0x14000000u | ((u32)((s32)(thunkOff - (off + 12)) >> 2) & 0x03FFFFFFu);
+    }
+    FlushIcacheSection(GetRXBase() + StubArenaStart, GetRXBase() + StubArenaEnd);
+}
+
+void Compiler::PatchEntryStub(u32 stubOff, u32 targetOff)
+{
+    *(u32*)(RWBase + stubOff) = 0x14000000u | ((u32)((s32)(targetOff - stubOff) >> 2) & 0x03FFFFFFu);
+    FlushIcacheSection(GetRXBase() + stubOff, GetRXBase() + stubOff + 4);
+}
+
+static JitBlockEntry LiteV_PendingResolve(ARMJIT* jit, u32 id)
+{
+    return jit->PendingResolve(id);
+}
+
+// Entered from an entry stub (W17 = job id) wherever a block entry can be: everything a block
+// entry may find live is kept (x0-x18, x30, NZCV; the rest is callee-saved).
+void* Compiler::Gen_PendingThunk(u32 num)
+{
+    (void)num;
+    AlignCode16();
+    void* res = GetRXPtr();
+    SUB(SP, SP, 176);
+    for (int r = 0; r < 18; r += 2)
+        STP(INDEX_SIGNED, (ARM64Reg)(X0 + r), (ARM64Reg)(X0 + r + 1), SP, r * 8);
+    STP(INDEX_SIGNED, X18, X30, SP, 144);
+    MRS(X0, FIELD_NZCV);
+    STR(INDEX_UNSIGNED, X0, SP, 160);
+    MOVP2R(X0, &NDS.JIT);
+    MOV(W1, W17);
+    QuickCallFunction(X2, LiteV_PendingResolve);
+    STR(INDEX_UNSIGNED, X0, SP, 128);     // into X16's slot: X16 = the code
+    LDR(INDEX_UNSIGNED, X0, SP, 160);
+    _MSR(FIELD_NZCV, X0);
+    for (int r = 0; r < 18; r += 2)
+        LDP(INDEX_SIGNED, (ARM64Reg)(X0 + r), (ARM64Reg)(X0 + r + 1), SP, r * 8);
+    LDP(INDEX_SIGNED, X18, X30, SP, 144);
+    ADD(SP, SP, 176);
+    BR(X16);
+    return res;
+}
+#endif
+
+#ifdef LITEV_JIT_BGEMIT
+// Everything Compiler::CompileBlock would read from the live emulator for this block, read now
+// (right after the block's first, interpreted run: where the base build emits it), plus the CPU
+// field changes that emission makes, made now in the same program order: Comp_JumpTo(u32) on every
+// static branch (JumpToCpuEffects) and the literal reads of Comp_MemLoadLiteral. The selection
+// below mirrors CompileBlock's dispatch and those comps' conditions; LITEV_JITBG_VERIFY=1 checks it
+// against a real emission for every block.
+void Compiler::CaptureEmitInputs(ARM* cpu, JitEmitJob& job)
+{
+    const bool thumb = job.Thumb;
+    const u32 num = cpu->Num;
+    job.Cpu = cpu;
+    job.Num = num;
+    job.CPSR = cpu->CPSR;
+    job.Ctx = NDS.JIT.Memory.MemCtx();
+    job.NumSnaps = 0;
+    job.NumA7 = 0;
+    const bool litOpt = NDS.JIT.LiteralOptimizationsEnabled();
+    u32 farParts = 0;
+
+    auto literal = [&](u32 iaddr, int size, bool sx, u32 addr, u32 r15)
+    {
+        JitEmitJob::Snap& sn = job.Add(JitEmitJob::SnapLit, iaddr);
+        sn.A2 = addr; sn.B = size;
+        if (NDS.JIT.InvalidLiterals.Find(NDS.JIT.LocaliseCodeAddress(num, addr)) != -1)
+            sn.State = 2;
+        else
+        {
+            sn.State = 1;
+            sn.A = LiteralRead(cpu, size, sx, addr, r15);
+        }
+        return sn.State == 1;
+    };
+    auto jump = [&](u32 iaddr, u32 target, u32 r15)
+    {
+        JitEmitJob::Snap& sn = job.Add(JitEmitJob::SnapJump, iaddr);
+        sn.A2 = target;
+        JumpToCpuEffects(cpu, target, r15, sn.A, sn.B);
+    };
+
+    for (int i = 0; i < job.Count; i++)
+    {
+        const FetchedInstr& in = job.Instrs[i];
+        const u32 instr = in.Instr;
+        const u32 r15 = in.Addr + (thumb ? 4 : 8);
+        if (num == 1)
+        {
+            int k = 0;
+            for (; k < job.NumA7; k++) if (job.A7[k].Row == in.CodeCycles) break;
+            if (k == job.NumA7)
+            {
+                assert(job.NumA7 < 40);
+                job.A7[k].Row = in.CodeCycles;
+                memcpy(job.A7[k].V, NDS.ARM7MemTimings[in.CodeCycles], 4);
+                job.NumA7++;
+            }
+        }
+        CompileFunc comp = thumb ? T_Comp[in.Info.Kind] : A_Comp[in.Info.Kind];
+        if (!thumb && in.Info.Kind != ARMInstrInfo::ak_BLX_IMM && (instr >> 28) == 0xF)
+            comp = nullptr;   // CompileBlock: Comp_AddCycles_C only
+        if (comp == &Compiler::A_Comp_LDM_STM || comp == &Compiler::T_Comp_PUSH_POP || comp == &Compiler::T_Comp_LDMIA_STMIA)
+            farParts++;
+        if (comp == &Compiler::A_Comp_BranchImm)
+        {
+            u32 target = r15 + ((s32)(instr << 8) >> 6);
+            if ((instr >> 28) == 0xF)
+                target += (((instr >> 24) & 1) << 1) + 1;
+            jump(i, target, r15);
+        }
+        else if (comp == &Compiler::T_Comp_BCOND)
+            jump(i, r15 + ((s32)(instr << 24) >> 23) + 1, r15);
+        else if (comp == &Compiler::T_Comp_B)
+            jump(i, r15 + ((s32)((instr & 0x7FF) << 21) >> 20) + 1, r15);
+        else if (comp == &Compiler::T_Comp_BL_Merged)
+        {
+            u32 r = r15 + 2;
+            u32 upperPart = instr >> 16;
+            u32 target = (r - 2) + ((s32)((instr & 0x7FF) << 21) >> 9);
+            target += (upperPart & 0x7FF) << 1;
+            if (num == 1 || upperPart & (1 << 12))
+                target |= 1;
+            jump(i, target, r);
+        }
+        else if (comp == &Compiler::A_Comp_MemWB || comp == &Compiler::A_Comp_MemHD)
+        {
+            // Comp_MemAccess: rn = pc, rd != pc, immediate offset, pre-indexed, no writeback, load
+            bool wb = comp == &Compiler::A_Comp_MemWB;
+            bool imm = wb ? !(instr & (1 << 25)) : (instr & (1 << 22));
+            if (litOpt && (instr & (1 << 20)) && ((instr >> 16) & 0xF) == 15 && ((instr >> 12) & 0xF) != 15
+                && (instr & (1 << 24)) && !(instr & (1 << 21)) && imm)
+            {
+                u32 off = wb ? (instr & 0xFFF) : ((instr & 0xF) | ((instr >> 4) & 0xF0));
+                u32 addr = r15 + off * ((instr & (1 << 23)) ? 1 : -1);
+                int size; bool sx = false;
+                if (wb)
+                    size = (instr & (1 << 22)) ? 8 : 32;
+                else
+                {
+                    int op = (instr >> 5) & 0x3;
+                    sx = op >= 2;
+                    size = op == 2 ? 8 : 16;
+                }
+                literal(i, size, sx, addr, r15);
+            }
+        }
+        else if (comp == &Compiler::T_Comp_LoadPCRel && litOpt)
+        {
+            u32 offset = (instr & 0xFF) << 2;
+            // an invalidated literal: Comp_MemAccess tries R15 + offset itself (the same address
+            // unless R15 & 2, which then finds the same capture)
+            if (!literal(i, 32, false, (r15 & ~0x2) + offset, r15) && (r15 & 0x2))
+                literal(i, 32, false, r15 + offset, r15);
+        }
+#ifdef LITEV_JIT_IDLE2
+        if ((in.BranchFlags & branch_Idle2Cand) && num == 0
+            && (thumb ? comp == &Compiler::T_Comp_BCOND : in.Info.Kind != ARMInstrInfo::ak_BLX_IMM && (instr >> 28) != 0xF))
+            job.Add(JitEmitJob::SnapIdle2, i).P = ((ARMv5*)cpu)->Idle2EnableByte(in.Addr | (thumb ? 1 : 0));
+#endif
+    }
+    // code bounds (CheckCodeSpace): the block, and the far-region slow path of each LDM/STM
+    job.Bound = 1024 + 512 * job.Count;
+    job.FarBound = 1536 * farParts;
+}
+
+JitEmitJob::Snap* Compiler::EmitSnap(u8 kind, u32 addr)
+{
+    JitEmitJob::Snap* sn = CurJob->Find(kind, addr);
+    return sn;
+}
+
+void Compiler::EmitSnapMissing(const char* what, u32 addr)
+{
+    Log(LogLevel::Error, "LITEV_JIT_BGEMIT: %s at %08x not captured (block %08x)\n", what, addr, CurJob->Instrs[0].Addr);
+    fprintf(stderr, "LITEV_JIT_BGEMIT: %s at %08x not captured (block %08x)\n", what, addr, CurJob->Instrs[0].Addr);
+    abort();
+}
+
+void Compiler::VerifyFail(const char* what, u32 addr, u32 captured, u32 live)
+{
+    fprintf(stderr, "LITEV_JITBG_VERIFY: %s mismatch at %08x (block %08x num %d): captured %08x, emission %08x\n",
+            what, addr, VerifyJob->Instrs[0].Addr, VerifyJob->Num, captured, live);
+    abort();
+}
+
+u8 Compiler::A7T(u32 row, int k)
+{
+    JitEmitJob* j = CurJob ? CurJob : VerifyJob;
+    if (j)
+    {
+        for (int i = 0; i < j->NumA7; i++)
+            if (j->A7[i].Row == row)
+            {
+                if (!CurJob && j->A7[i].V[k] != NDS.ARM7MemTimings[row][k])
+                    VerifyFail("arm7 timing", row, j->A7[i].V[k], NDS.ARM7MemTimings[row][k]);
+                return j->A7[i].V[k];
+            }
+        if (CurJob) EmitSnapMissing("arm7 timing row", row);
+        VerifyFail("arm7 timing row", row, 0, 0);
+    }
+    return NDS.ARM7MemTimings[row][k];
+}
+#else
+u8 Compiler::A7T(u32 row, int k) { return NDS.ARM7MemTimings[row][k]; }
 #endif
 
 JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[], int instrsCount, bool hasMemInstr)
@@ -2538,6 +2903,7 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     for (int i = 0; i < instrsCount; i++)
     {
         CurInstr = instrs[i];
+        CurIdx = i;
         R15 = CurInstr.Addr + (Thumb ? 4 : 8);
         CodeRegion = R15 >> 24;
 #ifdef LITEV_JIT_LAZYFLAGS
@@ -2929,15 +3295,18 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     }
 #endif
 
-    if (CountLogical)
-        LogicalSize += 256 + 64 * (u64)instrsCount;
     return res;
 }
 
 bool Compiler::NearlyFull()
 {
-    // Host room (as before): a block needs at most a few KB near and far.
-    if (JitMemMainSize - GetCodeOffset() < 1024 * 16 || (JitMemMainSize + JitMemSecondarySize) - OtherCodeRegion < 1024 * 8)
+    // Host room (as before): a block needs at most a few KB near and far. (Background emission:
+    // the stream is the emitter's, ARMJIT::CheckCodeSpace checks it with the queued blocks.)
+    if (
+#ifdef LITEV_JIT_BGEMIT
+        !BgLayout &&
+#endif
+        (JitMemMainSize - GetCodeOffset() < 1024 * 16 || (JitMemMainSize + JitMemSecondarySize) - OtherCodeRegion < 1024 * 8))
     {
         Log(LogLevel::Debug, "JIT memory full, resetting...\n");
         return true;
@@ -3089,6 +3458,16 @@ void Compiler::Reset()
 #ifdef LITEV_JIT_PERFMAP
     litev_perfmap::Add("jit_dispatcher7", DispatcherEntry[1], GetRXPtr());
 #endif
+#ifdef LITEV_JIT_BGEMIT
+    if (BgLayout)
+    {
+        PendingThunk[0] = PendingThunk[1] = Gen_PendingThunk(0);
+        StubCursor = StubArenaStart;
+        DPCursor = DPArenaStart;
+        RWBase = (u8*)GetRWPtr() - GetCodeOffset();
+        WriteAllEntryStubs();
+    }
+#endif
     FlushIcache();
 #endif
 }
@@ -3096,7 +3475,7 @@ void Compiler::Reset()
 void Compiler::Comp_AddCycles_C(bool forceNonConstant)
 {
     s32 cycles = Num ?
-        NDS.ARM7MemTimings[CurInstr.CodeCycles][Thumb ? 1 : 3]
+        A7T(CurInstr.CodeCycles, Thumb ? 1 : 3)
         : ((R15 & 0x2) ? 0 : CurInstr.CodeCycles);
 
     if (forceNonConstant)
@@ -3114,7 +3493,7 @@ void Compiler::Comp_AddCycles_CI(u32 numI)
     IrregularCycles = true;
 
     s32 cycles = (Num ?
-        NDS.ARM7MemTimings[CurInstr.CodeCycles][Thumb ? 0 : 2]
+        A7T(CurInstr.CodeCycles, Thumb ? 0 : 2)
         : ((R15 & 0x2) ? 0 : CurInstr.CodeCycles)) + numI;
 
     if (Thumb || CurInstr.Cond() == 0xE)
@@ -3128,7 +3507,7 @@ void Compiler::Comp_AddCycles_CI(u32 c, ARM64Reg numI, ArithOption shift)
     IrregularCycles = true;
 
     s32 cycles = (Num ?
-        NDS.ARM7MemTimings[CurInstr.CodeCycles][Thumb ? 0 : 2]
+        A7T(CurInstr.CodeCycles, Thumb ? 0 : 2)
         : ((R15 & 0x2) ? 0 : CurInstr.CodeCycles)) + c;
 
 #ifdef LITEV_JIT_CYCLE_BATCH
@@ -3153,7 +3532,7 @@ void Compiler::Comp_AddCycles_CDI()
 
         s32 cycles;
 
-        s32 numC = NDS.ARM7MemTimings[CurInstr.CodeCycles][Thumb ? 0 : 2];
+        s32 numC = A7T(CurInstr.CodeCycles, Thumb ? 0 : 2);
         s32 numD = CurInstr.DataCycles;
 
         if ((CurInstr.DataRegion >> 24) == 0x02) // mainRAM
@@ -3198,7 +3577,7 @@ void Compiler::Comp_AddCycles_CD()
     }
     else
     {
-        s32 numC = NDS.ARM7MemTimings[CurInstr.CodeCycles][Thumb ? 0 : 2];
+        s32 numC = A7T(CurInstr.CodeCycles, Thumb ? 0 : 2);
         s32 numD = CurInstr.DataCycles;
 
         if ((CurInstr.DataRegion >> 24) == 0x02)

@@ -635,6 +635,10 @@ public:
     bool SkipDisplay = false;
 #endif
     static constexpr int LITEV_FRAMESKIP_MAX = 9;
+    // the next frame's display capture is armed (it latches at line 0): its 3D (VCount 215) and
+    // line-0 sprites (line 262) are drawn on a skipped frame too; Tail*Done = they were
+    bool CaptureArmed() const noexcept { return (CaptureCnt & (1u << 31)) && !LITEV_HEADLESS(Headless); }
+    bool Tail3DDone = true, TailSprDone = true;
 
     // Netplay: a console nobody looks at (another player's) draws nothing. Rendering does not
     // feed back into emulation, except through display capture, so once the game has used
@@ -651,9 +655,8 @@ public:
     bool CaptureSeen = false;
     // Record mode: skipping a frame's drawing must not change guest state, but a display capture
     // writes the drawn picture into VRAM. Once the game has captured, draw every frame (fast-forward
-    // and auto frameskip then only drop the sleep), so a recording replays exactly.
-    // ponytail: a first capture right after a skipped frame can still see stale 3D; the replay's
-    // hash check reports it.
+    // and auto frameskip then only drop the sleep), so a recording replays exactly. (Every capture
+    // frame itself, its 3D and line-0 sprites included, is drawn in any case: GPU::StartFrame.)
     bool KeepCaptures = false;
     bool KeepCapturesSeen = false;
 #ifdef LITEV_NETPLAY_CAPTURE

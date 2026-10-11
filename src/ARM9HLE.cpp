@@ -29,8 +29,8 @@ namespace melonDS::A9HLE
 thread_local bool CheckPending = false;
 #endif
 #ifdef LITEV_A9HLE_GXCHECK
-std::vector<u32>* GxTap = nullptr;
-bool GxOtherSeen = false;
+thread_local std::vector<u32>* GxTap = nullptr;
+thread_local bool GxOtherSeen = false;
 #endif
 namespace
 {
@@ -258,15 +258,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 21;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 524287;
+constexpr int kKinds = 24;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 4194303;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -303,9 +303,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -656,7 +656,7 @@ struct Pending
 };
 thread_local Pending g_P;
 #ifdef LITEV_A9HLE_GXCHECK
-std::vector<u32> g_GxMatTap;
+thread_local std::vector<u32> g_GxMatTap;
 #endif
 
 __attribute__((noinline, cold)) void ArmCheck(melonDS::ARMv5* c, int kind, const Mem& m, const Expect& e)
@@ -1270,8 +1270,8 @@ u32 GxSend(melonDS::ARMv5* c, const State& s, u32 src, u32 len, u32 n)
 // reaching GXFIFO (and any other geometry command write) is recorded; when the guest's
 // MIi_FIFOCallback reaches the point the native path would leave, the words, src and length
 // must be what the native path computed.
-std::vector<u32> g_GxTapBuf;
-struct GxPending { bool on = false; u32 src = 0, len = 0, n = 0; u64 t0 = 0; std::vector<u32> w; } g_Gx;
+thread_local std::vector<u32> g_GxTapBuf;
+struct GxPending { bool on = false; u32 src = 0, len = 0, n = 0; u64 t0 = 0; std::vector<u32> w; }; thread_local GxPending g_Gx;
 u64 g_GxDmaCyc = 0;     // the DMA part of the guest cycles (same burst timing as GxSend)
 void GxCheckAt(State& s, melonDS::ARMv5* c)
 {
@@ -3192,6 +3192,506 @@ __attribute__((noinline)) bool RunCx(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
+// ---- 21. MKDS NNS G3D material: SBC MAT -> MAT_InternalDefault -> NNS_G3dGeBufferOP_N (ITCM, MKDS USA) -----------------
+// Mario Kart DS links its (2005) NNS G3D in ITCM: SBC MAT 0x01FF86B4 -> MAT_InternalDefault 0x01FF8738 -> OP_N 0x01FF9048 ->
+// MI_CpuSend32 0x0214D044. The same material logic as 8. (diffuse/ambient, specular/emission, polygon attr, texture image /
+// palette from the material and NNS_G3dGlb's defaults under the material's masks), but other code and frames than PW's, so
+// its own native. 51 calls a frame per console in the 8-console race (~200 guest instructions each, ~10k a frame).
+// Natively at SBC MAT's entry for the common case: the shape drawn, no material cache in the render object, no cached result
+// (opt 0x20 / 0x40 with the bit set), no texture SRT (TEXMTX_USE: its texture matrix goes through a function pointer), no
+// material animation for this material, no end-of-command callback (timing 3), no GE buffer / buffered GE: the 7 GX words in
+// one BulkWords, every memory byte (render state, the result, the three functions' frames) and register / flag as the guest
+// leaves them. Exact bytes of the four functions with their literal pools (FNV). Category B: a fitted cycle estimate.
+constexpr u32 kMkMatSbc = 0x01FF86B4, kMkMatDef = 0x01FF8738, kMkMatInstr = 0xE92D4070;   // push {r4-r6, lr}
+constexpr Range kMkMatCode[4] = {{0x01FF86B4, 0x01FF8B08}, {0x01FF9048, 0x01FF9144}, {0x0214D044, 0x0214D05C}, {0x01FF9300, 0x01FF94D4}};
+constexpr u64 kMkMatSig = 0x3aed0e6a8aedb200ull;   // (the last range: the texture matrix table, send and per-flags functions 6, 7)
+constexpr u32 kMkMatTab = 0x0216187C, kMkGCache = 0x021704E4, kMkGlb = 0x0217027C, kMkMask = 0x02152BEC;
+constexpr u32 kMkGeBuf = 0x021731E4, kMkGeFlag = 0x021731E8;
+constexpr u32 kMkTexMtx = 0x01FF9320, kMkTexTab = 0x01FF9300;   // the texture matrix send, its per-flags function table
+// fitted estimate (check mode, MKDS 8-console race, 646k calls: exact for every one): the send path, + the material
+// animation bit test, + the empty GE buffer test
+constexpr s32 kMkMatCyc = 372, kMkMatCycAnm = 11, kMkMatCycGe = 10, kMkTexCyc = 430;   // + the texture matrix (scale)   // (+ the empty GE buffer test)
+
+int MkMatAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a != kMkMatSbc) return 0;
+    std::vector<u8> b;
+    CodeBytes(c, b, kMkMatCode, 0, 4);
+    return Fnv(b) == kMkMatSig ? 1 : 2;
+}
+
+// the native path from SBC MAT's entry state in c->R (not changed): the writes queued in m, the final registers in e (retPc =
+// the entry lr), the GX words; false: the guest has to run it
+bool MkMatCore(melonDS::ARMv5* c, Mem& m, Expect& e, u32* gw, u32& ngw, s32& cyc, u32* fit)
+{
+    bool bad = false;
+    auto rd = [&](u32 a, u32 n) -> u32 {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    };
+    const u32 rs = c->R[0], opt = c->R[1], sp = c->R[13];
+    melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
+    Obj RS = m.O(rs, 0x100), st = m.O(sp - 176, 176);   // (texture matrix path: down to sp - 176)
+    bool ok = RS && st;
+    u32 flag = 0, sbc = 0, idx = 0, res = 0, md = 0, cbT = 0, ro = 0, r7 = 0, h = 0, v4 = 0, v8 = 0, vc = 0, v10 = 0, v14 = 0;
+    u32 geb = 0, g9c = 0, m10 = 0, anm = 0, bits = 0, bo = 0, bit = 0, r0f = 0;
+    bool send = false, setBit = false, tm = false;   // tm: TEXMTX_USE (texture matrix sent by 0x01FF9320)
+    u32 tmS = 0, tmT = 0, tmFn = 0;
+    Obj R7;
+    if (ok)
+    {
+        // SBC MAT: skipped shapes / an unchanged material run the guest
+        flag = RS.r(8); sbc = RS.r(0); idx = rd(sbc + 1, 1);
+        ok = !bad && !(flag & 0x200) && !(!(flag & 1) && (flag & 8) && idx == RS.p[0xAD]);
+    }
+    if (ok)
+    {
+        res = RS.r(0xD8);
+        const u32 dofs = rd(res + 0xA, 2), d = res + 4;
+        const u32 ent = d + dofs + rd(d + dofs, 2) * idx;
+        md = res + rd(ent + 4, 4);
+        ok = !bad && rd(kMkMatTab + rd(md, 2) * 4, 4) == kMkMatDef && !bad;
+    }
+    if (ok)
+    {
+        // MAT_InternalDefault(rs, opt, md, idx)
+        cbT = RS.r(0x1C) ? RS.p[0x90] : 0;
+        ro = RS.r(4);
+        bo = 0xBC + (idx >> 5) * 4; bit = 1u << (idx & 31); bits = RS.r(bo);
+        ok = cbT != 3 && !rd(ro + 0x38, 4) && !bad && !((opt == 0x20 || opt == 0x40) && (bits & bit));
+        setBit = opt == 0x40;
+        r7 = setBit ? kMkGCache + idx * 0x38 : rs + 0xF4;
+        R7 = m.O(r7, 0x38);
+        h = rd(md + 0x1E, 2);
+        anm = rd(ro + 8, 4);
+        ok = ok && R7 && !bad && !(anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit)) && !bad;
+        tm = h & 1;
+        if (ok && tm)
+        {
+            // TEXMTX_USE with a scale, no rotation, no translation (the race's case: flags 6), magnification 1: the texture
+            // matrix function [rs + 0xF0] = 0x01FF9320 and its per-flags function from its table (flags 7, identity: never
+            // seen, the guest runs it)
+            ok = !(h & 2) && (h & 4) && (h & 8) && rd(md + 0x24, 4) == 0x1000 && rd(md + 0x28, 4) == 0x1000 && RS.r(0xF0) == kMkTexMtx && !bad;
+            tmFn = R32(CodePtr(c, kMkTexTab + (((h & 2) ? 1u : 0u) | 6u) * 4));
+            ok = ok && tmFn == ((h & 2) ? kMkTexMtx + 0x14C : kMkTexMtx + 0x170);
+            if (!(h & 2)) { tmS = rd(md + 0x2C, 4); tmT = rd(md + 0x30, 4); }
+            ok = ok && !bad;
+        }
+    }
+    if (ok)
+    {
+        const u32 t1 = rd(kMkMask + ((h >> 6) & 7) * 4, 4), t2 = rd(kMkMask + ((h >> 9) & 7) * 4, 4);
+        v4 = (rd(kMkGlb + 0x94, 4) & ~t1) | (rd(md + 4, 4) & t1);
+        v8 = (rd(kMkGlb + 0x98, 4) & ~t2) | (rd(md + 8, 4) & t2);
+        m10 = rd(md + 0x10, 4); g9c = rd(kMkGlb + 0x9C, 4);
+        vc = (g9c & ~m10) | (rd(md + 0xC, 4) & m10);
+        v10 = rd(md + 0x14, 4); v14 = rd(md + 0x1C, 2);
+        r0f = (h & 0x20) ? 0x20 : 0;
+        send = vc & 0x1F0000;
+        ok = !bad;
+        if (send && r0f) vc &= ~0x1F0000u;
+        // (an invisible material or NOGECMD: never seen in the race; the guest runs them)
+        ok = ok && send && !((flag | 8) & 0x100)
+             && !rd(kMkGeFlag, 4) && !bad && (!(geb = rd(kMkGeBuf, 4)) || !rd(geb, 4)) && !bad /* no GE buffer or an empty one: straight to GXFIFO */ && (g_Check || g_Dry || (gx.GeometryEnabled && (gx.BulkReady() || gx.FifoLevel() + 32 <= 256)));
+    }
+    if (!ok) return false;
+    // frames: SBC MAT push {r4-r6, lr} (sp - 16) | MAT_InternalDefault push {r4-r8, lr} (sp - 40) + locals (sp - 72) |
+    // OP_N push {r4-r6, lr} (sp - 88)
+    m.W(st, 88 + 72, c->R[4]); m.W(st, 88 + 76, c->R[5]); m.W(st, 88 + 80, c->R[6]); m.W(st, 88 + 84, c->R[14]);
+    m.W(st, 88 + 48, rs); m.W(st, 88 + 52, res + 4); m.W(st, 88 + 56, res); m.W(st, 88 + 60, c->R[7]); m.W(st, 88 + 64, c->R[8]);
+    m.W(st, 88 + 68, kMkMatSbc + 0x6C);
+    m.W(st, 88 + 16, 0x00293130); m.W(st, 88 + 20, v4); m.W(st, 88 + 24, v8); m.W(st, 88 + 28, vc); m.W(st, 88 + 32, 0x2B2A);
+    m.W(st, 88 + 36, v10); m.W(st, 88 + 40, v14);
+    m.W(st, 88 + 0, cbT); m.W(st, 88 + 4, r7); m.W(st, 88 + 8, rs); m.W(st, 88 + 12, kMkMatDef + 0x360);
+    // render state, the result
+    m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFF00u) | idx << 8);
+    m.W(RS, 8, (flag | 8) & ~2u);
+    m.W(RS, 0xB0, r7);
+    if (setBit) m.W(RS, bo, bits | bit);
+    m.W(RS, 0, sbc + 2);
+    const u32 flags0 = tm ? (r0f | ((h & 2) ? 1 : 0) | 2 | 4 | 8) : r0f;
+    const u32 res6[6] = {flags0, v4, v8, vc, v10, v14};
+    for (int i = 0; i < 6; i++) m.W(R7, i * 4, res6[i]);
+    u32 tw[19] = {};
+    if (tm)
+    {
+        if (!(h & 2)) { m.W(R7, 0x18, tmS); m.W(R7, 0x1C, tmT); }
+        const u32 ow = rd(md + 0x20, 2), oh = rd(md + 0x22, 2);
+        m.W(R7, 0x2C, ow | oh << 16); m.W(R7, 0x30, 0x1000); m.W(R7, 0x34, 0x1000);
+        // 0x01FF9320: push {r4, lr}; sub sp, #0x50; the matrix (defaults + the per-flags function); OP_N(0x00101610, 18 words)
+        const u32 m0 = (h & 2) ? 0x1000 : tmS, m5 = (h & 2) ? 0x1000 : tmT;
+        const u32 m13 = (h & 2) ? 0 : (u32)(((0x2000 - (tmT << 1)) * oh) << 3);
+        const u32 M[16] = {m0, 0, 0, 0, 0, m5, 0, 0, 0, 0, 0, 0, 0, m13, 0, 0x1000};
+        // frames (st = sp - 176): OP_N push (0..15) | the locals (16..95: cmd, 3, M, 2; 96..99 = the first OP_N's r5 slot,
+        // kept) | push {r4, lr} (96 - 8 + 8: sp - 80 = 96, sp - 76 = 100)
+        m.W(st, 0, r7); m.W(st, 4, r7); m.W(st, 8, rs); m.W(st, 12, kMkTexMtx + 0x134);
+        m.W(st, 16, 0x00101610); m.W(st, 20, 3);
+        for (int i = 0; i < 16; i++) m.W(st, 24 + i * 4, M[i]);
+        m.W(st, 88, 2);
+        m.W(st, 96, cbT); m.W(st, 100, kMkMatDef + 0x378);
+        tw[0] = 0x00101610; tw[1] = 3; for (int i = 0; i < 16; i++) tw[2 + i] = M[i]; tw[18] = 2;
+    }
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = sbc + 2;
+    e.R[1] = 0x04000400; e.R[2] = tm ? 2 : v14; e.R[3] = kMkGeBuf; e.R[12] = tm ? sp - 160 + 76 : sp - 72 + 28;   // MI_CpuSend32's, OP_N's r3
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFDF) | Flags(cbT, 3) | ((e.retPc & 1) << 5);
+    const u32 g7[7] = {0x00293130, v4, v8, vc, 0x2B2A, v10, v14};
+    for (int i = 0; i < 7; i++) gw[i] = g7[i];
+    ngw = tm ? 26 : 7;
+    if (tm) for (int i = 0; i < 19; i++) gw[7 + i] = tw[i];
+    cyc = kMkMatCyc + (anm ? kMkMatCycAnm : 0) + (geb ? kMkMatCycGe : 0) + (tm ? kMkTexCyc + (geb ? kMkMatCycGe : 0) : 0);
+    if (fit) { fit[0] = 1; fit[1] = anm != 0; fit[2] = opt; fit[3] = (geb != 0) | (tm ? 2 : 0); }
+    return true;
+}
+
+// the GX words: the FIFO empty: at once (as GX_CPUSEND sends); else (a buffer swap pending) into the FIFO as the guest's stores
+inline void MkMatSend(melonDS::ARMv5* c, const u32* gw, u32 ngw)
+{
+    melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
+    if (gx.BulkReady()) gx.BulkWords(gw, ngw);
+    else for (u32 i = 0; i < ngw; i++) c->NDS.ARM9Write32(0x04000400, gw[i]);
+}
+
+__attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && MkMatAt(c, pc) != 1) return false;
+    s.calls[21]++;
+    Mem m(c, g_Check || g_Dry);
+    Expect e;
+    u32 gw[26], ngw = 0, fit[4];
+    s32 cyc = 0;
+    if (CheckPending || !MkMatCore(c, m, e, gw, ngw, cyc, fit))
+    {
+        s.fallback[21] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 21, m, e);
+            g_P.gx.assign(gw, gw + ngw);
+            for (int i = 0; i < 4; i++) g_P.fit[i] = fit[i];
+#ifdef LITEV_A9HLE_GXCHECK
+            if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
+#endif
+        }
+        s.checks[21]++;
+        if (g_Check && jit) { CheckRunGuest(c, pc); return true; }
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    m.Flush();
+    MkMatSend(c, gw, ngw);
+    s.native[21]++;
+    Return(c, e, cyc);
+    return true;
+}
+
+// ---- 23. MKDS NNS G3D SBC command loop (ITCM 0x01FF9008) ------------------------------------------------------------------
+// The loop step (flag 0x40 cleared, the command byte, its function from the table at [0x01FF9044], r1 = command & 0xE0,
+// blx) and, natively, MAT (21.'s core), NODE (visibility; no animation-visibility object, no callback timing 3) and RET (no
+// callback), command after command; any other command (SHP, NODEDESC, ...) or a native's fallback: entered as the guest's blx
+// would (lr = the loop's tail 0x01FF9030). Stops at the loop's tail (the guest runs its ldr / tst #0x20 / beq) when the list
+// ended (RET), the slice's budget is used, an IRQ is pending or the CPU stops. JIT only; not compare-checkable as a whole (its
+// natives are: 21.); gated by determinism, Mac == VM and the 8-console race. Exact bytes of the loop function, NODE and RET.
+// Category B: estimates (PW's 18.: the loop step 24, NODE 88, RET 20 cycles).
+constexpr u32 kMkSbcHead = 0x01FF9008, kMkSbcInstr = 0xE5941000, kMkSbcTail = 0x01FF9030, kMkSbcTabLit = 0x01FF9044;
+constexpr u32 kMkNode = 0x01FF8B98, kMkRet = 0x01FF8C98;
+constexpr Range kMkSbcCode[2] = {{0x01FF8FF8, 0x01FF9048}, {0x01FF8B98, 0x01FF8CC4}};
+constexpr u64 kMkSbcSig = 0x0b91aa0eb23d1365ull;
+constexpr s32 kMkSbcCycLoop = 24, kMkSbcCycNode = 88, kMkSbcCycRet = 20;
+
+int MkSbcAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a != kMkSbcHead) return 0;
+    std::vector<u8> b;
+    CodeBytes(c, b, kMkSbcCode, 0, 2);
+    return Fnv(b) == kMkSbcSig && MkMatAt(c, kMkMatSbc) == 1 ? 1 : 2;
+}
+
+__attribute__((noinline)) bool RunMkSbc(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 rs = c->R[5], tab = R32(CodePtr(c, kMkSbcTabLit)), sp = c->R[13];
+    Mem m(c, false);
+    Obj RS = m.O(rs, 0x188), fr = m.O(sp - 12, 12);
+    if (!jit || CheckPending || g_Check || g_Dry || !RS || !fr || c->R[4] != rs + 8 || c->R[6] != tab)
+    {
+        GuestFallback(c);
+        return true;
+    }
+    s.calls[23]++;
+    for (u32 it = 0;; it++)
+    {
+        // the loop step
+        const u32 sbc = RS.r(0);
+        const u8* op = m.P(sbc);
+        const u8* tp = op ? m.P(tab + (*op & 31) * 4) : nullptr;
+        if (!tp)
+        {
+            if (!it) GuestFallback(c);
+            return true;
+        }
+        const u32 fn = R32(tp), cmd = *op;
+        m.W(RS, 8, RS.r(8) & ~0x40u);
+        m.Flush();
+        c->R[0] = rs; c->R[1] = cmd & 0xE0; c->R[2] = fn; c->R[3] = cmd; c->R[14] = kMkSbcTail;
+        c->Cycles += kMkSbcCycLoop;
+        s.native[23]++;
+        bool done = false;
+        if (fn == kMkMatSbc && (s.mask & 524288))
+        {
+            Expect e; u32 gw[26], ngw = 0; s32 cyc = 0;
+            if (MkMatCore(c, m, e, gw, ngw, cyc, nullptr))
+            {
+                m.Flush();
+                MkMatSend(c, gw, ngw);
+                for (int i = 0; i < 15; i++) c->R[i] = e.R[i];
+                c->CPSR = (c->CPSR & 0x0FFFFFFFu) | (e.CPSR & 0xF0000000u);
+                c->Cycles += cyc;
+                s.native[21]++;
+                done = true;
+            }
+        }
+        else if (fn == kMkNode)
+        {
+            // NODE: push {r4, r5, lr}; skipped (flag 0x200): [rs] += 3; else the node index, flag |= 4, the visibility
+            // result (rs + 0x184 = the SBC's visible bit) and flag bit 0 from it; [rs] += 3
+            const u32 fl = RS.r(8), ro = RS.r(4);
+            const u8* rp = m.P(ro + 0x18);
+            const u32 cb2 = RS.r(0x14) ? RS.p[0x8E] : 0;
+            if (fl & 0x200)
+            {
+                m.W(fr, 0, rs + 8); m.W(fr, 4, rs); m.W(fr, 8, kMkSbcTail);
+                m.W(RS, 0, sbc + 3);
+                c->R[0] = sbc + 3;
+                c->CPSR = (c->CPSR & 0x1FFFFFFFu);      // ands r0, #0x200 (rotated immediate: C = 0), nonzero; V kept
+                c->Cycles += kMkSbcCycNode / 3;
+                done = true;
+            }
+            else if (rp && !R32(rp) && cb2 != 3)
+            {
+                const u32 vis = op[2] & 1, idx = op[1];
+                m.W(fr, 0, rs + 8); m.W(fr, 4, rs); m.W(fr, 8, kMkSbcTail);
+                m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFFu) | idx);
+                m.W(RS, 0xB8, rs + 0x184);
+                m.W(RS, 0x184, vis);
+                m.W(RS, 8, vis ? ((fl | 4) | 1) : ((fl | 4) & ~1u));
+                m.W(RS, 0, sbc + 3);
+                c->R[0] = sbc + 3; c->R[1] = vis; c->R[2] = idx;
+                c->CPSR = (c->CPSR & 0x0FFFFFFFu) | Flags(cb2, 3);
+                c->Cycles += kMkSbcCycNode;
+                done = true;
+            }
+        }
+        else if (fn == kMkRet && !RS.r(0x10))
+        {
+            // RET: push {r4, lr}; flag |= 0x20 (the list's end)
+            const u32 f2 = RS.r(8) | 0x20;
+            m.W(fr, 4, rs + 8); m.W(fr, 8, kMkSbcTail);
+            m.W(RS, 8, f2);
+            c->R[0] = f2; c->R[1] = 0;
+            c->CPSR = (c->CPSR & 0x0FFFFFFFu) | 0x60000000u;      // cmp r1, #0 with r1 = 0
+            c->Cycles += kMkSbcCycRet;
+            done = true;
+        }
+        m.Flush();
+        if (!done)
+        {
+            c->JumpTo(fn);      // the command's function as the guest's blx calls it
+            return true;
+        }
+        // the loop's tail: stop there (the guest runs it) when the list ended or the slice / IRQs / the CPU say so; else its
+        // ldr r0, [r5, #8]; ands r0, #0x20 (0: Z set, N clear) and the next step
+        if ((RS.r(8) & 0x20) || c->Cycles >= c->CyclesBudget || c->Halted || (c->IRQ && !(c->CPSR & 0x80)) || c->StopExecution)
+        {
+            c->JumpTo(kMkSbcTail);
+            return true;
+        }
+        c->R[0] = 0;
+        c->CPSR = (c->CPSR & 0x3FFFFFFFu) | 0x40000000u;
+    }
+}
+
+// ---- 22. MKDS course collision (KCL): the prism loop's rejection pass ---------------------------------------------------------
+// The KCL sphere query 0x01FFDEE4 (MKDS USA, ITCM; game code) walks the triangle (prism) list of an octree leaf: per prism its
+// 16-byte record (height, position / face normal / 3 edge normal indices, attribute) is copied to the stack, d = query point -
+// position (VEC_Subtract 0x021484D0), then up to 4 dot products (VEC_DotProduct 0x02039828, fx32) against the face normal and
+// the edge normals, each test able to reject the prism; then attribute filters. ~60 prisms a frame per console in the race,
+// two thirds rejected. Hooked at the loop head 0x01FFE208: the rejection tests prism after prism natively, instruction by
+// instruction (the stack locals and the helpers' frames below sp as the guest leaves them, registers r0-r3, r5-r10, r12, lr
+// and flags of the path taken), handing back at the first prism passing every test (0x01FFE3CC: the guest's hit code runs)
+// or at the list's end (0x01FFEDA4). Exact bytes (FNV) of the loop, its exits, the literal and both helpers.
+// Category B: per-path cycle constants (check mode).
+constexpr u32 kKclHead = 0x01FFE208, kKclInstr = 0xE59D102C, kKclHit = 0x01FFE3CC, kKclEnd = 0x01FFEDA4;
+constexpr Range kKclCode[5] = {{0x01FFE208, 0x01FFE3CC}, {0x01FFED90, 0x01FFEDA4}, {0x01FFEE48, 0x01FFEE4C}, {0x021484D0, 0x02148504},
+                               {0x02039828, 0x02039860}};
+constexpr u64 kKclSig = 0xddc135d96e85db76ull;
+constexpr u32 kKclMaxPrisms = 64;
+// guest cycles per prism path (check mode, MKDS 8P race: 319k calls, 1.3M prisms, a least-squares fit with zero error):
+// rejected by the face normal (below / above), edge normals 1 / 2 / 3, the 3rd's 0x1E000 bound, (attribute filters: never
+// seen, the guest runs those calls), passing; + 1 per call
+constexpr s32 kKclCyc0 = 1, kKclCycPath[10] = {111, 116, 167, 218, 269, 271, 0, 0, 0, 272};
+
+int KclAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a != kKclHead) return 0;
+    std::vector<u8> b;
+    CodeBytes(c, b, kKclCode, 0, 5);
+    return Fnv(b) == kKclSig ? 1 : 2;
+}
+
+__attribute__((noinline)) bool RunKcl(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && KclAt(c, pc) != 1) return false;
+    s.calls[22]++;
+    Mem m(c, g_Check || g_Dry);
+    const u32 sp = c->R[13];
+    // the frame the loop touches: [sp - 8, sp + 0x198) (the helpers' push below sp, the locals)
+    constexpr u32 kLo = 8, kN = (0x198 + kLo) / 4;
+    Obj S = m.O(sp - kLo, kN * 4);
+    if (CheckPending || !S)
+    {
+        s.fallback[22] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    u32 sh[kN]; u8 dirty[kN] = {};
+    memcpy(sh, S.p, sizeof(sh));
+    auto L = [&](u32 o) -> u32 { return sh[(o + kLo) / 4]; };
+    auto St = [&](u32 o, u32 v) { sh[(o + kLo) / 4] = v; dirty[(o + kLo) / 4] = 1; };
+    bool bad = false;
+    auto rd = [&](u32 a, u32 n) -> u32 {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    };
+    u32 r[16];
+    for (int i = 0; i < 16; i++) r[i] = c->R[i];
+    u32 fl = c->CPSR & 0xF0000000u, end = 0, nPath[10] = {}, n = 0;
+    const u32 t = L(0x24), negT = L(0x4C), prisms = L(0x2C), pos = L(0x38), nrm = L(0x3C);
+    const u32 f50 = L(0x50), f54 = L(0x54), f58 = L(0x58);
+    const u32 ax = L(0xA0), ay = L(0xA4), az = L(0xA8);
+    s32 dx = 0, dy = 0, dz = 0;
+    // VEC_DotProduct(sp + 0xB8, sp + o) after the normal (3 x s16 at nrm + 6 * idx) was stored at sp + o
+    auto dot = [&](u32 o, u32 idx, u32 ret) -> u32 {
+        const u32 na = nrm + idx * 6;
+        const s32 nx = (s16)rd(na, 2), ny = (s16)rd(na + 2, 2), nz = (s16)rd(na + 4, 2);
+        St(o, (u32)nx); St(o + 4, (u32)ny); St(o + 8, (u32)nz);
+        St(-8u, r[4]); St(-4u, ret);            // push {r4, lr}
+        const s64 sum = (s64)dy * ny + (s64)dx * nx + (s64)dz * nz;
+        r[1] = sp + o; r[2] = (u32)nx; r[3] = (u32)dz; r[12] = (u32)dx; r[14] = ret; r[5] = na;
+        return (u32)(sum >> 12);
+    };
+    // ands (flags N Z; C from a rotated immediate's bit 31 when rot != 0, else unchanged; V unchanged)
+    auto ands = [&](u32 v, bool rotC0) { u32 f = (fl & 0x30000000u) | (v & 0x80000000u) | (v ? 0 : 0x40000000u); if (rotC0) f &= ~0x20000000u; fl = f; return v; };
+    u32 tri = r[0];
+    for (;;)
+    {
+        if (n == kKclMaxPrisms) { end = kKclHead; break; }      // r0 = the next prism, flags of the loop's cmp r0, #0
+        n++;
+        // the prism record and its position; VEC_Subtract(sp + 0xA0, sp + 0x15C, sp + 0xB8)
+        const u32 pa = prisms + tri * 16;
+        const u32 w0 = rd(pa, 4), w1 = rd(pa + 4, 4), w2 = rd(pa + 8, 4), w3 = rd(pa + 12, 4);
+        const u32 qa = pos + (w1 & 0xFFFF) * 12;
+        const u32 px = rd(qa, 4), py = rd(qa + 4, 4), pz = rd(qa + 8, 4);
+        if (bad) break;
+        St(0x90, w0); St(0x94, w1); St(0x98, w2); St(0x9C, w3);
+        St(0x15C, px); St(0x160, py); St(0x164, pz);
+        dx = (s32)(ax - px); dy = (s32)(ay - py); dz = (s32)(az - pz);
+        St(0xB8, (u32)dx); St(0xBC, (u32)dy); St(0xC0, (u32)dz);
+        r[6] = 0xC;
+        int path = 9;
+        // face normal: dot < -thickness, or dot - height >= thickness: rejected
+        r[0] = dot(0x18C, w3 & 0xFFFF, 0x01FFE280);
+        r[1] = negT; fl = Flags(r[0], r[1]);
+        if ((s32)r[0] < (s32)r[1]) path = 0;
+        else
+        {
+            r[1] = w0; r[6] = r[0] - r[1]; r[0] = t; fl = Flags(r[6], r[0]);
+            if ((s32)r[6] >= (s32)r[0]) path = 1;
+        }
+        if (path == 9)
+        {
+            // the three edge normals
+            r[0] = dot(0x174, w2 & 0xFFFF, 0x01FFE2D8);
+            r[8] = r[0]; r[0] = t; fl = Flags(r[8], r[0]);
+            if ((s32)r[8] >= (s32)r[0]) path = 2;
+        }
+        if (path == 9)
+        {
+            r[0] = dot(0x180, w2 >> 16, 0x01FFE320);
+            r[7] = r[0]; r[0] = t; fl = Flags(r[7], r[0]);
+            if ((s32)r[7] >= (s32)r[0]) path = 3;
+        }
+        if (path == 9)
+        {
+            r[0] = dot(0x168, w1 >> 16, 0x01FFE368);
+            r[9] = r[0]; r[0] = t; r[10] = r[0] - r[9]; fl = Flags(r[0], r[9]);
+            if (fl & 0x80000000u) path = 4;
+            else { fl = Flags(r[10], 0x1E000); if ((s32)r[10] > 0x1E000) path = 5; }
+        }
+        if (path == 9)
+        {
+            // the attribute filters
+            r[5] = w3 >> 16; r[0] = 0x2010;
+            if ((r[0] = ands(r[5] & r[0], false)))
+            {
+                r[0] = f50; fl = Flags(r[0], 0);
+                if (r[0] && (r[0] = ands(r[5] & 0x2000, true))) path = 6;
+                if (path == 9) { r[0] = f54; fl = Flags(r[0], 0); if (r[0] && (r[0] = ands(r[5] & 0x10, false))) path = 7; }
+            }
+            if (path == 9) { r[0] = f58; fl = Flags(r[0], 0); if (r[0] && (r[0] = ands(r[5] & 0xA000, true))) path = 8; }
+        }
+        if (path >= 6 && path <= 8) bad = true;     // (the attribute filters' rejections: never seen in the race, not timed)
+        if (bad) break;
+        nPath[path]++;
+        if (path == 9) { end = kKclHit; break; }
+        // the next prism of the list (ldrh r0, [r1, #2]!)
+        r[1] = L(0x28) + 2; r[0] = rd(r[1], 2); St(0x28, r[1]); fl = Flags(r[0], 0);
+        if (bad) break;
+        if (!r[0]) { end = kKclEnd; break; }
+        tri = r[0];
+    }
+    if (bad)
+    {
+        s.fallback[22] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    for (u32 i = 0; i < kN; i++) if (dirty[i]) m.W(S, i * 4, sh[i]);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = r[i];
+    e.R[13] = sp; e.R[15] = c->R[15];
+    e.retPc = end;
+    e.CPSR = (c->CPSR & 0x0FFFFFFFu) | fl;
+    s32 cyc = kKclCyc0;
+    for (int i = 0; i < 10; i++) cyc += kKclCycPath[i] * (s32)nPath[i];
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check) { ArmCheck(c, 22, m, e); for (int i = 0; i < 4; i++) g_P.fit[i] = 0; g_P.fitA[0] = n; for (int i = 0; i < 7; i++) g_P.fitA[1 + i] = nPath[i < 6 ? i : 9]; g_P.fit[0] = nPath[6] + nPath[7] + nPath[8]; g_P.fit[1] = end == kKclHit ? 1 : end == kKclEnd ? 2 : 3; }
+        s.checks[22]++;
+        if (g_Check && jit) { CheckRunGuest(c, pc); return true; }
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    m.Flush();
+    s.native[22]++;
+    Return(c, e, cyc);
+    return true;
+}
+
 // ---- 19. NNS_G2dMakeCellToOams (Mario Kart DS race: the HUD / map icons) ---------------------------------------------------------
 // NNS G2D: u16 f(GXOamAttr* dst, u16 max, const NNSG2dCellData* cell, const MtxFx22* mtx, const VecFx32* trans, u16 affineIdx,
 // BOOL doubleAffine): n = min(max, cell->numOAMAttrs) objects, each the cell's 6-byte attr0..2 copied to dst[i] (8-byte stride,
@@ -3653,6 +4153,25 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return 10;
     }
 #endif
+    if (instr == kKclInstr && addr == kKclHead)
+    {
+        r = kKclCode;
+        return 5;
+    }
+    if (instr == kMkSbcInstr && addr == kMkSbcHead)
+    {
+        // the loop, NODE, RET and 21.'s functions (the loop runs MAT natively)
+        static thread_local Range sb[6];
+        sb[0] = kMkSbcCode[0]; sb[1] = kMkSbcCode[1];
+        for (int i = 0; i < 4; i++) sb[2 + i] = kMkMatCode[i];
+        r = sb;
+        return 6;
+    }
+    if (instr == kMkMatInstr && addr == kMkMatSbc)
+    {
+        r = kMkMatCode;
+        return 4;
+    }
     if (instr == kCxInstr && CxAt(&nds.ARM9, addr))
     {
         static thread_local Range cx;
@@ -3812,6 +4331,21 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return k;
     }
 #endif
+    if (instr == kMkSbcInstr && addr == kMkSbcHead)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 2097152) ? MkSbcAt(&nds.ARM9, addr) : 0;
+    }
+    if (instr == kKclInstr && addr == kKclHead)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 1048576) ? KclAt(&nds.ARM9, addr) : 0;
+    }
+    if (instr == kMkMatInstr && addr == kMkMatSbc)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 524288) ? MkMatAt(&nds.ARM9, addr) : 0;
+    }
     if (instr == kCxInstr && CxAt(&nds.ARM9, addr))
     {
         State& s = St(&nds.ARM9);
@@ -4893,6 +5427,21 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 16384) && RunFx(c, s, jit);
     }
+    if (in == kMkSbcInstr && pc == kMkSbcHead)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 2097152) && RunMkSbc(c, s, jit);
+    }
+    if (in == kKclInstr && pc == kKclHead)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 1048576) && RunKcl(c, s, jit);
+    }
+    if (in == kMkMatInstr && pc == kMkMatSbc)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 524288) && RunMkMat(c, s, jit);
+    }
     if (in == kCxInstr)
     {
         State& s = St(c);
@@ -4988,7 +5537,8 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     if (!atVec && (pc != (e.retPc & ~1u) || ((cpu->CPSR ^ e.CPSR) & (g_P.kind == 15 || g_P.kind == 17 ? 0x0FFFFFFFu : ~0u)))) return;
     if (g_P.kind == 10 || g_P.kind == 13) gR[1] = e.R[1];     // GX async: r1 = the IF value read (not modelled)
     if (g_P.kind == 6 && (cpu->R[2] != e.R[2] || cpu->R[3] != e.R[3] || cpu->R[6] != e.R[6])) return;   // LZ: same progress
-    if (g_P.kind == 20 && (cpu->R[1] != e.R[1] || cpu->R[3] != e.R[3])) return;                          // streaming LZ: the same
+    if (g_P.kind == 20 && (cpu->R[1] != e.R[1] || cpu->R[3] != e.R[3])) return;
+    if (g_P.kind == 22 && (cpu->R[0] != e.R[0] || cpu->R[1] != e.R[1])) return;                          // KCL: the same prism                          // streaming LZ: the same
     melonDS::NDS& nds = c->NDS;
     if ((g_P.kind == 0 || g_P.kind == 4) && R32(&nds.MainRAM[(g_State[&nds].v->info + 4) & nds.MainRAMMask]) != e.cur) return;
     CheckPending = false;
@@ -5005,6 +5555,11 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         fprintf(stderr, "ASYNCFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 13 && getenv("LITEV_A9HLE_SHPFIT") && !g_P.irq)
         fprintf(stderr, "SHPFIT %d %u %llu\n", (int)g_P.small, g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 22 && getenv("LITEV_A9HLE_KCLFIT") && !g_P.irq)
+        fprintf(stderr, "KCLFIT %u %u %u %u %u %u %u %u %u %u %llu\n", g_P.fit[1], g_P.fitA[0], g_P.fitA[1], g_P.fitA[2], g_P.fitA[3], g_P.fitA[4],
+                g_P.fitA[5], g_P.fitA[6], g_P.fit[0], g_P.fitA[7], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 21 && getenv("LITEV_A9HLE_MKMATFIT") && !g_P.irq)
+        fprintf(stderr, "MKMATFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 20 && getenv("LITEV_A9HLE_CXFIT") && !g_P.irq)
         fprintf(stderr, "CXFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 19 && getenv("LITEV_A9HLE_OAMFIT") && !g_P.irq)
@@ -5081,7 +5636,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             nd++;
         }
     }
-    if (k == 8 || (k == 13 && g_P.small) || k == 15 || k == 17)
+    if (k == 8 || (k == 13 && g_P.small) || k == 15 || k == 17 || k == 21)
     {
         // GXFIFO words: the guest's stores to GXFIFO, then what reached BulkWords (MI_CpuSend32 under GX_CPUSEND)
         std::vector<u32> gw;

@@ -26,15 +26,20 @@
 #include "../dolphin/Arm64Emitter.h"
 
 #include "../ARMJIT_Internal.h"
+#include "../ARMJIT_Memory.h"
 #include "../ARMJIT_RegisterCache.h"
 
 #include <unordered_map>
+#include <atomic>
+#include <mutex>
+#include <cassert>
 #include <vector>
 #include <algorithm>
 
 namespace melonDS
 {
 class ARMJIT;
+int JitBgMode();   // LITEV_JIT_BGEMIT: 0 off, 1 deferred (no worker), 2 worker; read once
 const Arm64Gen::ARM64Reg RMemBase = Arm64Gen::X26;
 const Arm64Gen::ARM64Reg RCPSR = Arm64Gen::W27;
 const Arm64Gen::ARM64Reg RCycles = Arm64Gen::W28;
@@ -197,6 +202,63 @@ private:
 };
 #endif
 
+#ifdef LITEV_JIT_BGEMIT
+// LITEV_JIT_BGEMIT: a block's code is emitted later (a worker thread, or the emulator thread on
+// the block's second run) from everything the emitter would have read at the moment the block
+// was compiled in the base build (right after its first, interpreted run). Captured by
+// Compiler::CaptureEmitInputs on the emulator thread, which also makes the CPU-field changes the
+// emitter made at that point (Comp_JumpTo, literal loads): the guest sees exactly the base build.
+struct JitEmitJob
+{
+    // per-instruction values, looked up by the instruction's address
+    enum { SnapJump = 1, SnapLit = 2, SnapIdle2 = 3 };
+    struct Snap { u32 Addr; u8 Kind, State, Used; u32 A, B, A2; u8* P; };
+    struct A7Row { u32 Row; u8 V[4]; };
+
+    ARM* Cpu = nullptr;
+    JitBlock* Block = nullptr;      // emulator thread only; cleared when the block is deleted
+    int Count = 0;
+    bool Thumb = false, HasMem = false;
+    u8 Num = 0;
+    u32 CPSR = 0;
+    u32 Id = 0;
+    u32 StubOff = 0;
+    u32 Bound = 0, FarBound = 0;
+    u64 BoundPrefix = 0, FarBoundPrefix = 0;   // sum of the bounds queued before it    // upper bounds of the code it emits (main, far region)
+    JitMemCtx Ctx {};
+    FetchedInstr Instrs[32];
+    Snap Snaps[64];
+    int NumSnaps = 0;
+    A7Row A7[40];
+    int NumA7 = 0;
+
+    // result (written by whoever emits it, read after Done)
+    std::atomic<u8> Done {0};
+    bool Finalized = false;         // result copied into the block, entry stub pointed at it
+    JitBlockEntry Entry = nullptr;
+    u8 NumLinkExits = 0;
+    OutgoingLink LinkExits[MaxOutgoingLinks];
+
+    Snap* Find(u8 kind, u32 addr)
+    {
+        for (int i = 0; i < NumSnaps; i++)
+            if (Snaps[i].Kind == kind && Snaps[i].Addr == addr) return &Snaps[i];
+        return nullptr;
+    }
+    Snap* Find(u8 kind, u32 addr, u32 a2)
+    {
+        for (int i = 0; i < NumSnaps; i++)
+            if (Snaps[i].Kind == kind && Snaps[i].Addr == addr && Snaps[i].A2 == a2) return &Snaps[i];
+        return nullptr;
+    }
+    Snap& Add(u8 kind, u32 addr)
+    {
+        assert(NumSnaps < 64);
+        Snap& s = Snaps[NumSnaps++]; s = Snap{}; s.Kind = kind; s.Addr = addr; return s;
+    }
+};
+#endif
+
 class Compiler : public Arm64Gen::ARM64XEmitter
 {
 public:
@@ -206,13 +268,12 @@ public:
     ~Compiler() override;
 
     // Code size of the blocks compiled since the last ResetBlockCache, as every console running
-    // the same guest code counts it: an estimate from the guest instruction count (the real size
-    // depends on host pointer values, e.g. ASLR), and blocks compiled from a savestate's profiles
-    // (ARMJIT::CompileFromProfile, CountLogical off) do not count. The cache is reset when it runs
-    // out, so that reset (which the guest sees: blocks are compiled again from a fresh interpreted
-    // run) falls on the same guest instruction everywhere; ARMJIT::DoSavestate carries it.
+    // the same guest code counts it (ARMJIT::CompileBlock adds it when it decides a compile): an
+    // estimate from the guest instruction count (the real size depends on host pointer values,
+    // e.g. ASLR), and blocks compiled from a savestate's profiles do not count. The cache is reset
+    // when it runs out, so that reset (which the guest sees: blocks are compiled again from a fresh
+    // interpreted run) falls on the same guest instruction everywhere; ARMJIT::DoSavestate carries it.
     u64 LogicalSize = 0;
-    bool CountLogical = true;
     // time to reset the block cache (checked before a block is looked up / compiled)
     bool NearlyFull();
 
@@ -226,6 +287,38 @@ public:
     }
 
     JitBlockEntry CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[], int instrsCount, bool hasMemInstr);
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    static constexpr int MaxPatchAddrs = 64;
+    int PatchBatchDepth = 0, NumPatchAddrs = 0;
+    u8* PatchAddrs[MaxPatchAddrs];
+    void BeginPatchBatch() { PatchBatchDepth++; }
+    void EndPatchBatch() { if (--PatchBatchDepth == 0) FlushPatchBatch(); }
+    void FlushPatchBatch();
+#endif
+    u8 A7T(u32 row, int k);   // NDS.ARM7MemTimings[row][k] (captured for a background-emitted block)
+    int ClassifyData9(u32 addr);
+    int ClassifyData7(u32 addr);
+#ifdef LITEV_JIT_BGEMIT
+    JitEmitJob* CurJob = nullptr;     // emitting this captured block: read nothing live
+    JitEmitJob* VerifyJob = nullptr;  // LITEV_JITBG_VERIFY: a base emission compares every read with it
+    void CaptureEmitInputs(ARM* cpu, JitEmitJob& job);
+    JitEmitJob::Snap* EmitSnap(u8 kind, u32 addr);
+    [[noreturn]] void EmitSnapMissing(const char* what, u32 addr);
+    [[noreturn]] void VerifyFail(const char* what, u32 addr, u32 captured, u32 live);
+    void JumpToCpuEffects(ARM* cpu, u32 addr, u32 r15, u32& regionCodeCycles, u32& cycles);
+    u32 LiteralRead(ARM* cpu, int size, bool signExtend, u32 addr, u32 r15);
+    // BG layout (blocks | far | entry stubs | DirectPatch guard stubs)
+    bool BgLayout = false;
+    ptrdiff_t StubArenaStart = 0, StubArenaEnd = 0, StubCursor = 0;
+    ptrdiff_t DPArenaStart = 0, DPArenaEnd = 0, DPCursor = 0;
+    void* PendingThunk[2] = {};
+    void* Gen_PendingThunk(u32 num);
+    u32 WriteEntryStub(u32 jobId, u32 num);   // returns the stub's RX offset, 0 if the arena is full
+    void PatchEntryStub(u32 stubOff, u32 targetOff);
+    void WriteAllEntryStubs();
+    u8* RWBase = nullptr;
+    std::recursive_mutex EmitLock;   // the emitter (stream cursor, patch log, code patches)
+#endif
 
     bool CanCompile(bool thumb, u16 kind);
 
@@ -639,6 +732,7 @@ public:
     {
         RegisterCache<Compiler, Arm64Gen::ARM64Reg> RegCache;
         FetchedInstr CurInstr;
+        int CurIdx;
         u32 R15, CodeRegion, ConstantCycles;
         bool Exit, IrregularCycles, CPSRDirty;
 #ifdef LITEV_JIT_CYCLE_BATCH
@@ -723,6 +817,7 @@ public:
     bool Exit;
 
     FetchedInstr CurInstr;
+    int CurIdx = 0;   // CurInstr's index in the block
     bool Thumb;
     u32 R15;
     u32 Num;

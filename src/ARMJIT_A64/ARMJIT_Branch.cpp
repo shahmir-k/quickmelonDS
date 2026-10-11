@@ -33,6 +33,90 @@ void JumpToTrampoline(T* cpu, u32 addr, bool changeCPSR)
     cpu->JumpTo(addr, changeCPSR);
 }
 
+#ifdef LITEV_JIT_BGEMIT
+// What Comp_JumpTo(u32) does to the CPU at compile time (in program order), and the timing it
+// bakes in. Same calls as the base build's inline code.
+void Compiler::JumpToCpuEffects(ARM* cpu, u32 addr, u32 r15, u32& regionCodeCycles, u32& cycles)
+{
+    cycles = 0;
+    if (cpu->Num == 0)
+    {
+        ARMv5* cpu9 = (ARMv5*)cpu;
+
+        u32 oldregion = r15 >> 24;
+        u32 newregion = addr >> 24;
+
+        regionCodeCycles = cpu9->MemTimings[addr >> 12][0];
+        u32 compileTimeCodeCycles = cpu9->RegionCodeCycles;
+        cpu9->RegionCodeCycles = regionCodeCycles;
+
+        bool setupRegion = newregion != oldregion;
+        if (setupRegion)
+            cpu9->SetupCodeMem(addr);
+
+        if (addr & 0x1)
+        {
+            addr &= ~0x1;
+            if (addr & 0x2)
+            {
+                cpu9->CodeRead32(addr-2, true);
+                cycles += cpu9->CodeCycles;
+                cpu9->CodeRead32(addr+2, false);
+                cycles += cpu9->CodeCycles;
+            }
+            else
+            {
+                cpu9->CodeRead32(addr, true);
+                cycles += cpu9->CodeCycles;
+            }
+        }
+        else
+        {
+            addr &= ~0x3;
+            cpu9->CodeRead32(addr, true);
+            cycles += cpu9->CodeCycles;
+            cpu9->CodeRead32(addr+4, false);
+            cycles += cpu9->CodeCycles;
+        }
+
+        cpu9->RegionCodeCycles = compileTimeCodeCycles;
+        if (setupRegion)
+            cpu9->SetupCodeMem(r15);
+    }
+    else
+    {
+        ARMv4* cpu7 = (ARMv4*)cpu;
+        regionCodeCycles = 0;
+
+        u32 codeRegion = addr >> 24;
+        u32 codeCycles = addr >> 15; // cheato
+
+        cpu7->CodeRegion = codeRegion;
+        cpu7->CodeCycles = codeCycles;
+
+        if (addr & 0x1)
+        {
+            addr &= ~0x1;
+            u32 compileTimePC = cpu->R[15];
+            cpu->R[15] = addr+2;
+            cycles += NDS.ARM7MemTimings[codeCycles][0] + NDS.ARM7MemTimings[codeCycles][1];
+            cpu->R[15] = compileTimePC;
+        }
+        else
+        {
+            addr &= ~0x3;
+            u32 compileTimePC = cpu->R[15];
+            cpu->R[15] = addr+4;
+            cycles += NDS.ARM7MemTimings[codeCycles][2] + NDS.ARM7MemTimings[codeCycles][3];
+            cpu->R[15] = compileTimePC;
+        }
+
+        cpu7->CodeRegion = r15 >> 24;
+        cpu7->CodeCycles = addr >> 15;
+    }
+}
+#endif
+
 void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
 {
     // we can simplify constant branches by a lot
@@ -76,6 +160,53 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
 #endif
     }
 
+#ifdef LITEV_JIT_BGEMIT
+    // The CPU-field part (timing lookups through the CPU, fields left changed) is
+    // JumpToCpuEffects; a background-emitted block reads its captured result instead.
+    {
+        u32 regionCodeCycles = 0;
+        if (CurJob)
+        {
+            JitEmitJob::Snap* sn = EmitSnap(JitEmitJob::SnapJump, CurIdx);
+            if (!sn || sn->A2 != addr) EmitSnapMissing("jump", addr);
+            regionCodeCycles = sn->A;
+            cycles = sn->B;
+        }
+        else
+        {
+            JumpToCpuEffects(CurCPU, addr, R15, regionCodeCycles, cycles);
+            if (VerifyJob)
+            {
+                JitEmitJob::Snap* sn = VerifyJob->Find(JitEmitJob::SnapJump, CurIdx);
+                if (!sn || sn->A2 != addr || sn->A != regionCodeCycles || sn->B != cycles)
+                    VerifyFail("jump", addr, sn ? sn->B : ~0u, cycles);
+                sn->Used = 1;
+            }
+        }
+        if (Num == 0)
+        {
+            MOVI2R(W0, regionCodeCycles);
+            STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARMv5, RegionCodeCycles));
+        }
+        else
+        {
+            MOVI2R(W0, addr >> 24);
+            STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, CodeRegion));
+            MOVI2R(W0, addr >> 15);
+            STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, CodeCycles));
+        }
+        if (addr & 0x1)
+        {
+            addr &= ~0x1;
+            newPC = addr+2;
+        }
+        else
+        {
+            addr &= ~0x3;
+            newPC = addr+4;
+        }
+    }
+#else
     if (Num == 0)
     {
         ARMv5* cpu9 = (ARMv5*)CurCPU;
@@ -173,6 +304,8 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
         cpu7->CodeRegion = R15 >> 24;
         cpu7->CodeCycles = addr >> 15;
     }
+
+#endif
 
 #ifdef LITEV_JIT_LINK
     StaticExitNewPC = newPC;
