@@ -1143,6 +1143,9 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         // LITEV_MP_PIN=c0,c1,...: console k's thread on core ck (list shorter than the consoles: round robin
         // over the entries after the first, which is console 0's)
         if (const char* pv = getenv("LITEV_MP_PIN"))
+#ifdef LITEV_MP_FIBERS
+        if (!Fiber::Active())   // (a fiber's worker is pinned by LITEV_MP_FIBER_PIN)
+#endif
         {
             std::vector<int> cores;
             for (const char* q = pv; *q; ) { cores.push_back(atoi(q)); while (*q && *q != ',') q++; if (*q) q++; }
