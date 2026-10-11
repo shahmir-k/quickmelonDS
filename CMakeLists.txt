@@ -226,6 +226,17 @@ option(LITEV_SOFT2D_BG3DNEON "liteV: 4-wide NEON 2D 3D-layer compositor (DrawBG_
 if (LITEV_SOFT2D_BG3DNEON)
     add_compile_definitions(LITEV_SOFT2D_BG3DNEON=1)
 endif()
+# DSperate's 2D compositing technique (GPLv3, docs/techniques/03-2d-engines-and-scanline-pipeline.md,
+# kernels_neon.cpp composite_line): the colour-effect compositor works on byte planes, 16 pixels
+# per step (vld4/vst4 of the 6-bit R/G/B + flag bytes), builds per-pixel effect masks and only
+# computes the effects a 16-pixel group actually uses; groups with no effect copy through. The
+# old LITEV_SOFT2D_NEON compositor computed all four effects for every pixel. Byte-exact (same
+# arithmetic per pixel). Needs LITEV_SOFT2D_NEON; AArch64 only. Check mode: env/prop
+# LITEV_S2DBITS_CHECK=1 runs the old compositor beside it and counts mismatching pixels.
+option(LITEV_SOFT2D_BITMASK "liteV: DSperate byte-plane masked 2D colour-effect compositor" OFF)
+if (LITEV_SOFT2D_BITMASK)
+    add_compile_definitions(LITEV_SOFT2D_BITMASK=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)
