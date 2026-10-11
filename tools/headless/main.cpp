@@ -47,8 +47,9 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsy
 #ifdef __APPLE__
 // Instructions retired / cycles of the calling thread (Apple Silicon PMU, libsystem_kernel).
 extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);
-static uint64_t EmuThreadInstr = 0, EmuThreadCycles = 0;
 #endif
+// emu-thread counters (macOS: instructions/cycles; Linux: instructions stay 0, "cycles" = thread CPU ns)
+static uint64_t EmuThreadInstr = 0, EmuThreadCycles = 0;
 #include "LiteProfile.h"
 #include "VerifyTrace.h"
 #include "InputScript.h"
@@ -766,6 +767,8 @@ int main(int argc, char** argv)
 #ifdef __APPLE__
         uint64_t tc0[2] = {};
         thread_selfcounts(1, tc0, sizeof(tc0));
+#else
+        timespec tcs0; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tcs0);
 #endif
 #ifdef __linux__
         {   // LITEV_MARKFRAMES=A-B: name the thread "markframes" during frames A..B (perf report --comm)
@@ -783,6 +786,12 @@ int main(int argc, char** argv)
             thread_selfcounts(1, tc1, sizeof(tc1));
             EmuThreadInstr += tc1[0] - tc0[0];
             EmuThreadCycles += tc1[1] - tc0[1];
+        }
+#endif
+#ifndef __APPLE__
+        {
+            timespec tcs1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &tcs1);
+            EmuThreadCycles += (tcs1.tv_sec - tcs0.tv_sec) * 1000000000ull + tcs1.tv_nsec - tcs0.tv_nsec;
         }
 #endif
         if (frameMs)
@@ -1038,6 +1047,9 @@ int main(int argc, char** argv)
     // emulation thread only (RunFrame), so render/worker threads don't dilute A/B deltas
     printf("emu_thread_instructions: %llu\nemu_thread_cycles: %llu\n",
            (unsigned long long)EmuThreadInstr, (unsigned long long)EmuThreadCycles);
+#endif
+#ifndef __APPLE__
+    printf("emu_thread_cpu_ns: %llu\n", (unsigned long long)EmuThreadCycles);
 #endif
     if (wav)
     {

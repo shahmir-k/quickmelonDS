@@ -277,6 +277,14 @@ public:
     }
 
     JitBlockEntry CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[], int instrsCount, bool hasMemInstr);
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    static constexpr int MaxPatchAddrs = 64;
+    int PatchBatchDepth = 0, NumPatchAddrs = 0;
+    u8* PatchAddrs[MaxPatchAddrs];
+    void BeginPatchBatch() { PatchBatchDepth++; }
+    void EndPatchBatch() { if (--PatchBatchDepth == 0) FlushPatchBatch(); }
+    void FlushPatchBatch();
+#endif
     u8 A7T(u32 row, int k);   // NDS.ARM7MemTimings[row][k] (captured for a background-emitted block)
     int ClassifyData9(u32 addr);
     int ClassifyData7(u32 addr);

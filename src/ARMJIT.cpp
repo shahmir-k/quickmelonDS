@@ -17,6 +17,13 @@
 */
 
 #include "ARMJIT.h"
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sched.h>
+#include <unistd.h>
+#endif
 #include "ARM7HLE.h"
 #include "ARM9HLE.h"
 #include "ARMJIT_Memory.h"
@@ -857,6 +864,23 @@ void ARMJIT::WorkerLoop()
 #elif defined(__APPLE__)
     pthread_setname_np("jitemit");
 #endif
+#if defined(__ANDROID__)
+    {
+        // keep off the emulator's core: debug.litev.jitbgcpu = CPU mask (default: every CPU but the
+        // last, where the app pins the emulator thread on the RG DS); 0 = no pinning
+        long n = sysconf(_SC_NPROCESSORS_CONF);
+        unsigned mask = n > 1 && n < 32 ? ((1u << n) - 1) & ~(1u << (n - 1)) : 0;
+        char b[16] = {0};
+        if (__system_property_get("debug.litev.jitbgcpu", b) > 0)
+            mask = (unsigned)strtoul(b, nullptr, 0);
+        if (mask)
+        {
+            cpu_set_t set; CPU_ZERO(&set);
+            for (int c = 0; c < 32; c++) if (mask & (1u << c)) CPU_SET(c, &set);
+            sched_setaffinity(0, sizeof(set), &set);
+        }
+    }
+#endif
     while (!WorkerStop.load())
     {
         if (Head.load() != Tail.load())
@@ -1037,6 +1061,9 @@ static inline void LiteV_UpdatePendingPeak(size_t p9, size_t p7) noexcept
 // code is finalized)
 void ARMJIT::LinkBlockOutgoing(JitBlock* block) noexcept
 {
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    struct PatchBatch { Compiler& c; PatchBatch(Compiler& c) : c(c) { c.BeginPatchBatch(); } ~PatchBatch() { c.EndPatchBatch(); } } patchBatch(JITCompiler);
+#endif
     auto& blocks  = block->Num == 0 ? JitBlocks9    : JitBlocks7;
     auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
     JitEnableWrite();
@@ -1069,6 +1096,9 @@ void ARMJIT::LinkBlockOutgoing(JitBlock* block) noexcept
 
 void ARMJIT::LinkBlock(JitBlock* block) noexcept
 {
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    struct PatchBatch { Compiler& c; PatchBatch(Compiler& c) : c(c) { c.BeginPatchBatch(); } ~PatchBatch() { c.EndPatchBatch(); } } patchBatch(JITCompiler);
+#endif
 #ifdef LITEV_JIT_BGEMIT
     LinkBlockOutgoing(block);
     auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
@@ -1136,6 +1166,9 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
 
 void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
 {
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    struct PatchBatch { Compiler& c; PatchBatch(Compiler& c) : c(c) { c.BeginPatchBatch(); } ~PatchBatch() { c.EndPatchBatch(); } } patchBatch(JITCompiler);
+#endif
     auto& blocks  = block->Num == 0 ? JitBlocks9    : JitBlocks7;
     auto& pending = block->Num == 0 ? PendingLinks9 : PendingLinks7;
 

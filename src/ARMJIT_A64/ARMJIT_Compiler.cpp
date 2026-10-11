@@ -2089,7 +2089,47 @@ void Compiler::PatchLinkSite(u32 rxOffset, u32 targetRxOffset)
     *(u32*)(rwbase + rxOffset) = instr;
 
     u8* rxptr = GetRXBase() + rxOffset;
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+    if (PatchBatchDepth)
+    {
+        if (NumPatchAddrs == MaxPatchAddrs)
+            FlushPatchBatch();
+        PatchAddrs[NumPatchAddrs++] = rxptr;
+        return;
+    }
+#endif
     __builtin___clear_cache((char*)rxptr, (char*)rxptr + 4);
+}
+#endif
+
+#ifdef LITEV_JIT_LINK_FLUSHBATCH
+// One cache-maintenance sequence for all the link sites a link/unlink patched: a line clean
+// and invalidate per site, but the barriers (DSB, DSB, ISB) once, not per 4-byte patch.
+// Nothing runs the patched code before the batch ends (the emulator thread is in C++).
+void Compiler::FlushPatchBatch()
+{
+    if (!NumPatchAddrs)
+        return;
+#if defined(__aarch64__) && !defined(__APPLE__) && !defined(_WIN32)
+    u64 ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    const u64 dsize = 4 << ((ctr >> 16) & 0xf), isize = 4 << (ctr & 0xf);
+    if (!((ctr >> 28) & 1))   // IDC clear: clean the data lines
+        for (int i = 0; i < NumPatchAddrs; i++)
+            __asm__ volatile("dc civac, %0" : : "r"((u64)PatchAddrs[i] & ~(dsize - 1)) : "memory");
+    __asm__ volatile("dsb ish" : : : "memory");
+    if (!((ctr >> 29) & 1))   // DIC clear: invalidate the instruction lines
+    {
+        for (int i = 0; i < NumPatchAddrs; i++)
+            __asm__ volatile("ic ivau, %0" : : "r"((u64)PatchAddrs[i] & ~(isize - 1)) : "memory");
+        __asm__ volatile("dsb ish" : : : "memory");
+    }
+    __asm__ volatile("isb" : : : "memory");
+#else
+    for (int i = 0; i < NumPatchAddrs; i++)
+        __builtin___clear_cache((char*)PatchAddrs[i], (char*)PatchAddrs[i] + 4);
+#endif
+    NumPatchAddrs = 0;
 }
 #endif
 

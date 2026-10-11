@@ -1236,6 +1236,11 @@ option(LITEV_JIT_MOV_ELIDE "JIT: no self-move before the dynamic-branch stub (ex
 if (LITEV_JIT_MOV_ELIDE)
     add_compile_definitions(LITEV_JIT_MOV_ELIDE=1)
 endif()
+option(LITEV_JIT_LINK_FLUSHBATCH "JIT: one cache-maintenance barrier sequence per link/unlink instead of per patched site (exact, host-only)" OFF)
+if (LITEV_JIT_LINK_FLUSHBATCH)
+    add_compile_definitions(LITEV_JIT_LINK_FLUSHBATCH=1)
+endif()
+
 option(LITEV_JIT_BGEMIT "JIT: emit a block's code in the background from inputs captured at its compile (exact, deterministic); debug.litev.jitbg" OFF)
 if (LITEV_JIT_BGEMIT)
     if (NOT LITEV_JIT_DISPATCH OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
