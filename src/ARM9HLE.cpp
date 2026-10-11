@@ -2999,6 +2999,24 @@ __attribute__((noinline)) bool RunFx(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
+// ---- 19. MKDS packed vertex transform -------------------------------------------------------
+// The 229 words from 020224e0 through its ARM return.  The entry opcode is shared with
+// NODEDESC, so require this whole-code fingerprint before ever selecting the MKDS path.
+constexpr u64 kMkVertSig = 0xE8BDABCB6D3929CFull;
+constexpr u32 kMkVertWords = 229;
+bool MkVertAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a & 3) return false;
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 i = 0; i < kMkVertWords * 4; i++)
+    {
+        const u8* p = CodePtr(c, a + i);
+        if (!p) return false;
+        h = (h ^ *p) * 0x100000001b3ull;
+    }
+    return h == kMkVertSig;
+}
+
 // ---- 9. _ll_sdiv: 64-bit signed divide of the compiler runtime -----------------------------------
 // r1:r0 / r3:r2 by shift-and-subtract (~750 guest instructions a call; PW: 2-3 calls a frame from one
 // caller in 3D scenes). Natively: the quotient, r3:r2 = |divisor| normalized (shifted left until bit
