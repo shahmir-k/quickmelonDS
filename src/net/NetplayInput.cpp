@@ -281,40 +281,31 @@ void NetplayInput::NoteSpeed(int player, int frame, const NetplayFrameInput& in)
     if (code != SpeedLast[player]) { SpeedChanges[player][frame] = code; SpeedLast[player] = code; }
 }
 
-int NetplayInput::SpeedAt(int frame, u32* requesters)
+int NetplayInput::SpeedAt(int frame, u32* requesters, int* inputFrame)
 {
-    if (requesters) *requesters = 0;
-    frame -= kSpeedLag;
-    if (frame < 0) return 0;
-    std::unique_lock<std::mutex> lk(Lock);
-    auto known = [&]
+    std::lock_guard<std::mutex> lk(Lock);
+    int upTo = std::min(frame - kSpeedLag, LocalUpTo);
+    for (int peer : Peers) if (!Dropped(peer)) upTo = std::min(upTo, RemoteUpTo[peer]);
+    for (; SpeedCursor < upTo; SpeedCursor++)
     {
-        if (!Running) return true;
-        if (LocalUpTo < frame) return false;
-        for (int peer : Peers) if (RemoteUpTo[peer] < frame && !Dropped(peer)) return false;
-        return true;
-    };
-    if (!known())
-    {
-        u64 start = NowUs();
-        while (!Changed.wait_for(lk, std::chrono::seconds(2), known))
-            Platform::Log(Platform::LogLevel::Warn, "Netplay: still waiting for every player's input at frame %d (session speed)\n", frame);
-        PeerWaitUs += NowUs() - start;
+        const int f = SpeedCursor + 1;
+        int best = 0;
+        u32 who = 0;
+        for (int p = 0; p < kMaxPlayers; p++)
+        {
+            auto& ch = SpeedChanges[p];
+            auto it = ch.upper_bound(f);
+            if (it == ch.begin()) continue;
+            int code = std::prev(it)->second;
+            ch.erase(ch.begin(), std::prev(it));    // older changes are never asked for again
+            if (code) who |= 1u << p;
+            best = std::max(best, code);
+        }
+        if (best != SpeedCode || who != SpeedWho) { SpeedCode = best; SpeedWho = who; SpeedFrom = f; }
     }
-    int best = 0;
-    u32 who = 0;
-    for (int p = 0; p < kMaxPlayers; p++)
-    {
-        auto& ch = SpeedChanges[p];
-        auto it = ch.upper_bound(frame);
-        if (it == ch.begin()) continue;
-        int code = std::prev(it)->second;
-        ch.erase(ch.begin(), std::prev(it));    // older changes are never asked for again
-        if (code) who |= 1u << p;
-        best = std::max(best, code);
-    }
-    if (requesters) *requesters = who;
-    return best;
+    if (requesters) *requesters = SpeedWho;
+    if (inputFrame) *inputFrame = SpeedFrom;
+    return SpeedCode;
 }
 #endif
 
