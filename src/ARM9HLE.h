@@ -28,7 +28,7 @@
 // 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ,
 // 2048 G3D shape (needs 512), 4096 VEC_Normalize, 8192 G3D node (NODEDESC),
 // 16384 MKDS stereo sample effect, 32768 G3D material animation (needs 128), 65536 G3D SBC loop,
-// 131072 NNS_G2dMakeCellToOams, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop; 8 needs 1)
+// 131072 NNS_G2dMakeCellToOams, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase; 8 needs 1)
 // for A/B of single hooks.
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
