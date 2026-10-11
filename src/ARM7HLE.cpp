@@ -223,6 +223,22 @@ s32 SinIdx(melonDS::NDS& nds, const ExVar& v, s32 x)
     return (s32)(s8)(-t(0x20 - (x - 0x60)));
 }
 
+// A busy one-shot SPU channel whose sample can end within the next ~24k timer ticks (~49k ARM7 cycles): the guest call
+// (<= ~10k cycles) can see its busy bit drop at an SPU event inside it (the batched Event_SPU runs every 8192 cycles), while
+// the native call reads the bits at its entry -> the guest runs that call (exact; found by compare mode on the PW battle
+// recording 20261011-115006). Conservative: timer ticks are counted as cycles, the current sample's progress ignored.
+constexpr s64 kEndWindowTicks = 24576;
+bool MayEndSoon(melonDS::NDS& nds, int i)
+{
+    const melonDS::SPUChannel& ch = nds.SPU.GetChannel(i);
+    const u32 cnt = ch.Cnt, fmt = (cnt >> 29) & 3;
+    if (!(cnt >> 31) || ((cnt >> 27) & 3) != 2 || fmt == 3 || ch.LoopPos + ch.Length < 16) return false;
+    const s64 total = (s64)ch.LoopPos + ch.Length;
+    const s64 thr = fmt == 0 ? total : fmt == 1 ? (total + 1) / 2 : 2 * total;     // the Pos at which NextSample stops it
+    const s64 pos = ch.KeyOn ? -3 : ch.Pos;
+    return (thr - pos - 1) * (s64)(0x10000 - ch.TimerReload) <= kEndWindowTicks;
+}
+
 // Runs the update into chans (a copy of the 16 structs). Returns false if the guest code has
 // to run instead (a channel callback would be called, or an unsupported path).
 bool ExChannelMain(melonDS::NDS& nds, const State& s, u8* chans, bool step)
@@ -237,6 +253,7 @@ bool ExChannelMain(melonDS::NDS& nds, const State& s, u8* chans, bool step)
 
         if (flags & 2)
             c[3] = (u8)((flags | 0x08) & ~2);          // syncFlag |= START, start = 0
+        else if (MayEndSoon(nds, i)) return false;
         else if (!(nds.ARM7Read8(0x04000403 + i * 16) & 0x80))
         {
             if (R32(c + 0x48)) return false;           // callback
@@ -1049,7 +1066,7 @@ struct StatsDump
             fprintf(stderr, "A7HLE hwcommit: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu cyc=%llu\n", s.hw,
                     (unsigned long long)s.hwN[0], (unsigned long long)s.hwN[1], (unsigned long long)s.hwN[2], (unsigned long long)s.hwN[3], (unsigned long long)s.hwN[4], (unsigned long long)s.hwN[5]);
 #ifdef LITEV_HLE_DIAG
-        if (g_BusyDiffs) fprintf(stderr, "A7HLE check: %llu exchannel differences with a channel stopping inside the guest call (busy bits sampled at entry; not counted)\n", (unsigned long long)g_BusyDiffs);
+        if (g_BusyDiffs) fprintf(stderr, "A7HLE check: %llu exchannel differences with a channel stopping inside the guest call (counted in check_diffs)\n", (unsigned long long)g_BusyDiffs);
         if (g_IrqDiffs) fprintf(stderr, "A7HLE check: %llu differences with an IRQ inside the guest call (not counted above)\n", (unsigned long long)g_IrqDiffs);
 #endif
     }
@@ -1604,8 +1621,8 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     {
         busyNow = 0;
         for (int i = 0; i < 16; i++) busyNow |= (nds.ARM7Read8(0x04000403 + i * 16) >> 7) << i;
-        // a channel that stopped inside the guest call: the native call sampled it at entry (documented category B)
-        if (diff && busyNow != g_Pending.busy) { g_BusyDiffs++; g_Pending.busy = -1; return; }
+        // a channel that stopped inside the guest call (the native call falls back when one can: MayEndSoon): counted
+        if (diff && busyNow != g_Pending.busy) g_BusyDiffs++;
         g_Pending.busy = -1;
     }
     if (diff)

@@ -380,6 +380,7 @@ public:
     void Write8(u32 addr, u8 val);
     void Write16(u32 addr, u16 val);
     void Write32(u32 addr, u32 val);
+    const SPUChannel& GetChannel(int i) const { return Channels[i]; }   // (A7HLE: is a sample about to end)
 
 private:
     u32 OutputBufferSize = 0;
