@@ -70,7 +70,7 @@
 //    NNS_G3dGeBufferOP_N's direct GXFIFO send (BulkWords); the frames, flags and registers up to SHP's return.
 //
 // 14. VEC_Normalize (position independent: PW, PB, W2): the divider / sqrt stores, results, frame, registers natively.
-// 15. NNS G3D NODEDESC (PW, PB): the joint's matrix (NSBCA joint animation or the model's node data, the scaling rule,
+// 15. NNS G3D NODEDESC (PW, PB; W2: Thumb, push {r4-r7, lr}): the joint's matrix (NSBCA joint animation or the model's node data, the scaling rule,
 //    MTX_RESTORE / MULT / TRANS / SCALE / STORE) natively at its entry; callee frames below sp and the scratch registers
 //    are not written (dead after the return).
 //
@@ -98,7 +98,7 @@ inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D
                                         || instr == 0xE92D4010 || instr == 0xE92D58F0 || instr == 0xE92D4FF8 || instr == 0xE92D4FF0; }
 // Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4} / MIi_FIFOCallback
 // push {r3-r7, lr} / SBC MAT push {r4-r6, lr}); instr: the halfword
-inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8 || instr == 0xB570; }
+inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8 || instr == 0xB570 || instr == 0xB5F0; }
 // JIT decode: is the instruction at addr (ARM, or Thumb with thumb set) a hooked entry?
 // 0 no, 1 yes (code signature verified: under the JIT this compile-time check is the code
 // check), 2 hook site whose code differs now (compile the guest code, but still depend on the

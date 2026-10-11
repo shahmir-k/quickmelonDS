@@ -2061,7 +2061,8 @@ constexpr u64 kNodeSig = 0xb607b6e45aa9d124ull;
 constexpr u16 kIdent33T[7] = {0x2100, 0x2200, 0x2300, 0xC00E, 0xC00E, 0xC00E, 0x4770};   // Thumb: 9 zero words to r0
 // ponytail: fitted estimate (check mode without IRQs, PW title / town / gift box / overworld, 23.4k calls, p95 error 6.6%):
 // base + per OP_N + per GX word + per VEC_Normalize + per rotation entry + per animation track + animation path
-constexpr s32 kNodeCyc0 = 248, kNodeCycOp = 68, kNodeCycWord = 20, kNodeCycVec = 212, kNodeCycRot = 190, kNodeCycTrk = 57, kNodeCycAnm = 129;
+// [0] PW / PB (ARM), [1] W2 (Thumb; W2 town, 14k calls, p95 6.0%)
+constexpr s32 kNodeCyc[2][7] = {{248, 68, 20, 212, 190, 57, 129}, {202, 56, 22, 208, 85, 44, 155}};
 
 u32 BlxTarget(melonDS::ARMv5* c, u32 a)
 {
@@ -2268,7 +2269,32 @@ struct Node
 };
 
 // result: the JntAnmResult (0x58 bytes: +0 flags, +4 scale, +0x10 inverse scale (Maya), +0x28 rotation, +0x4C trans)
-bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
+// the build's functions (pointer values as stored: Thumb ones | 1) and the literal words the native code reads
+struct NodeVar { u32 blend, anm, sclB, sclM, sndB, sndM, rsLit, rotTab, pivTab, mayaTab, ge; };
+NodeVar NodeVarPW(melonDS::ARMv5* c, u32 E, u32 opn)
+{
+    return {E + kNdAffc, E + kNdEb94, E + kNdCf0, E + kNdDf4, E + kNdC74, E + kNdD30, E + kNdEe78 + 0x3B0, E + kNdFfb8 + 0x15C,
+            E + 0x450, E + kNdDf4 + 0x144, R32(CodePtr(c, opn + 55 * 4))};
+}
+// W2 (TWL SDK build: the same NNS code in Thumb, the blend function in ARM)
+constexpr u32 kW2NodeEntry = 0x02066A10;
+constexpr NodeVar kW2Node = {0x02065D38, 0x020687DD, 0x02069FC1, 0x0206A071, 0x02069F6D, 0x02069FE9, 0x02068C88, 0x02069728,
+                             0x02066D34, 0x0206A150, 0x021469B4};
+constexpr Range kW2NodeCode[14] = {
+    {0x02066A10, 0x02066D44}, {0x02065D38, 0x02065DC4}, {0x020687DC, 0x02068800}, {0x020689DC, 0x02068C8C}, {0x02068C8C, 0x02068D7C},
+    {0x02068E94, 0x02068FDC}, {0x02069108, 0x020693BC}, {0x0206962C, 0x02069738}, {0x02069F6C, 0x0206A154}, {0x02067D48, 0x02067DD0},
+    {0x020786B0, 0x020786C8}, {0x02074280, 0x02074280 + 69 * 4}, {0x020790B0, 0x020790BE}, {0x0208D638, 0x0208D658}};
+constexpr u64 kW2NodeSig = 0xe20a5192f58b6b94ull;
+int W2NodeAt(melonDS::ARMv5* c)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    for (const Range& r : kW2NodeCode)
+        for (u32 a = r.a; a < r.b; a++) { const u8* p = CodePtr(c, a); if (!p) return 0; h = (h ^ *p) * 0x100000001b3ull; }
+    if (g_Stats && h != kW2NodeSig) fprintf(stderr, "A9HLE: W2 G3D node signature %016llx\n", (unsigned long long)h);
+    return h == kW2NodeSig ? 1 : 2;
+}
+
+bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, const NodeVar& v)
 {
     Mem& m = q.m;
     const u32 rs = c->R[0], opt = c->R[1];
@@ -2286,12 +2312,12 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
     // OP_N straight to GXFIFO: no buffering, no GE buffer or an empty one
     if (send)
     {
-        const u32 ge = R32(CodePtr(c, opn + 55 * 4)), gb = q.rd(ge, 4);
+        const u32 ge = v.ge, gb = q.rd(ge, 4);
         if (q.rd(ge + 4, 4) || (gb && q.rd(gb, 4)) || q.bad) return false;
     }
     const u32 send1 = RS.r(0xEC), scl = RS.r(0xE8);
-    const u32 rsg = q.rd(R32(CodePtr(c, E + kNdEe78 + 0x3B0)), 4);     // NNS_G3dRS
-    if (q.bad || rsg != rs || (send && send1 != E + kNdC74 && send1 != E + kNdD30) || (scl != E + kNdCf0 && scl != E + kNdDf4)) return false;
+    const u32 rsg = q.rd(R32(CodePtr(c, v.rsLit)), 4);     // NNS_G3dRS
+    if (q.bad || rsg != rs || (send && send1 != v.sndB && send1 != v.sndM) || (scl != v.sclB && scl != v.sclM)) return false;
     u32 r4 = 4;
     if (opt == 0x40 || opt == 0x60)
     {
@@ -2308,7 +2334,7 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
     // the joint animation (out of line: the in-order A55's code budget)
     auto bca = [&](u32 anm, u32 map, u32 fa) __attribute__((noinline)) -> bool
     {
-        if (fa != E + kNdEb94) return false;
+        if (fa != v.anm) return false;
         fromRes = false;
         q.anm = 1;
         // 0206eb94: frame clamp; 0206ee78: NNSi_G3dAnmCalcNsBca
@@ -2332,7 +2358,7 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
                     if (info & (8 << k)) { tr[k] = q.rs32(d); d += 4; }
                     else { tr[k] = q.Trans(frame, d, jr); d += 8; }
                 }
-            const u32 tab = R32(CodePtr(c, E + kNdFfb8 + 0x15C));
+            const u32 tab = R32(CodePtr(c, v.rotTab));
             if (info & 0xC0) fl |= 2;
             else if (info & 0x100)
             {
@@ -2354,7 +2380,7 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
     const u32 anm = q.rd(ro + 0x10, 4);
     if (anm)
     {
-        if (q.rd(ro + 0x14, 4) != E + kNdAffc || q.rd(anm + 0x10, 4)) return false;   // blend function; one animation
+        if (q.rd(ro + 0x14, 4) != v.blend || q.rd(anm + 0x10, 4)) return false;   // blend function; one animation
         const u32 nmap = q.rd(anm + 0x19, 1), map = idx < nmap ? q.rd(anm + 0x1A + idx * 2, 2) : 0;
         const u32 fa = q.rd(anm + 0xC, 4);
         if (q.bad) return false;
@@ -2379,7 +2405,7 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
         if (h & 2) fl |= 2;
         else if (h & 8)
         {
-            const u32 fp = (h & 0xF0) >> 4, tab = R32(CodePtr(c, E + 0x450));
+            const u32 fp = (h & 0xF0) >> 4, tab = R32(CodePtr(c, v.pivTab));
             s32 a = q.rs16(d), b = q.rs16(d + 2);
             const u32 t0 = q.rd(tab + fp * 4, 1), t1 = q.rd(tab + fp * 4 + 1, 1), t2 = q.rd(tab + fp * 4 + 2, 1), t3 = q.rd(tab + fp * 4 + 3, 1);
             if (q.bad || fp > 8 || t0 > 8 || t1 > 8 || t2 > 8 || t3 > 8) return false;
@@ -2405,7 +2431,7 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
     if (fromRes && !res()) return false;
     if (q.bad) return false;
     // the joint scaling rule
-    if (scl == E + kNdCf0)
+    if (scl == v.sclB)
     {
         if (sbits & 4) fl |= 1;
         else { R[1] = sc[0]; R[2] = sc[1]; R[3] = sc[2]; }
@@ -2414,7 +2440,7 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
     else
     {
         // Maya SSC: the node's flags byte (sbc + 3), the render state's bit vectors at +0xC4, the inverse-scale table
-        const u32 b3 = q.rd(sbc + 3, 1), tb = R32(CodePtr(c, E + kNdDf4 + 0x144));
+        const u32 b3 = q.rd(sbc + 3, 1), tb = R32(CodePtr(c, v.mayaTab));
         if (sbits & 4)
         {
             fl |= 1;
@@ -2454,7 +2480,7 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
     if (send)
     {
         const u32* Ru = (const u32*)R;
-        if (send1 == E + kNdC74)
+        if (send1 == v.sndB)
         {
             if (!(fl & 4)) { if (!(fl & 2)) q.Op(0x19, Ru + 10, 12); else q.Op(0x1C, Ru + 19, 3); }
             else if (!(fl & 2)) q.Op(0x1A, Ru + 10, 9);
@@ -2489,9 +2515,11 @@ bool NodeNative(melonDS::ARMv5* c, Node& q, Expect& e, u32 E, u32 opn)
 
 __attribute__((noinline)) bool RunNode(melonDS::ARMv5* c, State& s, bool jit)
 {
-    const u32 pc = c->R[15] - 8;
+    const bool t = c->CPSR & 0x20;
+    const u32 pc = c->R[15] - (t ? 4 : 8);
     u32 fn[4];
-    if (jit) fn[0] = BlTarget(c, pc + 0x70);
+    if (t) { if (pc != kW2NodeEntry || (!jit && W2NodeAt(c) != 1)) return false; fn[0] = 1; }
+    else if (jit) fn[0] = BlTarget(c, pc + 0x70);
     else if (NodeAt(c, pc, fn) != 1) return false;
     s.calls[15]++;
     melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
@@ -2504,7 +2532,7 @@ __attribute__((noinline)) bool RunNode(melonDS::ARMv5* c, State& s, bool jit)
     Expect e;
     // GX: the geometry engine takes the words now (FIFO empty); the IO page passes the protection unit (VEC_Normalize)
     bool ok = !CheckPending && fn[0] && gx.GeometryEnabled && gx.BulkReady() && (c->PU_Map[0x04000280 >> 12] & 0x03) == 0x03
-              && NodeNative(c, q, e, pc, fn[0]);
+              && NodeNative(c, q, e, t ? kW2Node : NodeVarPW(c, pc, fn[0]));
 #ifdef LITEV_HLE_DIAG
     if (ok && (g_Check || g_Dry))
     {
@@ -2532,8 +2560,8 @@ __attribute__((noinline)) bool RunNode(melonDS::ARMv5* c, State& s, bool jit)
     m.Flush();
     if (q.ngw) gx.BulkWords(q.gw, q.ngw);
     s.native[15]++;
-    Return(c, e, kNodeCyc0 + kNodeCycOp * (s32)q.nop + kNodeCycWord * (s32)q.ngw + kNodeCycVec * (s32)q.nvec + kNodeCycAnm * (s32)q.anm
-                 + kNodeCycRot * (s32)q.nrot + kNodeCycTrk * (s32)q.ntrk);
+    const s32* k = kNodeCyc[t];
+    Return(c, e, k[0] + k[1] * (s32)q.nop + k[2] * (s32)q.ngw + k[3] * (s32)q.nvec + k[4] * (s32)q.nrot + k[5] * (s32)q.ntrk + k[6] * (s32)q.anm);
     return true;
 }
 #endif
@@ -2825,6 +2853,9 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         r = &lz;
         return 1;
     }
+#ifdef LITEV_GX_BULK
+    if (addr == kW2NodeEntry && (instr & 0xFFFF) == 0xB5F0) { r = kW2NodeCode; return 14; }
+#endif
     const Variant& v = *Active(&nds.ARM9)->v;     // after IsHook != 0
     if (addr == v.wake)
     {
@@ -2862,6 +2893,13 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
     if (thumb)
     {
         if (!MaybeHookT(instr)) return 0;
+#ifdef LITEV_GX_BULK
+        if (addr == kW2NodeEntry && (instr & 0xFFFF) == 0xB5F0)
+        {
+            State& s = St(&nds.ARM9);
+            return s.on && (s.mask & 8192) ? W2NodeAt(&nds.ARM9) : 0;
+        }
+#endif
         State& s = Get(&nds.ARM9, addr, instr & 0xFFFF, true);
         if (s.status != 1) return 0;
         const int k = Kind(*s.v, addr, instr & 0xFFFF, true);
@@ -3679,6 +3717,13 @@ __attribute__((noinline)) bool RunOs(melonDS::ARMv5* c, State& s, int k, bool ji
 __attribute__((noinline)) bool RunThumb(melonDS::ARMv5* c, bool jit)
 {
     const u32 pc = c->R[15] - 4, in = c->CurInstr & 0xFFFF;
+#ifdef LITEV_GX_BULK
+    if (pc == kW2NodeEntry && in == 0xB5F0)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 8192) && RunNode(c, s, jit);
+    }
+#endif
     State& s = Get(c, pc, in, true);
     if (s.status != 1) return false;
     const int k = Kind(*s.v, pc, in, true);
