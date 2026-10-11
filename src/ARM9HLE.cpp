@@ -26,7 +26,7 @@
 namespace melonDS::A9HLE
 {
 #ifdef LITEV_HLE_DIAG
-bool CheckPending = false;
+thread_local bool CheckPending = false;
 #endif
 #ifdef LITEV_A9HLE_GXCHECK
 std::vector<u32>* GxTap = nullptr;
@@ -247,15 +247,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 16;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 16383;
+constexpr int kKinds = 17;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 32767;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -290,9 +290,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -639,7 +639,8 @@ struct Pending
     std::vector<std::pair<u32, u32>> io;    // GX async check: the IO writes of the native plan (IME toggles left out)
     Expect fin; u32 finA = 0, finV = 0;     // G3D shape check, stage 2: registers at SHP's return, the SBC pointer word
     bool stage2 = false, small = false;     // G3D shape check: stage 2 pending; the small-list path (no IO, GX words)
-} g_P;
+};
+thread_local Pending g_P;
 #ifdef LITEV_A9HLE_GXCHECK
 std::vector<u32> g_GxMatTap;
 #endif
@@ -2566,6 +2567,126 @@ __attribute__((noinline)) bool RunNode(melonDS::ARMv5* c, State& s, bool jit)
 }
 #endif
 
+// ---- 16. stereo sample effect over two s16 buffers (Mario Kart DS: its SND capture effect callback) ------------------
+// f(L, R, bytes, state): from the end down to index 2, d = L[k-2] - R[k-2]; L[k] += d, R[k] -= d, saturated to s16 (the side
+// that can overflow); then L/R[1], L/R[0] with the previous call's two saved differences (state + 0x18 / 0x1C), and the
+// clamped differences of the last two samples saved for the next call. ~548 samples a call, about once a frame from an
+// IRQ: ~10.7k guest instructions a frame (26% of MKDS's ARM9 guest work in the race) on every console of a Netplay
+// session. Natively: the buffers, the state, the stack frame, every register and the flags as the guest leaves them.
+// Position independent (exact code words). Category B: a fitted cycle estimate.
+constexpr u32 kFxCode[105] = {
+    0xE92D47F0, 0xE24DD008, 0xE1A050A2, 0xE3A04000, 0xE3A02902, 0xE59F8184, 0xE28D7000, 0xE2629000, 0xE080E085, 0xE0812085,
+    0xE08EA084, 0xE0826084, 0xE15AC0F4, 0xE156A0F4, 0xE3A06902, 0xE2666000, 0xE04CA00A, 0xE15A0006, 0xB1A0A009, 0xBA000001,
+    0xE15A0008, 0xC1A0A008, 0xE1A06084, 0xE2844001, 0xE187A0B6, 0xE3540002, 0xBAFFFFEE, 0xE2454001, 0xE080E084, 0xE2802004,
+    0xE15E0002, 0xE081C084, 0x3A00001D, 0xE3A04902, 0xE59F6110, 0xE2645000, 0xE15E90F4, 0xE15C80F4, 0xE1DE70F0, 0xE1DC40F0,
+    0xE0598008, 0xE0877008, 0xE0448008, 0x4A000006, 0xE1570006, 0xB1CE70B0, 0xA1CE60B0, 0xE1580005, 0xC1CC80B0, 0xD1CC50B0,
+    0xEA000007, 0xE3A04902, 0xE2644000, 0xE1570004, 0xC1CE70B0, 0xD1CE50B0, 0xE1580006, 0xB1CC80B0, 0xA1CC60B0, 0xE24EE002,
+    0xE15E0002, 0xE24CC002, 0x2AFFFFE4, 0xE3A04902, 0xE59F6098, 0xE3A02001, 0xE264C000, 0xE1A05082, 0xE0834102, 0xE19050F5,
+    0xE5944018, 0xE0854004, 0xE154000C, 0xB1A0400C, 0xBA000001, 0xE1540006, 0xC1A04006, 0xE1A05082, 0xE18040B5, 0xE0834102,
+    0xE19150F5, 0xE5944018, 0xE0455004, 0xE155000C, 0xB1A0500C, 0xBA000001, 0xE1550006, 0xC1A05006, 0xE1A04082, 0xE18150B4,
+    0xE2522001, 0x5AFFFFE6, 0xE3A04000, 0xE28D2000, 0xE1A00084, 0xE19210F0, 0xE0830104, 0xE2844001, 0xE5801018, 0xE3540002,
+    0xBAFFFFF8, 0xE28DD008, 0xE8BD47F0, 0xE12FFF1E, 0x00007FFF};
+// ponytail: fitted estimate (check mode, MKDS boot + 8-console race, 34k calls, all of 512 samples: exact to 1e-6 there):
+// base + per sample + per sample with a negative difference
+constexpr s32 kFxCyc0 = 214, kFxCycN = 39, kFxCycNeg = 3;
+constexpr u32 kFxMax = 4096;    // samples (stack buffers)
+
+bool FxAt(melonDS::ARMv5* c, u32 a, int n)
+{
+    if (a & 3) return false;
+    for (int i = 0; i < n; i++) { const u8* p = CodePtr(c, a + i * 4); if (!p || R32(p) != kFxCode[i]) return false; }
+    return true;
+}
+inline s32 Sat16(s32 v) { return v < -0x8000 ? -0x8000 : v > 0x7FFF ? 0x7FFF : v; }
+
+__attribute__((noinline)) bool RunFx(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && !FxAt(c, pc, 105)) return false;
+    s.calls[16]++;
+    const u32 l0 = c->R[0], r0 = c->R[1], n = c->R[2] >> 1, st = c->R[3], sp = c->R[13];
+    Mem m(c, g_Check || g_Dry);
+    Obj L = m.O(l0 & ~3u, ((l0 & 3) + n * 2 + 3) & ~3u), R = m.O(r0 & ~3u, ((r0 & 3) + n * 2 + 3) & ~3u);
+    Obj S = m.O(st + 0x18, 8), K = m.O(sp - 40, 40);
+    // halfword buffers in main RAM / DTCM, not overlapping; at least 3 samples (the guest reads before the buffers else)
+#ifdef LITEV_HLE_DIAG
+    // LITEV_A9HLE_FX_FROM=<frame>: guest code before that frame (A/B in a scene reached by a timing-sensitive script)
+    static const u32 from = getenv("LITEV_A9HLE_FX_FROM") ? (u32)atoi(getenv("LITEV_A9HLE_FX_FROM")) : 0;
+    const bool late = c->NDS.NumFrames >= from;
+#else
+    constexpr bool late = true;
+#endif
+    const bool ok = late && !CheckPending && n >= 3 && n <= kFxMax && !(l0 & 1) && !(r0 & 1) && L && R && S && K
+                    && (l0 + n * 2 <= r0 || r0 + n * 2 <= l0);
+    if (!ok)
+    {
+        s.fallback[16] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    u8* lp = L.p + (l0 & 3); u8* rp = R.p + (r0 & 3);
+    s16 a[kFxMax], b[kFxMax];
+    memcpy(a, lp, n * 2); memcpy(b, rp, n * 2);
+    s16 t[2];
+    for (int i = 0; i < 2; i++) t[i] = (s16)Sat16((s32)a[n - 2 + i] - (s32)b[n - 2 + i]);
+    u32 neg = 0;
+    for (u32 k = n - 1; k >= 2; k--)
+    {
+        const s32 d = (s32)((u32)a[k - 2] - (u32)b[k - 2]);
+        const s32 x = (s32)((u32)a[k] + (u32)d), y = (s32)((u32)b[k] - (u32)d);
+        if (d >= 0) { a[k] = (s16)(x < 0x7FFF ? x : 0x7FFF); b[k] = (s16)(y > -0x8000 ? y : -0x8000); }
+        else { a[k] = (s16)(x > -0x8000 ? x : -0x8000); b[k] = (s16)(y < 0x7FFF ? y : 0x7FFF); neg++; }
+    }
+    for (int k = 1; k >= 0; k--)
+    {
+        const s32 v = (s32)S.r(k * 4);
+        a[k] = (s16)Sat16((s32)((u32)a[k] + (u32)v));
+        b[k] = (s16)Sat16((s32)((u32)b[k] - (u32)v));
+    }
+    // stack: push {r4-r10, lr}, the two saved differences at sp - 40
+    for (int i = 0; i < 7; i++) m.W(K, 8 + i * 4, c->R[4 + i]);
+    m.W(K, 36, c->R[14]);
+    m.W(K, 0, (u32)(u16)t[0] | (u32)(u16)t[1] << 16);
+    m.W(S, 0, (u32)(s32)t[0]); m.W(S, 4, (u32)(s32)t[1]);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = st + 4; e.R[1] = (u32)(s32)t[1]; e.R[2] = sp - 40; e.R[12] = 0xFFFF8000;
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFDF) | 0x60000000 | ((e.retPc & 1) << 5);    // cmp r4, #2 with r4 = 2
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 16, m, e);
+            for (u32 k = 0; k < n; k++) { g_P.log.push_back({l0 + k * 2, (u16)a[k], 2}); g_P.log.push_back({r0 + k * 2, (u16)b[k], 2}); }
+            g_P.fit[0] = n; g_P.fit[1] = neg;
+        }
+        s.checks[16]++;
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    // the buffers: changed halfwords, the JIT invalidation check once per 16-byte granule written
+    auto put = [&](u8* p, u32 ga, const s16* v, bool dtcm)
+    {
+        u32 lastG = ~0u;
+        for (u32 k = 0; k < n; k++)
+        {
+            if (R16(p + k * 2) == (u16)v[k]) continue;
+            const u32 g = (ga + k * 2) >> 4;
+            if (g != lastG && !dtcm) { c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(ga + k * 2); lastG = g; }
+            memcpy(p + k * 2, &v[k], 2);
+        }
+    };
+    put(lp, l0, a, L.dtcm); put(rp, r0, b, R.dtcm);
+    m.Flush();
+    s.native[16]++;
+    Return(c, e, kFxCyc0 + kFxCycN * (s32)(n - 2) + kFxCycNeg * (s32)neg);
+    return true;
+}
+
 // ---- 9. _ll_sdiv: 64-bit signed divide of the compiler runtime -----------------------------------
 // r1:r0 / r3:r2 by shift-and-subtract (~750 guest instructions a call; PW: 2-3 calls a frame from one
 // caller in 3D scenes). Natively: the quotient, r3:r2 = |divisor| normalized (shifted left until bit
@@ -2832,6 +2953,13 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return 13;
     }
 #endif
+    if (instr == kSetInstr && FxAt(&nds.ARM9, addr, 3))
+    {
+        static thread_local Range fx;
+        fx = {addr, addr + 105 * 4};
+        r = &fx;
+        return 1;
+    }
     if (instr == kVecInstr)
     {
         static thread_local Range vn;
@@ -2940,6 +3068,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return s.on && (s.mask & 8192) ? NodeAt(&nds.ARM9, addr, fn) : 0;
     }
 #endif
+    if (instr == kSetInstr && FxAt(&nds.ARM9, addr, 3))
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 16384) ? (FxAt(&nds.ARM9, addr, 105) ? 1 : 2) : 0;
+    }
     if (instr == kVecInstr)
     {
         State& s = St(&nds.ARM9);
@@ -3773,6 +3906,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 4096) && RunVec(c, s, jit);
     }
+    if (in == kSetInstr && FxAt(c, pc, 3))
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 16384) && RunFx(c, s, jit);
+    }
 #ifdef LITEV_GX_BULK
     if (in == kNodeInstr)
     {
@@ -3874,6 +4012,8 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         fprintf(stderr, "ASYNCFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 13 && getenv("LITEV_A9HLE_SHPFIT") && !g_P.irq)
         fprintf(stderr, "SHPFIT %d %u %llu\n", (int)g_P.small, g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 16 && getenv("LITEV_A9HLE_FXFIT") && !g_P.irq)
+        fprintf(stderr, "FXFIT %u %u %llu\n", g_P.fit[0], g_P.fit[1], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 15 && getenv("LITEV_A9HLE_NODEFIT") && !g_P.irq)
         fprintf(stderr, "NODEFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 8 && getenv("LITEV_A9HLE_MATFIT") && !g_P.irq)
