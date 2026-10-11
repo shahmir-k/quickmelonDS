@@ -692,12 +692,24 @@ int main(int argc, char** argv)
     if (!opt.checkRecording.empty())
         if (FILE* f = fopen(opt.checkRecording.c_str(), "r"))
         {
-            char line[256];
-            int fr;
+            // the "hash" column by name: newer recordings append columns after it (jit, mprotect, rewrites);
+            // taking the last field read those as the hash -> a false "REPLAY DIFFERS at frame 59"
+            char line[512];
+            int fr, col = 7;
             unsigned long long h;
+            if (fgets(line, sizeof(line), f))
+            {
+                int i = 0;
+                for (char* t = strtok(line, ",\r\n"); t; t = strtok(nullptr, ",\r\n"), i++)
+                    if (!strcmp(t, "hash")) col = i;
+            }
             while (fgets(line, sizeof(line), f))
-                if (const char* c = strrchr(line, ','); sscanf(line, "%d", &fr) == 1 && c && sscanf(c + 1, "%llx", &h) == 1)
+            {
+                const char* c = line;
+                for (int i = 0; i < col && c; i++) { c = strchr(c, ','); if (c) c++; }
+                if (sscanf(line, "%d", &fr) == 1 && c && sscanf(c, "%llx", &h) == 1)
                     recordedHashes[fr] = h;
+            }
             fclose(f);
         }
     int firstDiff = -1, hashesChecked = 0;
@@ -721,6 +733,14 @@ int main(int argc, char** argv)
             loopsLeft--;
             if (!LoadSavestate(*nds, opt.savestate)) { fprintf(stderr, "error: loop reload failed\n"); return 1; }
             frame = 0;
+        }
+        // test hook: LITEV_STATE_ROUNDTRIP=<frame>: save the state to a file and load it back before that frame (a state the
+        // savestate misses shows as a hash change from there on, against a run without it)
+        if (static const int rt = getenv("LITEV_STATE_ROUNDTRIP") ? atoi(getenv("LITEV_STATE_ROUNDTRIP")) : -1; rt == frame && opt.reloadAt < 0)
+        {
+            const std::string tmp = std::string(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp") + "/litev-roundtrip.mln";
+            if (!SaveSavestate(*nds, tmp) || !LoadSavestate(*nds, tmp)) { fprintf(stderr, "error: roundtrip failed\n"); return 1; }
+            fprintf(stderr, "state roundtrip before frame %d\n", frame);
         }
         if (frame == opt.reloadAt && !opt.savestate.empty())
         {
@@ -817,7 +837,8 @@ int main(int argc, char** argv)
         }
 
         static const bool emitHashes = getenv("LITEV_RECORD_EMIT") != nullptr;   // print them (tests)
-        if ((!recordedHashes.empty() || emitHashes) && ((frame + 1) % 60) == 0)
+        static const int emitEvery = getenv("LITEV_RECORD_EVERY") ? atoi(getenv("LITEV_RECORD_EVERY")) : 60;   // tests: every n frames
+        if ((!recordedHashes.empty() || emitHashes) && ((frame + 1) % emitEvery) == 0)
         {
             auto it = recordedHashes.find(frame);
             if (it != recordedHashes.end() || emitHashes)
@@ -829,7 +850,7 @@ int main(int argc, char** argv)
                 u64 v[4] = { keys | ((u64)(u16)tx << 32) | ((u64)(u16)ty << 48), nds->GetSysTimestamp(),
                              XXH3_64bits(nds->MainRAM, nds->MainRAMMask + 1), (u64)frame };
                 u64 hash = XXH3_64bits(v, sizeof(v));
-                if (emitHashes) printf("%d,0,0,0,0,1,0,%016llx\n", frame, (unsigned long long) hash);
+                if (emitHashes) printf("%d,0,0,0,0,1,0,%016llx,%llu,%016llx\n", frame, (unsigned long long) hash, (unsigned long long)v[1], (unsigned long long)v[2]);
                 if (it != recordedHashes.end() && ++hashesChecked && hash != it->second && firstDiff < 0)
                     firstDiff = frame;
             }
