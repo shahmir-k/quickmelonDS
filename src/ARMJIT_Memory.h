@@ -67,6 +67,18 @@ static constexpr u32 MemBlockNWRAM_BOffset = MemBlockNWRAM_AOffset + RoundUp(NWR
 static constexpr u32 MemBlockNWRAM_COffset = MemBlockNWRAM_BOffset + RoundUp(NWRAMSize);
 static constexpr u32 MemoryTotalSize = MemBlockNWRAM_COffset + RoundUp(NWRAMSize);
 
+#ifdef LITEV_JIT_BGEMIT
+// What ClassifyAddress9/7 read: captured with a block for its background emission
+struct JitMemCtx
+{
+    u32 ITCMSize, DTCMMask, DTCMBase;
+    bool SWRAM9, SWRAM7;
+    int ConsoleType;
+    u32 SCFG_BIOS;
+    u32 NWRAMStart[2][3], NWRAMEnd[2][3];
+};
+#endif
+
 class ARMJIT_Memory
 {
 public:
@@ -133,6 +145,11 @@ public:
 
     int ClassifyAddress9(u32 addr) const noexcept;
     int ClassifyAddress7(u32 addr) const noexcept;
+#ifdef LITEV_JIT_BGEMIT
+    JitMemCtx MemCtx() const noexcept;
+    static int ClassifyAddress9(const JitMemCtx& x, u32 addr) noexcept;
+    static int ClassifyAddress7(const JitMemCtx& x, u32 addr) noexcept;
+#endif
     bool GetMirrorLocation(int region, u32 num, u32 addr, u32& memoryOffset, u32& mirrorStart, u32& mirrorSize) const noexcept;
     u32 LocaliseAddress(int region, u32 num, u32 addr) const noexcept;
     bool IsFastmemCompatible(int region) const noexcept;

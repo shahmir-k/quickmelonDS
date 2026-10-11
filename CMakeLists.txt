@@ -226,6 +226,17 @@ option(LITEV_SOFT2D_BG3DNEON "liteV: 4-wide NEON 2D 3D-layer compositor (DrawBG_
 if (LITEV_SOFT2D_BG3DNEON)
     add_compile_definitions(LITEV_SOFT2D_BG3DNEON=1)
 endif()
+# DSperate's 2D compositing technique (GPLv3, docs/techniques/03-2d-engines-and-scanline-pipeline.md,
+# kernels_neon.cpp composite_line): the colour-effect compositor works on byte planes, 16 pixels
+# per step (vld4/vst4 of the 6-bit R/G/B + flag bytes), builds per-pixel effect masks and only
+# computes the effects a 16-pixel group actually uses; groups with no effect copy through. The
+# old LITEV_SOFT2D_NEON compositor computed all four effects for every pixel. Byte-exact (same
+# arithmetic per pixel). Needs LITEV_SOFT2D_NEON; AArch64 only. Check mode: env/prop
+# LITEV_S2DBITS_CHECK=1 runs the old compositor beside it and counts mismatching pixels.
+option(LITEV_SOFT2D_BITMASK "liteV: DSperate byte-plane masked 2D colour-effect compositor" OFF)
+if (LITEV_SOFT2D_BITMASK)
+    add_compile_definitions(LITEV_SOFT2D_BITMASK=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)
@@ -778,6 +789,23 @@ if (LITEV_GX_BULK)
     add_compile_definitions(LITEV_GX_BULK=1)
 endif()
 
+# FAST_TIMING: DSperate's fast CPU timing model (src/FastTiming.h; GPL-3.0-or-later, DSperate commit
+# f5fa35e, src/core/cpu/timing_mode.h): a constant cost per data access (ARM9 by base register),
+# no fetch/data overlap, constant pipeline refills; code fetch stays exact. Category B.
+# Runtime off: debug.litev.fasttiming=0 (headless: the same name as an environment variable).
+option(LITEV_FAST_TIMING "DSperate fast CPU timing model (category B; runtime debug.litev.fasttiming)" OFF)
+if (LITEV_FAST_TIMING)
+    add_compile_definitions(LITEV_FAST_TIMING=1)
+endif()
+
+# GX_UNTIMED: geometry commands cost no guest time (category B). Inspired by DSperate's untimed
+# geometry engine (GPL-3.0-or-later, commit f5fa35e, src/core/gpu/gpu3d.cpp) and DraStic's GXFIFO
+# command timing x0 (as documented by DSperate). Runtime off: debug.litev.gxuntimed=0.
+option(LITEV_GX_UNTIMED "Untimed geometry engine (category B; runtime debug.litev.gxuntimed)" OFF)
+if (LITEV_GX_UNTIMED)
+    add_compile_definitions(LITEV_GX_UNTIMED=1)
+endif()
+
 # GX_CPUSEND: NitroSDK MI_CpuSend32 to GXFIFO (a display list sent by the CPU, one slow IO store
 # per word) runs through the bulk geometry path (LITEV_GX_BULK). Hooked by code signature at JIT
 # compile; category B (fixed cycle estimate, the FIFO never fills). Runtime off: debug.litev.gxsend=0.
@@ -1256,6 +1284,19 @@ option(LITEV_JIT_MOV_ELIDE "JIT: no self-move before the dynamic-branch stub (ex
 if (LITEV_JIT_MOV_ELIDE)
     add_compile_definitions(LITEV_JIT_MOV_ELIDE=1)
 endif()
+option(LITEV_JIT_LINK_FLUSHBATCH "JIT: one cache-maintenance barrier sequence per link/unlink instead of per patched site (exact, host-only)" OFF)
+if (LITEV_JIT_LINK_FLUSHBATCH)
+    add_compile_definitions(LITEV_JIT_LINK_FLUSHBATCH=1)
+endif()
+
+option(LITEV_JIT_BGEMIT "JIT: emit a block's code in the background from inputs captured at its compile (exact, deterministic); debug.litev.jitbg" OFF)
+if (LITEV_JIT_BGEMIT)
+    if (NOT LITEV_JIT_DISPATCH OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        message(FATAL_ERROR "LITEV_JIT_BGEMIT requires an AArch64 target with LITEV_JIT_DISPATCH links.")
+    endif()
+    add_compile_definitions(LITEV_JIT_BGEMIT=1)
+endif()
+
 option(LITEV_JIT_COMPILE_STATS "JIT diagnosis: per-phase compile time counters (JitCompileTicks), printed per frame by the app replay log / headless LITEV_FRAME_MS" OFF)
 if (LITEV_JIT_COMPILE_STATS)
     add_compile_definitions(LITEV_JIT_COMPILE_STATS=1)

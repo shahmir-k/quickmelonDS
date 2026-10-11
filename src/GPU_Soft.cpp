@@ -81,13 +81,17 @@ static int litevReadPipeDepth()
 // the FBHASH PRESENT seq: if RENDER bot repeats ~natural (17%) but PRESENT bot repeats ~50%, the
 // divergence is in the present/framebuffer path (NOT the 2D snapshot); if RENDER bot itself repeats
 // ~50%, the raster is stale and ss/buf localize which generation it read.
+#ifdef __APPLE__
+extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsystem_kernel: this thread's PMU counts
+#endif
 static int litevReadPipeTrace()
 {
 #if defined(__ANDROID__)
     char b[PROP_VALUE_MAX] = {0};
     return (__system_property_get("debug.litev.pipetrace", b) > 0) ? atoi(b) : 0;
 #else
-    return 0;
+    const char* e = getenv("LITEV_PIPETRACE");   // Mac/Linux headless
+    return e ? atoi(e) : 0;
 #endif
 }
 static int litevPropInt(const char* name, int def)
@@ -827,7 +831,31 @@ void SoftRenderer::AsyncRenderThreadFunc()
 #endif
         LSP_EV(EV_S2D_BEG);
         const double _t0 = LSP_NOW();
+        // diagnostic (env LITEV_S2D_CPU=1): thread CPU time (+ instructions on Apple) of the 2D raster
+        static const bool s2dCpu = getenv("LITEV_S2D_CPU") != nullptr;
+        timespec _c0{}; u64 _pc0[2] = {};
+        if (s2dCpu)
+        {
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &_c0);
+#ifdef __APPLE__
+            thread_selfcounts(1, _pc0, sizeof(_pc0));
+#endif
+        }
         AsyncRenderFrame();
+        if (s2dCpu)
+        {
+            static u64 frames, ns, ins, cyc;
+            timespec c1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+            u64 pc1[2] = {};
+#ifdef __APPLE__
+            thread_selfcounts(1, pc1, sizeof(pc1));
+#endif
+            ns += (u64)(c1.tv_sec - _c0.tv_sec) * 1000000000ull + c1.tv_nsec - _c0.tv_nsec;
+            ins += pc1[0] - _pc0[0]; cyc += pc1[1] - _pc0[1];
+            if (++frames % 300 == 0)
+                fprintf(stderr, "S2D_CPU frames=%llu cpu_ms_per_frame=%.4f instr_per_frame=%llu cyc_per_frame=%llu\n",
+                        (unsigned long long)frames, ns / 1e6 / frames, (unsigned long long)(ins / frames), (unsigned long long)(cyc / frames));
+        }
         const double _t1 = LSP_NOW();
         LSP_EV(EV_S2D_END);
 #ifdef LITEV_SOFT2D_HYB_BANDS

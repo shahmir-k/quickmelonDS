@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D.h"
@@ -726,8 +727,50 @@ void GPU2D::UpdateWindows(u32 line)
     else if (line == Win1Coords[2]) Win1Active |=  0x1;
 }
 
+#if defined(LITEV_SOFT2D_BITMASK)
+// LITEV_SOFT2D_BITMASK: windows as spans. The per-pixel loops below toggle WinNActive bit 1 at
+// x1 (set) and x2 (clear; x2 wins when x1 == x2) and write WinCnt where the state is 0x3. Between
+// those two events the state is constant, so each window is at most three memsets, and the state
+// left in WinNActive is the same. Inspired by DraStic's window-mask spans as documented by DSperate
+// (docs/techniques/03-2d-engines-and-scanline-pipeline.md §7).
+static void litevWindowSpans(u8* windowMask, u8& active, u8 x1, u8 x2, u8 cnt)
+{
+    u32 p = 0;
+    auto fill = [&](u32 to) { if (active == 0x3 && to > p) memset(windowMask + p, cnt, to - p); p = to; };
+    if (x1 < x2) { fill(x1); active |= 0x2; fill(x2); active &= ~0x2; }
+    else if (x1 > x2) { fill(x2); active &= ~0x2; fill(x1); active |= 0x2; }
+    else { fill(x2); active &= ~0x2; }
+    fill(256);
+}
+
+static void CalculateWindowMaskRef(u8* windowMask, const u8* objWindow, u32 DispCnt, const u8* WinCnt,
+                                   u8* Win0Coords, u8* Win1Coords, u8& Win0Active, u8& Win1Active);
+#endif
+
 void GPU2D::CalculateWindowMask(u8* windowMask, const u8* objWindow)
 {
+#if defined(LITEV_SOFT2D_BITMASK)
+    static const bool check = getenv("LITEV_S2DBITS_CHECK") && atoi(getenv("LITEV_S2DBITS_CHECK"));
+    u8 ref[256], a0 = Win0Active, a1 = Win1Active;
+    if (check) CalculateWindowMaskRef(ref, objWindow, DispCnt, WinCnt, Win0Coords, Win1Coords, a0, a1);
+    memset(windowMask, WinCnt[2], 256);   // window outside
+    if (DispCnt & (1<<15))
+        for (int i = 0; i < 256; i++)
+            if (objWindow[i]) windowMask[i] = WinCnt[3];
+    if (DispCnt & (1<<14)) litevWindowSpans(windowMask, Win1Active, Win1Coords[0], Win1Coords[1], WinCnt[1]);
+    if (DispCnt & (1<<13)) litevWindowSpans(windowMask, Win0Active, Win0Coords[0], Win0Coords[1], WinCnt[0]);
+    if (check && (memcmp(ref, windowMask, 256) || a0 != Win0Active || a1 != Win1Active))
+    {
+        fprintf(stderr, "S2DBITS window mismatch: dispcnt %08x win0 %u-%u win1 %u-%u\n", DispCnt,
+                Win0Coords[0], Win0Coords[1], Win1Coords[0], Win1Coords[1]);
+        abort();
+    }
+}
+
+static void CalculateWindowMaskRef(u8* windowMask, const u8* objWindow, u32 DispCnt, const u8* WinCnt,
+                                   u8* Win0Coords, u8* Win1Coords, u8& Win0Active, u8& Win1Active)
+{
+#endif
     for (u32 i = 0; i < 256; i++)
         windowMask[i] = WinCnt[2]; // window outside
 

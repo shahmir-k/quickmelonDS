@@ -1206,6 +1206,21 @@ void GPU::StartFrame() noexcept
 #ifdef LITEV_FF_SKIP_PRESENT
     SkipDisplay = SkipThisFrame;
 #endif
+    // a display capture latches at line 0 and writes the drawn picture to VRAM (guest state): draw
+    // every frame that captures. Its 3D is rendered at the previous frame's VCount 215 and its
+    // line-0 sprites at line 262, which also run when a capture is armed by then (StartHBlank);
+    // if it was armed later, do both now (the bank swapped at 192 is still the one 215 renders).
+    if ((CaptureCnt & (1u << 31)) && SkipThisFrame && !LITEV_HEADLESS(Headless))
+    {
+        SkipThisFrame = false;
+        if (!Tail3DDone
+#ifdef LITEV_FF_HEADLESS3D
+            && !GPU3D.RenderStale
+#endif
+            )
+            Rend->Start3DRendering();
+        if (!TailSprDone) Rend->DrawSprites(0);
+    }
     if (KeepCaptures)
     {
         KeepCapturesSeen |= (CaptureCnt & (1u << 31)) != 0;
@@ -1279,7 +1294,8 @@ void GPU::StartHBlank(u32 line) noexcept
     else if (VCount == 215)
     {
 #ifdef LITEV_AGGRESSIVE_SKIP
-        if (!SkipThisFrame && !(DiagNoDraw & 2)
+        Tail3DDone = (!SkipThisFrame || CaptureArmed()) && !(DiagNoDraw & 2);
+        if (Tail3DDone
 #ifdef LITEV_FF_HEADLESS3D
             && !GPU3D.RenderStale   // the render list wasn't prepared (fast-forward unwatched frames)
 #endif
@@ -1298,11 +1314,12 @@ void GPU::StartHBlank(u32 line) noexcept
 #endif
         // sprites are pre-rendered one scanline in advance
 #ifdef LITEV_AGGRESSIVE_SKIP
-        if (!SkipThisFrame
+        TailSprDone = (!SkipThisFrame || CaptureArmed())
 #ifdef LITEV_SKIP_REPEAT_FRAMES
             && !NextSkipRepeat
 #endif
-            )
+            ;
+        if (TailSprDone)
 #endif
         {
             Rend->DrawSprites(0);

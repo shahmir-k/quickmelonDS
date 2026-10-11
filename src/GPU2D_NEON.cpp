@@ -1,6 +1,9 @@
 /*
     Copyright 2016-2025 melonDS team
     liteDS-v2 modifications: NEON SIMD 2D output helpers (Milestone 4).
+    LITEV_SOFT2D_BITMASK compositor adapted from DSperate
+    (src/core/gpu/kernels_neon.cpp composite_line, blend16/brighten16/darken16),
+    Copyright (C) 2026 DSperate contributors, GPL-3.0-or-later.
 
     This file is part of melonDS.
 
@@ -38,6 +41,13 @@
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #include <cstdlib>
+#endif
+#if defined(LITEV_SOFT2D_BITMASK) && defined(__aarch64__)
+#define LITEV_S2DBITS_ON 1
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #endif
 
 namespace melonDS
@@ -410,8 +420,13 @@ static bool litevCompositeBrightUp()
 #endif
 }
 
+#ifdef LITEV_S2DBITS_ON
+static void ColorCompositeLineOld(u32* dst, const u32* bgobj, const u8* windowMask,
+                                  u32 blendCnt, u32 eva_g, u32 evb_g, u32 evy) noexcept
+#else
 void ColorCompositeLine(u32* dst, const u32* bgobj, const u8* windowMask,
                         u32 blendCnt, u32 eva_g, u32 evb_g, u32 evy) noexcept
+#endif
 {
 #if defined(__ANDROID__) && defined(LITEV_SOFTPROF)
     static const bool profileCE = [] {
@@ -541,6 +556,166 @@ void ColorCompositeLine(u32* dst, const u32* bgobj, const u8* windowMask,
         vst1q_u32(dst + i, out);
     }
 }
+
+#ifdef LITEV_S2DBITS_ON
+// ─────────────────────────────────────────────────────────────────────────────
+// LITEV_SOFT2D_BITMASK: the compositor of DSperate (GPLv3, Copyright (C) 2026
+// DSperate contributors; src/core/gpu/kernels_neon.cpp composite_line, see
+// docs/techniques/03-2d-engines-and-scanline-pipeline.md §4-5), adapted to the
+// melonDS ColorComposite rules. The pixel format is already DSperate's record
+// layout (R 0-5, G 8-13, B 16-21, flags 24-31), so vld4 splits 16 pixels into
+// R/G/B/flag byte planes. Per 16 pixels: build the three effect masks (sprite
+// blend, 3D blend, BLDCNT effect) as byte-lane masks; a group with none copies
+// val1 through; otherwise only the effects present in the group are computed,
+// as byte arithmetic (u8 x u8 -> u16 multiply-accumulate). Per pixel the
+// arithmetic is ColorBlend4/ColorBlend5/ColorBrightnessUp/Down exactly: the
+// fields are <= 63, EVA/EVB/EVY <= 16 (GPU2D clamps them; sprite alpha 1..16),
+// so every sum fits u16 and the scalar's & 0x7F masks are no-ops.
+// ─────────────────────────────────────────────────────────────────────────────
+template <int shift>
+static inline uint8x16_t BlendBytes(uint8x16_t a, uint8x16_t b, uint8x16_t ea, uint8x16_t eb) noexcept
+{
+    // (a*ea + b*eb + 2^(shift-1)) >> shift, clamped to 63
+    const uint16x8_t rnd = vdupq_n_u16(1u << (shift - 1));
+    const uint16x8_t lo = vmlal_u8(vmlal_u8(rnd, vget_low_u8(a), vget_low_u8(ea)), vget_low_u8(b), vget_low_u8(eb));
+    const uint16x8_t hi = vmlal_high_u8(vmlal_high_u8(rnd, a, ea), b, eb);
+    return vminq_u8(vcombine_u8(vshrn_n_u16(lo, shift), vshrn_n_u16(hi, shift)), vdupq_n_u8(63));
+}
+// c + (((63 - c) * f + 8) >> 4)
+static inline uint8x16_t BrightUpBytes(uint8x16_t c, uint8x16_t f) noexcept
+{
+    const uint8x16_t inv = vsubq_u8(vdupq_n_u8(63), c);
+    const uint16x8_t lo = vmlal_u8(vdupq_n_u16(8), vget_low_u8(inv), vget_low_u8(f));
+    const uint16x8_t hi = vmlal_high_u8(vdupq_n_u16(8), inv, f);
+    return vaddq_u8(c, vcombine_u8(vshrn_n_u16(lo, 4), vshrn_n_u16(hi, 4)));
+}
+// c - ((c * f + 7) >> 4)
+static inline uint8x16_t BrightDownBytes(uint8x16_t c, uint8x16_t f) noexcept
+{
+    const uint16x8_t lo = vmlal_u8(vdupq_n_u16(7), vget_low_u8(c), vget_low_u8(f));
+    const uint16x8_t hi = vmlal_high_u8(vdupq_n_u16(7), c, f);
+    return vsubq_u8(c, vcombine_u8(vshrn_n_u16(lo, 4), vshrn_n_u16(hi, 4)));
+}
+
+static void ColorCompositeLineMasked(u32* dst, const u32* bgobj, const u8* windowMask,
+                                     u32 blendCnt, u32 eva_g, u32 evb_g, u32 evy) noexcept
+{
+    const u32 ceElse = (blendCnt >> 6) & 0x3;
+    const uint8x16_t bcLo = vdupq_n_u8(ceElse ? (u8)blendCnt : 0);   // no effect -> fx stays empty
+    const uint8x16_t bcHi = vdupq_n_u8((u8)(blendCnt >> 8));
+    const uint8x16_t vEVA = vdupq_n_u8((u8)eva_g), vEVB = vdupq_n_u8((u8)evb_g), vEVY = vdupq_n_u8((u8)evy);
+    const uint8x16_t c80 = vdupq_n_u8(0x80), c40 = vdupq_n_u8(0x40), c3F = vdupq_n_u8(0x3F), c1F = vdupq_n_u8(0x1F);
+    const uint8x16_t c10 = vdupq_n_u8(0x10), c01 = vdupq_n_u8(0x01), c20 = vdupq_n_u8(0x20);
+
+    for (int i = 0; i < 256; i += 16)
+    {
+        const uint8x16x4_t A = vld4q_u8((const u8*)(bgobj + i));         // val1: R, G, B, flag1
+        const uint8x16_t f1 = A.val[3];
+        const uint8x16_t f2 = vld4q_u8((const u8*)(bgobj + 256 + i)).val[3];
+        // target2 bit of val2's layer in BLDCNT[15:8]: OBJ (0x80) -> bit 4, 3D (0x40) -> bit 0, else the layer bits
+        const uint8x16_t t2key = vbslq_u8(vtstq_u8(f2, c80), c10, vbslq_u8(vtstq_u8(f2, c40), c01, f2));
+        const uint8x16_t blendT2 = vtstq_u8(t2key, bcHi);
+        const uint8x16_t m1_80 = vtstq_u8(f1, c80), m1_40 = vtstq_u8(f1, c40);
+        const uint8x16_t spr = vandq_u8(m1_80, blendT2);                 // semi-transparent/bitmap sprite blend
+        const uint8x16_t b3d = vbicq_u8(vandq_u8(m1_40, blendT2), m1_80); // 3D layer blend
+        // BLDCNT effect: first target (OBJ -> bit 4, 3D -> bit 0) and window colour-effect bit
+        const uint8x16_t flag1b = vbslq_u8(m1_80, c10, vbslq_u8(m1_40, c01, f1));
+        uint8x16_t fx = vandq_u8(vtstq_u8(flag1b, bcLo), vtstq_u8(vld1q_u8(windowMask + i), c20));
+        fx = vbicq_u8(fx, vandq_u8(vorrq_u8(m1_80, m1_40), blendT2));
+        if (ceElse == 1) fx = vandq_u8(fx, blendT2);
+
+        const bool hasSpr = vmaxvq_u8(spr) != 0, has3D = vmaxvq_u8(b3d) != 0, hasFx = vmaxvq_u8(fx) != 0;
+        if (!(hasSpr | has3D | hasFx))
+        {
+            // the whole group passes val1 through
+            vst1q_u32(dst + i,      vld1q_u32(bgobj + i));
+            vst1q_u32(dst + i + 4,  vld1q_u32(bgobj + i + 4));
+            vst1q_u32(dst + i + 8,  vld1q_u32(bgobj + i + 8));
+            vst1q_u32(dst + i + 12, vld1q_u32(bgobj + i + 12));
+            continue;
+        }
+
+        const uint8x16x4_t B = vld4q_u8((const u8*)(bgobj + 256 + i));
+        uint8x16_t a6[3], b6[3], o[3];
+        for (int c = 0; c < 3; c++) { a6[c] = vandq_u8(A.val[c], c3F); b6[c] = vandq_u8(B.val[c], c3F); o[c] = A.val[c]; }
+        uint8x16_t changed = vdupq_n_u8(0);   // lanes whose result is a fresh colour (alpha byte 0xFF)
+        if (hasFx)
+        {
+            for (int c = 0; c < 3; c++)
+            {
+                uint8x16_t r;
+                if (ceElse == 1)      r = BlendBytes<4>(a6[c], b6[c], vEVA, vEVB);
+                else if (ceElse == 2) r = BrightUpBytes(a6[c], vEVY);
+                else                  r = BrightDownBytes(a6[c], vEVY);
+                o[c] = vbslq_u8(fx, r, o[c]);
+            }
+            changed = fx;
+        }
+        if (has3D)
+        {
+            // ColorBlend5: eva = alpha+1 of 32; eva == 32 returns val1 unchanged
+            const uint8x16_t a3 = vaddq_u8(vandq_u8(f1, c1F), c01);
+            const uint8x16_t eb3 = vsubq_u8(vdupq_n_u8(32), a3);
+            const uint8x16_t sel = vbicq_u8(b3d, vceqq_u8(a3, vdupq_n_u8(32)));
+            for (int c = 0; c < 3; c++) o[c] = vbslq_u8(sel, BlendBytes<5>(a6[c], b6[c], a3, eb3), o[c]);
+            changed = vorrq_u8(changed, sel);
+        }
+        if (hasSpr)
+        {
+            // bitmap sprites (0xC0) blend with their own alpha: eva = flag & 0x1F, evb = 16 - eva
+            const uint8x16_t ea = vbslq_u8(m1_40, vandq_u8(f1, c1F), vEVA);
+            const uint8x16_t eb = vbslq_u8(m1_40, vsubq_u8(c10, vandq_u8(f1, c1F)), vEVB);
+            for (int c = 0; c < 3; c++) o[c] = vbslq_u8(spr, BlendBytes<4>(a6[c], b6[c], ea, eb), o[c]);
+            changed = vorrq_u8(changed, spr);
+        }
+        const uint8x16x4_t rec = {{o[0], o[1], o[2], vbslq_u8(changed, vdupq_n_u8(0xFF), f1)}};
+        vst4q_u8((u8*)(dst + i), rec);
+    }
+}
+
+// LITEV_S2DBITS_CHECK=1 (env): run the old compositor too and count mismatching pixels (printed at exit).
+static std::atomic<u64> S2DBitsLines{0}, S2DBitsBad{0}, S2DBitsFx{0}, S2DBitsCe[4];
+static bool litevS2DBitsCheck()
+{
+    static const bool on = [] {
+        const char* e = getenv("LITEV_S2DBITS_CHECK");
+        if (!(e && atoi(e))) return false;
+        atexit([] { fprintf(stderr, "S2DBITS check: lines=%llu bad_pixels=%llu effect_pixels=%llu lines_by_bldcnt_effect=%llu/%llu/%llu/%llu\n",
+                            (unsigned long long)S2DBitsLines.load(), (unsigned long long)S2DBitsBad.load(), (unsigned long long)S2DBitsFx.load(),
+                            (unsigned long long)S2DBitsCe[0].load(), (unsigned long long)S2DBitsCe[1].load(),
+                            (unsigned long long)S2DBitsCe[2].load(), (unsigned long long)S2DBitsCe[3].load()); });
+        return true;
+    }();
+    return on;
+}
+
+void ColorCompositeLine(u32* dst, const u32* bgobj, const u8* windowMask,
+                        u32 blendCnt, u32 eva, u32 evb, u32 evy) noexcept
+{
+    ColorCompositeLineMasked(dst, bgobj, windowMask, blendCnt, eva, evb, evy);
+    if (!litevS2DBitsCheck()) return;
+    alignas(16) u32 ref[256];
+    ColorCompositeLineOld(ref, bgobj, windowMask, blendCnt, eva, evb, evy);
+    u64 bad = 0;
+    u64 fx = 0;
+    for (int i = 0; i < 256; i++) { bad += ref[i] != dst[i]; fx += ref[i] != bgobj[i]; }
+    S2DBitsLines.fetch_add(1, std::memory_order_relaxed);
+    S2DBitsFx.fetch_add(fx, std::memory_order_relaxed);
+    S2DBitsCe[(blendCnt >> 6) & 3].fetch_add(1, std::memory_order_relaxed);
+    if (bad)
+    {
+        if (S2DBitsBad.fetch_add(bad, std::memory_order_relaxed) == 0)
+            for (int i = 0; i < 256; i++)
+                if (ref[i] != dst[i])
+                {
+                    fprintf(stderr, "S2DBITS mismatch px %d: ref %08x got %08x val1 %08x val2 %08x win %02x bc %04x eva %u evb %u evy %u\n",
+                            i, ref[i], dst[i], bgobj[i], bgobj[256 + i], windowMask[i], blendCnt, eva, evb, evy);
+                    break;
+                }
+        memcpy(dst, ref, sizeof(ref));   // keep the output exact while diagnosing
+    }
+}
+#endif // LITEV_S2DBITS_ON
 
 #endif // __ARM_NEON
 #endif // LITEV_SOFT2D_NEON
