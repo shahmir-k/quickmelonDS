@@ -266,7 +266,7 @@ public: // TODO: Encapsulate the rest of these members
     SchedEvent SchedList[Event_MAX] {};
 #ifdef LITEV_NPSCHED_STATS
     // diagnostic: per frame window, read and reset by the headless harness
-    struct SchedStatsT { u64 Iter = 0, Exec[2] = {}, HaltedSkip[2] = {}, Disp[2] = {}, Ev[Event_MAX] = {}, Irq[2][32] = {}; } SchedStats;
+    struct SchedStatsT { u64 Iter = 0, Both = 0, A9Only = 0, Exec[2] = {}, HaltedSkip[2] = {}, Disp[2] = {}, Ev[Event_MAX] = {}, Irq[2][32] = {}; } SchedStats;
 #endif
     u8 ARM9MemTimings[0x40000][8];
     u32 ARM9Regions[0x40000];

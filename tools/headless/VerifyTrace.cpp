@@ -1276,7 +1276,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_NPSCHED_STATS
                     {
                         auto& st = bi.nds->SchedStats; double fr = every;
-                        printf("inst%d sched %d: iter %.0f | a9 exec %.0f halted %.0f jit %.0f | a7 exec %.0f halted %.0f jit %.0f | ev", inst, f + 1, st.Iter / fr,
+                        printf("inst%d sched %d: iter %.0f both-halted %.0f a9-only %.0f | a9 exec %.0f halted %.0f jit %.0f | a7 exec %.0f halted %.0f jit %.0f | ev", inst, f + 1, st.Iter / fr, st.Both / fr, st.A9Only / fr,
                                st.Exec[0] / fr, st.HaltedSkip[0] / fr, st.Disp[0] / fr, st.Exec[1] / fr, st.HaltedSkip[1] / fr, st.Disp[1] / fr);
                         for (int e = 0; e < Event_MAX; e++) if (st.Ev[e]) printf(" %d:%.1f", e, st.Ev[e] / fr);
                         for (int c = 0; c < 2; c++) { printf(" | irq%d", c ? 7 : 9); for (int q = 0; q < 32; q++) if (st.Irq[c][q]) printf(" %d:%.1f", q, st.Irq[c][q] / fr); }

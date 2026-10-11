@@ -1228,6 +1228,11 @@ u32 NDS::RunFrame()
                 LITE_PROFILE_ADD(LiteProfile::g_Frame.SchedulerIterations);
 #ifdef LITEV_NPSCHED_STATS
                 SchedStats.Iter++;
+                if (ARM7.Halted == 1 && !HaltInterrupted(1) && !CPUStop)
+                {
+                    if (ARM9.Halted == 1 && !HaltInterrupted(0)) SchedStats.Both++;
+                    else SchedStats.A9Only++;
+                }
 #endif
 
                 u64 target = NextTarget();
