@@ -30,8 +30,10 @@
 // Profiling only: per-compiled-block entry counter + dump at exit (LITEV_BLOCKPROF_OUT).
 #include <deque>
 #include <cstdio>
+#include <mutex>
 namespace { struct BPEnt { uint32_t addr, last; uint8_t num, thumb, idle; uint16_t n; uint64_t count; uint32_t instr[64]; uint32_t iaddr[64]; std::vector<uint8_t> host; };
 std::deque<BPEnt>& BP() { static std::deque<BPEnt> d; return d; }
+std::mutex BPMu; thread_local BPEnt* BPCur;   // --mp-test compiles on a thread per console
 void BPDump() { const char* o = getenv("LITEV_BLOCKPROF_OUT"); FILE* f = fopen(o ? o : "/tmp/blockprof.txt", "w"); if (!f) return;
   for (auto& e : BP()) if (e.count) { fprintf(f, "%d %d %08x %08x %d %d %llu", e.num, e.thumb, e.addr, e.last, e.n, e.idle, (unsigned long long)e.count);
     for (int i = 0; i < e.n && i < 64; i++) fprintf(f, " %08x:%08x", e.iaddr[i], e.instr[i]);
@@ -2443,8 +2445,8 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 #ifdef LITEV_BLOCKPROF
     {
         static bool reg = (BP(), atexit(BPDump), true); (void)reg;
-        BP().push_back({});
-        BPEnt& e = BP().back();
+        { std::lock_guard<std::mutex> lk(BPMu); BPCur = &BP().emplace_back(); }
+        BPEnt& e = *BPCur;
         e.addr = instrs[0].Addr; e.last = instrs[instrsCount-1].Addr; e.num = cpu->Num; e.thumb = thumb; e.n = instrsCount; e.count = 0; e.idle = 0;
         for (int i = 0; i < instrsCount; i++) { if (i < 64) { e.instr[i] = instrs[i].Instr; e.iaddr[i] = instrs[i].Addr; } if (instrs[i].BranchFlags & branch_IdleBranch) e.idle = 1; }
         MOVP2R(X16, &e.count);
@@ -2878,7 +2880,7 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     EmitTailStubs();
 #endif
 #ifdef LITEV_BLOCKPROF
-    BP().back().host.assign((const uint8_t*)res, (const uint8_t*)GetRXPtr());
+    BPCur->host.assign((const uint8_t*)res, (const uint8_t*)GetRXPtr());
 #endif
 #ifdef LITEV_JIT_COMPILE_STATS
     const u64 flushT0 = JitTicks();
