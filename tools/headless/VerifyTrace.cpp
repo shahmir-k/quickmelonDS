@@ -999,6 +999,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     if (getenv("LITEV_MP_GXSINK1") || getenv("LITEV_MP_GXTIMING"))   // Netplay: every console, local too
         for (int k = 0; k < n; k++) b[k].nds->GPU.GPU3D.TimingFixed = true;
 #endif
+#ifdef LITEV_NP_SCHED
+    if (getenv("LITEV_MP_NPSCHED"))   // Netplay timing model; bit k = console k (Netplay sets every console)
+        for (int k = 0; k < n; k++) b[k].nds->NPSched = (strtoul(getenv("LITEV_MP_NPSCHED"), nullptr, 0) >> k) & 1;
+#endif
 #ifdef LITEV_A7PROF
     if (getenv("LITEV_PROF_INST")) A7Prof::Target = b[atoi(getenv("LITEV_PROF_INST"))].nds.get();
 #endif

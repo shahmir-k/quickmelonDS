@@ -264,6 +264,10 @@ public: // TODO: Encapsulate the rest of these members
     int CurCPU;
 
     SchedEvent SchedList[Event_MAX] {};
+#ifdef LITEV_NP_SCHED
+    // Netplay session timing model on (every console of the session, local too): see LITEV_NP_SCHED
+    bool NPSched = false;
+#endif
 #ifdef LITEV_NPSCHED_STATS
     // diagnostic: per frame window, read and reset by the headless harness
     struct SchedStatsT { u64 Iter = 0, Both = 0, A9Only = 0, Exec[2] = {}, HaltedSkip[2] = {}, Disp[2] = {}, Ev[Event_MAX] = {}, Irq[2][32] = {}; } SchedStats;

@@ -622,6 +622,14 @@ option(LITEV_SCHED_LEAN "Exact: lazy timer catch-up + cached next event time" OF
 if (LITEV_SCHED_LEAN)
     add_compile_definitions(LITEV_SCHED_LEAN=1)
 endif()
+# LITEV_NP_SCHED: Netplay session timing model (category B; set on every console of the session, the local one
+# too, through NDS::NPSched): an MP client's idle Wi-Fi ticks are batched like LITEV_WIFI_BATCH does for the
+# host, up to the tick that polls for the next host frame (NextSync) or starts a reception. Fewer
+# scheduler slices per frame; every poll still happens on its own tick.
+option(LITEV_NP_SCHED "Netplay: batch an MP client's idle Wi-Fi ticks up to its next poll" OFF)
+if (LITEV_NP_SCHED)
+    add_compile_definitions(LITEV_NP_SCHED=1)
+endif()
 # LITEV_NPSCHED_STATS: diagnostic per-console scheduler counters (iterations, CPU entries, events by type, IRQs)
 option(LITEV_NPSCHED_STATS "Diagnostic: scheduler counters" OFF)
 if (LITEV_NPSCHED_STATS)
