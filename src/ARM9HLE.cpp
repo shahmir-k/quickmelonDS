@@ -258,15 +258,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 24;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 4194303;
+constexpr int kKinds = 25;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 8388607;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -303,9 +303,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc", "mkbp"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : k == 24 ? 4194304 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -3520,6 +3520,194 @@ __attribute__((noinline)) bool RunMkSbc(melonDS::ARMv5* c, State& s, bool jit)
     }
 }
 
+// ---- 24. MKDS collision broad phase: the sorted-interval candidate sweep (ITCM 0x01FFD900) ------------------------------------
+// f(idx, mask) for object idx (0..255, 0x1C-byte records at [0x0217B598]: +0 / +2 its slots in two key-sorted arrays A
+// ([0x0217B594]) and B ([0x0217B5A0], 4-byte entries: +0 / +1 bytes, +2 s16 key), +4 / +8 an interval, +0xC enabled,
+// +0x14 flags, +0x18 payload): count := 0, then two scans (by 8, then by 1) move the A slot down while the key there is still
+// >= its B key and the B slot up while the next key is <= its A key; then B is walked down from there to the A entry's byte,
+// every other object whose byte-0 is >= the A slot, whose interval overlaps and whose flags have mask (and not 0x200) is
+// appended to three output arrays ([0x0217B5AC] u16 object, [0x0217B59C] u16 flags, [0x0217B5A4] payload; count at
+// 0x0217B588, at most 0x80). Game code (MKDS USA), pure memory: natively, every return path with its registers / flags,
+// the pushed frame, the outputs. Exact bytes of the function with its literal pool (FNV). Category B: per-step cycles.
+constexpr u32 kBpEntry = 0x01FFD900;
+constexpr Range kBpCode[1] = {{0x01FFD900, 0x01FFDB70}};
+constexpr u64 kBpSig = 0x404e786758d5e4e4ull;
+// guest cycles (check mode fit, MKDS 8P race: 134k calls, mean error 1.1 cycles, total -0.04%): the walk to its end (the
+// only return path seen in the race; the others and the flags-filter rejection run the guest), the scans' steps, the
+// walk's entries: byte below the A slot / the object itself (always once: in the base) / interval / interval / - / added
+constexpr s32 kBpCycRet[7] = {0, 0, 0, 0, 0, 0, 147}, kBpCycScan8 = -14, kBpCycScan1 = 10, kBpCycW[6] = {21, 0, 35, 42, 0, 98};
+
+int BpAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a != kBpEntry) return 0;
+    std::vector<u8> b;
+    CodeBytes(c, b, kBpCode, 0, 1);
+    return Fnv(b) == kBpSig ? 1 : 2;
+}
+
+__attribute__((noinline)) bool RunBp(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && BpAt(c, pc) != 1) return false;
+    s.calls[24]++;
+    Mem m(c, g_Check || g_Dry);
+    bool bad = false;
+    auto rd = [&](u32 a, u32 n) -> u32 {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    };
+    const u32 sp = c->R[13], idx = c->R[0], mask = c->R[1];
+    Obj fr = m.O(sp - 36, 36);
+    u32 r[16];
+    for (int i = 0; i < 16; i++) r[i] = c->R[i];
+    u32 fl = 0, ret = 0, n8a = 0, n1a = 0, n8b = 0, n1b = 0, w[6] = {};
+    // the writes: count, then up to 0x80 output entries (applied after every read: the arrays are checked disjoint below)
+    u32 cnt = 0;
+    struct Out { u32 obj, flags, pay; };
+    Out out[0x80];
+    bool wroteCount = false;
+    if (!fr || CheckPending) bad = true;
+    if (!bad)
+    {
+        if ((s32)idx < 0) { fl = Flags(idx, 0); ret = 1; }
+        else if ((s32)idx >= 0x100) { fl = Flags(idx, 0x100); ret = 2; }
+    }
+    if (!bad && !ret)
+    {
+        const u32 objs = rd(0x0217B598, 4), A = rd(0x0217B594, 4), B = rd(0x0217B5A0, 4);
+        const s32 n1 = (s32)(s16)rd(0x0217B590, 2) - 1;
+        const u32 o = objs + idx * 0x1C;
+        const s32 i0 = (s16)rd(o, 2), ip = (s16)rd(o + 2, 2);
+        const s32 keyB = (s16)rd(B + ip * 4 + 2, 2), keyA = (s16)rd(A + i0 * 4 + 2, 2);
+        const u32 lo = rd(o + 4, 4), hi = rd(o + 8, 4), en = rd(o + 0xC, 4);
+        r[2] = hi; r[3] = lo; r[12] = (u32)ip;
+        if (bad) {}
+        else if (!en) { r[0] = 0x0217B588; r[1] = 0; fl = 0x60000000u; ret = 3; wroteCount = true; }
+        else
+        {
+            wroteCount = true;
+            // the A slot down
+            s32 a0 = i0;
+            for (;;) { if (a0 <= 7) break; const s32 k = (s16)rd(A + (a0 - 8) * 4 + 2, 2); if (k < keyB) break; a0 -= 8; n8a++; }
+            for (;;) { if (a0 <= 0) break; const s32 k = (s16)rd(A + (a0 - 1) * 4 + 2, 2); if (k < keyB) break; a0 -= 1; n1a++; }
+            // the B slot up
+            s32 b0 = ip;
+            const s32 lim8 = n1 - 7;
+            for (;;) { if (b0 >= lim8) break; const s32 k = (s16)rd(B + (b0 + 8) * 4 + 2, 2); if (k > keyA) break; b0 += 8; n8b++; }
+            for (;;) { if (b0 >= n1) break; const s32 k = (s16)rd(B + (b0 + 1) * 4 + 2, 2); if (k > keyA) break; b0 += 1; n1b++; }
+            r[0] = (u32)a0;
+            const s32 stop = (s16)rd(A + a0 * 4 + 1, 1);
+            s32 sl = (s16)b0;
+            if (bad) {}
+            else if (sl < stop) { fl = Flags((u32)sl, (u32)stop); ret = 4; }
+            else
+            {
+                for (;;)
+                {
+                    const u32 e = B + sl * 4;
+                    const u32 b0b = rd(e, 1);
+                    bool tail = true;     // the walk's skip path also tests sl == 0 (db28)
+                    int outc;
+                    if ((s32)b0b < a0) { fl = Flags(b0b, (u32)a0); outc = 0; }
+                    else if (sl == ip) { fl = Flags((u32)sl, (u32)ip); outc = 1; }
+                    else
+                    {
+                        tail = false;
+                        const u32 id = rd(e + 1, 1), o2 = objs + id * 0x1C;
+                        const u32 f2 = rd(o2 + 0x14, 2);
+                        const s32 l2 = (s32)rd(o2 + 4, 4), h2 = (s32)rd(o2 + 8, 4);
+                        if (l2 < (s32)hi) { fl = Flags((u32)l2, hi); outc = 2; }
+                        else if (h2 > (s32)lo) { fl = Flags((u32)h2, lo); outc = 3; }
+                        else if (!(f2 & mask)) { outc = 4; fl = (fl & 0x30000000u) | 0x40000000u; }          // ands r5, r6, r1: 0 (C, V kept)
+                        else if (f2 & 0x200) { outc = 4; fl &= 0x10000000u; }   // ands r5, r6, #0x200: nonzero, C = 0 (rotated immediate), V kept
+                        else
+                        {
+                            out[cnt++] = {id, f2, rd(o2 + 0x18, 4)};
+                            fl = Flags(cnt, 0x80); outc = 5;
+                            if (cnt == 0x80) { w[outc]++; ret = 5; break; }
+                            tail = true;
+                        }
+                    }
+                    if (bad) break;
+                    w[outc]++;
+                    if (tail) { fl = Flags((u32)sl, 0); if (sl == 0) { ret = 6; break; } }
+                    sl--;
+                    fl = Flags((u32)sl, (u32)stop);
+                    if (sl < stop) { ret = 7; break; }
+                }
+            }
+        }
+    }
+    if (ret != 7 || w[4] || w[1] != 1) bad = true;       // (not timed: never seen in the race)
+    u32 B0 = 0, objs0 = 0, o1 = 0, o2a = 0, o3 = 0;
+    if (!bad && wroteCount && cnt)
+    {
+        // the outputs must not overlap what the walk reads (B, the objects) or the count
+        objs0 = rd(0x0217B598, 4); B0 = rd(0x0217B5A0, 4);
+        o1 = rd(0x0217B5AC, 4); o2a = rd(0x0217B59C, 4); o3 = rd(0x0217B5A4, 4);
+        const u32 nB = (u32)(s16)rd(0x0217B590, 2) * 4;
+        auto dis = [](u32 a, u32 al, u32 b, u32 bl) { return a + al <= b || b + bl <= a; };
+        const u32 ranges[3][2] = {{o1, cnt * 2}, {o2a, cnt * 2}, {o3, cnt * 4}};
+        for (auto& g : ranges)
+        {
+            const u8* p = m.P(g[0]);
+            if (!p || m.P(g[0] + g[1] - 1) != p + g[1] - 1 || (g[0] & ((g == ranges[2]) ? 3 : 1))
+                || !dis(g[0], g[1], B0, nB) || !dis(g[0], g[1], objs0, 0x100 * 0x1C) || !dis(g[0], g[1], 0x0217B588, 2)) bad = true;
+        }
+    }
+    if (bad)
+    {
+        s.fallback[24] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    // push {r4-r11, lr}
+    for (int i = 0; i < 8; i++) m.W(fr, i * 4, c->R[4 + i]);
+    m.W(fr, 32, c->R[14]);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = r[i];
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFDFu) | fl | ((e.retPc & 1) << 5);
+    s32 cyc = kBpCycRet[ret - 1] + kBpCycScan8 * (s32)(n8a + n8b) + kBpCycScan1 * (s32)(n1a + n1b);
+    for (int i = 0; i < 6; i++) cyc += kBpCycW[i] * (s32)w[i];
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 24, m, e);
+            if (wroteCount) g_P.log.push_back({0x0217B588, cnt, 2});
+            for (u32 k = 0; k < cnt; k++)
+            {
+                g_P.log.push_back({o1 + k * 2, out[k].obj, 2}); g_P.log.push_back({o2a + k * 2, out[k].flags, 2});
+                g_P.log.push_back({o3 + k * 4, out[k].pay, 4});
+            }
+            g_P.fit[0] = ret; g_P.fit[1] = n8a + n8b; g_P.fit[2] = n1a + n1b; g_P.fit[3] = 0;
+            for (int k = 0; k < 6; k++) g_P.fitA[k] = w[k];
+        }
+        s.checks[24]++;
+        if (g_Check && jit) { CheckRunGuest(c, pc); return true; }
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    m.Flush();
+    // the count and the outputs (halfword / word stores, changed ones, the JIT invalidation check)
+    auto st = [&](u32 a, u32 v, u32 n) {
+        u8* p = m.P(a);
+        if (n == 2 ? R16(p) == (u16)v : R32(p) == v) return;
+        c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(a & ~3u);
+        if (n == 2) { const u16 h = (u16)v; memcpy(p, &h, 2); } else memcpy(p, &v, 4);
+    };
+    if (wroteCount) st(0x0217B588, cnt, 2);
+    for (u32 k = 0; k < cnt; k++) { st(o1 + k * 2, out[k].obj, 2); st(o2a + k * 2, out[k].flags, 2); st(o3 + k * 4, out[k].pay, 4); }
+    s.native[24]++;
+    Return(c, e, cyc);
+    return true;
+}
+
 // ---- 22. MKDS course collision (KCL): the prism loop's rejection pass ---------------------------------------------------------
 // The KCL sphere query 0x01FFDEE4 (MKDS USA, ITCM; game code) walks the triangle (prism) list of an octree leaf: per prism its
 // 16-byte record (height, position / face normal / 3 edge normal indices, attribute) is copied to the stack, d = query point -
@@ -4100,6 +4288,11 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         r = kKclCode;
         return 5;
     }
+    if (instr == kNodeInstr && addr == kBpEntry)
+    {
+        r = kBpCode;
+        return 1;
+    }
     if (instr == kMkSbcInstr && addr == kMkSbcHead)
     {
         // the loop, NODE, RET and 21.'s functions (the loop runs MAT natively)
@@ -4273,6 +4466,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return k;
     }
 #endif
+    if (instr == kNodeInstr && addr == kBpEntry)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 4194304) ? BpAt(&nds.ARM9, addr) : 0;
+    }
     if (instr == kMkSbcInstr && addr == kMkSbcHead)
     {
         State& s = St(&nds.ARM9);
@@ -5369,6 +5567,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 16384) && RunFx(c, s, jit);
     }
+    if (in == kNodeInstr && pc == kBpEntry)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 4194304) && RunBp(c, s, jit);
+    }
     if (in == kMkSbcInstr && pc == kMkSbcHead)
     {
         State& s = St(c);
@@ -5497,6 +5700,9 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         fprintf(stderr, "ASYNCFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 13 && getenv("LITEV_A9HLE_SHPFIT") && !g_P.irq)
         fprintf(stderr, "SHPFIT %d %u %llu\n", (int)g_P.small, g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 24 && getenv("LITEV_A9HLE_BPFIT") && !g_P.irq)
+        fprintf(stderr, "BPFIT %u %u %u %u %u %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fitA[0], g_P.fitA[1], g_P.fitA[2],
+                g_P.fitA[3], g_P.fitA[4], g_P.fitA[5], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 22 && getenv("LITEV_A9HLE_KCLFIT") && !g_P.irq)
         fprintf(stderr, "KCLFIT %u %u %u %u %u %u %u %u %u %u %llu\n", g_P.fit[1], g_P.fitA[0], g_P.fitA[1], g_P.fitA[2], g_P.fitA[3], g_P.fitA[4],
                 g_P.fitA[5], g_P.fitA[6], g_P.fit[0], g_P.fitA[7], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));

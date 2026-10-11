@@ -31,12 +31,12 @@
 #include <deque>
 #include <cstdio>
 #include <mutex>
-namespace { struct BPEnt { uint32_t addr, last; uint8_t num, thumb, idle; uint16_t n; uint64_t count; uint32_t instr[64]; uint32_t iaddr[64]; std::vector<uint8_t> host; };
+namespace { struct BPEnt { uint32_t addr, last; uint8_t num, thumb, idle; uint16_t n; uint64_t count; std::vector<uint32_t> instr, iaddr; std::vector<uint8_t> host; };   // (every instruction: a block can be longer than 64)
 std::deque<BPEnt>& BP() { static std::deque<BPEnt> d; return d; }
 std::mutex BPMu; thread_local BPEnt* BPCur;   // --mp-test compiles on a thread per console
 void BPDump() { const char* o = getenv("LITEV_BLOCKPROF_OUT"); FILE* f = fopen(o ? o : "/tmp/blockprof.txt", "w"); if (!f) return;
   for (auto& e : BP()) if (e.count) { fprintf(f, "%d %d %08x %08x %d %d %llu", e.num, e.thumb, e.addr, e.last, e.n, e.idle, (unsigned long long)e.count);
-    for (int i = 0; i < e.n && i < 64; i++) fprintf(f, " %08x:%08x", e.iaddr[i], e.instr[i]);
+    for (int i = 0; i < e.n; i++) fprintf(f, " %08x:%08x", e.iaddr[i], e.instr[i]);
     fprintf(f, " |"); for (uint8_t b : e.host) fprintf(f, "%02x", b); fprintf(f, "\n"); } fclose(f); } }
 #endif
 
@@ -2817,7 +2817,7 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
         { std::lock_guard<std::mutex> lk(BPMu); BPCur = &BP().emplace_back(); }
         BPEnt& e = *BPCur;
         e.addr = instrs[0].Addr; e.last = instrs[instrsCount-1].Addr; e.num = cpu->Num; e.thumb = thumb; e.n = instrsCount; e.count = 0; e.idle = 0;
-        for (int i = 0; i < instrsCount; i++) { if (i < 64) { e.instr[i] = instrs[i].Instr; e.iaddr[i] = instrs[i].Addr; } if (instrs[i].BranchFlags & branch_IdleBranch) e.idle = 1; }
+        for (int i = 0; i < instrsCount; i++) { e.instr.push_back(instrs[i].Instr); e.iaddr.push_back(instrs[i].Addr); if (instrs[i].BranchFlags & branch_IdleBranch) e.idle = 1; }
         MOVP2R(X16, &e.count);
         LDR(INDEX_UNSIGNED, X17, X16, 0);
         ADD(X17, X17, 1);
