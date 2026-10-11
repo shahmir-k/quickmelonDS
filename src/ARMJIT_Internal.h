@@ -26,6 +26,7 @@
 
 #include "ARM_InstrInfo.h"
 #include "JitBlock.h"
+#include <atomic>
 #include "TinyVector.h"
 
 namespace melonDS
@@ -101,6 +102,7 @@ enum JitPhase
     JitPhase_Count
 };
 extern u64 JitCompileTicks[JitPhase_Count];
+extern std::atomic<u64> JitWorkerTicks, JitStealTicks;
 inline u64 JitTicks()
 {
 #if defined(__aarch64__)
