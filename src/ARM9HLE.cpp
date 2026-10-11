@@ -257,15 +257,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 18;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 65535;
+constexpr int kKinds = 19;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 131071;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -273,7 +273,8 @@ struct State
     bool dmaOk = false;             // DMA-end IRQ path matches (11.)
     bool shpOk = false;             // G3D shape path matches (13.)
     bool matTOk = false;            // 8. in Thumb (W2) matches
-    u32 anmDef = 0; bool anmOk = false;     // 17. (ARM build): the code of MAT_InternalDefault at anmDef verified at the last compile
+    u32 anmDef = 0; bool anmOk = false;
+    u32 sbcLive = 0;                // 18.: what was verified with the loop's hook block (SbcVerify)     // 17. (ARM build): the code of MAT_InternalDefault at anmDef verified at the last compile
     std::vector<u8> matTCode;
     bool hbLive = false, dmaLive = false;   // 3. / 11. verified when the wake hook block (A9HLEGuard) was compiled
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
@@ -301,9 +302,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -1670,6 +1671,14 @@ constexpr s32 kMatCyc = 512, kMatCycNoSend = 325;
 bool MatAnm(melonDS::ARMv5* c, Mem& m, const MatAnmVar& v, u32 md, u32 h, u32 ro, u32 idx, u32 texFn, bool send, u32* r, u32* gw, u32& n, u32* cnt);
 int MatAnmAt(melonDS::ARMv5* c, u32 def);           // the ARM build's 17. code at its distances from MAT_InternalDefault: 0/1/2
 MatAnmVar MatAnmPW(melonDS::ARMv5* c, u32 def);     // its pointers (PW, PB)
+// 18. (defined after 13.)
+constexpr u32 kSbcInstr = 0xE5941008;   // ldr r1, [r4, #8] (the loop head)
+// (offset from SBC SHP, bytes): the loop function, RET .. NODE, NOP, POSSCALE, MAT, NODEDESC
+enum : s32 { kSbcFn = -0xBCC, kSbcHead = -0xBC0, kSbcRet = -0x87C, kSbcNode = -0x854, kSbcNop = -0x8A4, kSbcPs = 0x13A0,
+             kSbcMat = -0x184, kSbcNd = 0xA0 };
+constexpr u32 kW2SbcHead = 0x0206617C;    // W2 (Thumb): ldr r0, [r4]
+int SbcDeps(melonDS::ARMv5* c, const Variant& v, Range* r);
+u32 SbcVerify(melonDS::ARMv5* c, State& s);
 s32 MatAnmCyc(const u32* cnt, bool send, int thumb);
 
 bool CodeEq(melonDS::ARMv5* c, u32 a, const u32* w, u32 n, const u16* sk, u32 ns)
@@ -3214,6 +3223,14 @@ bool Defer(melonDS::ARMv5* c)
 
 int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
 {
+#ifdef LITEV_GX_BULK
+    if (instr == kSbcInstr)
+    {
+        static thread_local Range sb[48];
+        r = sb;
+        return SbcDeps(&nds.ARM9, *Active(&nds.ARM9)->v, sb);
+    }
+#endif
     if (instr == kCardInstr)
     {
         static thread_local Range card;
@@ -3288,6 +3305,12 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     }
 #ifdef LITEV_GX_BULK
     if (addr == kW2NodeEntry && (instr & 0xFFFF) == 0xB5F0) { r = kW2NodeCode; return 14; }
+    if (addr == kW2SbcHead && (instr & 0xFFFF) == 0x6820)
+    {
+        static thread_local Range sb[48];
+        r = sb;
+        return SbcDeps(&nds.ARM9, *Active(&nds.ARM9)->v, sb);
+    }
 #endif
     const Variant& v = *Active(&nds.ARM9)->v;     // after IsHook != 0
     if (addr == v.wake)
@@ -3327,6 +3350,13 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
     {
         if (!MaybeHookT(instr)) return 0;
 #ifdef LITEV_GX_BULK
+        if (addr == kW2SbcHead && (instr & 0xFFFF) == 0x6820)
+        {
+            State* s = Active(&nds.ARM9);
+            if (!s || !s->on || !(s->mask & 65536) || !s->v->twl) return 0;
+            s->sbcLive = SbcVerify(&nds.ARM9, *s);
+            return s->sbcLive & 1 ? 1 : 2;
+        }
         if (addr == kW2NodeEntry && (instr & 0xFFFF) == 0xB5F0)
         {
             State& s = St(&nds.ARM9);
@@ -3349,6 +3379,15 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return CodeIntact(&nds.ARM9, s, k) ? 1 : 2;
     }
     if (!MaybeHook(instr)) return 0;
+#ifdef LITEV_GX_BULK
+    if (instr == kSbcInstr)
+    {
+        State* s = Active(&nds.ARM9);
+        if (!s || !s->on || !(s->mask & 65536) || s->v->twl || !s->v->shp || addr != s->v->shp + kSbcHead) return 0;
+        s->sbcLive = SbcVerify(&nds.ARM9, *s);
+        return s->sbcLive & 1 ? 1 : 2;
+    }
+#endif
     if (instr == kCardInstr)
     {
         State& s = St(&nds.ARM9);
@@ -4155,10 +4194,223 @@ __attribute__((noinline)) bool RunOs(melonDS::ARMv5* c, State& s, int k, bool ji
 }
 
 // Thumb entries (TWL SDK build: OS_Set/GetIrqFunction)
+#ifdef LITEV_GX_BULK
+// ---- 18. the NNS G3D SBC command loop (NNS_G3dDraw) -----------------------------------------------------------------
+// The loop reads the next SBC command byte, clears render-state flag 0x40 and calls the command's function through
+// NNS_G3dFuncSbcTable until a RET sets flag 0x20: ~245 commands a frame in the PW town (13 guest instructions each, 12%
+// of the ARM9's guest work; W2 town 404 x 16, 16%), and every MAT / SHP / NODEDESC command is a separate hook exit (8.,
+// 13., 15.). Natively at the loop head: the loop step, then MAT (8./17.), SHP (13.), NODEDESC (15.) through their natives
+// and NODE (visibility), POSSCALE (MTX_SCALE), RET, NOP here, command after command, until the slice's cycle budget is
+// used, an IRQ is pending, the CPU stops (a display list's DMA), the list ends or a command needs the guest (any other
+// command, a callback, a native's fallback: the loop step is done and the command's function entered as the guest's blx
+// would). The loop's own registers (PW r4 = rs, r5 = table; W2 r4 = rs + 8, r5 = rs, r6 = 0x40, r7 = table) stay; the
+// commands' scratch registers / flags are dead (the loop reloads r0-r2 for every command). PW, PB: keyed to the
+// variant's SHP address, the loop, NOP, RET, NODE and POSSCALE by a code hash; W2 (Thumb): exact bytes. The other
+// commands as their hooks verify them, at the loop block's compile. Category B: the commands' estimates + the loop's.
+// the build's addresses (Thumb entries without the bit): loop head, the loop's tail (the blx return), the command functions
+struct SbcVar { u32 head, ret, nop, rret, node, ps, mat, shp, nd, opn, ge; bool thumb; s32 cLoop, cNode, cPs, cRet, cNop; };
+constexpr struct { s32 off; u32 len; } kSbcCode[3] = {{kSbcFn, 0x44}, {kSbcNop, 0x1CC}, {kSbcPs, 0x70}};
+constexpr u64 kSbcSig = 0x651b979a2b248086ull;
+// W2: the loop (with its literal), NOP .. NODE, POSSCALE
+constexpr Range kW2SbcCode[3] = {{0x02066170, 0x020661A4}, {0x020663BC, 0x020664FC}, {0x0206768C, 0x020676D8}};
+constexpr u64 kW2SbcSig = 0x826daf6ad4bd1184ull;
+// ponytail: guest cycles (interpreter profiles, PW / W2 town): the loop per command, NODE, POSSCALE, RET, NOP
+SbcVar SbcVarOf(melonDS::ARMv5* c, const Variant& v)
+{
+    if (v.twl) return {kW2SbcHead, 0x02066194, 0x020663BC, 0x020663D0, 0x020663E8, 0x0206768C, v.matT->sbc, v.shp, kW2NodeEntry,
+                       v.matT->opn, v.matT->ge, true, 22, 87, 132, 16, 16};
+    const u32 def = v.shp + kSbcMat - kMatOff, opn = BlTarget(c, def + 263 * 4);
+    return {v.shp + kSbcHead, v.shp + kSbcHead + 0x28, v.shp + kSbcNop, v.shp + kSbcRet, v.shp + kSbcNode, v.shp + kSbcPs,
+            v.shp + kSbcMat, v.shp, v.shp + kSbcNd, opn, opn ? R32(CodePtr(c, opn + 55 * 4)) : 0, false, 24, 88, 142, 20, 18};
+}
+
+int SbcAt(melonDS::ARMv5* c, const Variant& v)
+{
+    u64 h = 0xcbf29ce484222325ull;
+    auto add = [&](u32 a, u32 b) { for (; a < b; a++) { const u8* p = CodePtr(c, a); if (!p) return false; h = (h ^ *p) * 0x100000001b3ull; } return true; };
+    if (v.twl) { for (auto& r : kW2SbcCode) if (!add(r.a, r.b)) return 0; }
+    else for (auto& f : kSbcCode) if (!add(v.shp + f.off, v.shp + f.off + f.len)) return 0;
+    const u64 want = v.twl ? kW2SbcSig : kSbcSig;
+    if (g_Stats && h != want) fprintf(stderr, "A9HLE: G3D SBC loop signature %016llx\n", (unsigned long long)h);
+    return h == want ? 1 : 2;
+}
+// the loop hook's code ranges: its own, MAT (+ 17.), SHP (13. with 10.), NODEDESC
+int SbcDeps(melonDS::ARMv5* c, const Variant& v, Range* r)
+{
+    int n = 0;
+    if (v.twl)
+    {
+        for (auto& x : kW2SbcCode) r[n++] = x;
+        for (auto& x : v.matT->code) r[n++] = x;
+        for (auto& x : kW2NodeCode) r[n++] = x;
+    }
+    else
+    {
+        for (auto& f : kSbcCode) r[n++] = {v.shp + f.off, v.shp + f.off + f.len};
+        const u32 def = v.shp + kSbcMat - kMatOff;
+        u32 d, opn, snd;
+        MatAt(c, v.shp + kSbcMat, d, opn, snd);
+        r[n++] = {def, v.shp + kSbcMat + 0xB0}; r[n++] = {opn, opn ? opn + 57 * 4 : 0}; r[n++] = {snd, snd ? snd + 24 : 0};
+        for (auto& f : kMaFn) r[n++] = {def + f.off, def + f.off + f.len};
+        const u32 e = v.shp + kSbcNd;
+        u32 fn[4];
+        NodeAt(c, e, fn);
+        for (auto& f : kNodeFn) r[n++] = {e + f.off, e + f.off + f.len};
+        r[n++] = {fn[0], fn[0] ? fn[0] + 57 * 4 : 0}; r[n++] = {fn[1], fn[1] ? fn[1] + 24 : 0};
+        r[n++] = {fn[2], fn[2] ? fn[2] + 69 * 4 : 0}; r[n++] = {fn[3], fn[3] ? fn[3] + 14 : 0};
+    }
+    for (int i = 0; i < 3; i++) r[n++] = v.shpCode[i];
+    for (int i = 0; i < 7; i++) if (v.asyncCode[i].b) r[n++] = v.asyncCode[i];
+    r[n++] = v.gxCode; r[n++] = v.code[3]; r[n++] = v.code[9];
+    return n;
+}
+// verified with the loop's hook block (IsHook): bit 0 the loop's own code, 1 MAT (+ 17. in anmOk), 4 SHP, 8 NODEDESC
+u32 SbcVerify(melonDS::ARMv5* c, State& s)
+{
+    const Variant& v = *s.v;
+    if (SbcAt(c, v) != 1) return 0;
+    u32 ok = 1, def, opn, snd, fn[4];
+    if (v.twl)
+    {
+        if (!s.matTOk || !MatTIntact(c, s)) return 0;     // (POSSCALE's OP_N is MAT's)
+        if (s.mask & 128) ok |= 2;
+        if ((s.mask & 8192) && W2NodeAt(c) == 1) ok |= 8;
+    }
+    else
+    {
+        if (MatAt(c, v.shp + kSbcMat, def, opn, snd) != 1 || BlTarget(c, v.shp + kSbcPs + 0x58) != opn) return 0;    // (POSSCALE's OP_N)
+        if (s.mask & 128)
+        {
+            ok |= 2;
+            s.anmDef = def; s.anmOk = (s.mask & 32768) && MatAnmAt(c, def) == 1;
+        }
+        if ((s.mask & 8192) && NodeAt(c, v.shp + kSbcNd, fn) == 1) ok |= 8;
+    }
+    if (s.shpOk && (s.mask & 2560) == 2560 && ShpIntact(c, s) && AsyncIntact(c, s) && GxIntact(c, s) && CodeIntact(c, s, 0)) ok |= 4;
+    return ok;
+}
+
+// NODE (visibility) natively: false = the guest function
+bool SbcNode(melonDS::ARMv5* c, Mem& m, const Obj& RS, u32 sbc)
+{
+    u32 fl = RS.r(8);
+    if (fl & 0x200) { m.W(RS, 0, sbc + 3); return true; }
+    const u8* p = m.P(sbc + 1);
+    if (!p || m.P(sbc + 2) != p + 1) return false;
+    const u32 id = p[0], cbT = RS.r(0x14) ? RS.p[0x8E] : 0;
+    if (cbT >= 1 && cbT <= 3) return false;
+    const u32 ro = RS.r(4);
+    const u8* rp = m.P(ro);
+    if (!rp || (ro & 3) || m.P(ro + 0x4F + (id >> 5) * 4) != rp + 0x4F + (id >> 5) * 4) return false;
+    if (R32(rp + 0x18) && (R32(rp + 0x4C + (id >> 5) * 4) >> (id & 31) & 1)) return false;     // visibility animation
+    const u32 vis = p[1] & 1;
+    m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFFu) | id);
+    m.W(RS, 0xB8, RS.a + 0x184);
+    m.W(RS, 0x184, vis);
+    m.W(RS, 8, vis ? fl | 5 : (fl | 4) & ~1u);
+    m.W(RS, 0, sbc + 3);
+    return true;
+}
+
+__attribute__((noinline)) bool RunSbc(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const SbcVar V = SbcVarOf(c, *s.v);
+    const u32 L = c->R[15] - (V.thumb ? 4 : 8), ret = V.ret, back = V.thumb ? ret + 2 : ret + 4;
+    Mem m(c, false);
+    const u32 rs = c->R[V.thumb ? 5 : 4], tab = c->R[V.thumb ? 7 : 5];
+    Obj RS = m.O(rs, 0x188);
+    const u8* lp = CodePtr(c, V.thumb ? 0x020661A0 : L + 0x38);
+    const u32 ok = s.sbcLive;
+    if (!jit || CheckPending || g_Check || g_Dry || !(ok & 1) || L != V.head || !RS || !lp || tab != R32(lp)
+        || (V.thumb && (c->R[4] != rs + 8 || c->R[6] != 0x40)))
+    {
+        GuestFallback(c);
+        return true;
+    }
+    melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
+    s.calls[18]++;
+    for (u32 it = 0;; it++)
+    {
+        // the loop step: flag 0x40 cleared, the command, its function
+        const u32 sbc = RS.r(0);
+        const u8* op = m.P(sbc);
+        const u8* tp = op ? m.P(tab + (*op & 31) * 4) : nullptr;
+        if (!tp)
+        {
+            if (!it) GuestFallback(c);
+            return true;    // (at the loop's tail: the guest's ldr / tst / beq)
+        }
+        const u32 fn = R32(tp), f = fn & ~1u, cmd = *op;
+        m.W(RS, 8, RS.r(8) & ~0x40u);
+        m.Flush();
+        c->R[0] = rs; c->R[1] = cmd & 0xE0; c->R[2] = fn; c->R[14] = ret | V.thumb;
+        if (!V.thumb) c->R[3] = cmd;
+        c->Cycles += V.cLoop;
+        s.native[18]++;
+        bool done = false;
+        if ((fn & 1) == V.thumb && (f == V.mat || f == V.shp || f == V.nd))
+        {
+            if (f == V.shp ? ok & 4 : f == V.nd ? ok & 8 : ok & 2)
+            {
+                c->R[15] = f + (V.thumb ? 4 : 8);
+                const u8* ip = CodePtr(c, f);
+                c->CurInstr = V.thumb ? R16(ip) : R32(ip);
+                if (f == V.nd) RunNode(c, s, true);
+                else if (V.thumb) { if (f == V.shp) RunShpT(c, s, true); else RunMatT(c, s, true); }
+                else if (f == V.shp) RunShp(c, s, true);
+                else RunMat(c, s, true);
+                if (c->R[15] != back) return true;     // the command's guest code (its first instruction ran) or a stop
+                done = true;
+            }
+        }
+        else if ((fn & 1) != V.thumb) {}
+        else if (f == V.node && SbcNode(c, m, RS, sbc)) { c->Cycles += V.cNode; done = true; }
+        else if (f == V.rret && !RS.r(0x10)) { m.W(RS, 8, RS.r(8) | 0x20); c->Cycles += V.cRet; done = true; }
+        else if (f == V.nop && !RS.r(0xC)) { m.W(RS, 0, sbc + 1); c->Cycles += V.cNop; done = true; }
+        else if (f == V.ps)
+        {
+            const u32 fl = RS.r(8);
+            if (fl & 0x300) { m.W(RS, 0, sbc + 1); c->Cycles += V.cPs / 4; done = true; }
+            else if (V.opn && gx.GeometryEnabled && gx.BulkReady())
+            {
+                const u8* g = m.P(V.ge);
+                const u32 gb = g && m.P(V.ge + 7) == g + 7 ? R32(g) : 1;
+                const u8* gq = gb ? m.P(gb) : nullptr;
+                if (g && !R32(g + 4) && (!gb || (gq && !R32(gq))))
+                {
+                    const u32 val = RS.r(cmd & 0xE0 ? 0xE4 : 0xE0), w[4] = {0x1B, val, val, val};
+                    m.W(RS, 0, sbc + 1);
+                    m.Flush();
+                    gx.BulkWords(w, 4);
+                    c->Cycles += V.cPs;
+                    done = true;
+                }
+            }
+        }
+        m.Flush();
+        if (!done)
+        {
+            // the command's function as the guest calls it (blx: lr = the loop's tail)
+            c->JumpTo(fn);
+            return true;
+        }
+        // the loop's tail (ldr / tst #0x20 / beq head): stop there (the guest runs it) when the list ended, the slice's
+        // budget is used, an IRQ is pending or the CPU stops
+        if (c->R[15] != back) c->JumpTo(ret | V.thumb);
+        if ((RS.r(8) & 0x20) || c->Cycles >= c->CyclesBudget || c->Halted || (c->IRQ && !(c->CPSR & 0x80)) || c->StopExecution) return true;
+    }
+}
+#endif
+
 __attribute__((noinline)) bool RunThumb(melonDS::ARMv5* c, bool jit)
 {
     const u32 pc = c->R[15] - 4, in = c->CurInstr & 0xFFFF;
 #ifdef LITEV_GX_BULK
+    if (pc == kW2SbcHead && in == 0x6820)
+    {
+        State* s = Active(c);
+        return s && s->on && (s->mask & 65536) && s->v->twl && RunSbc(c, *s, jit);
+    }
     if (pc == kW2NodeEntry && in == 0xB5F0)
     {
         State& s = St(c);
@@ -4191,6 +4443,13 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 64) && RunLz(c, s, jit);
     }
+#ifdef LITEV_GX_BULK
+    if (in == kSbcInstr)
+    {
+        State* s = Active(c);
+        return s && s->on && (s->mask & 65536) && !s->v->twl && s->v->shp && pc == s->v->shp + kSbcHead && RunSbc(c, *s, jit);
+    }
+#endif
     if (in == kCardInstr)
     {
         State& s = St(c);
