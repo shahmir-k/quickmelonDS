@@ -4047,7 +4047,7 @@ __attribute__((noinline)) bool RunShp(melonDS::ARMv5* c, State& s, bool jit)
         // SHP_InternalDefault: no render callback at any timing ([rs + 0x91] 1/2/3 with a callback), no "no send" flag
         const u32 cbf = RS.r(0x20);
         r6 = cbf ? RS.p[0x91] : 0;
-        ok = ok && (r6 < 1 || r6 > 3);
+        ok = ok && (r6 < 1 || r6 > 3) && !(flag & 0x100);   // NNS_G3D_RSFLAG_SKIP / NOGECMD (0x100): the guest sends nothing
         u32 dl = 0, size = 0, dma = 0;
         if (ok)
         {
@@ -4062,7 +4062,7 @@ __attribute__((noinline)) bool RunShp(melonDS::ARMv5* c, State& s, bool jit)
             melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
             const u8* lp = m.P(dl);
             const u32 gb = rd(G, 4);   // OP_N: an empty GE buffer sends directly too
-            ok = !bad && size >= 4 && !(size & 3) && (!gb || !rd(gb, 4)) && !rd(G + 4, 4) && !bad && lp && (dl >> 24) == 0x02
+            ok = !bad && size >= 4 && size <= 0x100 /* BulkWords: <= 64 words */ && !(size & 3) && (!gb || !rd(gb, 4)) && !rd(G + 4, 4) && !bad && lp && (dl >> 24) == 0x02
                  && m.P(dl + size - 1) == lp + size - 1 && (dl & c->DTCMMask) != c->DTCMBase && ((dl + size - 1) & c->DTCMMask) != c->DTCMBase
                  && (chk || (gx.GeometryEnabled && gx.BulkReady()));
             fr = m.O(sp - 56, 56);
@@ -4223,7 +4223,7 @@ __attribute__((noinline)) bool RunShpT(melonDS::ARMv5* c, State& s, bool jit)
             if (ok) { shp = ip + rd(ent, 4); h = rd(shp, 2); fn = rd(lit(v.shp + 0x64) + h * 4, 4); ok = !bad && fn == (shpDef | 1); }
         }
         const u32 cbf = RS.r(0x20), r6 = cbf ? RS.p[0x91] : 0;
-        ok = ok && (r6 < 1 || r6 > 3);
+        ok = ok && (r6 < 1 || r6 > 3) && !(flag & 0x100);   // NNS_G3D_RSFLAG_SKIP / NOGECMD (0x100): the guest sends nothing
         u32 dl = 0, size = 0, dma = 0;
         if (ok)
         {
@@ -4240,7 +4240,7 @@ __attribute__((noinline)) bool RunShpT(melonDS::ARMv5* c, State& s, bool jit)
             melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
             const u8* lp = m.P(dl);
             const u32 gb = rd(G, 4);
-            ok = !bad && size >= 4 && !(size & 3) && !rd(G + 4, 4) && (!gb || !rd(gb, 4)) && !bad && lp && (dl >> 24) == 0x02
+            ok = !bad && size >= 4 && size <= 0x100 /* BulkWords: <= 64 words */ && !(size & 3) && !rd(G + 4, 4) && (!gb || !rd(gb, 4)) && !bad && lp && (dl >> 24) == 0x02
                  && m.P(dl + size - 1) == lp + size - 1 && (dl & c->DTCMMask) != c->DTCMBase && ((dl + size - 1) & c->DTCMMask) != c->DTCMBase
                  && (chk || (gx.GeometryEnabled && gx.BulkReady()));
             if (!ok) goto out;
