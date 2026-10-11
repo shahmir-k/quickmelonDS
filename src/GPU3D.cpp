@@ -4345,6 +4345,9 @@ bool GPU3D::BulkReady() const noexcept
 // FIFO empty throughout instead of filling and draining.
 void GPU3D::BulkWords(const u32* words, u32 n) noexcept
 {
+    // contract: n <= 64 (the decode buffer below; after a SWAP_BUFFERS the rest goes to the 260-entry FIFO). A larger
+    // call is a caller bug: split it so it can never overrun the stack (as consecutive calls: the decoder state carries)
+    for (; n > 64; words += 64, n -= 64) BulkWords(words, 64);
     Run(); // bring the engine clock up to now (the FIFO is empty: only time passes)
 #ifdef LITEV_A9HLE_GXCHECK
     if (A9HLE::GxTap) A9HLE::GxTap->insert(A9HLE::GxTap->end(), words, words + n);
