@@ -1486,14 +1486,22 @@ void* Compiler::Gen_Dispatcher(u32 num)
         FixupBranch wbSkip = CBZ(W9);
         MOVP2R(X2, (void*)ICacheTable[num]);
         ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICacheEntryShift));
+        // The epoch covers both ways: demote slot0 only if it is from the live epoch. A stale
+        // slot0 (its block may be invalidated since) would otherwise come back to life under
+        // the new stamp, and the guest would run a dead block's code (another JIT state than
+        // the one a savestate rebuilds, and the old code if the guest rewrote it). Stale: slot1
+        // gets key ~0, which no (even) instruction address matches.
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, ICacheEpoch));
+        CMP(W3, W5);
         LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key0));
-        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));   // key1 = old key0
+        CSINV(W3, W3, WZR, CC_EQ);
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));   // key1 = old key0 (or none)
         LDR(INDEX_UNSIGNED, X4, X2, offsetof(ICacheEntry, ptr0));
         STR(INDEX_UNSIGNED, X4, X2, offsetof(ICacheEntry, ptr1));   // ptr1 = old ptr0
         STR(INDEX_UNSIGNED, W0, X2, offsetof(ICacheEntry, key0));   // key0 = instrAddr
         STR(INDEX_UNSIGNED, X6, X2, offsetof(ICacheEntry, ptr0));   // ptr0 = host entry
-        LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, ICacheEpoch));
-        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        STR(INDEX_UNSIGNED, W5, X2, offsetof(ICacheEntry, epoch));
         SetJumpTarget(wbSkip);
     }
 #ifdef LITEV_JIT_RAS
@@ -1502,10 +1510,16 @@ void* Compiler::Gen_Dispatcher(u32 num)
         FixupBranch rasSkip = CBZ(W10);
         MOVP2R(X2, (void*)ICacheTable[num]);
         ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICacheEntryShift));
+        // (same rule: re-stamping a stale entry must not revive its slot1)
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, ICacheEpoch));
+        CMP(W3, W5);
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));
+        CSINV(W3, W3, WZR, CC_EQ);
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));
         STR(INDEX_UNSIGNED, W0, X2, offsetof(ICacheEntry, key0));
         STR(INDEX_UNSIGNED, X6, X2, offsetof(ICacheEntry, ptr0));
-        LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, ICacheEpoch));
-        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
+        STR(INDEX_UNSIGNED, W5, X2, offsetof(ICacheEntry, epoch));
         SetJumpTarget(rasSkip);
     }
 #endif
@@ -2176,25 +2190,38 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
     if (e.patchOff == 0) { e.hitCount = 0; return; }     // no exit-site recorded
     // Never emit past the main region (CompileBlock resets at <16KB; keep a stub's
     // headroom). Back off (reset streak, retry later) rather than promote when tight.
+    // One fixed-size stub slot per site, reused by every later promotion of it. Appending a new
+    // stub per promotion leaked: an invalidation reverts every promotion and the sites promote
+    // again, so the stubs filled the code memory (Sims 3: 20 of 29 MB by 3.4 min) and reset the
+    // block cache at a moment that depended on this host history (a savestate starts it over).
+    constexpr u32 kStubBytes = 128;
+    const bool reuse = e.stubOff != 0;
 #ifdef LITEV_JIT_BGEMIT
     // its own arena (the block stream belongs to the emitter, which may be another thread)
     // host-only: when the emitter is busy, promote later
     std::unique_lock<std::recursive_mutex> lk(EmitLock, std::try_to_lock);
     if (!lk.owns_lock()) { e.hitCount = 0; return; }
-    ptrdiff_t streamAt = GetCodeOffset();
-    if (BgLayout)
-    {
-        if (DPArenaEnd - DPCursor < 512) { e.hitCount = 0; return; }
-        SetCodePtrUnsafe(DPCursor);
-    }
-    else
+    if (BgLayout && !reuse && DPArenaEnd - DPCursor < (ptrdiff_t)kStubBytes) { e.hitCount = 0; return; }
 #endif
-    if ((ptrdiff_t)JitMemMainSize - GetCodeOffset() < 4096) { e.hitCount = 0; return; }
+    const ptrdiff_t high = GetCodeOffset();
+    if (!reuse && (ptrdiff_t)JitMemMainSize - high < 4096
+#ifdef LITEV_JIT_BGEMIT
+        && !BgLayout
+#endif
+        ) { e.hitCount = 0; return; }
 
     NDS.JIT.JitEnableWrite();
 
-    // --- emit the guard stub at the main high-water (append; advances m_code) ---
-    AlignCode16();
+    if (reuse)
+        SetCodePtrUnsafe(e.stubOff);
+    else
+    {
+#ifdef LITEV_JIT_BGEMIT
+        if (BgLayout)
+            SetCodePtrUnsafe(DPCursor);
+#endif
+        AlignCode16();
+    }
     u32 stubOff = (u32)((u8*)GetRXPtr() - GetRXBase());
 
     void* dispatcher = DispatcherEntry[num];
@@ -2287,16 +2314,16 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
 #endif
     B(dispatcher);
 
+    assert(GetCodeOffset() - (ptrdiff_t)stubOff <= (ptrdiff_t)kStubBytes);
+    FlushIcacheSection(GetRXBase() + stubOff, GetRXBase() + stubOff + kStubBytes);
 #ifdef LITEV_JIT_BGEMIT
+    if (BgLayout && !reuse)
+        DPCursor = (ptrdiff_t)stubOff + kStubBytes;
     if (BgLayout)
-    {
-        FlushIcacheSection(GetRXBase() + stubOff, (u8*)GetRXPtr());
-        DPCursor = GetCodeOffset();
-        SetCodePtrUnsafe(streamAt);
-    }
+        SetCodePtrUnsafe(high);
     else
 #endif
-    FlushIcache();                        // covers the align padding + the whole stub
+    SetCodePtrUnsafe(reuse ? high : (ptrdiff_t)stubOff + kStubBytes);
 
     // --- patch the exit-site B -> the stub, then flip back to executable ---
     DirectPatchWriteBranch(e.patchOff, stubOff);
@@ -2793,22 +2820,7 @@ u8 Compiler::A7T(u32 row, int k) { return NDS.ARM7MemTimings[row][k]; }
 
 JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[], int instrsCount, bool hasMemInstr)
 {
-#ifdef LITEV_JIT_BGEMIT
-    // a captured block: ARMJIT::CompileBlock already decided the cache resets (deterministically)
-    if (!CurJob)
-#endif
-    {
-    if (JitMemMainSize - GetCodeOffset() < 1024 * 16)
-    {
-        Log(LogLevel::Debug, "JIT near memory full, resetting...\n");
-        NDS.JIT.ResetBlockCache();
-    }
-    if ((JitMemMainSize +  JitMemSecondarySize) - OtherCodeRegion < 1024 * 8)
-    {
-        Log(LogLevel::Debug, "JIT far memory full, resetting...\n");
-        NDS.JIT.ResetBlockCache();
-    }
-    }
+    // (the cache-full reset happens in ARMJIT::CompileBlock, see NearlyFull)
 
     JitBlockEntry res = (JitBlockEntry)GetRXPtr();
 #ifdef LITEV_BLOCKPROF
@@ -3286,6 +3298,27 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
     return res;
 }
 
+bool Compiler::NearlyFull()
+{
+    // Host room (as before): a block needs at most a few KB near and far. (Background emission:
+    // the stream is the emitter's, ARMJIT::CheckCodeSpace checks it with the queued blocks.)
+    if (
+#ifdef LITEV_JIT_BGEMIT
+        !BgLayout &&
+#endif
+        (JitMemMainSize - GetCodeOffset() < 1024 * 16 || (JitMemMainSize + JitMemSecondarySize) - OtherCodeRegion < 1024 * 8))
+    {
+        Log(LogLevel::Debug, "JIT memory full, resetting...\n");
+        return true;
+    }
+    // The deterministic limit (LogicalSize: ~1.6x the real near code on Shrek; the near region
+    // also holds up to 4 MB of DIRECTPATCH stub slots and, after a savestate load, the blocks
+    // compiled from its profiles), reached well before the host one. ponytail: a game whose
+    // blocks run larger than the estimate on average could still reach the host check first
+    // (a reset at a host-dependent moment); raise the per-instruction estimate if one does.
+    return LogicalSize > (u64)JitMemMainSize - 6 * 1024 * 1024;
+}
+
 #ifdef LITEV_JIT_ICACHE
 void Compiler::ICacheAllocOnce()
 {
@@ -3317,6 +3350,7 @@ void Compiler::ICacheReset()
 
 void Compiler::Reset()
 {
+    LogicalSize = 0;
     LoadStorePatches.clear();
 #ifdef LITEV_JIT_STORE_REPROMOTE
     SlowStoreSites.clear();   // the code they point into is gone

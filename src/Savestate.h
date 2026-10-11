@@ -97,6 +97,9 @@ public:
     [[nodiscard]] u32 BufferLength() const { return buffer_length; }
 
     [[nodiscard]] u32 Length() const { return buffer_offset; }
+    [[nodiscard]] bool HasSection(const char* magic) const { return FindSection(magic) != NO_SECTION; }
+    // bytes a save can still write: a buffer the caller owns (the app's fixed-size rewind slots) cannot grow
+    [[nodiscard]] u64 Room() const { return buffer_owned ? ~0ull : (u64)buffer_length - buffer_offset; }
 
     [[nodiscard]] u16 MajorVersion() const
     {

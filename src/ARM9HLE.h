@@ -99,7 +99,7 @@
 #include <vector>
 #endif
 
-namespace melonDS { class ARM; class ARMv5; class NDS; }
+namespace melonDS { class ARM; class ARMv5; class NDS; class Savestate; }
 
 namespace melonDS::A9HLE
 {
@@ -138,6 +138,12 @@ bool Defer(melonDS::ARMv5* c);
 void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
 // ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted)
 void BlockGone(melonDS::NDS& nds, const void* block);
+// Savestate section "A9HL" (loaded before the JIT's blocks are rebuilt): the per-console state the JIT
+// paths trust (variant, code snapshots, the checks made when hook blocks were compiled) and a
+// deferred IRQ, so a state loaded into another process runs on like the console that saved it.
+void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* file);
+// ARMJIT: the wake hook block rebuilt from a savestate (A9HLEGuard from the restored checks)
+void HookRestored(melonDS::NDS& nds, u32 addr, const void* block);
 // interpreter check mode: called before every ARM9 instruction while a check is pending
 // (compiled out without LITEV_HLE_DIAG)
 #ifdef LITEV_HLE_DIAG

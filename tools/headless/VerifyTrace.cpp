@@ -1252,6 +1252,18 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                         unsigned long pv = strtoul(q, (char**)&q, 0); q += (*q == ',');
                         if ((int)pf == f) { bi.nds->ARM9Write32((u32)pa, (u32)pv); fprintf(stderr, "inst%d poke32 frame %d %08lx = %08lx\n", inst, f, pa, pv); }
                     }
+                // test hook: LITEV_MP_ROUNDTRIP="frame[:console mask]" saves and loads those consoles' states
+                // before that frame (a peer resynced from a savestate mid-session while the others run on:
+                // a session with it must log the same as one without)
+                if (static const char* rt = getenv("LITEV_MP_ROUNDTRIP"); rt && atoi(rt) == f
+                    && (strchr(rt, ':') ? strtoul(strchr(rt, ':') + 1, nullptr, 0) >> inst & 1 : 1))
+                {
+                    Savestate save;
+                    bi.nds->DoSavestate(&save);
+                    Savestate load(save.Buffer(), save.Length(), false);
+                    if (save.Error || !bi.nds->DoSavestate(&load) || load.Error) fprintf(stderr, "error: inst%d round trip failed\n", inst);
+                    else fprintf(stderr, "inst%d round trip before frame %d (%u bytes)\n", inst, f, save.Length());
+                }
                 // the frame's scanlines: the app paces by them (a game that rewinds VCOUNT, as the Wi-Fi
                 // client of a DS multiplayer session does to follow the host, runs longer frames)
                 const u32 lines = bi.nds->RunFrame();

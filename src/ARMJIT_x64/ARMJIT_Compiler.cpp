@@ -716,18 +716,15 @@ void Compiler::CreateMethod(const char* namefmt, void* start, ...)
 }
 #endif
 
+// ponytail: host room only (the A64 backend also has the deterministic logical limit)
+bool Compiler::NearlyFull()
+{
+    return NearSize - (GetCodePtr() - NearStart) < 1024 * 32 || FarSize - (FarCode - FarStart) < 1024 * 32; // guess...
+}
+
 JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[], int instrsCount, bool hasMemoryInstr)
 {
-    if (NearSize - (GetCodePtr() - NearStart) < 1024 * 32) // guess...
-    {
-        Log(LogLevel::Debug, "near reset\n");
-        NDS.JIT.ResetBlockCache();
-    }
-    if (FarSize - (FarCode - FarStart) < 1024 * 32) // guess...
-    {
-        Log(LogLevel::Debug, "far reset\n");
-        NDS.JIT.ResetBlockCache();
-    }
+    // (the cache-full reset happens in ARMJIT::CompileBlock, see NearlyFull)
 
     ConstantCycles = 0;
     Thumb = thumb;

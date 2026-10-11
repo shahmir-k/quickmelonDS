@@ -46,6 +46,7 @@
 namespace melonDS
 {
 class ARM;
+class Savestate;
 
 class JitBlock;
 class ARMJIT
@@ -59,8 +60,16 @@ public:
     void Reset() noexcept;
     void JitEnableWrite() noexcept;
     void JitEnableExecute() noexcept;
-    void CompileBlock(ARM* cpu) noexcept;
+    // Compiles the block at the CPU's PC. Normally that runs it once (interpreted, see
+    // JitProfileInstr) and returns null; when the block was already compiled and only had to be
+    // (re)entered into the lookup table (another mirror, or a block loaded from a savestate) it
+    // returns the code, which the caller runs now, as a lookup hit would have.
+    JitBlockEntry CompileBlock(ARM* cpu) noexcept;
     void ResetBlockCache() noexcept;
+    // Savestate section "JITS": the compiled blocks' profiles (what CompileBlock's interpreted
+    // first run baked into them), the invalidation bookkeeping and the IDLE2 sites, so that a
+    // loaded state runs on exactly like the console that saved it (load = Reset + restore).
+    void DoSavestate(Savestate* file) noexcept;
 
     template <u32 num, int region>
     void CheckAndInvalidate(u32 addr) noexcept
@@ -70,6 +79,8 @@ public:
             InvalidateByAddr(localAddr);
     }
     JitBlockEntry LookUpBlock(u32 num, u64* entries, u32 offset, u32 addr) noexcept;
+    // a block starts at addr and runs without compiling (part of the savestate, unlike LookUpBlock's table)
+    bool HasBlock(u32 num, u32 addr) noexcept;
     bool SetupExecutableRegion(u32 num, u32 blockAddr, u64*& entry, u32& start, u32& size, int* regionOut = nullptr) noexcept;
 #ifdef LITEV_JIT_REGION_CACHE
     bool RegionCacheable(u32 num, int region, u32 start, u32 size) const noexcept;
@@ -89,6 +100,8 @@ public:
     friend class ARMJIT_Memory;
     void blockSanityCheck(u32 num, u32 blockAddr, JitBlockEntry entry) noexcept;
     void RetireJitBlock(JitBlock* block) noexcept;
+    // compile a block restored from a savestate from its profile (no interpretation: it ran before)
+    void CompileFromProfile(JitBlock* block) noexcept;
 
     int GetMaxBlockSize() const noexcept { return MaxBlockSize; }
     bool LiteralOptimizationsEnabled() const noexcept { return LiteralOptimizations; }
@@ -292,7 +305,7 @@ public:
     void Reset() noexcept {}
     void JitEnableWrite() noexcept {}
     void JitEnableExecute() noexcept {}
-    void CompileBlock(ARM*) noexcept {}
+    JitBlockEntry CompileBlock(ARM*) noexcept { return nullptr; }
     void ResetBlockCache() noexcept {}
     template <u32, int>
     void CheckAndInvalidate(u32 addr) noexcept {}

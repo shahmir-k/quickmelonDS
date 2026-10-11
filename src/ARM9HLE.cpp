@@ -4147,6 +4147,64 @@ void BlockGone(melonDS::NDS& nds, const void* block)
     if (nds.ARM9.A9HLEGuard == block) nds.ARM9.A9HLEGuard = nullptr;
 }
 
+void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
+{
+    melonDS::ARMv5* c = &nds.ARM9;
+    if (!f->Saving)
+    {
+        // as a new console (host caches and stats start empty), then what the saving one had
+        g_State[&nds] = State{};                // (in place: the node stays where it is)
+        c->A9HLEState = nullptr;
+        c->A9HLEGuard = nullptr;                // (the JIT's section sets it again with its blocks)
+        c->A9HLEDefer = false;
+        if (!f->HasSection("A9HL")) return;     // an older state: as a new console
+    }
+    f->Section("A9HL");
+    // (only this build's layout and hooks: another build's state loads as a new console)
+    static const u64 build = [] { u64 h = 0xcbf29ce484222325ull; for (char ch : __DATE__ " " __TIME__) h = (h ^ (u8)ch) * 0x100000001b3ull; return h; }();
+    u64 b = build;
+    f->Var64(&b);
+    if (b != build) return;
+    u8 defer = c->A9HLEDefer;
+    f->Var8(&defer);
+    c->A9HLEDefer = defer;
+    u32 has = f->Saving && c->A9HLEState;
+    f->Var32(&has);
+    if (!has) return;
+    if (!f->Saving) c->A9HLEState = &g_State[&nds];
+    State& s = *(State*)c->A9HLEState;
+    s32 vi = -1;
+    for (int i = 0; i < kNumVariants; i++) if (s.v == kVariants[i]) vi = i;
+    f->Var32((u32*)&vi);
+    if (!f->Saving) s.v = vi >= 0 && vi < kNumVariants ? kVariants[vi] : nullptr;
+    f->Var32((u32*)&s.status);
+    f->Var32(&s.tried);
+    f->VarBool(&s.init);
+    f->VarBool(&s.on);
+    f->Var32(&s.mask);
+    for (std::vector<u8>* v : {&s.code, &s.irqCode, &s.gxCode, &s.asyncCode, &s.dmaCode, &s.shpCode, &s.matTCode})
+    {
+        u32 n = v->size();
+        f->Var32(&n);
+        if (!f->Saving) v->resize(n);
+        f->VarArray(v->data(), n);
+    }
+    for (bool* b : {&s.gxOk, &s.asyncOk, &s.irqOk, &s.dmaOk, &s.shpOk, &s.matTOk, &s.anmOk, &s.hbLive, &s.dmaLive})
+        f->VarBool(b);
+    f->Var32(&s.anmDef);
+    f->Var32(&s.sbcLive);
+    f->Var32(&s.biosRet);
+    f->Var32(&s.biosOk);
+    if (!f->Saving && s.status == 1 && !s.v) f->Error = true;
+}
+
+void HookRestored(melonDS::NDS& nds, u32 addr, const void* block)
+{
+    melonDS::ARMv5* c = &nds.ARM9;
+    State* s = Active(c);
+    if (s && addr == s->v->wake && (s->hbLive || s->dmaLive)) c->A9HLEGuard = block;
+}
+
 namespace
 {
 // one IRQ natively (3. HBlank, 11. a display list's DMA end): 1 done, 0 guest path, -1 check / dry (guest path, stop)

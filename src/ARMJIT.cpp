@@ -62,6 +62,7 @@
 #include "NDSCart.h"
 #include "Platform.h"
 #include "ARMJIT_x64/ARMJIT_Offsets.h"
+#include "Savestate.h"
 
 namespace melonDS
 {
@@ -1073,7 +1074,7 @@ void ARMJIT::LinkBlockOutgoing(JitBlock* block) noexcept
     {
         const OutgoingLink& link = block->Outgoing[i];
         auto it = blocks.find(link.TargetAddr);
-        if (it != blocks.end())
+        if (it != blocks.end() && it->second->EntryPoint)   // (none yet: loaded from a savestate)
         {
             JitBlock* target = it->second;
             u32 targetOff = EntryOff(target);
@@ -1115,7 +1116,7 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
     {
         const OutgoingLink& link = block->Outgoing[i];
         auto it = blocks.find(link.TargetAddr);
-        if (it != blocks.end())
+        if (it != blocks.end() && it->second->EntryPoint)
         {
             JitBlock* target = it->second;
             u32 targetOff = JITCompiler.SubEntryOffset(target->EntryPoint);
@@ -1345,7 +1346,7 @@ std::atomic<u64> JitWorkerTicks{0}, JitStealTicks{0};   // LITEV_JIT_BGEMIT emis
 #define JIT_PHASE(p) do {} while (0)
 #endif
 
-void ARMJIT::CompileBlock(ARM* cpu) noexcept
+JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
 {
     JitCompileCount++;
 #ifdef LITEV_JIT_COMPILE_STATS
@@ -1358,6 +1359,17 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     bool thumb = cpu->CPSR & 0x20;
 
     u32 blockAddr = cpu->R[15] - (thumb ? 2 : 4);
+
+    if (JITCompiler.NearlyFull())
+    {
+        JitEnableWrite();   // (the reset rewrites the code memory)
+        ResetBlockCache();
+        JitEnableExecute();
+    }
+#ifdef LITEV_JIT_BGEMIT
+    else if (BgMode)
+        CheckCodeSpace(MaxBlockSize);   // host room for a block compiled from a savestate's profile below
+#endif
 
     u32 localAddr = LocaliseCodeAddress(cpu->Num, blockAddr);
     if (!localAddr)
@@ -1378,14 +1390,23 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         {
             JIT_DEBUGPRINT("switching out block %x %x %x\n", localAddr, blockAddr, existingBlockIt->second->StartAddr);
 
+            JitBlock* block = existingBlockIt->second;
+            const bool fromState = !block->EntryPoint;
+            if (fromState)
+                CompileFromProfile(block);   // loaded from a savestate, first run since
+
             u64* entry = &FastBlockLookupRegions[localAddr >> 27][(localAddr & 0x7FFFFFF) / 2];
             *entry = ((u64)blockAddr | cpu->Num) << 32;
 #ifdef LITEV_JIT_BGEMIT
-            *entry |= EntryOff(existingBlockIt->second);
+            *entry |= EntryOff(block);
 #else
-            *entry |= JITCompiler.SubEntryOffset(existingBlockIt->second->EntryPoint);
+            *entry |= JITCompiler.SubEntryOffset(block->EntryPoint);
 #endif
-            return;
+#ifdef LITEV_JIT_LINK
+            if (fromState)
+                LinkBlock(block);
+#endif
+            return block->EntryPoint;
         }
 
         // some memory has been remapped
@@ -1872,6 +1893,30 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
         FloodFillSetFlags(instrs, i - 1, 0xF);
         JIT_PHASE(JitPhase_Alloc);
 
+        block->Profile.resize(i);
+        for (int j = 0; j < i; j++)
+        {
+            const FetchedInstr& f = instrs[j];
+            JitProfileInstr& p = block->Profile[j];
+            p.Instr = f.Instr; p.Addr = f.Addr; p.DataRegion = f.DataRegion; p.CodeCycles = f.CodeCycles;
+            p.BranchFlags = f.BranchFlags; p.SetFlags = f.SetFlags; p.DataCycles = f.DataCycles;
+#ifdef LITEV_JIT_COND_MEMGUESS
+            p.DataExecuted = f.DataExecuted;
+#else
+            p.DataExecuted = 0;
+#endif
+            p.DstRegs = f.Info.DstRegs; p.SrcRegs = f.Info.SrcRegs; p.NotStrictlyNeeded = f.Info.NotStrictlyNeeded;
+            p.Kind = f.Info.Kind; p.SpecialKind = f.Info.SpecialKind; p.ReadFlags = f.Info.ReadFlags;
+            p.WriteFlags = f.Info.WriteFlags; p.EndBlock = f.Info.EndBlock;
+        }
+        block->Thumb = thumb;
+        block->HasMemInstr = hasMemoryInstr;
+#ifdef LITEV_A9HLE
+        block->A9HookAt = a9HookAt;
+#endif
+
+        JITCompiler.LogicalSize += 256 + 64 * (u64)i;   // (decided here: a background emission runs later)
+
 #ifdef LITEV_JIT_BGEMIT
         if (BgMode)
         {
@@ -1967,6 +2012,8 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     {
         JIT_DEBUGPRINT("restored! %p\n", prevBlock);
         block = prevBlock;
+        if (!block->EntryPoint)
+            CompileFromProfile(block);
     }
 
     JIT_PHASE(JitPhase_Alloc);
@@ -2017,6 +2064,7 @@ void ARMJIT::CompileBlock(ARM* cpu) noexcept
     if (BgMode == 3)
         ProcessDone();
 #endif
+    return nullptr;
 }
 
 void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
@@ -2382,6 +2430,245 @@ void ARMJIT::JitEnableExecute() noexcept
     #elif defined(__NetBSD__)
         mprotect(JITCompiler.CodeMemBase, ARMJIT_Global::CodeMemorySliceSize, PROT_READ | PROT_EXEC);
     #endif
+}
+
+
+bool ARMJIT::HasBlock(u32 num, u32 addr) noexcept
+{
+    auto& map = num == 0 ? JitBlocks9 : JitBlocks7;
+    auto it = map.find(addr);
+    return it != map.end() && it->second->StartAddrLocal == LocaliseCodeAddress(num, addr);
+}
+
+void ARMJIT::CompileFromProfile(JitBlock* block) noexcept
+{
+    ARM* cpu = block->Num == 0 ? (ARM*)&NDS.ARM9 : (ARM*)&NDS.ARM7;
+    const int n = (int)block->Profile.size();
+    FetchedInstr instrs[MaxBlockSize];
+    for (int j = 0; j < n; j++)
+    {
+        const JitProfileInstr& p = block->Profile[j];
+        FetchedInstr& f = instrs[j];
+        f.Instr = p.Instr; f.Addr = p.Addr; f.DataRegion = p.DataRegion; f.CodeCycles = p.CodeCycles;
+        f.BranchFlags = p.BranchFlags; f.SetFlags = p.SetFlags; f.DataCycles = p.DataCycles;
+#ifdef LITEV_JIT_COND_MEMGUESS
+        f.DataExecuted = p.DataExecuted;
+#endif
+        f.Info.DstRegs = p.DstRegs; f.Info.SrcRegs = p.SrcRegs; f.Info.NotStrictlyNeeded = p.NotStrictlyNeeded;
+        f.Info.Kind = p.Kind; f.Info.SpecialKind = p.SpecialKind; f.Info.ReadFlags = p.ReadFlags;
+        f.Info.WriteFlags = p.WriteFlags; f.Info.EndBlock = p.EndBlock;
+    }
+    // The emitter models a static branch's target fetch on the CPU's code-fetch fields. A block
+    // compiled here already ran on the console that saved the state, so it must leave them alone.
+    // (Literal loads are read through DataRead, which sets the data access fields.)
+    const u32 r15 = cpu->R[15], codeRegion = cpu->CodeRegion, dataRegion = cpu->DataRegion;
+    const s32 codeCycles = cpu->CodeCycles, dataCycles = cpu->DataCycles;
+    const MemRegion codeMem = cpu->CodeMem;
+    const s32 regionCodeCycles = NDS.ARM9.RegionCodeCycles;
+
+#ifdef LITEV_JIT_BGEMIT
+    // inline, after the queued blocks (the stream's order); the same code a background emission
+    // of these inputs gives (a block from a savestate needs its code now: it is about to run)
+    std::unique_lock<std::recursive_mutex> emitLock(JITCompiler.EmitLock, std::defer_lock);
+    if (BgMode)
+    {
+        emitLock.lock();
+        while (EmitFront(false)) {}
+    }
+#endif
+    JitEnableWrite();
+    block->EntryPoint = JITCompiler.CompileBlock(cpu, block->Thumb, instrs, n, block->HasMemInstr);
+    JitEnableExecute();
+#ifdef LITEV_JIT_BGEMIT
+    if (BgMode)
+    {
+        PublishedUsed.store(JITCompiler.GetCodeOffset(), std::memory_order_relaxed);
+        PublishedFar.store(JITCompiler.OtherCodeRegion, std::memory_order_relaxed);
+    }
+#endif
+
+    cpu->R[15] = r15; cpu->CodeRegion = codeRegion; cpu->CodeCycles = codeCycles; cpu->CodeMem = codeMem;
+    cpu->DataRegion = dataRegion; cpu->DataCycles = dataCycles;
+    NDS.ARM9.RegionCodeCycles = regionCodeCycles;
+#ifdef LITEV_JIT_LINK
+    block->NumOutgoing = JITCompiler.NumLinkExits;
+    for (int j = 0; j < JITCompiler.NumLinkExits; j++)
+        block->Outgoing[j] = JITCompiler.LinkExits[j];
+    block->Incoming.Clear();
+#endif
+}
+
+// Guest timing under the JIT depends on what was compiled when (see JitProfileInstr), so a
+// savestate carries the block cache's guest-visible content: every live block and restore
+// candidate as compiled (profile, code ranges, literals), the per-512-byte code ranges with the
+// order of their block lists (the invalidation order picks which candidate survives), the
+// invalidated literals, the logical code size behind the deterministic cache-full reset,
+// the IDLE2 wait-loop sites and the CPUs' code-fetch fields. Loading rebuilds the blocks without
+// code; each is compiled from its profile when it first runs (CompileFromProfile), which is
+// what the saving console's cache already held. A state without this section (older states,
+// interpreter states, a fixed buffer without room) loads as before: an empty cache.
+void ARMJIT::DoSavestate(Savestate* file) noexcept
+{
+    // A profile is only meaningful to the build that compiled it (decoder, hooks, flags)
+    static const u64 build = XXH3_64bits(__DATE__ " " __TIME__, sizeof(__DATE__ " " __TIME__));
+    const u32 config = sizeof(JitProfileInstr) | (MaxBlockSize << 8) | (LiteralOptimizations << 16)
+        | (BranchOptimizations << 17) | (FastMemory << 18);
+
+    if (!file->Saving)
+    {
+        Reset();
+        for (int r = 0; r < ARMJIT_Memory::memregions_Count; r++)
+            if (CodeMemRegions[r])
+                for (u32 k = 0; k < CodeRegionSizes[r] / 512; k++)
+                {
+                    CodeMemRegions[r][k].Code = 0;
+                    CodeMemRegions[r][k].Blocks.Clear();
+                }
+        if (!NDS.IsJITEnabled() || !file->HasSection("JITS"))
+            return;
+    }
+
+    std::vector<JitBlock*> blocks;   // live ARM9, live ARM7, restore candidates
+    u32 n9 = 0, n7 = 0, nc = 0;
+    u64 b = build;
+    u32 c = config, ok = 1;
+    if (file->Saving)
+    {
+        ok = NDS.IsJITEnabled();
+        for (auto& kv : JitBlocks9) blocks.push_back(kv.second);
+        n9 = blocks.size();
+        for (auto& kv : JitBlocks7) blocks.push_back(kv.second);
+        n7 = blocks.size() - n9;
+        for (auto& kv : RestoreCandidates) blocks.push_back(kv.second);
+        nc = blocks.size() - n9 - n7;
+        u64 need = 4096 + (u64)InvalidLiterals.Length * 4;
+        for (JitBlock* bl : blocks)
+            need += 64 + bl->NumAddresses * 8 + bl->NumLiterals * 4 + bl->Profile.size() * sizeof(JitProfileInstr) + bl->NumAddresses * 16;
+#ifdef LITEV_JIT_IDLE2
+        need += NDS.ARM9.Idle2SavestateSize();
+#endif
+        if (need > file->Room())
+            ok = 0;   // the app's fixed-size rewind slots: no JIT state, loads cold
+    }
+
+    file->Section("JITS");
+    file->Var64(&b);
+    file->Var32(&c);
+    file->Var32(&ok);
+    if (!file->Saving && (b != build || c != config || !ok))
+        return;   // another build or JIT configuration, or saved without: load cold
+    if (file->Saving && !ok)
+        return;
+
+    // The CPUs' last code fetch and data access timings (not in the ARM sections). The
+    // compile pass samples them: a condition-failed load keeps the last access's DataCycles.
+    for (ARM* cpu : {(ARM*)&NDS.ARM9, (ARM*)&NDS.ARM7})
+    {
+        file->Var32(&cpu->CodeRegion);
+        file->Var32((u32*)&cpu->CodeCycles);
+        file->Var32(&cpu->DataRegion);
+        file->Var32((u32*)&cpu->DataCycles);
+    }
+    file->Var32((u32*)&NDS.ARM9.RegionCodeCycles);
+
+    file->Var64(&JITCompiler.LogicalSize);
+
+    u32 nlit = InvalidLiterals.Length;
+    file->Var32(&nlit);
+    for (u32 j = 0; j < nlit; j++)
+    {
+        u32 a = file->Saving ? InvalidLiterals[j] : 0;
+        file->Var32(&a);
+        if (!file->Saving)
+            InvalidLiterals.Add(a);
+    }
+
+#ifdef LITEV_JIT_IDLE2
+    NDS.ARM9.Idle2DoSavestate(file);
+#endif
+
+    file->Var32(&n9);
+    file->Var32(&n7);
+    file->Var32(&nc);
+    if (!file->Saving)
+        blocks.resize((size_t)n9 + n7 + nc);
+    std::unordered_map<JitBlock*, u32> ids;
+    for (u32 j = 0; j < n9 + n7 + nc; j++)
+    {
+        JitBlock* bl = file->Saving ? blocks[j] : nullptr;
+        u8 num = bl ? bl->Num : 0, thumb = bl ? bl->Thumb : 0, mem = bl ? bl->HasMemInstr : 0;
+        u16 na = bl ? bl->NumAddresses : 0, nl = bl ? bl->NumLiterals : 0, ni = bl ? (u16)bl->Profile.size() : 0;
+        file->Var8(&num); file->Var8(&thumb); file->Var8(&mem);
+        file->Var16(&na); file->Var16(&nl); file->Var16(&ni);
+        if (!file->Saving)
+        {
+            if (ni == 0 || ni > MaxBlockSize || num > 1) { file->Error = true; Reset(); return; }
+            bl = new JitBlock(num, 0, na, nl);
+            bl->Thumb = thumb; bl->HasMemInstr = mem;
+            bl->EntryPoint = nullptr;
+            bl->Profile.resize(ni);
+            blocks[j] = bl;
+        }
+        file->Var32(&bl->StartAddr);
+        file->Var32(&bl->StartAddrLocal);
+        file->Var32(&bl->InstrHash);
+        file->Var32(&bl->LiteralHash);
+        file->Var32(&bl->A9HookAt);
+        file->VarArray(bl->AddressRanges(), na * 4);
+        file->VarArray(bl->AddressMasks(), na * 4);
+        file->VarArray(bl->Literals(), nl * 4);
+        file->VarArray(bl->Profile.data(), ni * sizeof(JitProfileInstr));
+        if (file->Saving)
+            ids[bl] = j;
+        else if (j < n9) JitBlocks9[bl->StartAddr] = bl;   // (where Reset finds it)
+        else if (j < n9 + n7) JitBlocks7[bl->StartAddr] = bl;
+        else RestoreCandidates[bl->InstrHash] = bl;
+    }
+
+    // code ranges: mask and block list, in order
+    u32 nr = 0;
+    if (file->Saving)
+        for (int r = 0; r < ARMJIT_Memory::memregions_Count; r++)
+            if (CodeMemRegions[r])
+                for (u32 k = 0; k < CodeRegionSizes[r] / 512; k++)
+                    nr += CodeMemRegions[r][k].Code || CodeMemRegions[r][k].Blocks.Length;
+    file->Var32(&nr);
+    int r = 0; u32 k = 0;
+    for (u32 j = 0; j < nr; j++)
+    {
+        if (file->Saving)
+        {
+            for (;; k++)
+            {
+                if (!CodeMemRegions[r] || k >= CodeRegionSizes[r] / 512) { r++; k = (u32)-1; continue; }
+                if (CodeMemRegions[r][k].Code || CodeMemRegions[r][k].Blocks.Length) break;
+            }
+        }
+        u32 rk = (r << 24) | k, code = file->Saving ? CodeMemRegions[r][k].Code : 0;
+        u32 len = file->Saving ? CodeMemRegions[r][k].Blocks.Length : 0;
+        file->Var32(&rk); file->Var32(&code); file->Var32(&len);
+        r = rk >> 24; k = rk & 0xFFFFFF;
+        if (r >= ARMJIT_Memory::memregions_Count || !CodeMemRegions[r] || k >= CodeRegionSizes[r] / 512) { file->Error = true; Reset(); return; }
+        AddressRange& range = CodeMemRegions[r][k];
+        if (!file->Saving) range.Code = code;
+        for (u32 m = 0; m < len; m++)
+        {
+            u32 id = file->Saving ? ids[range.Blocks[m]] : 0;
+            file->Var32(&id);
+            if (!file->Saving)
+            {
+                if (id >= n9 + n7) { file->Error = true; Reset(); return; }
+                range.Blocks.Add(blocks[id]);
+            }
+        }
+        if (file->Saving) k++;
+    }
+
+#ifdef LITEV_A9HLE
+    if (!file->Saving)
+        for (u32 j = 0; j < n9; j++)
+            if (blocks[j]->A9HookAt) A9HLE::HookRestored(NDS, blocks[j]->A9HookAt, blocks[j]);
+#endif
 }
 
 }
