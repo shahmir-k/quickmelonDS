@@ -2117,12 +2117,21 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
     if (e.patchOff == 0) { e.hitCount = 0; return; }     // no exit-site recorded
     // Never emit past the main region (CompileBlock resets at <16KB; keep a stub's
     // headroom). Back off (reset streak, retry later) rather than promote when tight.
-    if ((ptrdiff_t)JitMemMainSize - GetCodeOffset() < 4096) { e.hitCount = 0; return; }
+    // One fixed-size stub slot per site, reused by every later promotion of it. Appending a new
+    // stub per promotion leaked: an invalidation reverts every promotion and the sites promote
+    // again, so the stubs filled the code memory (Sims 3: 20 of 29 MB by 3.4 min) and reset the
+    // block cache at a moment that depended on this host history (a savestate starts it over).
+    constexpr u32 kStubBytes = 128;
+    const ptrdiff_t high = GetCodeOffset();
+    const bool reuse = e.stubOff != 0;
+    if (!reuse && (ptrdiff_t)JitMemMainSize - high < 4096) { e.hitCount = 0; return; }
 
     NDS.JIT.JitEnableWrite();
 
-    // --- emit the guard stub at the main high-water (append; advances m_code) ---
-    AlignCode16();
+    if (reuse)
+        SetCodePtrUnsafe(e.stubOff);
+    else
+        AlignCode16();
     u32 stubOff = (u32)((u8*)GetRXPtr() - GetRXBase());
 
     void* dispatcher = DispatcherEntry[num];
@@ -2215,7 +2224,9 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
 #endif
     B(dispatcher);
 
-    FlushIcache();                        // covers the align padding + the whole stub
+    assert(GetCodeOffset() - (ptrdiff_t)stubOff <= (ptrdiff_t)kStubBytes);
+    FlushIcacheSection(GetRXBase() + stubOff, GetRXBase() + stubOff + kStubBytes);
+    SetCodePtrUnsafe(reuse ? high : (ptrdiff_t)stubOff + kStubBytes);
 
     // --- patch the exit-site B -> the stub, then flip back to executable ---
     DirectPatchWriteBranch(e.patchOff, stubOff);
@@ -2445,7 +2456,6 @@ bool Compiler::R15LiteralLoadFolds(CompileFunc comp)
 JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[], int instrsCount, bool hasMemInstr)
 {
     // (the cache-full reset happens in ARMJIT::CompileBlock, see NearlyFull)
-    const ptrdiff_t near0 = GetCodeOffset(), far0 = OtherCodeRegion;
 
     JitBlockEntry res = (JitBlockEntry)GetRXPtr();
 #ifdef LITEV_BLOCKPROF
@@ -2920,29 +2930,24 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 #endif
 
     if (CountLogical)
-    {
-        LogicalNear += GetCodeOffset() - near0;
-        LogicalFar += OtherCodeRegion - far0;
-    }
+        LogicalSize += 256 + 64 * (u64)instrsCount;
     return res;
 }
 
 bool Compiler::NearlyFull()
 {
-    // Host room (as before): a block needs at most a few KB near and far. The near region also
-    // holds runtime stubs (DIRECTPATCH guards, at most 2 x ICacheSites small ones) and, after a
-    // savestate load, the blocks compiled from its profiles, neither counted below.
+    // Host room (as before): a block needs at most a few KB near and far.
     if (JitMemMainSize - GetCodeOffset() < 1024 * 16 || (JitMemMainSize + JitMemSecondarySize) - OtherCodeRegion < 1024 * 8)
     {
         Log(LogLevel::Debug, "JIT memory full, resetting...\n");
         return true;
     }
-    // The deterministic limit, kept below the host one by that headroom so the host check
-    // never fires first. ponytail: a console that loaded a state and then compiled most of its
-    // profiles plus nearly a full cache of new code can still hit the host check first (a reset
-    // at a different moment than its peers); grow the reserve or compact the cache if a long
-    // Netplay session after a state transfer ever gets there.
-    return LogicalNear > (u64)JitMemMainSize - 6 * 1024 * 1024 || LogicalFar > (u64)JitMemSecondarySize - 1024 * 1024;
+    // The deterministic limit (LogicalSize: ~1.6x the real near code on Shrek; the near region
+    // also holds up to 4 MB of DIRECTPATCH stub slots and, after a savestate load, the blocks
+    // compiled from its profiles), reached well before the host one. ponytail: a game whose
+    // blocks run larger than the estimate on average could still reach the host check first
+    // (a reset at a host-dependent moment); raise the per-instruction estimate if one does.
+    return LogicalSize > (u64)JitMemMainSize - 6 * 1024 * 1024;
 }
 
 #ifdef LITEV_JIT_ICACHE
@@ -2976,7 +2981,7 @@ void Compiler::ICacheReset()
 
 void Compiler::Reset()
 {
-    LogicalNear = LogicalFar = 0;
+    LogicalSize = 0;
     LoadStorePatches.clear();
 #ifdef LITEV_JIT_STORE_REPROMOTE
     SlowStoreSites.clear();   // the code they point into is gone

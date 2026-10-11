@@ -2027,7 +2027,7 @@ void ARMJIT::CompileFromProfile(JitBlock* block) noexcept
 // savestate carries the block cache's guest-visible content: every live block and restore
 // candidate as compiled (profile, code ranges, literals), the per-512-byte code ranges with the
 // order of their block lists (the invalidation order picks which candidate survives), the
-// invalidated literals, the logical code counters behind the deterministic cache-full reset,
+// invalidated literals, the logical code size behind the deterministic cache-full reset,
 // the IDLE2 wait-loop sites and the CPUs' code-fetch fields. Loading rebuilds the blocks without
 // code; each is compiled from its profile when it first runs (CompileFromProfile), which is
 // what the saving console's cache already held. A state without this section (older states,
@@ -2096,8 +2096,7 @@ void ARMJIT::DoSavestate(Savestate* file) noexcept
     }
     file->Var32((u32*)&NDS.ARM9.RegionCodeCycles);
 
-    file->Var64(&JITCompiler.LogicalNear);
-    file->Var64(&JITCompiler.LogicalFar);
+    file->Var64(&JITCompiler.LogicalSize);
 
     u32 nlit = InvalidLiterals.Length;
     file->Var32(&nlit);

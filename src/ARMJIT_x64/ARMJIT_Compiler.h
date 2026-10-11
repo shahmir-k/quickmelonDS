@@ -84,7 +84,7 @@ class Compiler : public Gen::XEmitter
 {
 public:
     explicit Compiler(melonDS::NDS& nds);
-    u64 LogicalNear = 0, LogicalFar = 0;   // (see the A64 backend; not counted here)
+    u64 LogicalSize = 0;   // (see the A64 backend; not counted here)
     bool CountLogical = true;
     bool NearlyFull();
     ~Compiler();

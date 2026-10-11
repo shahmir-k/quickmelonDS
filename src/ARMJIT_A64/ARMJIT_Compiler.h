@@ -205,13 +205,13 @@ public:
     explicit Compiler(melonDS::NDS& nds);
     ~Compiler() override;
 
-    // Code bytes emitted by block compiles since the last ResetBlockCache, as every console
-    // running the same guest code counts them: blocks compiled from a savestate's profiles
-    // (ARMJIT::CompileFromProfile, CountLogical off) and runtime stubs do not count. The cache
-    // is reset when these run out, so the reset (which the guest sees: blocks are compiled
-    // again from a fresh interpreted run) falls on the same guest instruction everywhere;
-    // ARMJIT::DoSavestate carries them.
-    u64 LogicalNear = 0, LogicalFar = 0;
+    // Code size of the blocks compiled since the last ResetBlockCache, as every console running
+    // the same guest code counts it: an estimate from the guest instruction count (the real size
+    // depends on host pointer values, e.g. ASLR), and blocks compiled from a savestate's profiles
+    // (ARMJIT::CompileFromProfile, CountLogical off) do not count. The cache is reset when it runs
+    // out, so that reset (which the guest sees: blocks are compiled again from a fresh interpreted
+    // run) falls on the same guest instruction everywhere; ARMJIT::DoSavestate carries it.
+    u64 LogicalSize = 0;
     bool CountLogical = true;
     // time to reset the block cache (checked before a block is looked up / compiled)
     bool NearlyFull();
