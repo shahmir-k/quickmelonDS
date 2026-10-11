@@ -823,8 +823,8 @@ u32 ARMv5::CodeRead32(u32 addr, bool branch)
 }
 
 
-#ifdef LITEV_JIT_IDLE2
-// Record data accesses while ARMv5::Idle2Trace interprets a candidate wait loop.
+#if defined(LITEV_JIT_IDLE2) || defined(LITEV_HLE_DIAG)
+// Record data accesses while ARMv5::Idle2Trace interprets a candidate wait loop (or an HLE compare runs the guest).
 #define IDLE2_LOG(a, sz, v, w) do { if (__builtin_expect(Idle2Log != nullptr, 0)) Idle2Log->push_back({(a), (u32)(v), (sz), (w)}); } while (0)
 #else
 #define IDLE2_LOG(a, sz, v, w) do {} while (0)

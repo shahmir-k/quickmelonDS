@@ -21,8 +21,8 @@
 
 #include <algorithm>
 #include <optional>
-#ifdef LITEV_JIT_IDLE2
 #include <vector>
+#ifdef LITEV_JIT_IDLE2
 namespace melonDS { bool LiteIdle2On(); }
 #endif
 
@@ -496,10 +496,13 @@ public:
 
     bool (*GetMemRegion)(u32 addr, bool write, MemRegion* region);
 
+#if defined(LITEV_JIT_IDLE2) || defined(LITEV_HLE_DIAG)
+    // data access log (LITEV_JIT_IDLE2's wait-loop trace; the HLE compare mode's guest writes)
+    struct Idle2Access { u32 Addr; u32 Val; u8 Size; bool Write; };
+    std::vector<Idle2Access>* Idle2Log = nullptr;   // set only while a trace / compare runs
+#endif
 #ifdef LITEV_JIT_IDLE2
     // Generalized wait-loop skipping (see ARM.cpp, "LITEV_JIT_IDLE2").
-    struct Idle2Access { u32 Addr; u32 Val; u8 Size; bool Write; };
-    std::vector<Idle2Access>* Idle2Log = nullptr;   // set only while Idle2Trace runs
     struct Idle2State* Idle2 = nullptr;
     u8* Idle2EnableByte(u32 site);   // JIT compile time: per-site enable byte (null = no slot)
     bool Idle2Handle();              // at a candidate back-edge: true = skip to ARM9Target
