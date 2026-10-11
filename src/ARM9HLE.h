@@ -27,7 +27,7 @@
 // Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material,
 // 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ,
 // 2048 G3D shape (needs 512), 4096 VEC_Normalize, 8192 G3D node (NODEDESC),
-// 16384 MKDS stereo sample effect; 8 needs 1)
+// 16384 MKDS stereo sample effect, 32768 G3D material animation (needs 128); 8 needs 1)
 // for A/B of single hooks.
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
@@ -76,6 +76,9 @@
 //    are not written (dead after the return).
 // 16. A stereo sample effect over two s16 buffers (Mario Kart DS's SND capture effect, from an IRQ, ~1 call a frame on every
 //    console): the buffers, the saved differences, frame, registers and flags natively (position independent: exact code).
+// 17. NNS G3D material animation (with 8., PW, PB; W2: Thumb): the material's texture SRT, the texture SRT (NSBTA) and texture
+//    pattern (NSBTP) animations through NNSi_G3dAnmBlendMat, and the texture matrix send without a rotation, natively inside 8.;
+//    callee frames below sp and the scratch registers are not written (as 15.).
 //
 // Diagnostics (build with LITEV_HLE_DIAG; compiled out of shipping builds):
 //
