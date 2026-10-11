@@ -258,15 +258,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 25;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 8388607;
+constexpr int kKinds = 26;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 16777215;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase, 8388608 MKDS G3D shape
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -303,9 +303,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc", "mkbp"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc", "mkbp", "mkshp"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : k == 24 ? 4194304 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : k == 24 ? 4194304 : k == 25 ? 8388608 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -3395,6 +3395,9 @@ __attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
+struct MkShpPlan { u32 n = 0, a[6], v[6], sz[6]; void Add(u32 x, u32 y, u32 z) { a[n] = x; v[n] = y; sz[n++] = z; } };
+bool MkShpCore(melonDS::ARMv5* c, Mem& m, Expect& e, MkShpPlan& io, s32& cyc);
+constexpr u32 kMkShp = 0x01FF85D0;
 // ---- 23. MKDS NNS G3D SBC command loop (ITCM 0x01FF9008) ------------------------------------------------------------------
 // The loop step (flag 0x40 cleared, the command byte, its function from the table at [0x01FF9044], r1 = command & 0xE0,
 // blx) and, natively, MAT (21.'s core), NODE (visibility; no animation-visibility object, no callback timing 3) and RET (no
@@ -3457,6 +3460,25 @@ __attribute__((noinline)) bool RunMkSbc(melonDS::ARMv5* c, State& s, bool jit)
                 c->CPSR = (c->CPSR & 0x0FFFFFFFu) | (e.CPSR & 0xF0000000u);
                 c->Cycles += cyc;
                 s.native[21]++;
+                done = true;
+            }
+        }
+        else if (fn == kMkShp && (s.mask & 8388608))
+        {
+            // SHP (25.'s core): the display list's DMA started as the guest would
+            Expect e; MkShpPlan io; s32 cyc = 0;
+            if (MkShpCore(c, m, e, io, cyc))
+            {
+                m.Flush();
+                for (u32 i = 0; i < io.n; i++)
+                {
+                    if (io.sz[i] == 2) c->NDS.ARM9Write16(io.a[i], (u16)io.v[i]);
+                    else c->NDS.ARM9Write32(io.a[i], io.v[i]);
+                }
+                for (int i = 0; i < 15; i++) c->R[i] = e.R[i];
+                c->CPSR = (c->CPSR & 0x0FFFFFFFu) | (e.CPSR & 0xF0000000u);
+                c->Cycles += cyc;
+                s.native[25]++;
                 done = true;
             }
         }
@@ -3704,6 +3726,139 @@ __attribute__((noinline)) bool RunBp(melonDS::ARMv5* c, State& s, bool jit)
     if (wroteCount) st(0x0217B588, cnt, 2);
     for (u32 k = 0; k < cnt; k++) { st(o1 + k * 2, out[k].obj, 2); st(o2a + k * 2, out[k].flags, 2); st(o3 + k * 4, out[k].pay, 4); }
     s.native[24]++;
+    Return(c, e, cyc);
+    return true;
+}
+
+// ---- 25. MKDS NNS G3D shape: SBC SHP -> SHP_InternalDefault -> NNS_G3dGeSendDL -> MI_SendGXCommandAsync (DMA GXFIFO mode) -----
+// MKDS's 2005 SDK sends a display list of >= 0x100 bytes with one DMA in GXFIFO start mode (the DMA feeds the FIFO by itself)
+// and a DMA-end IRQ callback (0x0214CC94, the guest still takes that IRQ): SBC SHP 0x01FF85D0 -> SHP_InternalDefault 0x01FF8648
+// -> GeSendDL 0x01FF9144 -> the GE buffer flush 0x01FF9234 -> "sending" flag -> 0x0214CCD4 (params busy wait, the other DMA
+// channels' modes 0x0214C7E8, 0x0214C778, the channel's busy wait 0x0214C920, OS_SetIrqFunction-like 0x0200CB9C with
+// OS_EnableIrqMask 0x0200CAE4, MIi_DmaSetParams 0x01FFFF38 with OS_Disable/RestoreInterrupts). 55 shapes a frame per console
+// in the 8-console race, ~250 guest instructions each. Natively at SBC SHP's entry for that path: the same IO writes in the
+// same order (IME 0 / IE |= the DMA's bit / IME back, SAD, DAD, CNT: the DMA starts), the params, the IRQ tables, the
+// "sending" flag, every frame below sp, registers / flags as the guest leaves them. Guest: skipped shapes, callbacks, NOGECMD,
+// a list under 0x100 bytes or no DMA, the sync path, a busy GE buffer / DMA / params, another DMA channel active.
+// Exact bytes of every function (FNV). Category B: a fitted cycle estimate.
+constexpr u32 kMkShpInstr = 0xE92D4030, kMkShpDef = 0x01FF8648;
+constexpr Range kMkShpCode[9] = {{0x01FF85D0, 0x01FF86B4}, {0x01FF9144, 0x01FF92B4}, {0x0214CC94, 0x0214CD90}, {0x0214C778, 0x0214C89C},
+                                 {0x0214C920, 0x0214C990}, {0x0200CAE4, 0x0200CB1C}, {0x0200CB9C, 0x0200CBE8}, {0x01FFFF38, 0x01FFFF88},
+                                 {0x0200FCA0, 0x0200FCCC}};
+constexpr u64 kMkShpSig = 0xddef1f14595de87dull;
+// fitted estimate (check mode, MKDS 8P race, 363k calls: 574 or 579 cycles): + 5 with a GE buffer (its count test)
+constexpr s32 kMkShpCyc = 574, kMkShpCycGe = 5;
+
+int MkShpAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a != kMkShp) return 0;
+    std::vector<u8> b;
+    CodeBytes(c, b, kMkShpCode, 0, 9);
+    return Fnv(b) == kMkShpSig ? 1 : 2;
+}
+
+// the native path from SBC SHP's entry state in c->R; io: the IO writes (addr, value, size) in order
+bool MkShpCore(melonDS::ARMv5* c, Mem& m, Expect& e, MkShpPlan& io, s32& cyc)
+{
+    melonDS::NDS& nds = c->NDS;
+    bool bad = false;
+    auto rd = [&](u32 a, u32 n) -> u32 {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    };
+    const u32 rs = c->R[0], sp = c->R[13];
+    Obj RS = m.O(rs, 0xE0), st = m.O(sp - 84, 84);
+    if (!RS || !st) return false;
+    // SBC SHP: shown, the shape's function SHP_InternalDefault
+    const u32 flag = RS.r(8);
+    if ((flag & 0x202) || !(flag & 1) || (flag & 0x100)) return false;
+    const u32 sbc = RS.r(0), res = RS.r(0xDC), idx = rd(sbc + 1, 1);
+    const u32 dofs = rd(res + 6, 2);
+    const u32 ent = res + dofs + rd(res + dofs, 2) * idx;
+    const u32 shp = res + rd(ent + 4, 4);
+    if (bad || rd(0x0216188C + rd(shp, 2) * 4, 4) != kMkShpDef || bad) return false;
+    // SHP_InternalDefault: no callback at timing 3
+    const u32 cbT = RS.r(0x20) ? RS.p[0x91] : 0;
+    if (cbT == 3) return false;
+    const u32 dl = shp + rd(shp + 8, 4), size = rd(shp + 0xC, 4);
+    // GeSendDL: a DMA list; the GE buffer flushed (none or empty); the async path
+    const u32 dma = rd(0x0216F054, 4), gb = rd(0x021731E4, 4);
+    if (bad || size < 0x100 || dma == ~0u || dma < 1 || dma > 3 || rd(0x021731E8, 4) || (gb && rd(gb, 4)) || !rd(0x021731EC, 4)) return false;
+    // MI_SendGXCommandAsync: params free, no other DMA channel active, the channel idle
+    Obj P = m.O(0x021802E8, 0x18);
+    if (!P || P.r(0) || bad) return false;
+    for (u32 i = 0; i < 3; i++) if (i != dma && (nds.A9HLEDmaCnt(i) & 0x80000000u)) return false;
+    if (nds.A9HLEDmaCnt(dma) & 0x80000000u) return false;
+    if ((dl >> 24) != 0x02 || (dl & 3) || (size & 3)) return false;
+    Obj T0 = m.O(0x0216FEC0 + dma * 12, 12), G = m.O(0x021731E8, 4);
+    if (!T0 || !G) return false;
+    const u32 bit = 1u << (dma + 8), ie0 = nds.IE[0], ime0 = nds.IME[0];
+    // writes
+    const u32 sp0 = 84;     // st = sp - 84: offsets from st
+    m.W(st, sp0 - 12, c->R[4]); m.W(st, sp0 - 8, c->R[5]); m.W(st, sp0 - 4, c->R[14]);          // SBC SHP push
+    m.W(st, sp0 - 28, rs); m.W(st, sp0 - 24, res); m.W(st, sp0 - 20, kMkShp + 0x5C);               // SHP_InternalDefault push
+    m.W(st, sp0 - 44, rs); m.W(st, sp0 - 40, cbT); m.W(st, sp0 - 36, kMkShpDef + 0x38);           // GeSendDL push
+    m.W(st, sp0 - 48, 0x021731E8);                                                                  // [sp] = the callback's arg
+    m.W(st, sp0 - 64, size); m.W(st, sp0 - 60, dl); m.W(st, sp0 - 56, c->R[6]); m.W(st, sp0 - 52, 0x01FF91CC);   // 0x0214CCD4 push
+    m.W(st, 0, size); m.W(st, 4, dl); m.W(st, 8, dma); m.W(st, 12, c->R[7]); m.W(st, 16, 0x0214CD80);           // MIi_DmaSetParams push
+    m.W(G, 0, 1);
+    m.W(P, 0, 1); m.W(P, 4, dma); m.W(P, 0x10, 0x01FF9210); m.W(P, 0x14, 0x021731E8);
+    m.W(T0, 0, 0x0214CC94); m.W(T0, 8, 0); m.W(T0, 4, ie0 & bit);
+    m.W(RS, 0, sbc + 2);
+    io.Add(0x04000208, 0, 2); io.Add(0x04000210, ie0 | bit, 4); io.Add(0x04000208, ime0 & 0xFFFF, 2);
+    io.Add(0x040000B0 + dma * 12, dl, 4); io.Add(0x040000B4 + dma * 12, 0x04000400, 4); io.Add(0x040000B8 + dma * 12, 0xFC400000u | (size >> 2), 4);
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    const u32 i0 = c->CPSR & 0x80;
+    e.R[0] = sbc + 2;
+    e.R[1] = (c->CPSR & 0x0FFFFF7Fu) | 0x80 | 0x20000000u;     // OS_RestoreInterrupts' mrs (flags of cmp dma, #0)
+    e.R[2] = (e.R[1] & ~0x80u) | i0;
+    e.R[3] = dma * 12; e.R[12] = 0x04000208;
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFDFu) | Flags(cbT, 3) | ((e.retPc & 1) << 5);
+    cyc = kMkShpCyc + (gb ? kMkShpCycGe : 0);
+    return !bad;
+}
+
+__attribute__((noinline)) bool RunMkShp(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && MkShpAt(c, pc) != 1) return false;
+    s.calls[25]++;
+    Mem m(c, g_Check || g_Dry);
+    Expect e;
+    MkShpPlan io;
+    s32 cyc = 0;
+    if (CheckPending || !MkShpCore(c, m, e, io, cyc))
+    {
+        s.fallback[25] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 25, m, e);
+            g_P.fit[0] = (u32)cyc;
+            g_P.io.clear();
+            for (u32 i = 0; i < io.n; i++) if (io.a[i] != 0x04000208) g_P.io.push_back({io.a[i], io.v[i]});
+        }
+        s.checks[25]++;
+        if (g_Check && jit) { CheckRunGuest(c, pc); return true; }
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    m.Flush();
+    for (u32 i = 0; i < io.n; i++)
+    {
+        if (io.sz[i] == 2) c->NDS.ARM9Write16(io.a[i], (u16)io.v[i]);
+        else c->NDS.ARM9Write32(io.a[i], io.v[i]);
+    }
+    s.native[25]++;
     Return(c, e, cyc);
     return true;
 }
@@ -4351,6 +4506,11 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         r = kBpCode;
         return 1;
     }
+    if (instr == kMkShpInstr && addr == kMkShp)
+    {
+        r = kMkShpCode;
+        return 9;
+    }
     if (instr == kMkSbcInstr && addr == kMkSbcHead)
     {
         // the loop, NODE, RET and 21.'s functions (the loop runs MAT natively)
@@ -4524,6 +4684,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return k;
     }
 #endif
+    if (instr == kMkShpInstr && addr == kMkShp)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 8388608) ? MkShpAt(&nds.ARM9, addr) : 0;
+    }
     if (instr == kNodeInstr && addr == kBpEntry)
     {
         State& s = St(&nds.ARM9);
@@ -5625,6 +5790,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 16384) && RunFx(c, s, jit);
     }
+    if (in == kMkShpInstr && pc == kMkShp)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 8388608) && RunMkShp(c, s, jit);
+    }
     if (in == kNodeInstr && pc == kBpEntry)
     {
         State& s = St(c);
@@ -5758,6 +5928,8 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         fprintf(stderr, "ASYNCFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 13 && getenv("LITEV_A9HLE_SHPFIT") && !g_P.irq)
         fprintf(stderr, "SHPFIT %d %u %llu\n", (int)g_P.small, g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 25 && getenv("LITEV_A9HLE_MKSHPFIT") && !g_P.irq)
+        fprintf(stderr, "MKSHPFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 24 && getenv("LITEV_A9HLE_BPFIT") && !g_P.irq)
         fprintf(stderr, "BPFIT %u %u %u %u %u %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fitA[0], g_P.fitA[1], g_P.fitA[2],
                 g_P.fitA[3], g_P.fitA[4], g_P.fitA[5], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
@@ -5829,7 +6001,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             if (gs[i] != e.SVC[i]) { if (nd < 12) bl += snprintf(buf + bl, sizeof(buf) - bl, " svc[%d] guest %08x native %08x;", i, gs[i], e.SVC[i]); nd++; }
         }
     }
-    if (k == 10 || k == 11 || (k == 13 && !g_P.small) || k == 15)
+    if (k == 10 || k == 11 || (k == 13 && !g_P.small) || k == 15 || k == 25)
     {
         std::vector<std::pair<u32, u32>> io;
         for (auto& a : g_P.acc)
