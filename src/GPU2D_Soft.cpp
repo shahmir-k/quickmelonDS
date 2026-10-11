@@ -725,6 +725,14 @@ void SoftRenderer2D::DrawBG_3D()
 #endif
 }
 
+#ifdef LITEV_SOFT2D_BITMASK
+// LITEV_SOFT2D_BITMASK: the extended-palette slot base looked up once per layer line, not per
+// tile/pixel (GetBGExtPal is an out-of-line call): slot base + palette * 256 entries.
+#define S2D_EXTPAL(slot, p) (extbase + ((u32)(p) << 8))
+#else
+#define S2D_EXTPAL(slot, p) GPU2D.GetBGExtPal(slot, p)
+#endif
+
 template<bool mosaic>
 void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
 {
@@ -756,6 +764,9 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
 
     extpal = (GPU2D.DispCnt & (1<<30));
     if (extpal) extpalslot = ((bgnum<2) && (bgcnt&0x2000)) ? (2+bgnum) : bgnum;
+#ifdef LITEV_SOFT2D_BITMASK
+    u16* const extbase = extpal ? GPU2D.GetBGExtPal(extpalslot, 0) : nullptr;
+#endif
 
     u8* bgvram;
     u32 bgvrammask;
@@ -800,7 +811,7 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
         {
             curtile = *(u16*)&bgvram[(tilemapaddr + ((xoff & 0xF8) >> 2) + ((xoff & widexmask) << 3)) & bgvrammask];
 
-            if (extpal) curpal = GPU2D.GetBGExtPal(extpalslot, curtile>>12);
+            if (extpal) curpal = S2D_EXTPAL(extpalslot, curtile>>12);
             else        curpal = pal;
 
             pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 6)
@@ -821,7 +832,7 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
                 // load a new tile
                 curtile = *(u16*)&bgvram[(tilemapaddr + ((xpos & 0xF8) >> 2) + ((xpos & widexmask) << 3)) & bgvrammask];
 
-                if (extpal) curpal = GPU2D.GetBGExtPal(extpalslot, curtile>>12);
+                if (extpal) curpal = S2D_EXTPAL(extpalslot, curtile>>12);
                 else        curpal = pal;
 
                 pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 6)
@@ -1001,6 +1012,9 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
     GPU2D.GetBGVRAM(bgvram, bgvrammask);
 
     extpal = (GPU2D.DispCnt & (1<<30));
+#ifdef LITEV_SOFT2D_BITMASK
+    u16* const extbase = extpal ? GPU2D.GetBGExtPal(bgnum, 0) : nullptr;
+#endif
 
     s16 rotA = GPU2D.BGRotA[bgnum-2];
     s16 rotC = GPU2D.BGRotC[bgnum-2];
@@ -1172,7 +1186,7 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
                 {
                     curtile = *(u16*)&bgvram[(tilemapaddr + (((((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11)) << 1)) & bgvrammask];
 
-                    if (extpal) curpal = GPU2D.GetBGExtPal(bgnum, curtile>>12);
+                    if (extpal) curpal = S2D_EXTPAL(bgnum, curtile>>12);
                     else        curpal = pal;
 
                     // draw pixel
