@@ -29,8 +29,8 @@ namespace melonDS::A9HLE
 thread_local bool CheckPending = false;
 #endif
 #ifdef LITEV_A9HLE_GXCHECK
-std::vector<u32>* GxTap = nullptr;
-bool GxOtherSeen = false;
+thread_local std::vector<u32>* GxTap = nullptr;
+thread_local bool GxOtherSeen = false;
 #endif
 namespace
 {
@@ -258,15 +258,15 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 21;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 524287;
+constexpr int kKinds = 22;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 1048575;
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
     const Variant* v = nullptr;     // the game's variant (status 1)
     u32 tried = 0;                  // variants whose signature was checked (bit per kVariants entry)
     bool init = false, on = true;   // prop read; prop on
-    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ
+    u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ, 524288 MKDS G3D material
     std::vector<u8> code, irqCode, gxCode, asyncCode, dmaCode, shpCode;
     bool gxOk = false;              // MIi_FIFOCallback matches the variant (5.)
     bool asyncOk = false;           // MI_SendGXCommandAsync's synchronous part matches (10.)
@@ -303,9 +303,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -656,7 +656,7 @@ struct Pending
 };
 thread_local Pending g_P;
 #ifdef LITEV_A9HLE_GXCHECK
-std::vector<u32> g_GxMatTap;
+thread_local std::vector<u32> g_GxMatTap;
 #endif
 
 __attribute__((noinline, cold)) void ArmCheck(melonDS::ARMv5* c, int kind, const Mem& m, const Expect& e)
@@ -1270,8 +1270,8 @@ u32 GxSend(melonDS::ARMv5* c, const State& s, u32 src, u32 len, u32 n)
 // reaching GXFIFO (and any other geometry command write) is recorded; when the guest's
 // MIi_FIFOCallback reaches the point the native path would leave, the words, src and length
 // must be what the native path computed.
-std::vector<u32> g_GxTapBuf;
-struct GxPending { bool on = false; u32 src = 0, len = 0, n = 0; u64 t0 = 0; std::vector<u32> w; } g_Gx;
+thread_local std::vector<u32> g_GxTapBuf;
+struct GxPending { bool on = false; u32 src = 0, len = 0, n = 0; u64 t0 = 0; std::vector<u32> w; }; thread_local GxPending g_Gx;
 u64 g_GxDmaCyc = 0;     // the DMA part of the guest cycles (same burst timing as GxSend)
 void GxCheckAt(State& s, melonDS::ARMv5* c)
 {
@@ -3192,6 +3192,154 @@ __attribute__((noinline)) bool RunCx(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
+// ---- 21. MKDS NNS G3D material: SBC MAT -> MAT_InternalDefault -> NNS_G3dGeBufferOP_N (ITCM, MKDS USA) -----------------
+// Mario Kart DS links its (2005) NNS G3D in ITCM: SBC MAT 0x01FF86B4 -> MAT_InternalDefault 0x01FF8738 -> OP_N 0x01FF9048 ->
+// MI_CpuSend32 0x0214D044. The same material logic as 8. (diffuse/ambient, specular/emission, polygon attr, texture image /
+// palette from the material and NNS_G3dGlb's defaults under the material's masks), but other code and frames than PW's, so
+// its own native. 51 calls a frame per console in the 8-console race (~200 guest instructions each, ~10k a frame).
+// Natively at SBC MAT's entry for the common case: the shape drawn, no material cache in the render object, no cached result
+// (opt 0x20 / 0x40 with the bit set), no texture SRT (TEXMTX_USE: its texture matrix goes through a function pointer), no
+// material animation for this material, no end-of-command callback (timing 3), no GE buffer / buffered GE: the 7 GX words in
+// one BulkWords, every memory byte (render state, the result, the three functions' frames) and register / flag as the guest
+// leaves them. Exact bytes of the four functions with their literal pools (FNV). Category B: a fitted cycle estimate.
+constexpr u32 kMkMatSbc = 0x01FF86B4, kMkMatDef = 0x01FF8738, kMkMatInstr = 0xE92D4070;   // push {r4-r6, lr}
+constexpr Range kMkMatCode[3] = {{0x01FF86B4, 0x01FF8B08}, {0x01FF9048, 0x01FF9144}, {0x0214D044, 0x0214D05C}};
+constexpr u64 kMkMatSig = 0x8c1125aa907d3f20ull;
+constexpr u32 kMkMatTab = 0x0216187C, kMkGCache = 0x021704E4, kMkGlb = 0x0217027C, kMkMask = 0x02152BEC;
+constexpr u32 kMkGeBuf = 0x021731E4, kMkGeFlag = 0x021731E8;
+// fitted estimate (check mode, MKDS 8-console race, 646k calls: exact for every one): the send path, + the material
+// animation bit test, + the empty GE buffer test
+constexpr s32 kMkMatCyc = 372, kMkMatCycAnm = 11, kMkMatCycGe = 10;   // (+ the empty GE buffer test)
+
+int MkMatAt(melonDS::ARMv5* c, u32 a)
+{
+    if (a != kMkMatSbc) return 0;
+    std::vector<u8> b;
+    CodeBytes(c, b, kMkMatCode, 0, 3);
+    return Fnv(b) == kMkMatSig ? 1 : 2;
+}
+
+__attribute__((noinline)) bool RunMkMat(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 pc = c->R[15] - 8;
+    if (!jit && MkMatAt(c, pc) != 1) return false;
+    s.calls[21]++;
+    Mem m(c, g_Check || g_Dry);
+    bool bad = false;
+    auto rd = [&](u32 a, u32 n) -> u32 {
+        const u8* p = (a & (n - 1)) ? nullptr : m.P(a);
+        if (!p || m.P(a + n - 1) != p + n - 1) { bad = true; return 0; }
+        return n == 4 ? R32(p) : n == 2 ? R16(p) : *p;
+    };
+    const u32 rs = c->R[0], opt = c->R[1], sp = c->R[13];
+    melonDS::GPU3D& gx = c->NDS.GPU.GPU3D;
+    Obj RS = m.O(rs, 0x100), st = m.O(sp - 88, 88);
+    bool ok = !CheckPending && RS && st;
+    u32 flag = 0, sbc = 0, idx = 0, res = 0, md = 0, cbT = 0, ro = 0, r7 = 0, h = 0, v4 = 0, v8 = 0, vc = 0, v10 = 0, v14 = 0;
+    u32 geb = 0, g9c = 0, m10 = 0, anm = 0, bits = 0, bo = 0, bit = 0, r0f = 0;
+    bool send = false, setBit = false;
+    Obj R7;
+    if (ok)
+    {
+        // SBC MAT: skipped shapes / an unchanged material run the guest
+        flag = RS.r(8); sbc = RS.r(0); idx = rd(sbc + 1, 1);
+        ok = !bad && !(flag & 0x200) && !(!(flag & 1) && (flag & 8) && idx == RS.p[0xAD]);
+    }
+    if (ok)
+    {
+        res = RS.r(0xD8);
+        const u32 dofs = rd(res + 0xA, 2), d = res + 4;
+        const u32 ent = d + dofs + rd(d + dofs, 2) * idx;
+        md = res + rd(ent + 4, 4);
+        ok = !bad && rd(kMkMatTab + rd(md, 2) * 4, 4) == kMkMatDef && !bad;
+    }
+    if (ok)
+    {
+        // MAT_InternalDefault(rs, opt, md, idx)
+        cbT = RS.r(0x1C) ? RS.p[0x90] : 0;
+        ro = RS.r(4);
+        bo = 0xBC + (idx >> 5) * 4; bit = 1u << (idx & 31); bits = RS.r(bo);
+        ok = cbT != 3 && !rd(ro + 0x38, 4) && !bad && !((opt == 0x20 || opt == 0x40) && (bits & bit));
+        setBit = opt == 0x40;
+        r7 = setBit ? kMkGCache + idx * 0x38 : rs + 0xF4;
+        R7 = m.O(r7, 0x18);
+        h = rd(md + 0x1E, 2);
+        anm = rd(ro + 8, 4);
+        ok = ok && R7 && !bad && !(h & 1) && !(anm && (rd(ro + 0x3C + (idx >> 5) * 4, 4) & bit)) && !bad;
+    }
+    if (ok)
+    {
+        const u32 t1 = rd(kMkMask + ((h >> 6) & 7) * 4, 4), t2 = rd(kMkMask + ((h >> 9) & 7) * 4, 4);
+        v4 = (rd(kMkGlb + 0x94, 4) & ~t1) | (rd(md + 4, 4) & t1);
+        v8 = (rd(kMkGlb + 0x98, 4) & ~t2) | (rd(md + 8, 4) & t2);
+        m10 = rd(md + 0x10, 4); g9c = rd(kMkGlb + 0x9C, 4);
+        vc = (g9c & ~m10) | (rd(md + 0xC, 4) & m10);
+        v10 = rd(md + 0x14, 4); v14 = rd(md + 0x1C, 2);
+        r0f = (h & 0x20) ? 0x20 : 0;
+        send = vc & 0x1F0000;
+        ok = !bad;
+        if (send && r0f) vc &= ~0x1F0000u;
+        // (an invisible material or NOGECMD: never seen in the race; the guest runs them)
+        ok = ok && send && !((flag | 8) & 0x100)
+             && !rd(kMkGeFlag, 4) && !bad && (!(geb = rd(kMkGeBuf, 4)) || !rd(geb, 4)) && !bad /* no GE buffer or an empty one: straight to GXFIFO */ && (g_Check || g_Dry || (gx.GeometryEnabled && (gx.BulkReady() || gx.FifoLevel() + 8 <= 256)));
+    }
+    if (!ok)
+    {
+        s.fallback[21] += !g_Check;
+        GuestFallback(c);
+        return true;
+    }
+    // frames: SBC MAT push {r4-r6, lr} (sp - 16) | MAT_InternalDefault push {r4-r8, lr} (sp - 40) + locals (sp - 72) |
+    // OP_N push {r4-r6, lr} (sp - 88)
+    m.W(st, 72, c->R[4]); m.W(st, 76, c->R[5]); m.W(st, 80, c->R[6]); m.W(st, 84, c->R[14]);
+    m.W(st, 48, rs); m.W(st, 52, res + 4); m.W(st, 56, res); m.W(st, 60, c->R[7]); m.W(st, 64, c->R[8]); m.W(st, 68, kMkMatSbc + 0x6C);
+    {
+        m.W(st, 16, 0x00293130); m.W(st, 20, v4); m.W(st, 24, v8); m.W(st, 28, vc); m.W(st, 32, 0x2B2A); m.W(st, 36, v10); m.W(st, 40, v14);
+        m.W(st, 0, cbT); m.W(st, 4, r7); m.W(st, 8, rs); m.W(st, 12, kMkMatDef + 0x360);
+    }
+    // render state, the result
+    m.W(RS, 0xAC, (RS.r(0xAC) & ~0xFF00u) | idx << 8);
+    m.W(RS, 8, (flag | 8) & ~2u);
+    m.W(RS, 0xB0, r7);
+    if (setBit) m.W(RS, bo, bits | bit);
+    m.W(RS, 0, sbc + 2);
+    const u32 res6[6] = {r0f, v4, v8, vc, v10, v14};
+    for (int i = 0; i < 6; i++) m.W(R7, i * 4, res6[i]);
+    Expect e;
+    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+    e.R[0] = sbc + 2;
+    e.R[1] = 0x04000400; e.R[2] = v14; e.R[3] = kMkGeBuf; e.R[12] = sp - 72 + 28;   // MI_CpuSend32's, OP_N's r3
+    e.retPc = c->R[14];
+    e.CPSR = (c->CPSR & 0x0FFFFFDF) | Flags(cbT, 3) | ((e.retPc & 1) << 5);
+    const u32 gw[7] = {0x00293130, v4, v8, vc, 0x2B2A, v10, v14};
+#ifdef LITEV_HLE_DIAG
+    if (g_Check || g_Dry)
+    {
+        m.Flush();      // logs only
+        if (g_Check)
+        {
+            ArmCheck(c, 21, m, e);
+            g_P.gx.assign(gw, gw + 7);
+            g_P.fit[0] = 1; g_P.fit[1] = anm != 0; g_P.fit[2] = opt; g_P.fit[3] = geb != 0;
+#ifdef LITEV_A9HLE_GXCHECK
+            if (!GxTap) { g_GxMatTap.clear(); GxTap = &g_GxMatTap; g_P.gxOn = true; }
+#endif
+        }
+        s.checks[21]++;
+        if (g_Check && jit) { CheckRunGuest(c, pc); return true; }
+        GuestFallback(c);
+        return true;
+    }
+#endif
+    m.Flush();
+    // the FIFO empty: at once (as GX_CPUSEND sends); else (a buffer swap pending) into the FIFO as the guest's stores do
+    if (gx.BulkReady()) gx.BulkWords(gw, 7);
+    else for (u32 w : gw) c->NDS.ARM9Write32(0x04000400, w);
+    s.native[21]++;
+    Return(c, e, kMkMatCyc + (anm ? kMkMatCycAnm : 0) + (geb ? kMkMatCycGe : 0));
+    return true;
+}
+
 // ---- 19. NNS_G2dMakeCellToOams (Mario Kart DS race: the HUD / map icons) ---------------------------------------------------------
 // NNS G2D: u16 f(GXOamAttr* dst, u16 max, const NNSG2dCellData* cell, const MtxFx22* mtx, const VecFx32* trans, u16 affineIdx,
 // BOOL doubleAffine): n = min(max, cell->numOAMAttrs) objects, each the cell's 6-byte attr0..2 copied to dst[i] (8-byte stride,
@@ -3595,6 +3743,11 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         return 10;
     }
 #endif
+    if (instr == kMkMatInstr && addr == kMkMatSbc)
+    {
+        r = kMkMatCode;
+        return 3;
+    }
     if (instr == kCxInstr && CxAt(&nds.ARM9, addr))
     {
         static thread_local Range cx;
@@ -3754,6 +3907,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         return k;
     }
 #endif
+    if (instr == kMkMatInstr && addr == kMkMatSbc)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 524288) ? MkMatAt(&nds.ARM9, addr) : 0;
+    }
     if (instr == kCxInstr && CxAt(&nds.ARM9, addr))
     {
         State& s = St(&nds.ARM9);
@@ -4835,6 +4993,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
         State& s = St(c);
         return s.on && (s.mask & 16384) && RunFx(c, s, jit);
     }
+    if (in == kMkMatInstr && pc == kMkMatSbc)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 524288) && RunMkMat(c, s, jit);
+    }
     if (in == kCxInstr)
     {
         State& s = St(c);
@@ -4947,6 +5110,8 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         fprintf(stderr, "ASYNCFIT %u %llu\n", g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 13 && getenv("LITEV_A9HLE_SHPFIT") && !g_P.irq)
         fprintf(stderr, "SHPFIT %d %u %llu\n", (int)g_P.small, g_P.fit[0], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
+    if (k == 21 && getenv("LITEV_A9HLE_MKMATFIT") && !g_P.irq)
+        fprintf(stderr, "MKMATFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 20 && getenv("LITEV_A9HLE_CXFIT") && !g_P.irq)
         fprintf(stderr, "CXFIT %u %u %u %u %llu\n", g_P.fit[0], g_P.fit[1], g_P.fit[2], g_P.fit[3], (unsigned long long)(nds.ARM9Timestamp + c->Cycles - g_P.t0));
     if (k == 19 && getenv("LITEV_A9HLE_OAMFIT") && !g_P.irq)
@@ -5023,7 +5188,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
             nd++;
         }
     }
-    if (k == 8 || (k == 13 && g_P.small) || k == 15 || k == 17)
+    if (k == 8 || (k == 13 && g_P.small) || k == 15 || k == 17 || k == 21)
     {
         // GXFIFO words: the guest's stores to GXFIFO, then what reached BulkWords (MI_CpuSend32 under GX_CPUSEND)
         std::vector<u32> gw;
