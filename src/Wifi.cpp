@@ -260,6 +260,10 @@ void Wifi::Reset()
     IsMPClient = false;
     NextSync = 0;
     MPInExchange = false;
+#ifdef LITEV_WIFI_EVT
+    NextTickTs = 0;
+    QuietUntil = 0;
+#endif
     RXTimestamp = 0;
 #ifdef LITEV_LAN_EARLY_REPLY
     EarlyReplyLen = -1;
@@ -341,11 +345,178 @@ void Wifi::DoSavestate(Savestate* file)
     file->Bool32(&IsMPClient);
     file->Var64(&NextSync);
     file->Var64(&RXTimestamp);
+
 #ifdef LITEV_LAN_EARLY_REPLY
     if (!file->Saving) EarlyReplyLen = -1;
 #endif
+#ifdef LITEV_WIFI_EVT
+    // own section: states without it (other builds) load with no idle ticks pending
+    if (!file->Saving && !file->HasSection("WEVT"))
+    {
+        NextTickTs = NDS.SchedList[Event_Wifi].Timestamp;
+        QuietUntil = 0;
+        return;
+    }
+    file->Section("WEVT");
+    file->Var64(&NextTickTs);
+    file->Var64(&QuietUntil);
+#endif
 }
 
+
+#ifdef LITEV_WIFI_EVT
+// One 8 us tick's length in system cycles; err carries the rounding (ScheduleTimer's step)
+static inline s32 WifiTickDelay(s32& err)
+{
+    s32 cycles = 33513982 * 8 - err;
+    s32 delay = (cycles + 999999) / 1000000;
+    err = delay * 1000000 - cycles;
+    return delay;
+}
+
+static constexpr int kEvtMaxIdle = 2048;            // ticks per event at most (16 ms)
+static constexpr u64 kEvtQuietSpan = 268 * 64;      // MP client: ask the link about the next ~512 us of polls
+static constexpr u64 kEvtAskAhead = 33514 * 2;      // ... only up to 2 ms past our clock (< LockstepMP::kDelay: no deadlock)
+
+// USTick on a tick EvtSchedule found idle: counters, and a transfer's in-between steps (TX phase
+// countdown / address, RX halfword copy from the frame already in RXBuffer); no IRQ, no link call
+void Wifi::EvtIdleTick()
+{
+    USTimestamp += kTimerInterval;
+    if (!(USTimestamp & 0x3FF & kTimeCheckMask))
+        WifiAP->MSTimer();
+    if (IOPORT(W_USCountCnt))
+        USCounter += kTimerInterval;
+    if ((IOPORT(W_CmdCountCnt) & 0x0001) && CmdCounter > 0)
+        CmdCounter = CmdCounter < kTimerInterval ? 0 : CmdCounter - kTimerInterval;
+    if (IOPORT(W_ContentFree) != 0)
+        IOPORT(W_ContentFree) = IOPORT(W_ContentFree) < kTimerInterval ? 0 : IOPORT(W_ContentFree) - kTimerInterval;
+    if (ComStatus == 0)
+        RXCounter += kTimerInterval;
+    else if (ComStatus == 2)
+    {
+        TXSlot* slot = &TXSlots[TXCurSlot];
+        slot->CurPhaseTime -= kTimerInterval;
+        if (slot->CurPhase == 1)
+        {
+            if (!(slot->CurPhaseTime & slot->HalfwordTimeMask))
+                IOPORT(W_RXTXAddr)++;
+        }
+        else if (slot->CurPhase == 2)
+            MPReplyTimer -= kTimerInterval;
+    }
+    else
+    {
+        RXTime -= kTimerInterval;
+        if (!(RXTime & RXHalfwordTimeMask))
+        {
+            u16 addr = IOPORT(W_RXTXAddr) << 1;
+            if (addr < 0x1FFF) *(u16*)&RAM[addr] = *(u16*)&RXBuffer[RXBufferPtr];
+            IncrementRXAddr(addr);
+            IOPORT(W_RXTXAddr) = addr >> 1;
+            RXBufferPtr += 2;
+        }
+    }
+}
+
+// Runs the idle ticks due by `now` (all before the pending event's tick)
+void Wifi::EvtCatchUp(u64 now)
+{
+    const u64 evt = NDS.SchedList[Event_Wifi].Timestamp;
+    while (NextTickTs <= now && NextTickTs < evt)
+    {
+        EvtIdleTick();
+        NextTickTs += WifiTickDelay(TimerError);
+    }
+}
+
+void Wifi::EvtScheduleAt(u64 ts)
+{
+    NDS.CancelEvent(Event_Wifi);
+    NDS.SchedList[Event_Wifi].Timestamp = ts;
+    NDS.ScheduleEvent(Event_Wifi, true, 0, 0, 0);
+}
+
+// Event_Wifi at the first tick from NextTickTs that does more than EvtIdleTick, judged from the
+// current state with the counters advanced linearly (anything else changes only on such a tick or
+// on a register write, which reschedules). ask: the MP client may wait on the link (HostQuiet)
+// to learn that its host polls return nothing; else only what QuietUntil already says counts.
+void Wifi::EvtSchedule(bool ask)
+{
+    u64 t = NextTickTs;
+    s32 err = TimerError;
+    int why = 0;
+    if (USUntilPowerOn >= 0 && ComStatus != 3 && !(ComStatus == 0 && IOPORT(W_TXBusy)))
+    {
+        why = 7;
+        const bool client = IsMPClient;
+        // CheckRX returns before any link call
+        const bool rxoff = (IOPORT(W_PowerState) & (1<<9)) || !(IOPORT(W_RXCnt) & 0x8000) || IOPORT(W_RXBufBegin) == IOPORT(W_RXBufEnd);
+        const bool cnt = IOPORT(W_USCountCnt), cmp = IOPORT(W_USCompareCnt);
+        const u32 pre = IOPORT(W_PreBeacon) & kTimeCheckMask, bc1 = IOPORT(W_BeaconCount1);
+        u64 us = USTimestamp, usc = USCounter;
+        u32 rxc = RXCounter;
+        // the transfer in progress (ComStatus 2: TX slot; 1: RX)
+        const TXSlot* slot = ComStatus == 2 ? &TXSlots[TXCurSlot] : nullptr;
+        int pt = slot ? slot->CurPhaseTime : 0, mprt = MPReplyTimer, rt = RXTime;
+        u16 rxaddr = IOPORT(W_RXTXAddr) << 1;
+        const u16 rdcur = IOPORT(W_RXBufReadCursor) << 1;
+        for (int k = 0; k < kEvtMaxIdle; k++)
+        {
+            us += kTimerInterval;
+            if (ComStatus == 2)
+            {
+                pt -= kTimerInterval;
+                if (pt <= 0) { why = 0; break; }                                            // next TX phase
+                if (slot->CurPhase == 2 && (mprt -= kTimerInterval) <= 0 && MPClientMask) { why = 0; break; }   // a reply is due
+            }
+            else if (ComStatus == 1)
+            {
+                rt -= kTimerInterval;
+                if (!(rt & RXHalfwordTimeMask))
+                {
+                    IncrementRXAddr(rxaddr);
+                    if (rt <= 0 || rxaddr == rdcur) { why = 0; break; }                     // RX done / buffer full
+                }
+            }
+            else if (client)
+            {
+                if (RXTimestamp && us >= RXTimestamp) { why = 1; break; }
+                if (us >= NextSync && !rxoff && t > QuietUntil)
+                {
+                    const u64 until = t + kEvtQuietSpan;
+                    if (!ask || !NDS.MPHostQuiet || until > NDS.GetSysTimestamp() + kEvtAskAhead) { why = 2; break; }
+                    u64 ft; int fs;
+                    int r = NDS.MPHostQuiet(NDS.MPHostQuietCtx, NDS.MPHostQuietInst, until, &ft, &fs);
+                    if (r < 0) { why = 2; break; }
+                    // (a frame sent at ft shows from visible ft + 1, or ft for a lower sender id)
+                    QuietUntil = r == 0 ? until : (fs < NDS.MPHostQuietInst ? ft - 1 : ft);
+                    if (t > QuietUntil) { why = 3; break; }
+                }
+            }
+            if (cnt)
+            {
+                usc += kTimerInterval;
+                u32 uspart = usc & 0x3FF;
+                if (cmp && ((((bc1 << 10) | (0x3FF - uspart)) & kTimeCheckMask) == pre)) { why = 4; break; }   // IRQ15
+                if (!(uspart & kTimeCheckMask)) { why = 5; break; }                                             // MSTimer
+            }
+            if (ComStatus == 0)
+            {
+                if (!rxoff && !(rxc & 0x1FF & kTimeCheckMask)
+                    && (!client || (us > NextSync && !(LinkDelaysRegularFrames && (MPInExchange || RXTimestamp)))))
+                    { why = 6; break; }                                                                // CheckRX(0)
+                rxc += kTimerInterval;
+            }
+            t += WifiTickDelay(err);
+        }
+    }
+    #ifdef LITEV_NPSCHED_STATS
+    if (ask) NDS.SchedStats.WifiWhy[why]++;
+#endif
+    EvtScheduleAt(t);
+}
+#endif
 
 void Wifi::ScheduleTimer(bool first, int ticks)
 {
@@ -389,7 +560,14 @@ void Wifi::UpdatePowerOn()
     {
         Log(LogLevel::Debug, "WIFI: ON\n");
 
+#ifdef LITEV_WIFI_EVT
+        TimerError = 0;
+        NextTickTs = (NDS.CurCPU == 0 ? (NDS.ARM9Timestamp >> NDS.ARM9ClockShift) : NDS.ARM7Timestamp) + WifiTickDelay(TimerError);
+        QuietUntil = 0;
+        EvtScheduleAt(NextTickTs);
+#else
         ScheduleTimer(true);
+#endif
 
         Platform::MP_Begin(NDS.UserData);
     }
@@ -405,6 +583,9 @@ void Wifi::UpdatePowerOn()
 
 void Wifi::SetPowerCnt(u32 val)
 {
+#ifdef LITEV_WIFI_EVT
+    if (PowerOn) EvtCatchUp(NDS.ARM7Timestamp);
+#endif
     Enabled = val & (1<<1);
     UpdatePowerOn();
 }
@@ -2050,6 +2231,13 @@ void Wifi::MSTimer()
 
 void Wifi::USTimer(u32 param)
 {
+#ifdef LITEV_WIFI_EVT
+    EvtCatchUp(NDS.SchedList[Event_Wifi].Timestamp - 1);   // the idle ticks before this one
+    USTick();
+    NextTickTs += WifiTickDelay(TimerError);
+    if (PowerOn) EvtSchedule(true);
+    return;
+#endif
     int ticks = 0;
     do
     {
@@ -2342,6 +2530,9 @@ u16 Wifi::Read(u32 addr)
 {
     if (addr >= 0x04810000)
         return 0;
+#ifdef LITEV_WIFI_EVT
+    if (PowerOn) EvtCatchUp(NDS.ARM7Timestamp);
+#endif
 
     addr &= 0x7FFE;
 
@@ -2441,7 +2632,20 @@ u16 Wifi::Read(u32 addr)
     return IOPORT(addr&0xFFF);
 }
 
+#ifdef LITEV_WIFI_EVT
 void Wifi::Write(u32 addr, u16 val)
+{
+    if (addr >= 0x04810000) return;
+    if (PowerOn) EvtCatchUp(NDS.ARM7Timestamp);
+    WriteReg(addr, val);
+    // (Wi-Fi RAM is not what EvtSchedule judges by)
+    if (PowerOn && !((addr & 0x7FFE) >= 0x2000 && (addr & 0x7FFE) < 0x6000)) EvtSchedule(false);
+}
+
+void Wifi::WriteReg(u32 addr, u16 val)
+#else
+void Wifi::Write(u32 addr, u16 val)
+#endif
 {
     if (addr >= 0x04810000)
         return;

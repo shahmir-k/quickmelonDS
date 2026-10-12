@@ -1438,6 +1438,14 @@ set(LITEV_WIFI_BATCH_N "4" CACHE STRING "Wi-Fi ticks per event while idle")
 if (LITEV_WIFI_BATCH)
     add_compile_definitions(LITEV_WIFI_BATCH=1 LITEV_WIFI_BATCH_N=${LITEV_WIFI_BATCH_N})
 endif()
+# LITEV_WIFI_EVT: event-driven Wi-Fi (category B, session-wide: every console of a Netplay session needs it).
+# One Event_Wifi per tick that does something (IRQ, ms timer, RX/TX step, link call); the idle ticks between
+# (counters only) are applied lazily, before any Wi-Fi register access. An MP client's host polls are skipped
+# where the link proves nothing can arrive (LockstepMP::HostQuiet). Replaces LITEV_WIFI_BATCH / LITEV_NP_SCHED.
+option(LITEV_WIFI_EVT "Event-driven Wi-Fi: no 8 us tick events while idle (category B)" OFF)
+if (LITEV_WIFI_EVT)
+    add_compile_definitions(LITEV_WIFI_EVT=1)
+endif()
 option(LITEV_NETPLAY_HEADLESS "Netplay: GPU::Headless/GPU3D::Headless/SPU::Silent consoles skip render- and audio-only work (else the members are ignored)" OFF)
 if (LITEV_NETPLAY_HEADLESS)
     add_compile_definitions(LITEV_NETPLAY_HEADLESS=1)

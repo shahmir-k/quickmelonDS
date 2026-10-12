@@ -51,7 +51,36 @@ void LockstepMP::SetWake(int inst, NDS& nds)
 #ifdef LITEV_MP_POLL_INLINE
     nds.MPHostPoll = &HostFrameMaybe; nds.MPHostPollCtx = this; nds.MPHostPollInst = inst;
 #endif
+#ifdef LITEV_WIFI_EVT
+    if (!NoQuiet) { nds.MPHostQuiet = &HostQuiet; nds.MPHostQuietCtx = this; nds.MPHostQuietInst = inst; }
+#endif
 }
+
+#ifdef LITEV_WIFI_EVT
+int LockstepMP::HostQuiet(void* self, int inst, u64 until, u64* time, int* sender)
+{
+    LockstepMP& m = *(LockstepMP*)self;
+    const int host = m.ClientHost[inst];   // (written by this console's own thread)
+    if (host < 0 || host == inst || !(m.Members & (1 << host)) || kHostDelay) return -1;
+    // RecvHostPacket's rules at visible = until (its clock: ours + the harness's skew, if any)
+    if (!m.Console[inst]) return -1;
+    const u64 skew = m.Now(inst) - m.Console[inst]->GetSysTimestamp();
+    until += skew;
+    auto past = [&] { u64 t = m.Now(host); return t > until || (t == until && host > inst); };
+    std::unique_lock<std::mutex> lk(m.Lock);
+    std::deque<Packet>& q = m.FromHost[inst];
+    while (!q.empty() && q.front().Time < m.BeginTime[inst]) q.pop_front();
+    auto shown = [&] { return !q.empty() && (q.front().Time < until || (q.front().Time == until && q.front().Sender < inst)); };
+    // (no deadlock: the host waits on our clock for at most its own - kDelay (regular frames) or a
+    // CMD's time + kDelay, and `until` is < kDelay past our clock; a sent CMD shows or the host is past)
+    m.WaitFor(lk, [&] { return shown() || past(); }, [&] { m.NeedClock(inst, host, host > inst ? until : until + 1); }, inst, 1);
+    m.FromHostChanged(inst);
+    if (m.Stopped) return -1;
+    if (!shown()) return 0;
+    *time = q.front().Time - skew; *sender = q.front().Sender;
+    return 1;
+}
+#endif
 
 #ifdef LITEV_MP_CLOCKWAKE
 void LockstepMP::Wake(int inst)
