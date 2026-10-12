@@ -376,6 +376,7 @@ struct Txn
     u32 r0 = 0, r1 = 0; bool ret = false;
     s32 t = 0;                  // the virtual clock: cycles since the start
     u16 ticks[4]; u32 nticks = 0;
+    s32 tickT[4];               // (cycle fits: when the native read them)
     s32 walk = 0, ins = -1, steps = -1, set = 0, inc = 0, dpath = -1;   // the path taken (cycle fits)
     s32 tsWake = 0, tsRes = 0, tsWalk = 0, tsSw = 0;
     struct SegAt { u32 pc; s32 t; u8 seg; };
@@ -537,7 +538,7 @@ constexpr Cyc kCyc[3] = {
     {16,  77, 17,  8, 100, 139, -3,  22, 40, 133, 126, 18, 138, 12},   // NTR
     {19,  74, 16,  8, 110, 161, -3,  20, -68, 134, 127, 18, 139, 12},  // V4 (Kirby, Chrono, CV OoE, M&L BIS)
 };
-inline int CycIdx(u8 fam) { return fam == famTWL ? 0 : fam == famV4 ? 2 : 1; }
+inline int CycIdx(u8 fam) { return fam == famTWL || fam == famT5 ? 0 : fam == famV4 ? 2 : 1; }
 inline const Cyc& CycOf(u8 fam) { return kCyc[CycIdx(fam)]; }
 // the OS data layouts by build: the tick counter 8 bytes into its literal, the alarm queue's head 4 bytes into its own
 inline bool Plus(u8 fam) { return fam == famTWL || fam == famV4; }
@@ -584,7 +585,7 @@ bool GetTick(Ctx& c, u64& tick)
         if (h == e.f[f_handler] && !Rd(c, e.f[f_soft] + 8, extra)) return false;
     }
     if (!c.nds.PeekTimer7(4, c.interp ? c.t0 + c.x.t + k.gtRead : c.t0, lo)) return false;
-    if (c.x.nticks < 4) c.x.ticks[c.x.nticks++] = lo;
+    if (c.x.nticks < 4) { c.x.tickT[c.x.nticks] = c.x.t + k.gtRead; c.x.ticks[c.x.nticks++] = lo; }
     if (!Rd(c, tc, cl) || !Rd(c, tc + 4, ch)) return false;
     if (!probe) { c.x.gtTc = tc; c.x.gtLo = lo; c.x.gtCl = cl; c.x.gtCh = ch; c.x.gtExtra = extra; }
     }
@@ -801,16 +802,19 @@ struct Cyc2
     s32 awPre, awPost;              // (the NTR 2005 build's OSi_AlarmHandler: one cycle less each)
     s32 arrPre, arrEmpty, arrSet, arrSetEnd, arrDue, arrNoHandler, arrPost, arrIns, arrHead, arrEnd;
     s32 tsNone, tsWake, tsWakeEach, tsResched, tsWalk, tsSwitch;
+    s32 arrNoIns = 0;               // OSi_ArrangeTimer after a one-shot alarm (no re-insert)
 };
 // fitted in check mode (LITEV_A7N_FIT: the guest's time at each segment, its TM0 reads and TM1's start; PW, PB, The Sims 3 /
 // Shrek, Castlevania, Mario Kart DS); ponytail: irqhNone, icbNoCall, icbDis, arrEmpty, arrNoHandler: instruction-count
 // estimates (paths not seen in the fits)
-constexpr Cyc2 kCyc2[3] = {
+constexpr Cyc2 kCyc2[5] = {
     {16, 8,  40, 5, 9, 12,  6, 38, 32, 26, 30,  5, 6,  63, 12, 20, 8, 47, 40, 8, 6, 8, 8,  23, 12, 8, 28, 10, 78},   // TWL
     {16, 8,  34, 5, 0, 12,  6, 38, 32, 26, 30,  5, 6,  50, 12, 18, 10, 50, 40, 8, 6, 8, 8,  23, 12, 8, 28, 10, 78},  // NTR
-    {16, 8,  40, 7, 0, 12,  6, 38, 32, 26, 30,  5, 6,  63, 12, 18, 10, 49, 40, 9, 6, 6, 8,  25, 12, 8, 28, 10, 78},  // V4
+    {16, 8,  40, 7, 0, 12,  6, 38, 32, 26, 30,  5, 6,  63, 12, 18, 10, 49, 40, 9, 6, 6, 9,  25, 12, 8, 34, 16, 78, 3},  // V4 (Kirby: arr-post end, one-shot, resched, walk refitted)
+    {16, 8,  40, 5, 9, 12,  6, 38, 32, 26, 30,  5, 6,  63, 12, 20, 8, 47, 40, 8, 6, 8, 8,  23, 12, 8, 28, 10, 79},   // T5 (its thread switch: Spider-Man SD, Golden Sun DD)
+    {16, 8,  34, 5, 0, 12,  6, 38, 32, 26, 30,  5, 6,  50, 12, 18, 10, 50, 40, 8, 6, 8, 8,  22, 12, 8, 28, 10, 78},  // S2 (its thread switch: Brain Age, Nintendogs, SM64DS; ponytail: its flag wake path estimated as NTR's queue wake)
 };
-inline const Cyc2& Cyc2Of(u8 fam) { return kCyc2[CycIdx(fam)]; }
+inline const Cyc2& Cyc2Of(u8 fam) { return kCyc2[fam == famT5 ? 3 : fam == famS2 ? 4 : CycIdx(fam)]; }
 constexpr u32 kMovLrPc = 0xE1A0E00F;
 
 enum Want : u8 { wBiosIn, wIrqH, wStub, wIcb, wIcbPost, wAw, wAwPost, wArr, wArrPost, wTs, wBiosRet, wNone };
@@ -870,11 +874,13 @@ bool BiosOk(melonDS::NDS& nds, State& s)
 struct HandCyc { s32 pad, sndFull, snd, sndDiv, sndWake, sndWakeEach, sndRes; };
 // fitted in check mode (LITEV_A7N_FIT: the hand segment's guest time, 1 woken thread); ponytail: sndFull, sndDiv (a slot index
 // past the end), and the split of wake / each / resched: estimates (paths not seen in the fits)
-constexpr HandCyc kHandCyc[4] = {
+constexpr HandCyc kHandCyc[6] = {
     {60, 40, 140, 3, 43, 12, 30},   // TWL (PW)
     {56, 40, 159, 3, 43, 12, 30},   // NTR (Shrek; Mario Kart DS's PAD alarm)
     {55, 40, 139, 3, 43, 12, 30},   // V4 (Kirby)
     {56, 40, 168, 3, 43, 12, 30},   // NTR05 (Mario Kart DS's sound alarm)
+    {60, 40, 140, 3, 43, 12, 30},   // T5 (no handler of its own: as TWL)
+    {56, 40, 153, 3, 43, 12, 30},   // S2 (Brain Age, Nintendogs: the 2005 sound alarm with the 2.x OS_SendMessage)
 };
 s32 Hand(Run& R, u32 h)
 {
@@ -893,12 +899,16 @@ s32 Hand(Run& R, u32 h)
     if (!f) return -1;
     Ctx c{nds, f->e, R.x, R.t0, R.interp};
     const Env& e = f->e;
-    const HandCyc& k = kHandCyc[e.kf[kSndAlarm]];
     const u32 q = e.f[f_sndq];
+    // the queue: TWL / NTR / V4 send / receive thread queues (head, tail) at +0 / +8, array +0x10, count +0x14, first +0x18,
+    // used +0x1C; SDK 2.x thread queues are u16 masks at +0 / +2, array +4, count +8, first +0xC, used +0x10
+    const bool s2 = e.kf[kSendMsg] == famS2;
+    const HandCyc& k = kHandCyc[s2 ? famS2 : e.kf[kSndAlarm]];
+    const u32 oArr = s2 ? 4 : 0x10;
     u32 cnt, used, first, arr;
-    if (!Rd(c, q + 0x14, cnt) || !Rd(c, q + 0x1C, used)) return -1;
+    if (!Rd(c, q + oArr + 4, cnt) || !Rd(c, q + oArr + 0xC, used)) return -1;
     if ((s32)cnt <= (s32)used) return e.kf[kSndAlarm] == famNTR05 ? -1 : k.sndFull;   // (full: not sent; 2005: *sndfail, the guest)
-    if (!Rd(c, q + 0x18, first) || !Rd(c, q + 0x10, arr) || (s32)used < 0) return -1;
+    if (!Rd(c, q + oArr + 8, first) || !Rd(c, q + oArr, arr) || (s32)used < 0) return -1;
     // _s32_div_f's remainder (sign of the dividend, as C); its cycles: 3 a step after the shift search
     const s32 num = (s32)(first + used), den = (s32)cnt;
     const u32 slot = (u32)(num % den);
@@ -912,20 +922,41 @@ s32 Hand(Run& R, u32 h)
         if (d <= r3) r2 -= 4;
         cyc += k.sndDiv * (s32)(32 - r2);
     }
-    if (!Wr(c, arr + 4 * slot, 1) || !Wr(c, q + 0x1C, used + 1)) return -2;
+    if (!Wr(c, arr + 4 * slot, 1) || !Wr(c, q + oArr + 0xC, used + 1)) return -2;
     // OS_WakeupThread(&queue->queueReceive)
-    const u32 tq = q + 8;
     u32 t;
-    if (!Rd(c, tq, t)) return -2;
-    if (!t) return cyc;
-    for (int n = 0; t; n++)
+    if (s2)
     {
-        u32 nx;
-        if (n > 64 || !Wr(c, t + 0x48, 1) || !Wr(c, t + 0x5C, 0) || !Wr(c, t + 0x60, 0) || !Rd(c, t + 0x64, nx) || !Wr(c, t + 0x64, 0))
-            return -2;
-        t = nx; cyc += k.sndWakeEach;
+        // SDK 2.x: every thread (the list from the thread info + 0xC) whose number (+0x50) is in the mask: READY
+        const u32 tq = q + 2;
+        u32 m;
+        if (!Rd16(c, tq, m)) return -2;
+        if (!m) return cyc;
+        if (!Rd(c, e.f[f_tinfo] + 0xC, t)) return -2;
+        for (int n = 0; t; n++)
+        {
+            u32 b;
+            if (n > 64 || !Rd(c, t + 0x50, b)) return -2;
+            if ((b & 0xFF) < 32 && (m >> (b & 0xFF) & 1) && !Wr(c, t + 0x48, 1)) return -2;
+            if (!Rd(c, t + 0x4C, t)) return -2;
+            cyc += k.sndWakeEach;
+        }
+        if (!Wr16(c, tq, 0)) return -2;
     }
-    if (!Wr(c, tq + 4, 0) || !Wr(c, tq, 0)) return -2;
+    else
+    {
+        const u32 tq = q + 8;
+        if (!Rd(c, tq, t)) return -2;
+        if (!t) return cyc;
+        for (int n = 0; t; n++)
+        {
+            u32 nx;
+            if (n > 64 || !Wr(c, t + 0x48, 1) || !Wr(c, t + 0x5C, 0) || !Wr(c, t + 0x60, 0) || !Rd(c, t + 0x64, nx) || !Wr(c, t + 0x64, 0))
+                return -2;
+            t = nx; cyc += k.sndWakeEach;
+        }
+        if (!Wr(c, tq + 4, 0) || !Wr(c, tq, 0)) return -2;
+    }
     cyc += k.sndWake;
     // OS_RescheduleThread: unless rescheduling is off (its count), in IRQ mode only the flag
     const u8 rf = e.kf[kResched];
@@ -1171,6 +1202,7 @@ int Step(Run& R)
                     R.x.t += k.arrIns;
                     if (!InsertAlarm(c, alarm, 0)) return false;
                 }
+                else R.x.t += k.arrNoIns;
                 u32 h;
                 if (!Rd(c, head, h)) return false;
                 if (h) { R.x.t += k.arrHead; if (!SetTimer(c, h)) return false; }
@@ -1253,10 +1285,32 @@ int Step(Run& R)
             const Cyc2& k = Cyc2Of(f->e.kf[kThreadSwitch]);
             const u32 irqq = f->e.f[f_irqq], ti = f->e.f[f_tinfo];
             s32 cyc = k.tsNone;
+            // SDK 2.x: the thread info one word further (current, list, callback at +8 / +0xC / +0x10)
+            const bool s2 = f->e.kf[kThreadSwitch] == famS2;
+            const u32 o = s2 ? 4 : 0;
             // wake the threads waiting for an IRQ (OS_WaitIrq)
             u32 t;
-            if (!Rd(c, irqq, t)) return 0;
-            if (t)
+            if (s2)
+            {
+                // SDK 2.x: a pending-IRQ flags halfword (irqq); every thread whose wait-IRQ number (+0x50) is in it: READY
+                u32 fl;
+                if (!Rd16(c, irqq, fl)) return 0;
+                if (fl)
+                {
+                    if (!Wr16(c, irqq, 0) || !Wr16(c, ti, 1) || !Rd(c, ti + 0xC, t)) return 0;
+                    for (int n = 0; t; n++)
+                    {
+                        u32 b;
+                        if (n > 64 || !Rd(c, t + 0x50, b)) return 0;
+                        if ((b & 0xFF) < 32 && (fl >> (b & 0xFF) & 1)) { if (!Wr(c, t + 0x48, 1)) return 0; R.x.tsWake++; }
+                        if (!Rd(c, t + 0x4C, t)) return 0;
+                        cyc += k.tsWakeEach;
+                    }
+                    cyc += k.tsWake;
+                }
+            }
+            else if (!Rd(c, irqq, t)) return 0;
+            else if (t)
             {
                 for (int n = 0; t; n++)
                 {
@@ -1274,7 +1328,7 @@ int Step(Run& R)
             if (resched)
             {
                 cyc += k.tsResched; R.x.tsRes = 1;
-                if (!Rd(c, ti + 8, to)) return 0;
+                if (!Rd(c, ti + 8 + o, to)) return 0;
                 for (int n = 0; to; n++)
                 {
                     u32 stt;
@@ -1283,9 +1337,9 @@ int Step(Run& R)
                     cyc += k.tsWalk + ((to >> 24) == 0x02 ? 11 : 0); R.x.tsWalk++;     // (main RAM: slower loads)
                     if (!Rd(c, to + 0x4C, to)) return 0;
                 }
-                if (!Rd(c, ti + 4, cur)) return 0;
+                if (!Rd(c, ti + 4 + o, cur)) return 0;
                 u32 cb;
-                if (to && to != cur && (!Rd(c, ti + 0xC, cb) || cb)) return 0;      // a thread switch callback: the guest
+                if (to && to != cur && (!Rd(c, ti + 0xC + o, cb) || cb)) return 0;      // a thread switch callback: the guest
                 if (!Wr16(c, ti, 0)) return 0;
             }
             if (!resched || !to || to == cur)
@@ -1306,7 +1360,7 @@ int Step(Run& R)
             for (int i = 0; i < 7; i++) if (!Rd(c, S0 + 4 * i, fr[i])) return 0;
             const u32 old[18] = {st.spsr, fr[1], fr[2], fr[3], fr[4], st.r[4], st.r[5], st.r[6], st.r[7], st.r[8], st.r[9], st.r[10],
                                  st.r[11], fr[5], st.usr13, st.usr14, fr[6], st.svc13};
-            if (!Wr(c, ti + 4, to)) return 0;
+            if (!Wr(c, ti + 4 + o, to)) return 0;
             for (int i = 0; i < 18; i++) if (!Wr(c, cur + 4 * i, old[i])) return 0;
             u32 nw[18];
             for (int i = 0; i < 18; i++) if (!Rd(c, to + 4 * i, nw[i])) return 0;
@@ -1632,7 +1686,7 @@ void FinishChain(melonDS::ARM* cpu)
                 u16 v;
                 if (nds.PeekTimer7(4, g_P.t0 + off, v) && v == g_P.gticks[i]) { if (lo < 0) lo = off; hi = off; }
             }
-            fprintf(stderr, " tick%u=[%d,%d]", i, lo, hi);
+            fprintf(stderr, " tick%u=[%d,%d]@%d", i, lo, hi, i < x.nticks ? x.tickT[i] : -1);
         }
         const Timer& t1 = nds.Timers[5];
         if (x.set && (t1.Cnt & 0x80))
@@ -1660,7 +1714,7 @@ void FinishChain(melonDS::ARM* cpu)
     if (g.usr13 != e.usr13 || g.usr14 != e.usr14) Diff(s, d, tag, "usr13/14", 0, g.usr13, e.usr13);
     if (g.svc13 != e.svc13) Diff(s, d, tag, "svc13", 0, g.svc13, e.svc13);
     if (g.spsr != e.spsr) Diff(s, d, tag, "spsr", 0, g.spsr, e.spsr);
-    if (!e.ret && (g.cpsr & 0xFF) != (e.cpsr & 0xFF)) Diff(s, d, tag, "cpsr", 0, g.cpsr, e.cpsr);
+    if (!e.ret && (g.cpsr & 0xDF) != (e.cpsr & 0xDF)) Diff(s, d, tag, "cpsr", 0, g.cpsr, e.cpsr);
     MemDiff(nds, s, d, tag, x, e.r[13]);       // (the IRQ stack below the stop's sp: the guest's callees' dead frames)
     IoDiff(nds, s, d, tag, x, g_P.ie, g_P.ifl);
     if (g_Nd)
@@ -1802,9 +1856,10 @@ void Irq(melonDS::ARM* cpu)
         if (s.tsBlock && cpu->NDS.IsJITEnabled() && Host(cpu->NDS, s.tsHook, reg)) Inval(cpu->NDS, s.tsHook, reg);
     }
 #ifdef LITEV_HLE_DIAG
-    // LITEV_A7N_MEMDUMP=<prefix>: main RAM + the ARM7's shared / own WRAM at the 2000th IRQ as <prefix>.mem (the A7PROF
+    // LITEV_A7N_MEMDUMP=<prefix>: main RAM + the ARM7's shared / own WRAM at the 2000th IRQ (LITEV_A7N_MEMDUMP_AT) as <prefix>.mem (the A7PROF
     // layout: tools/hle/a7sig.py finds a new SDK build's functions in it)
-    if (s.irqs == 2000)
+    static const u64 dumpAt = getenv("LITEV_A7N_MEMDUMP_AT") ? strtoull(getenv("LITEV_A7N_MEMDUMP_AT"), nullptr, 0) : 2000;
+    if (s.irqs == dumpAt)
         if (const char* d = getenv("LITEV_A7N_MEMDUMP"))
             if (FILE* f = fopen((std::string(d) + ".mem").c_str(), "wb"))
             {
@@ -1973,7 +2028,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         const bool irq = (cpu->CPSR & 0x1F) == 0x12;
         // (a return to the interrupted code is compared at the BIOS's subs pc, lr, #4: right after it, another pending IRQ
         // may enter the handler again before the interrupted code runs an instruction)
-        if (irq && cpu->R[13] == e.r[13] && (e.ret ? pc == g_P.s->biosRet + 4 : pc == e.r[15])) FinishChain(cpu);
+        if (irq && cpu->R[13] == e.r[13] && (e.ret ? pc == g_P.s->biosRet + 4 : pc == (e.r[15] & ~1u))) FinishChain(cpu);   // (a Thumb stop: bit 0)
         else if (++g_P.n > 50000) { CheckPending = false; g_P.s->chainLost++; }
         return;
     }

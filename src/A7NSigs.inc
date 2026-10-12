@@ -2,7 +2,7 @@
 // kinds: 0 DisInt 1 ResInt 2 TwlIsTwl 3 TwlXIF 4 GetTick 5 DisIME 6 EnIrqMask 7 DisIrqMask 8 TimerCb 9 Udiv32 10 Udiv64 11 SetTimer 12 InsertAlarm 13 ThreadSwitch 14 IrqHandler 15 IrqCallback 16 ArrangeTimer 17 AlarmWrap 18 PadRcnt 19 PadSel 20 PadAlarm 21 SDiv32 22 ProcMode 23 RemoveLink 24 Resched 25 Wakeup 26 SendMsg 27 SndAlarm
 enum A7NKind : u8 { kDisInt, kResInt, kTwlIsTwl, kTwlXIF, kGetTick, kDisIME, kEnIrqMask, kDisIrqMask, kTimerCb, kUdiv32, kUdiv64, kSetTimer, kInsertAlarm, kThreadSwitch, kIrqHandler, kIrqCallback, kArrangeTimer, kAlarmWrap, kPadRcnt, kPadSel, kPadAlarm, kSDiv32, kProcMode, kRemoveLink, kResched, kWakeup, kSendMsg, kSndAlarm, kKinds };
 enum A7NField : u8 { f_flags, f_handler, f_soft, f_tc, f_cbf, f_cbe, f_cba, f_ah, f_q, f_irqq, f_tinfo, f_table, f_table2, f_save, f_ts, f_icbf, f_ibits, f_icba, f_icbe, f_rcntf, f_pad, f_rsc, f_rsc2, f_rsc3, f_sndq, f_sendf, f_sndfail, f_sndfa, kFields };
-enum A7NFam : u8 { famTWL, famNTR, famV4, famNTR05 };
+enum A7NFam : u8 { famTWL, famNTR, famV4, famNTR05, famT5, famS2 };
 constexpr u8 kPtrKind[kFields] = {kKinds, kKinds, kKinds, kKinds, kKinds, kKinds, kKinds, kAlarmWrap, kKinds, kKinds, kKinds, kKinds, kKinds, kKinds, kThreadSwitch, kKinds, kKinds, kKinds, kKinds, kPadRcnt, kKinds, kKinds, kKinds, kKinds, kKinds, kSendMsg, kKinds, kKinds};   // code-pointer fields: their function kind
 constexpr s16 kR0[][2] = {{0, 5}};
 constexpr A7NMask kM0[] = {{0, 2, 0}};
@@ -121,7 +121,17 @@ constexpr A7NMask kM56[] = {{5, 3, 25}, {6, 1, 24}};
 constexpr s16 kR57[][2] = {{0, 4}};
 constexpr A7NMask kM57[] = {{1, 0, 16}};
 constexpr s16 kR58[][2] = {{0, 19}};
-constexpr A7NMask kM58[] = {{5, 0, 26}, {16, 1, 24}, {17, 1, 26}, {18, 1, 27}};
+constexpr A7NMask kM58[] = {{5, 0, 26}, {16, 1, 24}, {17, 1, 27}, {18, 1, 26}};
+constexpr s16 kR59[][2] = {{0, 74}};
+constexpr A7NMask kM59[] = {{72, 1, 9}, {73, 1, 10}};
+constexpr s16 kR60[][2] = {{0, 71}};
+constexpr A7NMask kM60[] = {{69, 1, 9}, {70, 1, 10}};
+constexpr s16 kR61[][2] = {{0, 53}};
+constexpr A7NMask kM61[] = {{9, 0, 22}, {18, 2, 0}, {25, 2, 0}, {46, 2, 0}, {49, 1, 10}, {50, 1, 21}, {51, 1, 22}, {52, 1, 23}};
+constexpr s16 kR62[][2] = {{0, 28}};
+constexpr A7NMask kM62[] = {{3, 0, 0}, {21, 0, 24}, {23, 0, 1}, {27, 1, 10}};
+constexpr s16 kR63[][2] = {{0, 37}};
+constexpr A7NMask kM63[] = {{5, 0, 0}, {12, 0, 1}, {16, 2, 0}, {23, 0, 21}, {30, 0, 25}, {32, 0, 1}};
 constexpr A7NSig kSigs[] = {
     {"TWL DisInt", kDisInt, famTWL, 0xE10F0000, 0x08bf6b6fa8b89a42ull, 1, kR0, 0, kM0, 0, 0x00000000},   // ref 037fef5c, 5 words
     {"TWL ResInt", kResInt, famTWL, 0xE10F1000, 0xfd3c9de99740f980ull, 1, kR1, 0, kM1, 0, 0x00000000},   // ref 037fef70, 6 words
@@ -182,4 +192,9 @@ constexpr A7NSig kSigs[] = {
     {"V4 SndAlarm", kSndAlarm, famV4, 0xE59FC00C, 0xe7ccd988c2de170dull, 1, kR56, 2, kM56, 0, 0x00000000},   // ref 037fefec, 7 words
     {"NTR05 AlarmWrap", kAlarmWrap, famNTR05, 0xE92D4000, 0x1c0dd7852bd04984ull, 1, kR57, 1, kM57, 8, 0xE8BD4000},   // ref 037fa454, 4 words
     {"NTR05 SndAlarm", kSndAlarm, famNTR05, 0xE92D4000, 0xd8ea788aa9113c28ull, 1, kR58, 4, kM58, 52, 0xE28DD004},   // ref 037fc248, 19 words
+    {"T5 ThreadSwitch", kThreadSwitch, famT5, 0xE59FC118, 0xe5bec6e999b591f2ull, 1, kR59, 2, kM59, 196, 0xE8BD1003},   // ref 037fb9f8, 74 words
+    {"S2 ThreadSwitch", kThreadSwitch, famS2, 0xE59FC10C, 0x23ed7d612f7d6395ull, 1, kR60, 2, kM60, 188, 0xE8BD1003},   // ref 037fb4ac, 71 words
+    {"S2 Resched", kResched, famS2, 0xE92D4070, 0xad98b5532fc78c72ull, 1, kR61, 8, kM61, 144, 0xE5942010},   // ref 037fbe20, 53 words
+    {"S2 Wakeup", kWakeup, famS2, 0xE92D4030, 0x1075ae79c20d94a1ull, 1, kR62, 4, kM62, 0, 0x00000000},   // ref 037fbf54, 28 words
+    {"S2 SendMsg", kSendMsg, famS2, 0xE92D40F0, 0x776382cf3f8ff147ull, 1, kR63, 6, kM63, 0, 0x00000000},   // ref 037fc574, 37 words
 };
