@@ -20,6 +20,7 @@
 #define ARM_H
 
 #include <algorithm>
+#include <memory>
 #include <optional>
 #include <vector>
 #ifdef LITEV_JIT_IDLE2
@@ -538,6 +539,10 @@ class ARMv4 : public ARM
 {
 public:
     ARMv4(melonDS::NDS& nds, std::optional<GDBArgs> gdb, bool jit);
+#ifdef LITEV_A7HLE
+    // A7Native's per-console state (owned here, defined in ARM7Native.cpp)
+    std::unique_ptr<void, void (*)(void*)> A7NState{nullptr, nullptr};
+#endif
 
     void FillPipeline() override;
 

@@ -11,7 +11,8 @@
 // Category B: guest memory and the hardware register writes are the guest's; the call takes a fitted cycle estimate,
 // the IO accesses happen at the call (JIT) or at fitted offsets from it (interpreter), scratch registers r2, r3, r12 and
 // the flags are not written (dead after a call), the stack bytes below sp are not written.
-// Runtime: debug.litev.a7hle bit 32 (on by default: unset or 1 = all).
+// Runtime: debug.litev.a7hle bit 32 (on by default: unset or 1), bit 64 the IRQ path (Irq / IsHook / Hook; default off: slower on
+// the RG DS for 2 of 3 games, see Mask()).
 // Diagnostics (LITEV_HLE_DIAG): LITEV_A7N_CHECK=1 in --mode interp: native result computed, the guest runs, compared at its
 // return (memory, return registers, timer / IE state); LITEV_A7N_FIT=1 prints the guest cycles per call (cycle fits).
 // LITEV_A7HLE_STATS=1: per-kind call counts.
