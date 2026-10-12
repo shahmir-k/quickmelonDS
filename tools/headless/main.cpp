@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <chrono>
+#include <time.h>
 #include <algorithm>
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -54,7 +55,7 @@ static uint64_t EmuThreadInstr = 0, EmuThreadCycles = 0;
 #include "VerifyTrace.h"
 #include "ARM9HLE.h"
 #include "InputScript.h"
-namespace melonDS { extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults, JitStoreRepromotions; }
+namespace melonDS { extern u64 JitReviveCount; extern u64 JitRestoreCount, JitRecompileSame[8]; extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults, JitStoreRepromotions; }
 #ifdef LITEV_JIT_COMPILE_STATS
 #include "ARMJIT_Internal.h"
 #endif
@@ -609,6 +610,8 @@ int main(int argc, char** argv)
     if (wav) fseek(wav, 44, SEEK_SET);
 
     auto wallStart = std::chrono::steady_clock::now();
+    timespec emuCpu0{};   // emu (this) thread CPU time: the device A/B metric (blocked time excluded)
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &emuCpu0);
 #ifdef __APPLE__
     // emu-thread instructions/cycles (this thread only; render workers excluded): deterministic
     // A/B metric on a loaded Mac, where wall time is noise.
@@ -1069,6 +1072,11 @@ int main(int argc, char** argv)
     printf("mode:        %s\n", opt.jit ? "jit" : "interp");
     printf("frames:      %d\n", opt.frames);
     printf("wall_time_s: %.4f\n", wallSec);
+    {
+        timespec t1{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t1);
+        printf("emu_thread_cpu_s: %.4f\n", (t1.tv_sec - emuCpu0.tv_sec) + (t1.tv_nsec - emuCpu0.tv_nsec) * 1e-9);
+    }
 #ifdef __APPLE__
     {
         uint64_t thsc1[2] = {0, 0};
@@ -1092,6 +1100,15 @@ int main(int argc, char** argv)
     printf("audio_samples: %llu\n", (unsigned long long)audioSampleCount);
 #ifdef __APPLE__
     // emulation thread only (RunFrame), so render/worker threads don't dilute A/B deltas
+    printf("jit_compiles: %llu restored: %llu same-bytes recompiles: restored %llu not %llu (nocand %llu addr %llu lit %llu ranges %llu) resets %llu revert-locks %llu\n", (unsigned long long)melonDS::JitCompileCount, (unsigned long long)melonDS::JitRestoreCount, (unsigned long long)melonDS::JitRecompileSame[0], (unsigned long long)melonDS::JitRecompileSame[1], (unsigned long long)melonDS::JitRecompileSame[2], (unsigned long long)melonDS::JitRecompileSame[3], (unsigned long long)melonDS::JitRecompileSame[4], (unsigned long long)melonDS::JitRecompileSame[5], (unsigned long long)melonDS::JitRecompileSame[6], (unsigned long long)melonDS::JitRecompileSame[7]);
+#ifdef LITEV_JIT_REVIVE
+    printf("jit_revived: %llu\n", (unsigned long long)melonDS::JitReviveCount);
+#endif
+#ifdef LITEV_JIT_COMPILE_STATS
+    printf("jit_phase_us_total:");   // Lookup Decode Hash Alloc Emit Protect Insert Link Flush
+    for (int p = 0; p < melonDS::JitPhase_Count; p++) printf(" %.0f", melonDS::JitCompileTicks[p] * 1e6 / melonDS::JitTicksPerSec());
+    printf("\n");
+#endif
     printf("emu_thread_instructions: %llu\nemu_thread_cycles: %llu\n",
            (unsigned long long)EmuThreadInstr, (unsigned long long)EmuThreadCycles);
 #endif

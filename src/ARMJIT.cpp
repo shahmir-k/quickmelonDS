@@ -1075,6 +1075,9 @@ void ARMJIT::RetireJitBlock(JitBlock* block) noexcept
     auto it = RestoreCandidates.find(block->InstrHash);
     if (it != RestoreCandidates.end())
     {
+#ifdef LITEV_JIT_REVIVE
+        ForgetParked(it->second);
+#endif
         delete it->second;
         it->second = block;
     }
@@ -1082,6 +1085,9 @@ void ARMJIT::RetireJitBlock(JitBlock* block) noexcept
     {
         RestoreCandidates[block->InstrHash] = block;
     }
+#ifdef LITEV_JIT_REVIVE
+    ParkedByAddr[((u64)block->Num << 32) | block->StartAddr] = block;
+#endif
 }
 
 #ifdef LITEV_JIT_LINK
@@ -1377,6 +1383,8 @@ void ARMJIT::SetFastMemory(bool enabled) noexcept
 }
 
 u64 JitCompileCount = 0;   // blocks compiled so far (headless LITEV_FRAME_MS)
+u64 JitRestoreCount = 0;   // of those, restored from RestoreCandidates (no emission)
+u64 JitRecompileSame[8] = {};   // LITEV_JIT_COMPILE_STATS: same (cpu, address, bytes) compiled before: restored / not
 #ifdef LITEV_JIT_COMPILE_STATS
 // time per compile phase in timer ticks (JitTicks(); JitTicksPerSec), see JitPhase
 u64 JitCompileTicks[JitPhase_Count] = {};
@@ -1384,6 +1392,108 @@ std::atomic<u64> JitWorkerTicks{0}, JitStealTicks{0};   // LITEV_JIT_BGEMIT emis
 #define JIT_PHASE(p) do { u64 t_ = JitTicks(); JitCompileTicks[p] += t_ - jitT; jitT = t_; } while (0)
 #else
 #define JIT_PHASE(p) do {} while (0)
+#endif
+
+u64 JitReviveCount = 0;   // LITEV_JIT_REVIVE: blocks revived at dispatch
+#ifdef LITEV_JIT_REVIVE
+static const bool JitReviveOn = [] {   // runtime off (A/B): debug.litev.jitrevive=0
+#if defined(__ANDROID__)
+    char b[8] = {0};
+    return __system_property_get("debug.litev.jitrevive", b) > 0 ? atoi(b) != 0 : true;
+#else
+    const char* e = getenv("debug.litev.jitrevive");
+    return e ? atoi(e) != 0 : true;
+#endif
+}();
+
+// host memory of a localised code address (the regions guest code runs from), null elsewhere
+const u8* ARMJIT::HostCodePtr(u32 localAddr) const noexcept
+{
+    const u32 off = localAddr & 0x7FFFFFF;
+    switch (localAddr >> 27)
+    {
+    case ARMJIT_Memory::memregion_MainRAM: return NDS.MainRAM + off;
+    case ARMJIT_Memory::memregion_ITCM: return NDS.ARM9.ITCM + off;
+    case ARMJIT_Memory::memregion_SharedWRAM: return Memory.GetSharedWRAM() + off;
+    case ARMJIT_Memory::memregion_WRAM7: return NDS.ARM7WRAM + off;
+    default: return nullptr;
+    }
+}
+
+// Park-and-revive (DSperate runtime.cpp:323-360): a killed block whose guest bytes (every
+// instruction it compiled, its literal values) match again is put back as it is, at dispatch,
+// without CompileBlock's fetch / decode / first-run interpretation / hash. Category B: the
+// revived block's first run is its code (the cycle counts of its compile-time profile, IRQs at
+// the block end) where the restore path interprets it once. Blocks with HLE hooks or a native
+// call are never revived (their hook decisions are re-verified by a compile).
+JitBlock* ARMJIT::ReviveParked(ARM* cpu, u32 blockAddr, u32 localAddr, bool thumb) noexcept
+{
+    if (!JitReviveOn) return nullptr;
+    auto pit = ParkedByAddr.find(((u64)cpu->Num << 32) | blockAddr);
+    if (pit == ParkedByAddr.end()) return nullptr;
+    JitBlock* b = pit->second;
+    if (b->StartAddrLocal != localAddr || b->Thumb != (u8)thumb || !b->EntryPoint || b->Profile.empty()
+#ifdef LITEV_A9HLE
+        || b->A9HookAt
+#endif
+        )
+        return nullptr;
+    for (const JitProfileInstr& p : b->Profile)
+    {
+        if (p.Kind == (thumb ? ARMInstrInfo::tk_UNK : ARMInstrInfo::ak_UNK)
+#if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
+            || p.Kind == (thumb ? ARMInstrInfo::tk_HLECALL : ARMInstrInfo::ak_HLECALL)
+#endif
+            )
+            return nullptr;   // hook placeholder (A7HLE / A7Native / GXSend / HLELeaf)
+        const u8* h = HostCodePtr(LocaliseCodeAddress(cpu->Num, p.Addr));
+        if (!h) return nullptr;
+        if (thumb) { u16 w; memcpy(&w, h, 2); if (w != (u16)p.Instr) return nullptr; }
+        else { u32 w; memcpy(&w, h, 4); if (w != p.Instr) return nullptr; }
+    }
+    if (b->NumLiterals)
+    {
+        u32 vals[MaxBlockSize];
+        for (int j = 0; j < b->NumLiterals; j++)
+        {
+            const u32 la = b->Literals()[j];
+            const u8* h = HostCodePtr(la);
+            if (!h || InvalidLiterals.Find(la) != -1) return nullptr;
+            memcpy(&vals[j], h, 4);
+        }
+        if ((u32)XXH3_64bits(vals, b->NumLiterals * 4) != b->LiteralHash) return nullptr;
+    }
+
+    // unpark (the same block may sit in RestoreCandidates under its hash)
+    ParkedByAddr.erase(pit);
+    auto rc = RestoreCandidates.find(b->InstrHash);
+    if (rc != RestoreCandidates.end() && rc->second == b) RestoreCandidates.erase(rc);
+    JitReviveCount++;
+
+    // register it as CompileBlock's tail does for a restored block
+    for (u32 j = 0; j < b->NumAddresses; j++)
+    {
+        const u32 ar = b->AddressRanges()[j];
+        AddressRange* region = CodeMemRegions[ar >> 27];
+        if (!PageContainsCode(&region[(ar & 0x7FFF000 & ~(Memory.PageSize - 1)) / 512], Memory.PageSize))
+            Memory.SetCodeProtection(ar >> 27, ar & 0x7FFFFFF, true);
+        AddressRange* range = &region[(ar & 0x7FFFFFF) / 512];
+        range->Code |= b->AddressMasks()[j];
+        range->Blocks.Add(b);
+    }
+    if (cpu->Num == 0) JitBlocks9[blockAddr] = b; else JitBlocks7[blockAddr] = b;
+    u64* entry = &FastBlockLookupRegions[(localAddr >> 27)][(localAddr & 0x7FFFFFF) / 2];
+    *entry = ((u64)blockAddr | cpu->Num) << 32;
+#ifdef LITEV_JIT_BGEMIT
+    *entry |= EntryOff(b);
+#else
+    *entry |= JITCompiler.SubEntryOffset(b->EntryPoint);
+#endif
+#ifdef LITEV_JIT_LINK
+    LinkBlock(b);
+#endif
+    return b;
+}
 #endif
 
 JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
@@ -1459,6 +1569,11 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
         map.erase(existingBlockIt);
     }
 
+#ifdef LITEV_JIT_REVIVE
+    if (!ParkedByAddr.empty())
+        if (JitBlock* rb = ReviveParked(cpu, blockAddr, localAddr, thumb))
+            return rb->EntryPoint;
+#endif
     FetchedInstr instrs[MaxBlockSize];
     int i = 0;
     u32 r15 = cpu->R[15];
@@ -1950,6 +2065,9 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
     {
         prevBlock = prevBlockIt->second;
         RestoreCandidates.erase(prevBlockIt);
+#ifdef LITEV_JIT_REVIVE
+        ForgetParked(prevBlock);
+#endif
 
         mayRestore = prevBlock->StartAddr == blockAddr && prevBlock->LiteralHash == literalHash;
 
@@ -1974,6 +2092,17 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
     }
 
     JIT_PHASE(JitPhase_Hash);
+#ifdef LITEV_JIT_COMPILE_STATS
+    {   // revive potential: a block compiled again with the same bytes (address, instruction hash)
+        static std::unordered_set<u64> seen;
+        if (!seen.insert(((u64)cpu->Num << 63) | ((u64)blockAddr << 32) | instrHash).second)
+        {
+            (mayRestore ? JitRecompileSame[0] : JitRecompileSame[1])++;
+            if (!mayRestore)   // why not: 2 no candidate, 3 other address, 4 literals, 5 ranges
+                JitRecompileSame[!prevBlock ? 2 : prevBlock->StartAddr != blockAddr ? 3 : prevBlock->LiteralHash != literalHash ? 4 : 5]++;
+        }
+    }
+#endif
     JitBlock* block;
     if (!mayRestore)
     {
@@ -2118,6 +2247,7 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
     else
     {
         JIT_DEBUGPRINT("restored! %p\n", prevBlock);
+        JitRestoreCount++;
         block = prevBlock;
         if (!block->EntryPoint)
             CompileFromProfile(block);
@@ -2190,6 +2320,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
     range->Code = 0;
 #ifdef LITEV_JIT_DIRECTPATCH
     bool dpAnyInval = false;
+#ifdef LITEV_JIT_DP_TARGETED
+    u32 dpDead[2][32]; int dpN[2] = {0, 0};   // dead blocks' start addresses per CPU (overflow: revert all)
+#endif
 #endif
     for (int i = 0; i < range->Blocks.Length;)
     {
@@ -2280,6 +2413,10 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
         // but any promoted direct edge into it (or out of a co-invalidated source) must
         // be neutralised BEFORE it can execute. Revert-all once after the loop.
         dpAnyInval = true;
+#ifdef LITEV_JIT_DP_TARGETED
+        if (dpN[block->Num] < 32) dpDead[block->Num][dpN[block->Num]] = block->StartAddr;
+        dpN[block->Num]++;
+#endif
 #endif
         if (block->Num == 0)
             JitBlocks9.erase(block->StartAddr);
@@ -2304,8 +2441,25 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
 
 #ifdef LITEV_JIT_DIRECTPATCH
     // Neutralise every live promotion once, after all block removals for this address.
+#ifdef LITEV_JIT_DP_TARGETED
+    static const bool dpTargeted = [] {   // runtime off (A/B): debug.litev.dptargeted=0
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return __system_property_get("debug.litev.dptargeted", b) > 0 ? atoi(b) != 0 : true;
+#else
+        const char* e = getenv("debug.litev.dptargeted");
+        return e ? atoi(e) != 0 : true;
+#endif
+    }();
+    if (dpAnyInval && (!dpTargeted || dpN[0] > 32 || dpN[1] > 32))
+        JITCompiler.DirectPatchRevertAll();
+    else if (dpAnyInval)
+        for (u32 num = 0; num < 2; num++)
+            if (dpN[num]) JITCompiler.DirectPatchRevertTargets(num, dpDead[num], dpN[num]);
+#else
     if (dpAnyInval)
         JITCompiler.DirectPatchRevertAll();
+#endif
 #endif
 
 #if defined(LITEV_JIT_LINK) && defined(LITEV_SHADOW_ASSERT)
@@ -2430,6 +2584,10 @@ template void ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWR
 
 void ARMJIT::ResetBlockCache() noexcept
 {
+    JitRecompileSame[6]++;
+#ifdef LITEV_JIT_COMPILE_STATS
+    if (getenv("LITEV_JIT_RESETLOG")) fprintf(stderr, "JIT reset at frame %u (compiles so far %llu)\n", NDS.NumFrames, (unsigned long long)JitCompileCount);
+#endif
     Log(LogLevel::Debug, "Resetting JIT block cache...\n");
 #ifdef __aarch64__
     static const bool resetLog = getenv("LITEV_JITRESET_LOG") != nullptr;   // when / how full (diagnosis)
@@ -2470,6 +2628,9 @@ void ARMJIT::ResetBlockCache() noexcept
     for (auto it = RestoreCandidates.begin(); it != RestoreCandidates.end(); it++)
         delete it->second;
     RestoreCandidates.clear();
+#ifdef LITEV_JIT_REVIVE
+    ParkedByAddr.clear();
+#endif
     for (auto it : JitBlocks9)
     {
         JitBlock* block = it.second;

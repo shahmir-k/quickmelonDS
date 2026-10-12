@@ -51,6 +51,9 @@
 
 namespace melonDS
 {
+#ifdef LITEV_IDLE_CENSUS
+void IdleCensus(int kind, u32 pc, u32 frame);
+#endif
 struct NDSArgs;
 class Firmware;
 enum

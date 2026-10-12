@@ -170,6 +170,19 @@ public:
 
     BlockMap<u32, JitBlock*> RestoreCandidates {};
 #endif
+#ifdef LITEV_JIT_REVIVE
+    // LITEV_JIT_REVIVE (park-and-revive at dispatch; DSperate https://github.com/beebono/DSperate,
+    // GPL-3.0-or-later, commit f5fa35e, src/core/cpu/jit/runtime.cpp:323-360): the RestoreCandidates
+    // (parked: killed blocks that keep their code) by (CPU << 32 | start address)
+    std::unordered_map<u64, JitBlock*> ParkedByAddr;
+    void ForgetParked(JitBlock* b) noexcept
+    {
+        auto it = ParkedByAddr.find(((u64)b->Num << 32) | b->StartAddr);
+        if (it != ParkedByAddr.end() && it->second == b) ParkedByAddr.erase(it);
+    }
+    JitBlock* ReviveParked(ARM* cpu, u32 blockAddr, u32 localAddr, bool thumb) noexcept;
+    const u8* HostCodePtr(u32 localAddr) const noexcept;
+#endif
 
 #ifdef LITEV_JIT_LINK
     // liteDS-v2 Unit 4 (direct block linking). Per-CPU pending links keyed by the

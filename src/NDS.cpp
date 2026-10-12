@@ -48,6 +48,9 @@
 #include "ARMJIT.h"
 #include "ARMJIT_Memory.h"
 #include "LiteProfile.h"
+#include <map>
+#include <algorithm>
+#include <vector>
 
 // LITEV_MEM_SPLIT: keep the IO register handlers out of line, so ARM9Read32/ARM9Write32 (every
 // slow-path access: VRAM, palette, OAM, rewritten main RAM stores) stay a small switch instead of
@@ -60,6 +63,30 @@
 
 namespace melonDS
 {
+#ifdef LITEV_IDLE_CENSUS
+// Diagnosis (idle-loop shapes, DSperate cpu/idle_loop.cpp): reads of ARM7 SPICNT (kind 0) and ARM9 GXSTAT
+// (kind 1) per guest PC; the top PCs per kind are printed at exit (reads per frame).
+void IdleCensus(int kind, u32 pc, u32 frame)
+{
+    static std::map<u64, u64> counts[4];   // SPICNT reads, GXSTAT reads, ARM9 / ARM7 idle-loop skips
+    static u32 frames = 0;
+    static bool reg = (atexit([] {
+        static const char* kn[4] = {"SPICNT", "GXSTAT", "IDLE9", "IDLE7"};
+        for (int k = 0; k < 4; k++)
+        {
+            std::vector<std::pair<u64, u64>> v(counts[k].begin(), counts[k].end());
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+            u64 tot = 0; for (auto& e : v) tot += e.second;
+            fprintf(stderr, "IDLECENSUS %s total %.1f/frame (%u frames)\n", kn[k], frames ? (double)tot / frames : 0.0, frames);
+            for (size_t i = 0; i < v.size() && i < 6; i++)
+                fprintf(stderr, "IDLECENSUS   %s pc %08x %.1f/frame\n", kn[k], (u32)v[i].first, frames ? (double)v[i].second / frames : 0.0);
+        }
+    }), true);
+    (void)reg;
+    frames = std::max(frames, frame);
+    counts[kind][pc]++;
+}
+#endif
 #ifdef LITEV_ACCESS_STATS
 // diagnosis: slow-path ARM9 accesses by kind and address (headless LITEV_ACCESS_STATS dump)
 u64 LitevAccess[6][0x10000];
@@ -4698,7 +4725,11 @@ u16 NDS::ARM7IORead16(u32 addr)
     case 0x040001A4: return NDSCartSlots[0]->ReadROMCnt(1) & 0xFFFF;
     case 0x040001A6: return NDSCartSlots[0]->ReadROMCnt(1) >> 16;
 
-    case 0x040001C0: return SPI.ReadCnt();
+    case 0x040001C0:
+#ifdef LITEV_IDLE_CENSUS
+        IdleCensus(0, ARM7.R[15], NumFrames);
+#endif
+        return SPI.ReadCnt();
     case 0x040001C2: return SPI.ReadData();
 
     case 0x04000204: return ExMemCnt[1];
@@ -4763,6 +4794,9 @@ u32 NDS::ARM7IORead32(u32 addr)
     case 0x040001A4: return NDSCartSlots[0]->ReadROMCnt(1);
 
     case 0x040001C0:
+#ifdef LITEV_IDLE_CENSUS
+        IdleCensus(0, ARM7.R[15], NumFrames);
+#endif
         return SPI.ReadCnt() | (SPI.ReadData() << 16);
 
     case 0x04000208: return IME[1];
