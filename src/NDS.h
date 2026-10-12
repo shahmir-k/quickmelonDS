@@ -372,6 +372,11 @@ public: // TODO: Encapsulate the rest of these members
     }
     u32 A9HLEDmaCnt(u32 n) const noexcept { return DMAs[n].Cnt; }   // ARM9 DMA n control
 #endif
+#if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
+    // per-console A9HLE (0) / A7HLE (1) state, created and typed by ARM9HLE.cpp / ARM7HLE.cpp (never shared between
+    // consoles: headless --mp-test / 8-player Netplay run a console per thread)
+    std::shared_ptr<void> HLEState[2];
+#endif
     void SetARM9BIOS(const std::array<u8, ARM9BIOSSize>& bios) noexcept;
 
     [[nodiscard]] const std::array<u8, ARM7BIOSSize>& GetARM7BIOS() const noexcept { return ARM7BIOS; }

@@ -12,7 +12,6 @@
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
-#include <unordered_map>
 #include <algorithm>
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
@@ -91,11 +90,13 @@ struct State
     int hw = 0;                     // SND hardware commit: 0 unprobed, 1 on, -1 off
     std::vector<u8> hwCode;
     std::vector<Range3> hwRanges;   // the code the commit replaces (static or relocated)
-    s32 hwRel = -1;                 // relocated: index of the reference HwVar (hv then points into g_HwRel)
+    s32 hwRel = -1;                 // relocated: index of the reference HwVar (hv then points to Console::hwRel)
     const HwVar* hv = nullptr;      // the matching build
     u64 hwN[6] = {};                // calls, native, fallback, checks, check diffs, charged cycles (diag)
 };
-std::unordered_map<const melonDS::NDS*, State> g_State;
+// All of a console's A7HLE state lives in a Console (below) owned by its NDS (NDS::HLEState[1]): headless --mp-test /
+// 8-player Netplay run a console per thread, nothing here is shared between them
+State& Get(melonDS::NDS& nds);
 #ifdef LITEV_HLE_DIAG
 bool g_Check = getenv("LITEV_A7HLE_CHECK") && atoi(getenv("LITEV_A7HLE_CHECK"));
 bool g_CommitCheck = getenv("LITEV_A7HLE_COMMITCHECK") && atoi(getenv("LITEV_A7HLE_COMMITCHECK"));
@@ -243,15 +244,6 @@ void Probe(melonDS::NDS& nds, State& s, u32 addr, u32 instr)
     s.status = 1;
 }
 
-State& Get(melonDS::NDS& nds)
-{
-    static const melonDS::NDS* last = nullptr;     // per-call map lookup avoided (one console)
-    static State* lastS = nullptr;
-    if (&nds == last) return *lastS;
-    State& s = g_State[&nds];                      // map nodes are stable
-    last = &nds; lastS = &s;
-    return s;
-}
 
 // ---- native SND_ExChannelMain -----------------------------------------------------------
 // Offsets in SNDExChannel (0x54 bytes), from the PW ARM7 code:
@@ -534,15 +526,7 @@ struct SeqState
     std::vector<u8> code;
     u64 calls = 0, native = 0, fallbacks = 0, checks = 0, checkDiffs = 0, cyc = 0;
 };
-std::unordered_map<const melonDS::NDS*, SeqState> g_Seq;
-
-SeqState& GetSeq(melonDS::NDS& nds)
-{
-    static const melonDS::NDS* last = nullptr;
-    static SeqState* lastS = nullptr;
-    if (&nds != last) { last = &nds; lastS = &g_Seq[&nds]; }
-    return *lastS;
-}
+SeqState& GetSeq(melonDS::NDS& nds);
 // SeqMain at addr (instruction instr): a static variant there with its exact bytes, or one relocated there (status 1);
 // status -1 if off
 void SeqProbe(melonDS::NDS& nds, SeqState& s, u32 addr, u32 instr)
@@ -1168,28 +1152,17 @@ void ArmCheck(melonDS::ARM* cpu, const char* name, u64* diffs)
     CheckPending = true;
 }
 #endif
+#ifdef LITEV_HLE_DIAG
 struct StatsDump
 {
     ~StatsDump()
     {
         if (!g_Stats) return;
-        for (auto& [k, s] : g_State)
-            fprintf(stderr, "A7HLE: status=%d copies=%llu calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu\n",
-                    s.status, (unsigned long long)s.copies, (unsigned long long)s.calls, (unsigned long long)s.native,
-                    (unsigned long long)s.fallbacks, (unsigned long long)s.checks, (unsigned long long)s.checkDiffs);
-        for (auto& [k, s] : g_Seq)
-            fprintf(stderr, "A7HLE seq: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu cyc=%llu\n",
-                    s.status, (unsigned long long)s.calls, (unsigned long long)s.native,
-                    (unsigned long long)s.fallbacks, (unsigned long long)s.checks, (unsigned long long)s.checkDiffs, (unsigned long long)s.cyc);
-        for (auto& [k, s] : g_State)
-            fprintf(stderr, "A7HLE hwcommit: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu cyc=%llu\n", s.hw,
-                    (unsigned long long)s.hwN[0], (unsigned long long)s.hwN[1], (unsigned long long)s.hwN[2], (unsigned long long)s.hwN[3], (unsigned long long)s.hwN[4], (unsigned long long)s.hwN[5]);
-#ifdef LITEV_HLE_DIAG
         if (g_BusyDiffs) fprintf(stderr, "A7HLE check: %llu exchannel differences with a channel stopping inside the guest call (counted in check_diffs)\n", (unsigned long long)g_BusyDiffs);
         if (g_IrqDiffs) fprintf(stderr, "A7HLE check: %llu differences with an IRQ inside the guest call (not counted above)\n", (unsigned long long)g_IrqDiffs);
-#endif
     }
 } g_StatsDump;
+#endif
 }
 
 
@@ -1248,7 +1221,7 @@ void Copy32(melonDS::ARM* cpu)
 
 bool CopyOn(melonDS::NDS& nds)
 {
-    State& s = g_State[&nds];
+    State& s = Get(nds);
     if (s.copyOn < 0) s.copyOn = ReadOn(4);
     return s.copyOn != 0;
 }
@@ -1355,7 +1328,37 @@ constexpr HwVar kHwV[] = {
 };
 // (MKDS's commit relocates to the NTR 2006 build: Shrek, Castlevania PoR)
 constexpr const HLESig::Recipe* kHwRec[] = {&kRecHwPW, &kRecHwMK};
-std::unordered_map<const melonDS::NDS*, HwVar> g_HwRel;    // State::hv when relocated (State::hwRel >= 0)
+
+struct Console
+{
+    State s;
+    SeqState q;
+    HwVar hwRel = {};               // State::hv when relocated (State::hwRel >= 0)
+};
+void DumpStats(const Console& c);
+Console& Con(melonDS::NDS& nds)
+{
+    std::shared_ptr<void>& p = nds.HLEState[1];
+    if (__builtin_expect(!p, 0)) p = std::shared_ptr<Console>(new Console, [](Console* c) { DumpStats(*c); delete c; });
+    return *(Console*)p.get();
+}
+State& Get(melonDS::NDS& nds) { return Con(nds).s; }
+SeqState& GetSeq(melonDS::NDS& nds) { return Con(nds).q; }
+// LITEV_A7HLE_STATS: a console's counts when its NDS goes away
+void DumpStats(const Console& c)
+{
+    if (!g_Stats) return;
+    const State& s = c.s;
+    const SeqState& q = c.q;
+    fprintf(stderr, "A7HLE: status=%d copies=%llu calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu\n",
+            s.status, (unsigned long long)s.copies, (unsigned long long)s.calls, (unsigned long long)s.native,
+            (unsigned long long)s.fallbacks, (unsigned long long)s.checks, (unsigned long long)s.checkDiffs);
+    fprintf(stderr, "A7HLE seq: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu cyc=%llu\n",
+            q.status, (unsigned long long)q.calls, (unsigned long long)q.native,
+            (unsigned long long)q.fallbacks, (unsigned long long)q.checks, (unsigned long long)q.checkDiffs, (unsigned long long)q.cyc);
+    fprintf(stderr, "A7HLE hwcommit: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu cyc=%llu\n", s.hw,
+            (unsigned long long)s.hwN[0], (unsigned long long)s.hwN[1], (unsigned long long)s.hwN[2], (unsigned long long)s.hwN[3], (unsigned long long)s.hwN[4], (unsigned long long)s.hwN[5]);
+}
 }
 // the SND commit at addr (instruction instr): static variant with its exact bytes, or relocated (HLESig); s.hw 1 on a match
 void HwMatch(melonDS::NDS& nds, State& s, u32 addr, u32 instr)
@@ -1376,7 +1379,7 @@ void HwMatch(melonDS::NDS& nds, State& s, u32 addr, u32 instr)
     }
     if (!s.hv && std::find(s.tried.begin(), s.tried.end(), addr | 1) == s.tried.end())
     {
-        HwVar& rel = g_HwRel[&nds];
+        HwVar& rel = Con(nds).hwRel;
         int i = Relocated(nds, kHwV, kHwRec, addr, instr, rel, s.hwRanges, [](HwVar& v, const HLESig::Map& m)
             { v.entry = m(v.entry); v.chans = m(v.chans); v.fx = m(v.fx); v.vol = m(v.vol); v.pan = m(v.pan); v.panOvr = m(v.panOvr);
               v.retVol = m(v.retVol); v.retPan = m(v.retPan);
@@ -1600,8 +1603,9 @@ __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
 
 void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
 {
-    State& s = g_State[&nds];       // (nodes stay put: Get/GetSeq cache them)
-    SeqState& q = g_Seq[&nds];
+    Console& c = Con(nds);
+    State& s = c.s;
+    SeqState& q = c.q;
     if (!f->Saving)
     {
         s = State{};                // as a new console (stats start empty), then what the saving one had
@@ -1641,7 +1645,7 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
     }
     if (s.hwRel >= 0)
     {
-        HwVar& h = g_HwRel[&nds];
+        HwVar& h = c.hwRel;
         if (!f->Saving) { h = kHwV[s.hwRel]; s.hv = &h; }
         for (u32* p : {&h.entry, &h.chans, &h.fx, &h.vol, &h.pan, &h.panOvr, &h.retVol, &h.retPan}) f->Var32(p);
     }
@@ -1716,7 +1720,7 @@ bool Run(melonDS::ARM* cpu, bool jit)
     if (cpu->CurInstr == kCopy32[0])
     {
         if (!CopyOn(nds) || (!jit && !IsCopy32(nds, pc))) return false;
-        g_State[&nds].copies++;
+        Get(nds).copies++;
         Copy32(cpu);
         return true;
     }
