@@ -4701,7 +4701,7 @@ void GPU3D::VBlank() noexcept
             FFPeriod = (period >= 1 && period <= 4) ? period : 1;
             FFLastFlush = FFFrame;
             // a bank partly built unwatched lands on a frame that renders 3D: the guess was wrong
-            if (badBank && !GPU.SkipThisFrame) FFBackoff = 120;
+            if (badBank && (GPU.NextFrameDrawn() || GPU.CaptureDraw())) FFBackoff = 120;   // its 215 renders
         }
         if (FlushRequest) RenderStale = !RenderingEnabled || LITEV_HEADLESS(Headless) || badBank;
         if (RenderingEnabled && !LITEV_HEADLESS(Headless) && !badBank)

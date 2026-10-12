@@ -303,6 +303,11 @@ protected:
 #ifdef LITEV_SOFT2D_DEPTH2
     void P2RetireOld();                   // depth-2: retire passes kicked 2+ VBlanks ago
 #endif
+#if defined(LITEV_SKIP_REPEAT_FRAMES) && defined(LITEV_SOFT2D_DEPTH2)
+    // skip-repeat: the frame ending at this VBlank shows exactly what the last drawn frame showed
+    bool RepeatUnchanged() noexcept;
+    bool RepeatBaseOK = false;   // the last drawn frame had no mid-frame 2D writes (its state = its snapshot)
+#endif
 #endif
 
     void DrawScanlineA(u32 line, u32* dst, const u32* src2d, u32 dispcnt, u16 mbright);

@@ -1160,9 +1160,47 @@ void SoftRenderer::FlushAsyncRender()
 // Depth-1 async VBlank: barrier the previous frame, snapshot the emu-mutable render
 // inputs for THIS frame, then signal the render thread and return immediately so the
 // emu can start frame N+1. emu frame time -> max(emu, render) instead of emu+render.
+#if defined(LITEV_SKIP_REPEAT_FRAMES) && defined(LITEV_SOFT2D_DEPTH2)
+// Nothing visible changed since the last drawn (kicked) frame, whose snapshots are in slot
+// SnapParity: no 3D change (GPU::RepeatChanged3D), no mid-frame 2D write in either frame (journal
+// empty, every line snapshotted inside the window), the same per-line registers, palette, OAM and
+// BG/OBJ VRAM contents (GPU::RepeatFlat2DDiff, after this VBlank's VRAM sync), no capture and no
+// VRAM / main-memory display mode (read outside the flat VRAM). ~45 KB of compares on candidates.
+bool SoftRenderer::RepeatUnchanged() noexcept
+{
+    if (!RepeatBaseOK || GPU.RepeatChanged3D || !S2DJBegun || GPU.S2DJOverflow || GPU.S2DJN) return false;
+    const int s = SnapParity;
+    for (int y = 0; y < 192; y++)
+    {
+        const FrameLineSnap& a = FrameSnap[y];
+        const FrameLineSnap& b = FrameSnapR[s][y];   // (its Valid is cleared by the render)
+        if (a.JMarkLine == ~0u || a.JMarkSpr == ~0u || a.CaptureEnable || ((a.DispCntA >> 16) & 3) >= 2
+            || a.DispCntA != b.DispCntA || a.DispCntB != b.DispCntB || a.MasterBrightnessA != b.MasterBrightnessA
+            || a.MasterBrightnessB != b.MasterBrightnessB || a.ScreenSwap != b.ScreenSwap || a.ScreensEnabled != b.ScreensEnabled
+            || a.XPos3D != b.XPos3D || a.Abort3D != b.Abort3D)
+            return false;
+    }
+    auto* r2a = static_cast<SoftRenderer2D*>(Rend2D_A.get());
+    auto* r2b = static_cast<SoftRenderer2D*>(Rend2D_B.get());
+    if (!r2a->LineSnapsEqual(s) || !r2b->LineSnapsEqual(s)
+        || memcmp(GPU.Palette, PaletteSnap[s], sizeof(PaletteSnap[s])) || memcmp(GPU.OAM, OAMSnap[s], sizeof(OAMSnap[s])))
+        return false;
+    r2a->SyncVRAM_BG(); r2a->SyncVRAM_OBJ();
+    r2b->SyncVRAM_BG(); r2b->SyncVRAM_OBJ();
+    return !GPU.RepeatFlat2DDiff;
+}
+#endif
+
 void SoftRenderer::VBlank()
 {
     VBlankSeq++;
+#if defined(LITEV_SKIP_REPEAT_FRAMES) && defined(LITEV_SOFT2D_DEPTH2)
+    if (S2DDeferActive && GPU.SkipRepeatCand && RepeatUnchanged())
+    {
+        GPU.SkipRepeat = true;     // not drawn, not presented: the screen keeps the same picture
+        S2DDeferActive = false;
+    }
+#endif
     if (!S2DDeferActive)
     {
 #ifdef LITEV_SOFT2D_DEPTH2
@@ -1253,6 +1291,12 @@ void SoftRenderer::VBlank()
     // bank (same SnapParity as the 2D snapshots above). The async 2D render reads it via the
     // *Read pointers redirected on the async thread (SetBGOBJReadShadow, keyed on AsyncSnapSlot).
     GPU.SnapshotBGOBJShadow(SnapParity);
+#endif
+#if defined(LITEV_SKIP_REPEAT_FRAMES) && defined(LITEV_SOFT2D_DEPTH2)
+    // this frame is the skip-repeat comparison base from now on
+    RepeatBaseOK = S2DJFrameN[SnapParity] == 0;
+    GPU.RepeatChanged3D = false;
+    GPU.RepeatFlat2DDiff = false;
 #endif
 #ifdef LITEV_SOFT2D_HYB_BANDS
     for (int b = 0; b < S2DBandsN; b++)

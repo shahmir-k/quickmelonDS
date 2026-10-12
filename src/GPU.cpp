@@ -98,6 +98,9 @@ GPU::~GPU() noexcept
 
 void GPU::ResetVRAMCache() noexcept
 {
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+    RepeatChanged3D = RepeatFlat2DDiff = RepeatTexDiff = true;   // reset / state load: draw the next frame
+#endif
 #ifdef LITEV_SNAP_DIRTY
 #if defined(LITEV_SOFT2D_DEPTH2)
     SnapPendABG.arm(); SnapPendBBG.arm(); SnapPendAOBJ.arm(); SnapPendBOBJ.arm();
@@ -1178,12 +1181,13 @@ void GPU::FFHeadlessDecide(bool frameStart) noexcept
     bool skipped = false;
     if (FrameskipTarget > 0 && !GPU3D.FFBackoff)
     {
-        // a bank swapped in at frame f is rendered on every non-skipped frame until the next swap,
-        // so frames f .. f+period-1 must all be skipped (frames 1..FrameskipCounter ahead are)
+        // a bank swapped in at frame f is rendered at VCount 215 of every frame f .. f+period-1
+        // whose next frame is drawn (it shows that 3D), so frames f+1 .. f+period must all be
+        // skipped (frames 1..FrameskipCounter ahead are)
         const s32 p = (s32)GPU3D.FFPeriod;
         s32 k = (s32)(GPU3D.FFLastFlush + GPU3D.FFPeriod - GPU3D.FFFrame);
-        if (k <= 0 && frameStart) skipped = SkipThisFrame && (p - 1) <= FrameskipCounter;
-        else skipped = ((k < 1 ? 1 : k) + p - 1) <= FrameskipCounter;
+        if (k <= 0 && frameStart) skipped = p <= FrameskipCounter;
+        else skipped = ((k < 1 ? 1 : k) + p) <= FrameskipCounter;
     }
     GPU3D.Headless = FFHeadless3D && skipped && !CaptureSeen && !KeepCapturesSeen
                      && !(CaptureCnt & (1u << 31));
@@ -1228,24 +1232,34 @@ void GPU::StartFrame() noexcept
     // before anything shows them: skipped. A run's end can't be predicted (the bit is set at line
     // 0 of each frame), so the last capture before it can be up to FrameskipTarget frames old.
     // Its 3D is rendered at the previous frame's VCount 215 and its line-0 sprites at line 262
-    // under the same rule (CaptureDraw); if it was armed later, do both now.
+    // under the same rule (CaptureDraw).
     const bool capRunStart = !CaptureLast;
     CaptureLast = (CaptureCnt & (1u << 31)) != 0;
     if (CaptureLast && SkipThisFrame && !LITEV_HEADLESS(Headless) && (capRunStart || FrameskipCounter == 0))
-    {
         SkipThisFrame = false;
-        if (!Tail3DDone
-#ifdef LITEV_FF_HEADLESS3D
-            && !GPU3D.RenderStale
-#endif
-            )
-            Rend->Start3DRendering();
-        if (!TailSprDone) Rend->DrawSprites(0);
-    }
     if (KeepCaptures)
     {
         KeepCapturesSeen |= (CaptureCnt & (1u << 31)) != 0;
         if (KeepCapturesSeen) SkipThisFrame = false;
+    }
+    // A drawn frame shows the 3D rendered at the previous frame's VCount 215 and the line-0
+    // sprites snapshotted at its line 262, done there when this frame was known to be drawn
+    // (NextFrameDrawn, CaptureDraw). If it was decided later (capture armed, target changed,
+    // recording), do both now.
+    if (!SkipThisFrame && !LITEV_HEADLESS(Headless))
+    {
+        if (!Tail3DDone && !(DiagNoDraw & 2)
+#ifdef LITEV_FF_HEADLESS3D
+            && !GPU3D.RenderStale
+#endif
+            )
+        {
+            Rend->Start3DRendering();
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+            RepeatChanged3D = true;   // (its texture check lands after line 262's)
+#endif
+        }
+        if (!TailSprDone) Rend->DrawSprites(0);
     }
 #ifdef LITEV_NETPLAY_CAPTURE
     if (CaptureSeen) GPU3D.Headless = false;
@@ -1268,7 +1282,8 @@ void GPU::StartFrame() noexcept
     }
 #endif
 #ifdef LITEV_SKIP_REPEAT_FRAMES
-    SkipRepeat = NextSkipRepeat && !(CaptureCnt & (1u << 31));   // never drop a frame a capture records
+    SkipRepeatCand = NextSkipRepeat && !SkipThisFrame && !(CaptureCnt & (1u << 31));   // never drop a frame a capture records
+    SkipRepeat = false;   // the renderer decides at VBlank
     NextSkipRepeat = false;
 #endif
 #endif
@@ -1285,6 +1300,62 @@ void GPU::StartFrame() noexcept
 #endif
     StartScanline(0);
 }
+
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+// skip-repeat: do the texture / texture-palette chunks that changed at the last 3D render
+// (RepeatTexMap / RepeatPalMap, byte spans) hold texels or colours the 3D frame reads? Only matters when its
+// polygons repeat the previous 3D frame's (RenderFrameIdentical). Per polygon, the texel rows its
+// vertices' texture coordinates span (+1 texel margin; interpolation stays inside them; repeat
+// across the edge = all rows): animation frames uploaded into other rows of a sheet, or textures
+// uploaded ahead into unused slots, don't count. 4x4-compressed textures index palettes freely:
+// any palette change counts for them.
+bool GPU::RepeatTexUsedChanged() const noexcept
+{
+    auto hit = [](const VRAMDiffMap& m, u32 nchunks, u32 start, u32 len) { return m.Hit(nchunks, start, len); };
+    const bool palAny = RepeatPalMap.Any();
+    if ((GPU3D.RenderDispCnt & (1 << 14)) && hit(RepeatTexMap, 1024, 0x40000, 0x40000)) return true;   // rear-plane bitmap: slots 2-3
+    static constexpr u8 bpp[8] = {0, 8, 2, 4, 8, 2, 8, 16};
+    static constexpr u16 palSize[8] = {0, 64, 8, 32, 512, 0, 16, 0};
+    for (u32 i = 0; i < GPU3D.RenderNumPolygons; i++)
+    {
+        const Polygon* p = GPU3D.RenderPolygonRAM[i];
+        const u32 tp = p->TexParam, fmt = (tp >> 26) & 7;
+        if (!fmt) continue;
+        const s32 h = 8 << ((tp >> 23) & 7);
+        const u32 w = 8u << ((tp >> 20) & 7), addr = (tp & 0xFFFF) << 3;
+        // texel rows t0..t1 (texture coordinates: 1/16 texel)
+        s32 t0 = INT32_MAX, t1 = INT32_MIN;
+        for (u32 v = 0; v < p->NumVertices; v++)
+        {
+            const s32 t = p->Vertices[v]->TexCoords[1] >> 4;
+            t0 = std::min(t0, t); t1 = std::max(t1, t);
+        }
+        t0--; t1++;
+        if (!(tp & (1 << 17))) { t0 = std::clamp(t0, 0, h - 1); t1 = std::clamp(t1, 0, h - 1); }
+        else if (t1 - t0 + 1 >= h || ((t0 % h + h) % h) + (t1 - t0) >= h) { t0 = 0; t1 = h - 1; }   // crosses a repeat edge
+        else
+        {
+            const s32 m0 = (t0 % h + h) % h, m1 = m0 + (t1 - t0);
+            t0 = (tp & (1 << 19)) ? std::min(m0, h - 1 - m1) : m0;   // flip: the mirrored tile reads the mirrored rows
+            t1 = (tp & (1 << 19)) ? std::max(m1, h - 1 - m0) : m1;
+        }
+        if (fmt == 5)
+        {
+            // 4x4 blocks: block rows t0/4..t1/4, w bytes of texels + w/2 of palette index data per block
+            // row (slot 1, half the address offset: slot 0 -> 1st half, slot 2 -> 2nd)
+            const u32 b0 = t0 >> 2, nb = (t1 >> 2) - b0 + 1;
+            if (hit(RepeatTexMap, 1024, addr + b0 * w, nb * w)) return true;
+            if (hit(RepeatTexMap, 1024, 0x20000 + ((addr & 0x1FFFF) >> 1) + (addr >= 0x40000 ? 0x10000 : 0) + b0 * (w / 2), nb * (w / 2))) return true;
+            if (palAny) return true;
+            continue;
+        }
+        const u32 row = w * bpp[fmt] / 8;
+        if (hit(RepeatTexMap, 1024, addr + t0 * row, (t1 - t0 + 1) * row)) return true;
+        if (fmt != 7 && hit(RepeatPalMap, 256, p->TexPalette << (fmt == 2 ? 3 : 4), palSize[fmt])) return true;
+    }
+    return false;
+}
+#endif
 
 void GPU::StartHBlank(u32 line) noexcept
 {
@@ -1317,11 +1388,7 @@ void GPU::StartHBlank(u32 line) noexcept
         // note: this should start 48 cycles after the scanline start
         // (CheckDMAs below always runs; only the renderer draw calls are gated)
 #ifdef LITEV_AGGRESSIVE_SKIP
-        if (!SkipThisFrame && !(DiagNoDraw & 1)
-#ifdef LITEV_SKIP_REPEAT_FRAMES
-            && !SkipRepeat
-#endif
-            )
+        if (!SkipThisFrame && !(DiagNoDraw & 1))
 #endif
         {
             if (line < 192)
@@ -1335,7 +1402,8 @@ void GPU::StartHBlank(u32 line) noexcept
     else if (VCount == 215)
     {
 #ifdef LITEV_AGGRESSIVE_SKIP
-        Tail3DDone = (!SkipThisFrame || CaptureDraw()) && !(DiagNoDraw & 2);
+        // this 3D shows on the NEXT frame: render it if that one is drawn
+        Tail3DDone = (NextFrameDrawn() || CaptureDraw()) && !(DiagNoDraw & 2);
         if (Tail3DDone
 #ifdef LITEV_FF_HEADLESS3D
             && !GPU3D.RenderStale   // the render list wasn't prepared (fast-forward unwatched frames)
@@ -1347,19 +1415,26 @@ void GPU::StartHBlank(u32 line) noexcept
     else if (VCount == 262)
     {
 #ifdef LITEV_SKIP_REPEAT_FRAMES
-        // RenderFrameIdentical (set at this frame's VBlank): next frame's 3D repeats this one's
-        const bool repeat = GPU3D.RenderFrameIdentical;
-        NextSkipRepeat = SkipRepeatEnabled && repeat && !LastRepeat3D && !CaptureSeen && !LITEV_HEADLESS(Headless)
+        // the next frame's 3D (rendered at VCount 215 from the state latched at this frame's
+        // VBlank) repeats the previous 3D frame's inputs and texture VRAM contents?
+        // (texture changes only count where this 3D frame's polygons or rear-plane bitmap read)
+        RepeatChanged3D |= !GPU3D.RenderFrameIdentical || !GPU3D.RenderingEnabled || !SkipRepeatEnabled
+#ifdef LITEV_FF_HEADLESS3D
+                           || GPU3D.RenderStale
+#endif
+                           || (RepeatTexDiff && RepeatTexUsedChanged());
+        if (RepeatTexDiff)
+        {
+            RepeatTexDiff = false;
+            RepeatTexMap.Clear();
+            RepeatPalMap.Clear();
+        }
+        NextSkipRepeat = SkipRepeatEnabled && !CaptureSeen && !LITEV_HEADLESS(Headless)
                          && !(CaptureCnt & (1u << 31));
-        LastRepeat3D = repeat;
 #endif
         // sprites are pre-rendered one scanline in advance
 #ifdef LITEV_AGGRESSIVE_SKIP
-        TailSprDone = (!SkipThisFrame || CaptureDraw())
-#ifdef LITEV_SKIP_REPEAT_FRAMES
-            && !NextSkipRepeat
-#endif
-            ;
+        TailSprDone = NextFrameDrawn() || CaptureDraw();
         if (TailSprDone)
 #endif
         {
@@ -1772,13 +1847,20 @@ template NonStupidBitField<512*1024/VRAMDirtyGranularity> VRAMTrackingSet<512*10
 
 
 
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+#define LITEV_REPDIFF(f) , RepeatDiff(f)
+#define LITEV_REPDIFFB(f, b) , RepeatDiff(f), SkipRepeatEnabled ? b : nullptr
+#else
+#define LITEV_REPDIFF(f)
+#define LITEV_REPDIFFB(f, b)
+#endif
 bool GPU::MakeVRAMFlat_TextureCoherent(NonStupidBitField<512*1024/VRAMDirtyGranularity>& dirty, u8* dst) noexcept
 {
-    return CopyLinearVRAM<128*1024>(dst ? dst : VRAMFlat_Texture, VRAMMap_Texture, dirty, &GPU::ReadVRAM_Texture<u64>);
+    return CopyLinearVRAM<128*1024>(dst ? dst : VRAMFlat_Texture, VRAMMap_Texture, dirty, &GPU::ReadVRAM_Texture<u64> LITEV_REPDIFFB(RepeatTexDiff, &RepeatTexMap));
 }
 bool GPU::MakeVRAMFlat_TexPalCoherent(NonStupidBitField<128*1024/VRAMDirtyGranularity>& dirty, u8* dst) noexcept
 {
-    return CopyLinearVRAM<16*1024>(dst ? dst : VRAMFlat_TexPal, VRAMMap_TexPal, dirty, &GPU::ReadVRAM_TexPal<u64>);
+    return CopyLinearVRAM<16*1024>(dst ? dst : VRAMFlat_TexPal, VRAMMap_TexPal, dirty, &GPU::ReadVRAM_TexPal<u64> LITEV_REPDIFFB(RepeatTexDiff, &RepeatPalMap));
 }
 
 
@@ -1815,14 +1897,14 @@ bool GPU::MakeVRAMFlat_ABGCoherent(NonStupidBitField<512*1024/VRAMDirtyGranulari
 #if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
     SnapPendABG.add(dirty);
 #endif
-    return CopyLinearVRAM<16*1024>(VRAMFlat_ABG, VRAMMap_ABG, dirty, &GPU::ReadVRAM_ABG<u64>);
+    return CopyLinearVRAM<16*1024>(VRAMFlat_ABG, VRAMMap_ABG, dirty, &GPU::ReadVRAM_ABG<u64> LITEV_REPDIFF(RepeatFlat2DDiff));
 }
 bool GPU::MakeVRAMFlat_BBGCoherent(NonStupidBitField<128*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
 #if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
     SnapPendBBG.add(dirty);
 #endif
-    return CopyLinearVRAM<16*1024>(VRAMFlat_BBG, VRAMMap_BBG, dirty, &GPU::ReadVRAM_BBG<u64>);
+    return CopyLinearVRAM<16*1024>(VRAMFlat_BBG, VRAMMap_BBG, dirty, &GPU::ReadVRAM_BBG<u64> LITEV_REPDIFF(RepeatFlat2DDiff));
 }
 
 bool GPU::MakeVRAMFlat_AOBJCoherent(NonStupidBitField<256*1024/VRAMDirtyGranularity>& dirty) noexcept
@@ -1830,14 +1912,14 @@ bool GPU::MakeVRAMFlat_AOBJCoherent(NonStupidBitField<256*1024/VRAMDirtyGranular
 #if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
     SnapPendAOBJ.add(dirty);
 #endif
-    return CopyLinearVRAM<16*1024>(VRAMFlat_AOBJ, VRAMMap_AOBJ, dirty, &GPU::ReadVRAM_AOBJ<u64>);
+    return CopyLinearVRAM<16*1024>(VRAMFlat_AOBJ, VRAMMap_AOBJ, dirty, &GPU::ReadVRAM_AOBJ<u64> LITEV_REPDIFF(RepeatFlat2DDiff));
 }
 bool GPU::MakeVRAMFlat_BOBJCoherent(NonStupidBitField<128*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
 #if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
     SnapPendBOBJ.add(dirty);
 #endif
-    return CopyLinearVRAM<16*1024>(VRAMFlat_BOBJ, VRAMMap_BOBJ, dirty, &GPU::ReadVRAM_BOBJ<u64>);
+    return CopyLinearVRAM<16*1024>(VRAMFlat_BOBJ, VRAMMap_BOBJ, dirty, &GPU::ReadVRAM_BOBJ<u64> LITEV_REPDIFF(RepeatFlat2DDiff));
 }
 
 bool GPU::MakeVRAMFlat_ABGExtPalCoherent(NonStupidBitField<32*1024/VRAMDirtyGranularity>& dirty) noexcept
@@ -1845,14 +1927,14 @@ bool GPU::MakeVRAMFlat_ABGExtPalCoherent(NonStupidBitField<32*1024/VRAMDirtyGran
 #if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
     SnapPendABGExtPal.add(dirty);
 #endif
-    return CopyLinearVRAM<8*1024>(VRAMFlat_ABGExtPal, VRAMMap_ABGExtPal, dirty, &GPU::ReadVRAM_ABGExtPal<u64>);
+    return CopyLinearVRAM<8*1024>(VRAMFlat_ABGExtPal, VRAMMap_ABGExtPal, dirty, &GPU::ReadVRAM_ABGExtPal<u64> LITEV_REPDIFF(RepeatFlat2DDiff));
 }
 bool GPU::MakeVRAMFlat_BBGExtPalCoherent(NonStupidBitField<32*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
 #if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
     SnapPendBBGExtPal.add(dirty);
 #endif
-    return CopyLinearVRAM<8*1024>(VRAMFlat_BBGExtPal, VRAMMap_BBGExtPal, dirty, &GPU::ReadVRAM_BBGExtPal<u64>);
+    return CopyLinearVRAM<8*1024>(VRAMFlat_BBGExtPal, VRAMMap_BBGExtPal, dirty, &GPU::ReadVRAM_BBGExtPal<u64> LITEV_REPDIFF(RepeatFlat2DDiff));
 }
 
 bool GPU::MakeVRAMFlat_AOBJExtPalCoherent(NonStupidBitField<8*1024/VRAMDirtyGranularity>& dirty) noexcept
@@ -1860,14 +1942,14 @@ bool GPU::MakeVRAMFlat_AOBJExtPalCoherent(NonStupidBitField<8*1024/VRAMDirtyGran
 #if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
     SnapPendAOBJExtPal.add(dirty);
 #endif
-    return CopyLinearVRAM<8*1024>(VRAMFlat_AOBJExtPal, &VRAMMap_AOBJExtPal, dirty, &GPU::ReadVRAM_AOBJExtPal<u64>);
+    return CopyLinearVRAM<8*1024>(VRAMFlat_AOBJExtPal, &VRAMMap_AOBJExtPal, dirty, &GPU::ReadVRAM_AOBJExtPal<u64> LITEV_REPDIFF(RepeatFlat2DDiff));
 }
 bool GPU::MakeVRAMFlat_BOBJExtPalCoherent(NonStupidBitField<8*1024/VRAMDirtyGranularity>& dirty) noexcept
 {
 #if defined(LITEV_SNAP_DIRTY) && defined(LITEV_SOFT2D_DEPTH2)
     SnapPendBOBJExtPal.add(dirty);
 #endif
-    return CopyLinearVRAM<8*1024>(VRAMFlat_BOBJExtPal, &VRAMMap_BOBJExtPal, dirty, &GPU::ReadVRAM_BOBJExtPal<u64>);
+    return CopyLinearVRAM<8*1024>(VRAMFlat_BOBJExtPal, &VRAMMap_BOBJExtPal, dirty, &GPU::ReadVRAM_BOBJExtPal<u64> LITEV_REPDIFF(RepeatFlat2DDiff));
 }
 
 
