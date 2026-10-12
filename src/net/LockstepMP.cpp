@@ -38,6 +38,10 @@ void LockstepMP::Begin(int inst)
     Connected |= (1 << inst);
     BeginTime[inst] = Now(inst);
     ClientHost[inst] = -1;
+#ifdef LITEV_WIFI_EVT
+    QuietOff[inst] = 0;
+    QuietGiveUp &= (u16)~(1 << inst);
+#endif
     NotifyAll();
 }
 
@@ -69,17 +73,50 @@ int LockstepMP::HostQuiet(void* self, int inst, u64 until, u64* time, int* sende
     until += skew;
     auto past = [&] { u64 t = m.Now(host); return t > until || (t == until && host > inst); };
     std::unique_lock<std::mutex> lk(m.Lock);
+    // after a deadlock this wait was part of (ResolveDeadlock): poll every tick until our clock
+    // reaches the host's clock at that deadlock
+    if (m.Now(inst) < m.QuietOff[inst]) return -1;
     std::deque<Packet>& q = m.FromHost[inst];
     while (!q.empty() && q.front().Time < m.BeginTime[inst]) q.pop_front();
     auto shown = [&] { return !q.empty() && (q.front().Time < until || (q.front().Time == until && q.front().Sender < inst)); };
-    // (no deadlock: the host waits on our clock for at most its own - kDelay (regular frames) or a
-    // CMD's time + kDelay, and `until` is < kDelay past our clock; a sent CMD shows or the host is past)
-    m.WaitFor(lk, [&] { return shown() || past(); }, [&] { m.NeedClock(inst, host, host > inst ? until : until + 1); }, inst, 1);
+    // (with the host alone no deadlock: it waits on our clock for at most its own - kDelay (regular
+    // frames) or a CMD's time + kDelay, and `until` is < kDelay past our clock; a sent CMD shows or the
+    // host is past. Through a third console it can deadlock: ResolveDeadlock)
+    m.Log(inst, "HQ", (int)q.size(), until);
+    m.InQuiet |= (u16)(1 << inst);
+    m.WaitFor(lk, [&] { return shown() || past() || (m.QuietGiveUp & (1 << inst)); }, [&] { m.NeedClock(inst, host, host > inst ? until : until + 1); }, inst, 1);
+    m.InQuiet &= (u16)~(1 << inst);
     m.FromHostChanged(inst);
     if (m.Stopped) return -1;
+    if (m.QuietGiveUp & (1 << inst)) { m.QuietGiveUp &= (u16)~(1 << inst); return -1; }
     if (!shown()) return 0;
     *time = q.front().Time - skew; *sender = q.front().Sender;
     return 1;
+}
+
+// (Lock held) Called by a console that has been blocked a while. The waits are deterministic: a
+// console's link calls and answers do not depend on thread timing, so a set of waits that can never
+// end is reached at the same point (same calls, same clocks) in every run and on every device.
+// HostQuiet's wait looks ahead (the host past `until`, up to kEvtAskAhead past our clock), which
+// the "one strict, one inclusive" argument does not cover: host H waits in RecvReplies for console X
+// to reach H + kDelay, X waits in RecvPacket for client Y to pass X - kDelay (so Y < H), and Y waits
+// in HostQuiet for H to pass `until` >= H. Every member blocked with its wait unsatisfied is that
+// final state (nothing else changes the link), so it is detected exactly; then each HostQuiet in it
+// answers -1 (unknown: the client polls every tick, which only waits for the host to pass its own
+// clock) until its clock reaches its host's (frozen, so deterministic) clock.
+void LockstepMP::ResolveDeadlock()
+{
+    if ((BlockedMask & Members) != Members || !(InQuiet & Members)) return;
+    for (int i = 0; i < kMaxInst; i++)
+        if ((Members & (1 << i)) && (*BlockedPred[i])()) return;
+    for (int i = 0; i < kMaxInst; i++)
+        if (InQuiet & Members & (1 << i))
+        {
+            QuietOff[i] = ClientHost[i] >= 0 ? Now(ClientHost[i]) : 0;
+            QuietGiveUp |= (u16)(1 << i);
+            NotifyOne(i);
+        }
+    fprintf(stderr, "LockstepMP: deadlock resolved: HostQuiet waiters %x, host clock %llu\n", InQuiet & Members, (unsigned long long)(HostID >= 0 ? Now(HostID) : 0));
 }
 #endif
 
@@ -213,6 +250,9 @@ template <typename Pred, typename Need> void LockstepMP::WaitFor(std::unique_loc
     if (pred() || Stopped) return;
     if (stats) WS[inst].Blocked[kind]++;
     TLog(inst, kind == 0 ? "B_pkt" : "B_host");
+#ifdef LITEV_WIFI_EVT
+    const std::function<bool()> blockedPred = [&pred] { return pred(); };
+#endif
     while (!pred() && !Stopped)
     {
 #ifdef LITEV_MP_CLOCKWAKE
@@ -225,7 +265,13 @@ template <typename Pred, typename Need> void LockstepMP::WaitFor(std::unique_loc
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (pred()) break;
 #endif
+#ifdef LITEV_WIFI_EVT
+        Blocked(inst, &blockedPred, start);
+#endif
         bool timedOut = Sleep(lk, inst);
+#ifdef LITEV_WIFI_EVT
+        BlockedMask &= (u16)~(1 << inst);
+#endif
         if (stats) { WS[inst].Wakeups++; if (timedOut && pred()) WS[inst].Missed++; }
         if (!reported && std::chrono::steady_clock::now() - start > std::chrono::seconds(1))
         {
@@ -563,6 +609,23 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
         }
     };
 
+#ifdef LITEV_WIFI_EVT
+    // (ResolveDeadlock) the loop below would return now
+    std::chrono::steady_clock::time_point waitStart;
+    auto ready = [&] {
+        u16 passed = 0, seen = (1 << inst), seenAids = 0;
+        for (int i = 0; i < kMaxInst; i++)
+            if ((Members & (1 << i)) && Now(i) >= deadline) passed |= (1 << i);
+        for (const Packet& p : Replies[inst])
+        {
+            if (p.Sender == inst || p.Time < CmdTime[inst] || p.Time >= deadline || (seen & (1 << p.Sender)) || p.Timestamp < timestamp - 32) continue;
+            seen |= (1 << p.Sender);
+            if (!p.Data.empty()) seenAids |= (1 << (p.Type >> 16));
+        }
+        return (seenAids & aidmask) == aidmask || ((seen | passed) & Members) == Members || Stopped;
+    };
+    const std::function<bool()> readyNow = [&ready] { return ready(); };
+#endif
     for (;;)
     {
 #ifdef LITEV_MP_FUTEX
@@ -648,8 +711,17 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
 #endif
         if (!blocked && St.On > 0) WS[inst].Blocked[2]++;
         if (!blocked) TLog(inst, "B_rep");
+#ifdef LITEV_WIFI_EVT
+        if (!blocked) waitStart = std::chrono::steady_clock::now();
+#endif
         blocked = true;
+#ifdef LITEV_WIFI_EVT
+        Blocked(inst, &readyNow, waitStart);
+#endif
         Sleep(lk, inst);
+#ifdef LITEV_WIFI_EVT
+        BlockedMask &= (u16)~(1 << inst);
+#endif
         if (St.On > 0) WS[inst].Wakeups++;
     }
 }
