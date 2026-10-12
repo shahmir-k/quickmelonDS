@@ -20,6 +20,7 @@
 #include "NDS.h"
 #include "ARMInterpreter.h"
 #include "ARM7HLE.h"
+#include "ARM7Native.h"
 #include "ARM9HLE.h"
 #include "ARMInterpreter_ALU.h"
 #include "ARMInterpreter_Branch.h"
@@ -40,7 +41,7 @@ void A_UNK(ARM* cpu)
 {
 #ifdef LITEV_A7HLE
     // the JIT compiles a hooked ARM7 function entry as this fallback (see ARMJIT CompileBlock)
-    if (cpu->Num == 1 && A7HLE::Run(cpu, true))
+    if (cpu->Num == 1 && (A7Native::Hook(cpu, true) || A7HLE::Run(cpu, true)))
         return;
 #endif
 #ifdef LITEV_GX_CPUSEND
