@@ -102,7 +102,7 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsy
 // diagnostic (env LITEV_S3D_CPU=1): thread CPU time (+ instructions on Apple) of the tile workers and
 // the coordinator, per produced 3D frame; printed every 300 frames (same pattern as LITEV_S2D_CPU)
 static const bool s3dCpu = getenv("LITEV_S3D_CPU") != nullptr;
-static std::atomic<unsigned long long> s3dWorkNs{0}, s3dWorkIns{0}, s3dCoordNs{0}, s3dCoordIns{0}, s3dFrames{0}, s3dKept{0};
+static std::atomic<unsigned long long> s3dWorkNs{0}, s3dWorkIns{0}, s3dCoordNs{0}, s3dCoordIns{0}, s3dFrames{0}, s3dKept{0}, s3dTexDecodes{0};
 struct S3DCpuScope
 {
     std::atomic<unsigned long long>& ns; std::atomic<unsigned long long>& ins;
@@ -132,9 +132,25 @@ static void s3dCpuFrame()
     if (!s3dCpu) return;
     const unsigned long long f = s3dFrames.fetch_add(1, std::memory_order_relaxed) + 1;
     if (f % 300 == 0)
-        fprintf(stderr, "S3D_CPU frames=%llu worker_ms_per_frame=%.4f coord_ms_per_frame=%.4f worker_instr_per_frame=%llu coord_instr_per_frame=%llu kept=%llu\n",
-                f, s3dWorkNs.load() / 1e6 / f, s3dCoordNs.load() / 1e6 / f, s3dWorkIns.load() / f, s3dCoordIns.load() / f, s3dKept.load());
+        fprintf(stderr, "S3D_CPU frames=%llu worker_ms_per_frame=%.4f coord_ms_per_frame=%.4f worker_instr_per_frame=%llu coord_instr_per_frame=%llu kept=%llu texdecodes=%llu\n",
+                f, s3dWorkNs.load() / 1e6 / f, s3dCoordNs.load() / 1e6 / f, s3dWorkIns.load() / f, s3dCoordIns.load() / f, s3dKept.load(), s3dTexDecodes.load());
 }
+
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+#define TILE_TEXSH 1
+#include <algorithm>
+// flat texture / palette VRAM ranges (addresses wrap like ReadVRAMFlat_*)
+static void texFlatCopy(const melonDS::u8* base, melonDS::u32 mask, melonDS::u32 addr, melonDS::u32 len, melonDS::u8* dst)
+{
+    while (len) { const melonDS::u32 a = addr & mask, n = std::min(len, mask + 1 - a); memcpy(dst, base + a, n); dst += n; addr += n; len -= n; }
+}
+static bool texFlatEqual(const melonDS::u8* base, melonDS::u32 mask, melonDS::u32 addr, melonDS::u32 len, const melonDS::u8* src)
+{
+    while (len) { const melonDS::u32 a = addr & mask, n = std::min(len, mask + 1 - a); if (memcmp(src, base + a, n)) return false; src += n; addr += n; len -= n; }
+    return true;
+}
+static const bool texShVerify = getenv("LITEV_TEXSHARED_VERIFY") != nullptr;   // re-decode every hit, abort on a mismatch
+#endif
 
 namespace melonDS
 {
@@ -199,6 +215,9 @@ void TileRenderer3D::Reset()
     for (int g = 0; g < NGEOM; g++) FrameNumPolys[g] = 0;
 #if defined(LITEV_TILE_SAMEFRAME) && defined(LITEV_TILE_COORD)
     LastValid = false;   // ColorOut was wiped
+#endif
+#ifdef TILE_TEXSH
+    TexSh.clear(); TexShBytes = 0; TexGen++;
 #endif
 }
 
@@ -482,6 +501,10 @@ u32 TileRenderer3D::ShadeTexel(const PolyShade& ps, u32 vr, u32 vg, u32 vb, s16 
 
     if (ps.texEnable)
     {
+#ifdef TILE_TEXSH
+        const u32 tp = ps.tex32[TexAddr(ps, s, t)];
+        const u8 tr = tp & 0x3F, tg = (tp >> 8) & 0x3F, tb = (tp >> 16) & 0x3F, talpha = tp >> 24;
+#else
         u16 tcolor; u8 talpha;
         if (ps.texcache)
         {
@@ -497,6 +520,7 @@ u32 TileRenderer3D::ShadeTexel(const PolyShade& ps, u32 vr, u32 vg, u32 vb, s16 
         u8 tr = (tcolor << 1) & 0x3E; if (tr) tr++;
         u8 tg = (tcolor >> 4) & 0x3E; if (tg) tg++;
         u8 tb = (tcolor >> 9) & 0x3E; if (tb) tb++;
+#endif
 
         if (ps.decal)
         {
@@ -1041,8 +1065,17 @@ void TileRenderer3D::RasterPolyInTile(BandScratch& bs, const TilePoly& poly, s32
         ps.texW = 0; ps.texH = 0;
         // the cache keeps 1 bit of alpha: the graded-alpha formats (A3I5 = 1, A5I3 = 6) look texels
         // up directly, else their soft alpha became opaque (Pokemon White's town mist: white blobs)
+#ifdef TILE_TEXSH
+        if (ps.texEnable)
+        {
+            ps.tex32 = PolyTex[&poly - FramePolys[GeomRead]];
+            ps.texW = 8 << ((ps.texparam >> 20) & 0x7);
+            ps.texH = 8 << ((ps.texparam >> 23) & 0x7);
+        }
+#else
         if (ps.texEnable && texfmt != 1 && texfmt != 6)
             ps.texcache = ResolveTexCache(bs.Tex, ps.texparam, ps.texpal, &ps.texW, &ps.texH);
+#endif
     }
 
     auto advL = [&](s32 yy) -> s32
@@ -1422,6 +1455,10 @@ void TileRenderer3D::RenderFrame()
 #ifdef LITEV_TILE_SAMEFRAME
     Cfg[GeomWrite].TexDirty = TexCacheDirty;
 #endif
+#ifdef TILE_TEXSH
+    if (TexCacheDirty) TexGen++;
+    Cfg[GeomWrite].TexGen = TexGen;
+#endif
 
 #ifdef LITEV_TILE_COORD
     // DraStic decouple: the emu HANDS OFF the built frame to the coordinator thread and returns
@@ -1472,6 +1509,132 @@ void TileRenderer3D::RenderFrame()
 // The coordinator publishes one queued frame to the 2D consumer, dispatches the 3 band workers,
 // and blocks (on THIS thread, not the emu) until they finish. Same sequence the single-frame
 // RenderFrame did — just owned by the coordinator so the emu never waits on the raster.
+#ifdef TILE_TEXSH
+// Decode one texture into e (exact: the per-texel DecodeTexel, expanded as ShadeTexel expands it)
+// and record the VRAM byte ranges the decode read (a superset is fine: it only costs a re-decode).
+void TileRenderer3D::DecodeTexShared(TexShEntry& e, u32 texparam, u32 texpal) const
+{
+    const s32 W = 8 << ((texparam >> 20) & 0x7), H = 8 << ((texparam >> 23) & 0x7);
+    const u32 fmt = (texparam >> 26) & 0x7, addr = (texparam & 0xFFFF) << 3, n = (u32)W * (u32)H;
+    e.texels.resize(n);
+    u32* out = e.texels.data();
+    for (s32 t = 0; t < H; t++)
+        for (s32 x = 0; x < W; x++)
+        {
+            u16 c; u8 a;
+            DecodeTexel(texparam, texpal, x, t, &c, &a);
+            u32 r = (c << 1) & 0x3E; if (r) r++;
+            u32 g = (c >> 4) & 0x3E; if (g) g++;
+            u32 b = (c >> 9) & 0x3E; if (b) b++;
+            *out++ = r | (g << 8) | (b << 16) | ((u32)a << 24);
+        }
+    e.ranges.clear();
+    auto tex = [&](u32 a, u32 len) { e.ranges.push_back({a, len, false}); };
+    auto pal = [&](u32 a, u32 len) { e.ranges.push_back({a, len, true}); };
+    switch (fmt)
+    {
+    case 1: tex(addr, n);     pal(texpal << 4, 64);  break;   // A3I5
+    case 2: tex(addr, n / 4); pal(texpal << 3, 8);   break;   // 4-colour
+    case 3: tex(addr, n / 2); pal(texpal << 4, 32);  break;   // 16-colour
+    case 4: tex(addr, n);     pal(texpal << 4, 512); break;   // 256-colour
+    case 6: tex(addr, n);     pal(texpal << 4, 16);  break;   // A5I3
+    case 7: tex(addr, n * 2); break;                          // direct
+    case 5:   // 4x4: the bounds of every texel / slot-1 / palette address DecodeTexel reads
+    {
+        u32 vlo = ~0u, vhi = 0, slo = ~0u, shi = 0, plo = ~0u, phi = 0;
+        for (s32 t = 0; t < H; t += 1)
+            for (s32 x = 0; x < W; x += 4)   // the 4 texels of a block row share va / slot1
+            {
+                u32 va = (addr + ((t & 0x3FC) * (W >> 2)) + (x & 0x3FC) + (t & 0x3)) & 0x7FFFF;
+                u32 s1 = 0x20000 + ((va & 0x1FFFC) >> 1);
+                if (va >= 0x40000) s1 += 0x10000;
+                const u32 po = (GPU.ReadVRAMFlat_Texture<u16>(s1) & 0x3FFF) << 2;
+                vlo = std::min(vlo, va); vhi = std::max(vhi, va);
+                slo = std::min(slo, s1); shi = std::max(shi, s1);
+                plo = std::min(plo, po); phi = std::max(phi, po);
+            }
+        tex(vlo, vhi - vlo + 1);
+        tex(slo, shi - slo + 2);
+        pal((texpal << 4) + plo, phi - plo + 8);
+        break;
+    }
+    }
+    size_t total = 0;
+    for (const TexRange& r : e.ranges) total += r.len;
+    e.src.resize(total);
+    u8* d = e.src.data();
+    for (const TexRange& r : e.ranges)
+    {
+        texFlatCopy(r.pal ? GPU.VRAMFlat_TexPal : GPU.VRAMFlat_Texture, r.pal ? 0x1FFFF : 0x7FFFF, r.addr, r.len, d);
+        d += r.len;
+    }
+}
+
+// Coordinator, before the workers start: a texel pointer for every textured polygon of frame gi.
+void TileRenderer3D::ResolveTexShared(int gi)
+{
+    TexShDecodes = 0;
+    TexShFrame++;
+    if (TexShBytes > TexShBudget)   // over budget: drop what the last frame didn't use, then anything older than this frame
+        for (int pass = 0; pass < 2 && TexShBytes > TexShBudget; pass++)
+            for (auto it = TexSh.begin(); it != TexSh.end();)
+                if (it->second.used + (pass == 0 ? 1 : 0) < TexShFrame)
+                {
+                    TexShBytes -= it->second.texels.size() * 4 + it->second.src.size();
+                    it = TexSh.erase(it);
+                }
+                else ++it;
+
+    const FrameCfg& cfg = Cfg[gi];
+    if (!(cfg.DispCnt & 1)) return;   // texturing off: no polygon reads PolyTex
+    const TilePoly* polys = FramePolys[gi];
+    const u32 n = FrameNumPolys[gi];
+    u64 lastKey = ~0ull;
+    const u32* lastTex = nullptr;
+    for (u32 i = 0; i < n; i++)
+    {
+        const u32 tp = polys[i].texparam, fmt = (tp >> 26) & 0x7;
+        if (!fmt) continue;
+        const u64 key = (tp & 0x3FF0FFFF) | ((u64)(fmt == 7 ? 0 : polys[i].texpal) << 32);
+        if (key == lastKey) { PolyTex[i] = lastTex; continue; }
+        auto [it, fresh] = TexSh.try_emplace(key);
+        TexShEntry& e = it->second;
+        bool decode = fresh;
+        if (!fresh && e.gen != cfg.TexGen)
+        {
+            const u8* sp = e.src.data();
+            for (const TexRange& r : e.ranges)
+            {
+                if (!texFlatEqual(r.pal ? GPU.VRAMFlat_TexPal : GPU.VRAMFlat_Texture, r.pal ? 0x1FFFF : 0x7FFFF, r.addr, r.len, sp)) { decode = true; break; }
+                sp += r.len;
+            }
+        }
+        if (decode)
+        {
+            TexShBytes -= e.texels.size() * 4 + e.src.size();
+            DecodeTexShared(e, tp, polys[i].texpal);
+            TexShBytes += e.texels.size() * 4 + e.src.size();
+            TexShDecodes++;
+            if (s3dCpu) s3dTexDecodes.fetch_add(1, std::memory_order_relaxed);
+        }
+        else if (texShVerify)
+        {
+            TexShEntry chk;
+            DecodeTexShared(chk, tp, polys[i].texpal);
+            if (chk.texels != e.texels)
+            {
+                fprintf(stderr, "LITEV_TEXSHARED_VERIFY: stale entry texparam %08x pal %04x (gen %u/%u)\n", tp, polys[i].texpal, e.gen, cfg.TexGen);
+                abort();
+            }
+        }
+        e.gen = cfg.TexGen;
+        e.used = TexShFrame;
+        PolyTex[i] = lastTex = e.texels.data();
+        lastKey = key;
+    }
+}
+#endif
+
 #ifdef LITEV_TILE_SAMEFRAME
 // Does frame gi repeat the last kept frame's inputs? Everything the raster reads: the compact
 // polygons and vertices (bucket lists derive from them) and the per-frame render state. Textures:
@@ -1507,10 +1670,19 @@ void TileRenderer3D::SaveLast(int gi, u32 nvtx, int col)
 
 void TileRenderer3D::CoordDispatch(int geomIdx, int colIdx)
 {
+#ifdef TILE_TEXSH
+    ResolveTexShared(geomIdx);
+#endif
 #ifdef LITEV_TILE_SAMEFRAME
     const u32 np = FrameNumPolys[geomIdx];
     const u32 nvtx = np ? FramePolys[geomIdx][np - 1].vtxBase + FramePolys[geomIdx][np - 1].numVerts : 0;
+#ifdef TILE_TEXSH
+    // every texel the frame reads comes from the shared cache: unchanged unless an entry was
+    // (re)decoded, and a frame that decodes is rastered, so no decode since the kept frame
+    TexDirtySinceLast = TexShDecodes != 0;
+#else
     TexDirtySinceLast |= Cfg[geomIdx].TexDirty;
+#endif
     if (!TexDirtySinceLast && SameAsLast(geomIdx, nvtx))
     {
         // same inputs -> same picture: copy the kept output, every row ready at once
