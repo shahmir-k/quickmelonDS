@@ -101,6 +101,10 @@ private:
     // later, so an upload never targets a texture an earlier merge may still be reading)
     GLuint DescTex[NFB] {};
     GLuint DescPBO[NFB] {};
+    // LITEV_HYB_DESC_TBO: the descriptors in a buffer (texture) per slot: a linear copy, not a
+    // texture upload (which the driver re-tiles on the CPU)
+    bool DescTBO = false;
+    GLuint DescBuf[NFB] {}, DescBufTex[NFB] {};
     GLuint OutTex[2] {};           // Nx, 2 layers (top, bottom), like GLRenderer's FPOutputTex
     GLuint OutFB[2] {};
     int OutIdx = 0;

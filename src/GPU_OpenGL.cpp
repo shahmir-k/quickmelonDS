@@ -36,7 +36,7 @@ using Platform::Log;
 using Platform::LogLevel;
 
 GLDefer::Recorder* GLDefer::Active = nullptr;
-thread_local bool GLDefer::OnWorker = false;
+thread_local bool GLDefer::RecordThread = false;
 
 #include "OpenGL_shaders/FinalPassVS.h"
 #include "OpenGL_shaders/FinalPassFS.h"
@@ -131,8 +131,6 @@ void GLRenderer::PresentIntoImpl(int front, GLuint dstTex, int dstWidth, std::fu
     {
         Present = std::make_unique<GLWorker>();
         if (GLHiAsync()) Present->StartThread("glhi-present");
-        // its GL calls (BlitFront) are issued there directly, never recorded
-        if (Present->Threaded) Present->Run([] { GLDefer::OnWorker = true; }, true);
     }
     if (!Present->Threaded)
     {
@@ -159,7 +157,7 @@ void GLRenderer::PresentIntoImpl(int front, GLuint dstTex, int dstWidth, std::fu
 
 void GLRenderer::WaitPresent()
 {
-    if (Defer && !GLDefer::OnWorker) Defer->Drain();
+    if (Defer && GLDefer::RecordThread) Defer->Drain();
     if (Present && PresDone.load(std::memory_order_acquire) < PresSeq) Present->Wait();
 }
 
@@ -240,9 +238,9 @@ bool GLRenderer::Init()
         d->W->StartThread("glhi-2d");
         if (d->W->Threaded)
         {
-            d->W->Run([] { GLDefer::OnWorker = true; }, true);
             Defer = std::move(d);
             GLDefer::Active = Defer.get();
+            GLDefer::RecordThread = true;
             bool ok = false;
             Defer->RunSync([&] { ok = InitGL(); });
             return ok;
@@ -448,6 +446,7 @@ GLRenderer::~GLRenderer()
         WaitPresent();
         Defer->RunSync([this] { DeleteGL(); Rend2D_A.reset(); Rend2D_B.reset(); });
         GLDefer::Active = nullptr;
+        GLDefer::RecordThread = false;
         Defer.reset();
         return;
     }

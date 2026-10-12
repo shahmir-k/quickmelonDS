@@ -102,6 +102,7 @@ HybridRenderer::~HybridRenderer()
     glDeleteVertexArrays(1, &EmptyVAO);
     glDeleteTextures(NFB, DescTex);
     glDeleteBuffers(NFB, DescPBO);
+    if (DescTBO) { glDeleteTextures(NFB, DescBufTex); glDeleteBuffers(NFB, DescBuf); }
     glDeleteTextures(2, OutTex);
     glDeleteFramebuffers(2, OutFB);
     if (PresentFB) glDeleteFramebuffers(1, &PresentFB);
@@ -139,13 +140,18 @@ bool HybridRenderer::Init()
 #endif
     if (OpenGL::Prop("hybdiv", 1))
         mergeFS.insert(mergeFS.find('\n') + 1, "#define NATIVE_VARYING\n");
+#ifdef LITEV_HYB_DESC_TBO
+    // debug.litev.hybtbo=0: the descriptor texture upload as before
+    DescTBO = HybDirect() && OpenGL::Prop("hybtbo", 1) != 0;
+    if (DescTBO) mergeFS.insert(mergeFS.find('\n') + 1, "#define DESC_TBO\n");
+#endif
     if (!OpenGL::CompileVertexFragmentProgram(MergeShader,
             kHybridMergeVS, mergeFS, "HybridMergeShader",
             {}, {{"oTopColor", 0}, {"oBottomColor", 1}}))
         return false;
 
     glUseProgram(MergeShader);
-    glUniform1i(glGetUniformLocation(MergeShader, "DescTex"), 0);
+    glUniform1i(glGetUniformLocation(MergeShader, DescTBO ? "DescBuf" : "DescTex"), 0);
     glUniform1i(glGetUniformLocation(MergeShader, "Tex3D"), 1);
     glUniform1i(glGetUniformLocation(MergeShader, "EdgeTex"), 2);
     EdgeULoc = glGetUniformLocation(MergeShader, "uEdge");
@@ -178,6 +184,21 @@ bool HybridRenderer::Init()
         glBindTexture(GL_TEXTURE_2D_ARRAY, t);
         texParams(GL_TEXTURE_2D_ARRAY);
         glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8UI, HybStride, 192, 2, 0, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, HybFB[0]);
+    }
+
+    if (DescTBO)
+    {
+        glGenBuffers(NFB, DescBuf);
+        glGenTextures(NFB, DescBufTex);
+        for (int i = 0; i < NFB; i++)
+        {
+            glBindBuffer(GL_TEXTURE_BUFFER, DescBuf[i]);
+            glBufferData(GL_TEXTURE_BUFFER, 2 * 192 * HybStride * 4, HybFB[0], GL_STREAM_DRAW);
+            glBindTexture(GL_TEXTURE_BUFFER, DescBufTex[i]);
+            glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA8UI, DescBuf[i]);
+        }
+        glBindBuffer(GL_TEXTURE_BUFFER, 0);
+        glBindTexture(GL_TEXTURE_BUFFER, 0);
     }
 
     glGenTextures(2, OutTex);
@@ -619,6 +640,14 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
                         GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, nullptr);
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     }
+    else if (DescTBO)
+    {
+        // both screens in one linear copy into this slot's buffer (a fresh store: no wait for
+        // a merge that may still read the old one)
+        glBindBuffer(GL_TEXTURE_BUFFER, DescBuf[fb]);
+        glBufferData(GL_TEXTURE_BUFFER, 2 * 192 * HybStride * 4, HybFB[fb], GL_STREAM_DRAW);
+        glBindBuffer(GL_TEXTURE_BUFFER, 0);
+    }
     else if (HybDirect())
     {
         // per screen: everything if a line carries 3D descriptors, else plane 1 + control column
@@ -651,7 +680,8 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
     glUseProgram(MergeShader);
     glUniform1i(ScaleULoc, Scale);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, DescTex[fb]);
+    if (DescTBO) glBindTexture(GL_TEXTURE_BUFFER, DescBufTex[fb]);
+    else glBindTexture(GL_TEXTURE_2D_ARRAY, DescTex[fb]);
     const double ts = HybNowMs();
     if (sync) Sync3D(tag);
     glActiveTexture(GL_TEXTURE1);

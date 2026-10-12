@@ -139,10 +139,11 @@ private:
     }
 };
 
-// the recorder calls go to; null or on the worker: GL calls run directly
+// the recorder calls go to; only the thread that set up the renderer (the emulator thread)
+// records, every other thread (the worker, the 3D and present threads) calls GL directly
 extern Recorder* Active;
-extern thread_local bool OnWorker;
-inline bool Recording() { return Active && !OnWorker; }
+extern thread_local bool RecordThread;
+inline bool Recording() { return Active && RecordThread; }
 
 // trivially copyable argument pack
 template <class... P> struct Pack {};
