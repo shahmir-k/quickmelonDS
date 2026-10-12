@@ -54,6 +54,7 @@ public:
     // reads (remapped off LCDC: BG/OBJ shadows, textures, CPU): finish it first, as on hardware
     // (capture of frame N is complete at its line 191)
     void DrainCaptures();
+    void WaitCaptures() override;
 #else
     void VBlank() override {};
 #endif
@@ -229,7 +230,6 @@ protected:
     Platform::Semaphore* AsyncDone  = nullptr;   // render -> emu: "frame complete"
     std::atomic<bool> AsyncThreadRunning { false };
     bool AsyncInFlight = false;           // a render was signaled and not yet barriered
-    u32  AsyncCapBanks = 0;               // VRAM banks A-D an in-flight render may capture into
     bool AsyncEverProduced = false;       // at least one async frame completed
     int  AsyncTargetBuf = 0;              // framebuffer index the render thread writes
     // last COMPLETED framebuffer (returned by GetFramebuffers). Inits to 1 so the

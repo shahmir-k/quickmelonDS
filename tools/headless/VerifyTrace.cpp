@@ -501,6 +501,18 @@ int RecordTrace(const TraceRunConfig& cfg, int frames, const std::string& outPat
         LITE_PROFILE_RESET_FRAME();
         b.nds->RunFrame();
         RoundTripAt(*b.nds, (int)frame);
+        if (const char* d = getenv("LITEV_TRACE_DUMP")) // diagnostics: "<prefix>:f1,f2,..." -> <prefix>_fN.{ram,state}
+        {
+            std::string s = d; size_t c = s.rfind(':');
+            std::string fl = "," + s.substr(c + 1) + ",";
+            if (fl.find("," + std::to_string(frame) + ",") != std::string::npos)
+            {
+                std::string p = s.substr(0, c) + "_f" + std::to_string(frame);
+                if (FILE* fp = fopen((p + ".ram").c_str(), "wb")) { fwrite(b.nds->MainRAM, 1, b.nds->MainRAMMask + 1, fp); fclose(fp); }
+                Savestate st; b.nds->DoSavestate(&st);
+                if (FILE* fp = fopen((p + ".state").c_str(), "wb")) { fwrite(st.Buffer(), 1, st.Length(), fp); fclose(fp); }
+            }
+        }
 
         TraceRecord rec;
         CaptureRecord(*b.nds, frame, rec);

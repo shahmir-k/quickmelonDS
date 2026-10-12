@@ -1213,7 +1213,15 @@ void SoftRenderer::FlushAsyncRender()
 // renders unpresented (present cadence unchanged: the barrier takes the done ones first).
 void SoftRenderer::DrainCaptures()
 {
-    if (!(AsyncCapBanks & ~GPU.VRAMMap_LCDC)) return;
+    if (AsyncCapBanks & ~GPU.VRAMMap_LCDC) WaitCaptures();
+}
+
+// Every render in flight is finished (their captures are in VRAM). Called by DrainCaptures and by
+// GPU::SyncVRAMCaptureBlock / MapVRAM_CD for an emulator access to a bank in AsyncCapBanks: the CPU,
+// DMA or ARM7 reading a capture while it was still being written gave run-to-run different
+// emulated state (Golden Sun DD copies a captured screen to main RAM at frame ~372).
+void SoftRenderer::WaitCaptures()
+{
 #ifdef LITEV_SOFT2D_DEPTH2
     for (; P2Done < P2InFlight; P2Done++)
     {

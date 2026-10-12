@@ -1204,6 +1204,12 @@ public:
     virtual bool NeedsShaderCompile() { return false; }
     virtual void ShaderCompileStep(int& current, int& count) {}
 
+    // VRAM banks A-D (bits 0-3) an in-flight asynchronous render (LITEV_SOFT2D_THREADED) still
+    // display-captures into. Any emulator access to such a bank first waits for it
+    // (WaitCaptures): on hardware frame N's capture is in VRAM at its line 191.
+    u32 AsyncCapBanks = 0;
+    virtual void WaitCaptures() {}
+
 protected:
     melonDS::GPU& GPU;
 
