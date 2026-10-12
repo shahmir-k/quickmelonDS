@@ -247,7 +247,18 @@ private:
     u32 SeqSeen[kMaxInst] {};   // (its own console) SleepSeq before the last look at the clocks
     static void FutexWait(std::atomic<u32>* a, u32 v, u32 us);
     static void FutexWake(std::atomic<u32>* a);
+#ifdef LITEV_MP_LAZYWAKE
+    // the console is in (or entering) FutexWait: only then does a wake need the syscall
+    std::atomic<u8> Asleep[kMaxInst] {};
+    void WakeOne(int i)
+    {
+        SleepSeq[i].fetch_add(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (Asleep[i].load(std::memory_order_seq_cst)) FutexWake(&SleepSeq[i]);
+    }
+#else
     void WakeOne(int i) { SleepSeq[i].fetch_add(1, std::memory_order_release); FutexWake(&SleepSeq[i]); }
+#endif
 #else
     u16 WaitersOn[kMaxInst] {};             // (Lock) who waits on each console's clock
 #endif
@@ -343,7 +354,16 @@ private:
 #if defined(LITEV_MP_FUTEX)
         // (SleepSeq was read before the last look at the clocks: a wake since then changed it)
         lk.unlock();
+#ifdef LITEV_MP_LAZYWAKE
+        // (Dekker with WakeOne: either the waker sees Asleep, or the kernel's compare sees its new
+        // SleepSeq and returns at once)
+        Asleep[inst].store(1, std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         FutexWait(&SleepSeq[inst], SeqSeen[inst], (u32)kPoll.count());
+        Asleep[inst].store(0, std::memory_order_relaxed);
+#else
+        FutexWait(&SleepSeq[inst], SeqSeen[inst], (u32)kPoll.count());
+#endif
         lk.lock();
         return false;
 #elif defined(LITEV_MP_CLOCKWAKE)

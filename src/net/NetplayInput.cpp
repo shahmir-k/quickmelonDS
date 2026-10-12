@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <cmath>
 #include <cstdarg>
@@ -153,6 +154,10 @@ NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const
         return;
     }
 
+#ifdef LITEV_NP_LEAN_IO
+    if (pipe(WakePipe) != 0) WakePipe[0] = WakePipe[1] = -1;
+    for (int fd : WakePipe) if (fd >= 0) fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+#endif
     Receiver = std::thread([this] { ReceiveLoop(); });
 }
 
@@ -161,6 +166,9 @@ NetplayInput::~NetplayInput()
     Running = false;
     if (Receiver.joinable()) Receiver.join();
     if (Socket >= 0) close(Socket);
+#ifdef LITEV_NP_LEAN_IO
+    for (int fd : WakePipe) if (fd >= 0) close(fd);
+#endif
 }
 
 #ifdef LITEV_NP_ADAPTIVE_DELAY
@@ -224,6 +232,11 @@ void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
 #endif
         Changed.notify_all();
     }
+#ifdef LITEV_NP_LEAN_IO
+    // the receive thread sends it (on the RG DS a sendto per peer through the Wi-Fi driver cost the
+    // local emulator ~1 ms a frame with 7 peers)
+    if (WakePipe[1] >= 0) { const u8 one = 1; if (write(WakePipe[1], &one, 1) == 1) return; }
+#endif
     Send();
 }
 
@@ -271,6 +284,9 @@ void NetplayInput::Send()
         }
         sendto(Socket, packet.data(), packet.size(), 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
     }
+#ifdef LITEV_NP_LEAN_IO
+    LastSendUs = NowUs();
+#endif
 }
 
 #ifdef LITEV_NP_SPEED
@@ -388,6 +404,46 @@ void NetplayInput::ReceiveLoop()
 #endif
     std::multimap<u64, std::vector<u8>> pending; // artificial latency: (due time, packet)
     u8 buf[2048];
+#ifdef LITEV_NP_LEAN_IO
+    const bool faults = Faults.LatencyMs || Faults.JitterMs || Faults.LossPct;
+    while (Running)
+    {
+        // sleep until a packet, a send request (SubmitLocal) or the heartbeat is due (faults: the
+        // next delayed packet, at most 1 ms, as before)
+        u64 now = NowUs();
+        const u64 since = now - LastSendUs.load();
+        int waitMs = since >= kResendMs * 1000 ? 0 : (int)((kResendMs * 1000 - since + 999) / 1000);
+        if (faults && !pending.empty()) waitMs = std::min(waitMs, 1);
+        pollfd fds[2] = {{Socket, POLLIN, 0}, {WakePipe[0], POLLIN, 0}};
+        poll(fds, WakePipe[0] >= 0 ? 2 : 1, waitMs);
+        bool send = false;
+        if (WakePipe[0] >= 0 && (fds[1].revents & POLLIN))
+        {
+            u8 drain[64];
+            while (read(WakePipe[0], drain, sizeof(drain)) > 0) {}
+            send = true;
+        }
+        // heartbeat: re-sends what each peer has not acknowledged, and our acknowledgements, after
+        // kResendMs with nothing sent
+        now = NowUs();
+        if (send || now - LastSendUs.load() >= kResendMs * 1000) Send();
+        for (ssize_t len; (len = recv(Socket, buf, sizeof(buf), MSG_DONTWAIT)) > 0;)
+        {
+            now = NowUs();
+            if (len > 4 && IsPeer(buf[4])) LastPeerUs[buf[4]] = now; // both packet kinds: magic, player
+            u64 due;
+            if (len < (ssize_t)sizeof(WireHeader)) continue;
+            if (!faults) Receive(buf, len, now);    // no copy
+            else if (Faults.Deliver(now, due)) pending.emplace(due, std::vector<u8>(buf, buf + len));
+        }
+        now = NowUs();
+        while (!pending.empty() && pending.begin()->first <= now)
+        {
+            Receive(pending.begin()->second.data(), pending.begin()->second.size(), now);
+            pending.erase(pending.begin());
+        }
+    }
+#else
     u64 lastSend = 0;
     while (Running)
     {
@@ -407,80 +463,101 @@ void NetplayInput::ReceiveLoop()
 
         while (!pending.empty() && pending.begin()->first <= now)
         {
-            std::vector<u8>& packet = pending.begin()->second;
-            WireHash wh;
-            if (packet.size() == sizeof(WireHash) && (memcpy(&wh, packet.data(), sizeof(wh)), wh.Magic == kHashMagic))
-            {
-                if (IsPeer(wh.Player))
-                {
-                    std::lock_guard<std::mutex> lk(Lock);
-                    auto& hashes = PeerHashes[wh.Player];
-                    hashes[wh.Frame] = wh.Hash;
-                    while (hashes.size() > 64) hashes.erase(hashes.begin());
-                }
-                pending.erase(pending.begin());
-                continue;
-            }
-            WireHeader header;
-            memcpy(&header, packet.data(), sizeof(header));
-            if (header.Magic == kMagic && IsPeer(header.Player) && !Dropped(header.Player) &&
-                packet.size() >= sizeof(header) + header.Count * sizeof(WireEntry))
-            {
-                std::lock_guard<std::mutex> lk(Lock);
-                int from = header.Player;
-                auto& inputs = Inputs[from];
-                const u8* p = packet.data() + sizeof(header);
-                for (int i = 0; i < header.Count; i++, p += sizeof(WireEntry))
-                {
-                    WireEntry e;
-                    memcpy(&e, p, sizeof(e));
-#ifdef LITEV_NP_WIRE_RUNS
-                    for (int k = std::max(0, RemoteUpTo[from] + 1 - e.Frame); k < e.Len; k++)
-                        inputs.emplace(e.Frame + k, NetplayFrameInput {e.Keys, e.TouchX, e.TouchY});
-#else
-                    if (e.Frame > RemoteUpTo[from]) // older ones were received (and maybe consumed) already
-                        inputs.emplace(e.Frame, NetplayFrameInput {e.Keys, e.TouchX, e.TouchY});
-#endif
-                }
-#ifdef LITEV_NP_WIRE_RUNS
-                // round trip: our send time echoed back, less how long the peer held it
-                EchoSent[from] = header.SentUs;
-                EchoAt[from] = now;
-                if (header.EchoUs)
-                {
-                    auto& rtt = Rtt[from];
-                    rtt.emplace_back(now, (u32)now - header.EchoUs - header.EchoAgeUs);
-                    while (rtt.front().first + 2000000 < now) rtt.pop_front();
-                    // the slowest peer's 90th percentile over the last 2 s: a lone Wi-Fi spike costs
-                    // one stall, not seconds of extra input lag
-                    u32 worst = 0;
-                    for (int peer : Peers)
-                    {
-                        std::vector<u32> us;
-                        for (auto& [t, v] : Rtt[peer]) us.push_back(v);
-                        if (us.empty()) continue;
-                        std::nth_element(us.begin(), us.begin() + us.size() * 9 / 10, us.end());
-                        worst = std::max(worst, us[us.size() * 9 / 10]);
-                    }
-                    RttMaxUs = worst;
-                }
-#endif
-#ifdef LITEV_NP_SPEED
-                while (inputs.count(RemoteUpTo[from] + 1)) { RemoteUpTo[from]++; NoteSpeed(from, RemoteUpTo[from], inputs[RemoteUpTo[from]]); }
-#else
-                while (inputs.count(RemoteUpTo[from] + 1)) RemoteUpTo[from]++;
-#endif
-                PeerAck[from] = std::max(PeerAck[from], header.Ack);
-                int allAcked = INT32_MAX;
-                for (int peer : Peers) allAcked = std::min(allAcked, PeerAck[peer]);
-                while (!Unacked.empty() && Unacked.front().first <= allAcked) Unacked.pop_front();
-                Changed.notify_all();
-            }
+            Receive(pending.begin()->second.data(), pending.begin()->second.size(), now);
             pending.erase(pending.begin());
         }
     }
+#endif
     std::lock_guard<std::mutex> lk(Lock);
     Changed.notify_all();
+}
+
+void NetplayInput::Receive(const u8* data, size_t size, u64 now)
+{
+    WireHash wh;
+    if (size == sizeof(WireHash) && (memcpy(&wh, data, sizeof(wh)), wh.Magic == kHashMagic))
+    {
+        if (IsPeer(wh.Player))
+        {
+            std::lock_guard<std::mutex> lk(Lock);
+            auto& hashes = PeerHashes[wh.Player];
+            hashes[wh.Frame] = wh.Hash;
+            while (hashes.size() > 64) hashes.erase(hashes.begin());
+        }
+        return;
+    }
+    WireHeader header;
+    memcpy(&header, data, sizeof(header));
+    if (header.Magic == kMagic && IsPeer(header.Player) && !Dropped(header.Player) &&
+        size >= sizeof(header) + header.Count * sizeof(WireEntry))
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        int from = header.Player;
+        auto& inputs = Inputs[from];
+        const size_t had = inputs.size();
+        const u8* p = data + sizeof(header);
+        for (int i = 0; i < header.Count; i++, p += sizeof(WireEntry))
+        {
+            WireEntry e;
+            memcpy(&e, p, sizeof(e));
+#ifdef LITEV_NP_WIRE_RUNS
+            for (int k = std::max(0, RemoteUpTo[from] + 1 - e.Frame); k < e.Len; k++)
+                inputs.emplace(e.Frame + k, NetplayFrameInput {e.Keys, e.TouchX, e.TouchY});
+#else
+            if (e.Frame > RemoteUpTo[from]) // older ones were received (and maybe consumed) already
+                inputs.emplace(e.Frame, NetplayFrameInput {e.Keys, e.TouchX, e.TouchY});
+#endif
+        }
+#ifdef LITEV_NP_WIRE_RUNS
+        // round trip: our send time echoed back, less how long the peer held it
+        EchoSent[from] = header.SentUs;
+        EchoAt[from] = now;
+        if (header.EchoUs)
+        {
+            auto& rtt = Rtt[from];
+            rtt.emplace_back(now, (u32)now - header.EchoUs - header.EchoAgeUs);
+            while (rtt.front().first + 2000000 < now) rtt.pop_front();
+            // the slowest peer's 90th percentile over the last 2 s: a lone Wi-Fi spike costs
+            // one stall, not seconds of extra input lag
+            u32 worst = 0;
+#ifdef LITEV_NP_LEAN_IO
+            // only this peer's samples changed: the others' percentiles are the ones cached
+            {
+                std::vector<u32> us;
+                us.reserve(rtt.size());
+                for (auto& [t, v] : rtt) us.push_back(v);
+                std::nth_element(us.begin(), us.begin() + us.size() * 9 / 10, us.end());
+                RttP90[from] = us[us.size() * 9 / 10];
+            }
+            for (int peer : Peers) if (!Rtt[peer].empty()) worst = std::max(worst, RttP90[peer]);
+#else
+            for (int peer : Peers)
+            {
+                std::vector<u32> us;
+                for (auto& [t, v] : Rtt[peer]) us.push_back(v);
+                if (us.empty()) continue;
+                std::nth_element(us.begin(), us.begin() + us.size() * 9 / 10, us.end());
+                worst = std::max(worst, us[us.size() * 9 / 10]);
+            }
+#endif
+            RttMaxUs = worst;
+        }
+#endif
+#ifdef LITEV_NP_SPEED
+        while (inputs.count(RemoteUpTo[from] + 1)) { RemoteUpTo[from]++; NoteSpeed(from, RemoteUpTo[from], inputs[RemoteUpTo[from]]); }
+#else
+        while (inputs.count(RemoteUpTo[from] + 1)) RemoteUpTo[from]++;
+#endif
+        PeerAck[from] = std::max(PeerAck[from], header.Ack);
+        int allAcked = INT32_MAX;
+        for (int peer : Peers) allAcked = std::min(allAcked, PeerAck[peer]);
+        while (!Unacked.empty() && Unacked.front().first <= allAcked) Unacked.pop_front();
+#ifdef LITEV_NP_LEAN_IO
+        if (inputs.size() != had)   // Get() waits only for inputs (a re-sent packet adds none)
+#endif
+            Changed.notify_all();
+        (void)had;
+    }
 }
 
 // ---- ROM identity ----

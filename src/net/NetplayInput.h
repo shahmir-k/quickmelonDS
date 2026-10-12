@@ -219,6 +219,12 @@ private:
     void Adapt(int frame);
 #endif
     bool IsPeer(int player) const { return player >= 0 && player < kMaxPlayers && PeerSet[player]; }
+#ifdef LITEV_NP_LEAN_IO
+    int WakePipe[2] {-1, -1};           // SubmitLocal -> the receive thread: "send now"
+    std::atomic<u64> LastSendUs {0};    // the last Send(): the heartbeat waits kResendMs after it
+    u32 RttP90[kMaxPlayers] {};         // each peer's 90th percentile (0 = none yet)
+#endif
+    void Receive(const u8* data, size_t len, u64 now);   // one packet (receive thread)
     void ReceiveLoop();
     void Send();
 };
