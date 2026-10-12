@@ -88,6 +88,11 @@ void FreeCodeMem(void* codeMem)
         if (codeMem == &GetAlignedCodeMemoryStart()[CodeMemorySliceSize * i])
         {
             //printf("freeing slice\n");
+#if defined(LITEV_JIT_LIMIT) && !defined(_WIN32)
+            // pages back to the system, zero (UDF, traps like the BRK fill) on reuse: Compiler::Reset
+            // fills only the code it wrote, so a reused slice must not hold a previous console's code
+            madvise(codeMem, CodeMemorySliceSize, MADV_DONTNEED);
+#endif
             AvailableCodeMemSlices |= 1 << i;
             return;
         }
