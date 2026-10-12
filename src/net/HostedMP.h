@@ -76,12 +76,7 @@ struct HostedCalls
 class RecordMP : public MPInterface
 {
 public:
-    explicit RecordMP(std::unique_ptr<LockstepMP> link) : Inner(std::move(link))
-    {
-#ifdef LITEV_WIFI_EVT
-        Inner->NoQuiet = true;
-#endif
-    }
+    explicit RecordMP(std::unique_ptr<LockstepMP> link) : Inner(std::move(link)) { Inner->NoQuiet = true; }
 
     LockstepMP& Link() { return *Inner; }
     void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = clock; Inner->SetClock(inst, std::move(clock)); }

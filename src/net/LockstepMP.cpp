@@ -49,7 +49,7 @@ void LockstepMP::SetWake(int inst, NDS& nds)
     nds.MPWake = [this, inst] { Wake(inst); };
 #endif
 #ifdef LITEV_MP_POLL_INLINE
-    nds.MPHostPoll = &HostFrameMaybe; nds.MPHostPollCtx = this; nds.MPHostPollInst = inst;
+    if (!NoQuiet) { nds.MPHostPoll = &HostFrameMaybe; nds.MPHostPollCtx = this; nds.MPHostPollInst = inst; }
 #endif
 #ifdef LITEV_WIFI_EVT
     if (!NoQuiet) { nds.MPHostQuiet = &HostQuiet; nds.MPHostQuietCtx = this; nds.MPHostQuietInst = inst; }

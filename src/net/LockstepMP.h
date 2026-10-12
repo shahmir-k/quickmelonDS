@@ -105,8 +105,11 @@ public:
     // so the answer depends on emulated times only. The host is the console's own last host
     // (ClientHost), as RecvPacket's on-time rule.
     static int HostQuiet(void* self, int inst, u64 until, u64* time, int* sender);
-    bool NoQuiet = false;   // (RecordMP) Hosted replays poll every tick: keep the recorded calls the same
 #endif
+    // (RecordMP) Hosted replicas poll on every Wi-Fi tick: the consoles here must make the same link
+    // calls, so no HostQuiet and no inline host poll (LITEV_MP_POLL_INLINE: its skips depend on the
+    // host thread's timing, which left the record short of calls the replica makes)
+    bool NoQuiet = false;
     // Ends every wait (the session is shutting down).
     void Stop();
 
