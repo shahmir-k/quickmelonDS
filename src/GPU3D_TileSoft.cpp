@@ -93,6 +93,49 @@ static int litevTileProp(const char*, int def) { return def; }
 static int litevTilePropInt(const char*, int def, int, int) { return def; }
 #endif
 
+#ifdef __APPLE__
+extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsystem_kernel: this thread's PMU counts
+#endif
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
+// diagnostic (env LITEV_S3D_CPU=1): thread CPU time (+ instructions on Apple) of the tile workers and
+// the coordinator, per produced 3D frame; printed every 300 frames (same pattern as LITEV_S2D_CPU)
+static const bool s3dCpu = getenv("LITEV_S3D_CPU") != nullptr;
+static std::atomic<unsigned long long> s3dWorkNs{0}, s3dWorkIns{0}, s3dCoordNs{0}, s3dCoordIns{0}, s3dFrames{0}, s3dKept{0};
+struct S3DCpuScope
+{
+    std::atomic<unsigned long long>& ns; std::atomic<unsigned long long>& ins;
+    timespec c0{}; unsigned long long pc0[2] = {};
+    S3DCpuScope(std::atomic<unsigned long long>& n, std::atomic<unsigned long long>& i) : ns(n), ins(i)
+    {
+        if (!s3dCpu) return;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
+#ifdef __APPLE__
+        thread_selfcounts(1, pc0, sizeof(pc0));
+#endif
+    }
+    ~S3DCpuScope()
+    {
+        if (!s3dCpu) return;
+        timespec c1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+        unsigned long long pc1[2] = {};
+#ifdef __APPLE__
+        thread_selfcounts(1, pc1, sizeof(pc1));
+#endif
+        ns.fetch_add((unsigned long long)(c1.tv_sec - c0.tv_sec) * 1000000000ull + c1.tv_nsec - c0.tv_nsec, std::memory_order_relaxed);
+        ins.fetch_add(pc1[0] - pc0[0], std::memory_order_relaxed);
+    }
+};
+static void s3dCpuFrame()
+{
+    if (!s3dCpu) return;
+    const unsigned long long f = s3dFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (f % 300 == 0)
+        fprintf(stderr, "S3D_CPU frames=%llu worker_ms_per_frame=%.4f coord_ms_per_frame=%.4f worker_instr_per_frame=%llu coord_instr_per_frame=%llu kept=%llu\n",
+                f, s3dWorkNs.load() / 1e6 / f, s3dCoordNs.load() / 1e6 / f, s3dWorkIns.load() / f, s3dCoordIns.load() / f, s3dKept.load());
+}
+
 namespace melonDS
 {
 
@@ -113,11 +156,14 @@ TileRenderer3D::~TileRenderer3D()
     for (int b = 0; b < NBMax; b++)
         delete[] Band[b].Tex.Arena;
     for (int g = 0; g < NGEOM; g++) delete[] VtxArena[g];
+#if defined(LITEV_TILE_SAMEFRAME) && defined(LITEV_TILE_COORD)
+    delete LastCfg; delete[] LastPolys; delete[] LastVtx;
+#endif
 }
 
 bool TileRenderer3D::Init()
 {
-    for (int g = 0; g < NGEOM; g++) if (!VtxArena[g]) VtxArena[g] = new TileVtx[VtxArenaSlots];
+    for (int g = 0; g < NGEOM; g++) if (!VtxArena[g]) VtxArena[g] = new TileVtx[VtxArenaSlots]();
     return true;
 }
 
@@ -133,7 +179,7 @@ void TileRenderer3D::Reset()
             Platform::Semaphore_Wait(Sema_RingFree);
 #endif
     WaitFrameComplete();                 // no worker may be mid-frame while we wipe state
-    for (int g = 0; g < NGEOM; g++) if (!VtxArena[g]) VtxArena[g] = new TileVtx[VtxArenaSlots];
+    for (int g = 0; g < NGEOM; g++) if (!VtxArena[g]) VtxArena[g] = new TileVtx[VtxArenaSlots]();
     memset(ColorOut, 0, sizeof(ColorOut));
     for (int b = 0; b < NB; b++)
     {
@@ -151,6 +197,9 @@ void TileRenderer3D::Reset()
     TexCacheDirty = true;
     GeomWrite = 0; GeomRead = 0;
     for (int g = 0; g < NGEOM; g++) FrameNumPolys[g] = 0;
+#if defined(LITEV_TILE_SAMEFRAME) && defined(LITEV_TILE_COORD)
+    LastValid = false;   // ColorOut was wiped
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1296,7 +1345,10 @@ void TileRenderer3D::BandWorkerFunc(int idx)
         if (!PoolRunning.load(std::memory_order_relaxed))
             return;
 
-        WorkerRender(idx);
+        {
+            S3DCpuScope cs(s3dWorkNs, s3dWorkIns);
+            WorkerRender(idx);
+        }
 
         // Barrier-free frame completion: each worker already finished its own (idx|idx+1) seam early
         // (in WorkerRender), so the LAST worker to arrive (acq_rel fetch_sub reads 1) only publishes
@@ -1367,6 +1419,9 @@ void TileRenderer3D::RenderFrame()
 
     BuildFrameGeom(GeomWrite);   // compact vertex snapshot + per-block buckets (emu thread)
     ComputeClearConfig();   // clear vals + DoPost/NeedHalo + border (emu thread)
+#ifdef LITEV_TILE_SAMEFRAME
+    Cfg[GeomWrite].TexDirty = TexCacheDirty;
+#endif
 
 #ifdef LITEV_TILE_COORD
     // DraStic decouple: the emu HANDS OFF the built frame to the coordinator thread and returns
@@ -1417,8 +1472,57 @@ void TileRenderer3D::RenderFrame()
 // The coordinator publishes one queued frame to the 2D consumer, dispatches the 3 band workers,
 // and blocks (on THIS thread, not the emu) until they finish. Same sequence the single-frame
 // RenderFrame did — just owned by the coordinator so the emu never waits on the raster.
+#ifdef LITEV_TILE_SAMEFRAME
+// Does frame gi repeat the last kept frame's inputs? Everything the raster reads: the compact
+// polygons and vertices (bucket lists derive from them) and the per-frame render state. Textures:
+// TexDirtySinceLast (no texture VRAM rewrite since that frame was rastered).
+bool TileRenderer3D::SameAsLast(int gi, u32 nvtx) const
+{
+    const u32 n = FrameNumPolys[gi];
+    if (!LastValid || n != LastNumPolys || nvtx != LastNumVtx) return false;
+    const FrameCfg& a = Cfg[gi];
+    const FrameCfg& b = *LastCfg;
+    if (a.ClearColorVal != b.ClearColorVal || a.ClearDepthIdVal != b.ClearDepthIdVal || a.DispCnt != b.DispCnt
+        || a.AlphaRef != b.AlphaRef || a.FogColor != b.FogColor || a.FogOffset != b.FogOffset || a.FogShift != b.FogShift
+        || memcmp(a.ToonTable, b.ToonTable, sizeof(a.ToonTable)) || memcmp(a.EdgeTable, b.EdgeTable, sizeof(a.EdgeTable))
+        || memcmp(a.FogDensityTable, b.FogDensityTable, sizeof(a.FogDensityTable)))
+        return false;
+    return !memcmp(FramePolys[gi], LastPolys, n * sizeof(TilePoly))
+        && !memcmp(VtxArena[gi], LastVtx, nvtx * sizeof(TileVtx));   // arenas are zeroed: padding compares equal
+}
+
+void TileRenderer3D::SaveLast(int gi, u32 nvtx, int col)
+{
+    if (!LastCfg) { LastCfg = new FrameCfg; LastPolys = new TilePoly[MaxPolys]; LastVtx = new TileVtx[VtxArenaSlots](); }
+    *LastCfg = Cfg[gi];
+    memcpy(LastPolys, FramePolys[gi], FrameNumPolys[gi] * sizeof(TilePoly));
+    memcpy(LastVtx, VtxArena[gi], nvtx * sizeof(TileVtx));
+    LastNumPolys = FrameNumPolys[gi];
+    LastNumVtx = nvtx;
+    LastCol = col;
+    LastValid = true;
+    TexDirtySinceLast = false;
+}
+#endif
+
 void TileRenderer3D::CoordDispatch(int geomIdx, int colIdx)
 {
+#ifdef LITEV_TILE_SAMEFRAME
+    const u32 np = FrameNumPolys[geomIdx];
+    const u32 nvtx = np ? FramePolys[geomIdx][np - 1].vtxBase + FramePolys[geomIdx][np - 1].numVerts : 0;
+    TexDirtySinceLast |= Cfg[geomIdx].TexDirty;
+    if (!TexDirtySinceLast && SameAsLast(geomIdx, nvtx))
+    {
+        // same inputs -> same picture: copy the kept output, every row ready at once
+        memcpy(ColorOut[colIdx], ColorOut[LastCol], sizeof(ColorOut[0]));
+        LastCol = colIdx;
+        DisplayIdx.store(colIdx, std::memory_order_release);
+        for (int y = 0; y < OutHeight; y++) RowReady[colIdx][y].store(1, std::memory_order_release);
+        Platform::Semaphore_Post(Sema_RowPub, OutHeight);
+        if (s3dCpu) s3dKept.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+#endif
     GeomRead = geomIdx;
     WorkerColIdx = colIdx;
     for (int b = 0; b < NB; b++) SeamFirstReady[b].store(0, std::memory_order_relaxed);
@@ -1437,6 +1541,9 @@ void TileRenderer3D::CoordDispatch(int geomIdx, int colIdx)
     for (int b = 0; b < NB; b++)
         Platform::Semaphore_Post(BandStartSema[b]);
     WaitFrameComplete();                             // block for the workers (coordinator thread)
+#ifdef LITEV_TILE_SAMEFRAME
+    SaveLast(geomIdx, nvtx, colIdx);
+#endif
 }
 
 void TileRenderer3D::CoordFunc()
@@ -1448,7 +1555,11 @@ void TileRenderer3D::CoordFunc()
         if (!CoordRunning.load(std::memory_order_acquire)) return;
         const u32 c = FrameConsumed.load(std::memory_order_acquire);
         const PendFrame pf = PendRing[c % NCOL];
-        CoordDispatch(pf.geomIdx, pf.colIdx);
+        {
+            S3DCpuScope cs(s3dCoordNs, s3dCoordIns);
+            CoordDispatch(pf.geomIdx, pf.colIdx);
+        }
+        s3dCpuFrame();
         FrameConsumed.fetch_add(1, std::memory_order_release);
         Platform::Semaphore_Post(Sema_RingFree);     // a ring slot freed -> unblock a waiting emu
     }
