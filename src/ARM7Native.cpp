@@ -1842,6 +1842,7 @@ bool Interp(melonDS::ARM* cpu, bool thumb)
     return true;
 }
 
+bool VecCand(melonDS::NDS& nds);
 void Irq(melonDS::ARM* cpu)
 {
     if (cpu->Num != 1 || CheckPending) return;
@@ -1870,12 +1871,23 @@ void Irq(melonDS::ARM* cpu)
             }
 #endif
     {
+        // (a vector target that is no SDK IRQ handler, e.g. a library's nested IRQ handler: nothing to step, skip the run)
+        if (!VecCand(cpu->NDS)) { s.stops[kSegs]++; return; }
         A7N_PMU(0);
         if (RunChain(cpu, 0x18, wBiosIn, !cpu->NDS.IsJITEnabled())) s.irqNative++;
     }
 #if defined(__APPLE__) && defined(LITEV_HLE_DIAG)
     if (g_PmuLvl == 4 && g_LastStop) { g_GapPc = g_LastStop; g_LastStop = 0; u64 c[2]; thread_selfcounts(1, c, sizeof(c)); g_Gap0 = c[0]; }
 #endif
+}
+
+// the IRQ vector's target may be an SDK OS_IrqHandler (its first word)
+bool VecCand(melonDS::NDS& nds)
+{
+    u32 h, w0;
+    if (!Word(nds, 0x03FFFFFC, h) || !Word(nds, h, w0)) return false;
+    for (int j = 0; j < kByKind.n[kIrqHandler]; j++) if (kSigs[kByKind.i[kIrqHandler][j]].w0 == w0) return true;
+    return false;
 }
 
 bool MaybeExit(u32 instr)
@@ -1894,7 +1906,9 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, u32* a, u32* b, int max)
     for (const A7NSig& g : kSigs)
     {
         u32 at;
-        if (g.kind == kThreadSwitch && g.w0 == instr) at = addr;
+        // (the thread switch only while the IRQ vector is an SDK OS_IrqHandler: a library's nested IRQ handler (Brain Age,
+        // Zelda PH) enters it on another stack layout, where the native run stops right after it: slower than the guest)
+        if (g.kind == kThreadSwitch && g.w0 == instr) { if (!VecCand(nds)) continue; at = addr; }
         else if ((g.kind == kIrqCallback || g.kind == kArrangeTimer) && g.pw == instr)
         {
             u32 w;
@@ -1995,8 +2009,9 @@ bool Hook(melonDS::ARM* cpu, bool jit)
 #if defined(__APPLE__) && defined(LITEV_HLE_DIAG)
     if (g_PmuLvl == 4 && g_Gap0) { u64 c[2]; thread_selfcounts(1, c, sizeof(c)); g_Gaps[g_GapPc].push_back(c[0] - g_Gap0); g_Gap0 = 0; }
 #endif
+    if (want == wTs && jit && !VecCand(cpu->NDS)) s.reguard = true;     // (recompile the block without the hook: see IsHook)
     A7N_PMU(1);
-    if (want != wNone && RunChain(cpu, pc, want, !jit))
+    if (want != wNone && (want != wTs || !s.reguard) && RunChain(cpu, pc, want, !jit))
     {
         s.exits++;
         return true;
