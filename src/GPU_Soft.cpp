@@ -23,6 +23,9 @@
 #endif
 #include "NDS.h"
 #include "GPU_Soft.h"
+#ifdef S2D_OUTNEON
+#include "GPU2D_Planes.h"
+#endif
 #include "GPU_ColorOp.h"
 #include "Platform.h"
 #include "LitevSoftProf.h"
@@ -687,16 +690,31 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             dstB = &Framebuffer[AsyncTargetBuf][0][dstoffset];
         }
 
+#ifdef S2D_OUTNEON
+        // a regular-display line goes to the framebuffer in one pass (brightness + expansion)
+        const bool fuseA = f.ScreensEnabled && ((f.DispCntA >> 16) & 0x3) == 1;
+        const bool fuseB = f.ScreensEnabled && ((f.DispCntB >> 16) & 0x1) == 1;
+        if (fuseA) S2DPlanes::OutputLine(BandOut2D[0][line], f.MasterBrightnessA, dstA);
+        else DrawScanlineA(line, dstA, BandOut2D[0][line], f.DispCntA, f.MasterBrightnessA);
+        if (fuseB) S2DPlanes::OutputLine(BandOut2D[1][line], f.MasterBrightnessB, dstB);
+        else DrawScanlineB(line, dstB, BandOut2D[1][line], f.DispCntB, f.MasterBrightnessB);
+#else
         DrawScanlineA(line, dstA, BandOut2D[0][line], f.DispCntA, f.MasterBrightnessA);
         DrawScanlineB(line, dstB, BandOut2D[1][line], f.DispCntB, f.MasterBrightnessB);
+#endif
 
         if (f.CaptureEnable)
             DoCapture(line, BandOut2D[0][line], l3d, &f);
 
         if (f.ScreensEnabled)
         {
+#ifdef S2D_OUTNEON
+            if (!fuseA) ExpandColor(dstA);
+            if (!fuseB) ExpandColor(dstB);
+#else
             ExpandColor(dstA);
             ExpandColor(dstB);
+#endif
         }
         else
         {
@@ -1526,6 +1544,17 @@ void SoftRenderer::DoCapture(u32 line, const u32* srcA2d, const u32* src3d, cons
     static_assert(VRAMDirtyGranularity == 512);
     GPU.VRAMDirty[dstvram][(dstaddr * 2) / VRAMDirtyGranularity] = true;
 
+#ifdef S2D_OUTNEON
+    {
+        const u32 csrc = (captureCnt >> 29) & 0x3;
+        if (csrc != 1)
+        {
+            if (csrc == 0) S2DPlanes::CaptureA15(srcA, width, dst);
+            else S2DPlanes::CaptureBlend(srcA, srcB, width, std::min<u32>(captureCnt & 0x1F, 16), std::min<u32>((captureCnt >> 8) & 0x1F, 16), dst);
+            return;
+        }
+    }
+#endif
     switch ((captureCnt >> 29) & 0x3)
     {
     case 0: // source A

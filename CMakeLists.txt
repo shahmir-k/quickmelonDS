@@ -268,6 +268,14 @@ option(LITEV_SOFT2D_PLANES "liteV: plane-based 2D (layer planes + one select/com
 if (LITEV_SOFT2D_PLANES)
     add_compile_definitions(LITEV_SOFT2D_PLANES=1)
 endif()
+# LITEV_SOFT2D_OUTNEON: the threaded 2D's output stage in NEON: a regular-display line goes to the
+# framebuffer in one pass (master brightness + 6->8 bit expansion, no copy), and display capture
+# (source A, A+B blend) 16 pixels at a time. Render-only, exact. AArch64. Inspired by DSperate's
+# output_line / capture_a15 / capture_blend (src/core/gpu/kernels_neon.cpp).
+option(LITEV_SOFT2D_OUTNEON "liteV: one-pass NEON 2D output stage + NEON display capture" OFF)
+if (LITEV_SOFT2D_OUTNEON)
+    add_compile_definitions(LITEV_SOFT2D_OUTNEON=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

@@ -16,10 +16,12 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
-// NEON line kernels of the software 2D: layer planes (LITEV_SOFT2D_PLANES). Ported from / based on DSperate
+// NEON line kernels of the software 2D: layer planes (LITEV_SOFT2D_PLANES), output stage
+// (LITEV_SOFT2D_OUTNEON). Ported from / based on DSperate
 // (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
 // src/core/gpu/kernels_neon.cpp: text_ctl, text_pair, text_one, text_row_16, text_row_256,
-// merge16/select16, brighten16/darken16, composite_line_fade), adapted to melonDS's line formats (OBJLine attribute words, 3D line,
+// merge16/select16, brighten16/darken16, composite_line_fade, output_line, capture_a15,
+// capture_blend), adapted to melonDS's line formats (OBJLine attribute words, 3D line,
 // BGOBJLine colour records):
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -262,6 +264,95 @@ inline void FadeLine(const u32* top, const u8* win, u32 bc, u32 evy, u32* out)
     }
 }
 
+// ---- output stage (LITEV_SOFT2D_OUTNEON) --------------------------------------------------------
+// A regular-display line to the framebuffer in one pass: master brightness, then 6 -> 8 bit
+// expansion to 0xAARRGGBB (SoftRenderer::ApplyMasterBrightness + ExpandColor).
+inline void OutputLine(const u32* src, u16 reg, u32* dst)
+{
+    const u32 mode = reg >> 14;
+    u32 factor = reg & 0x1F;
+    if (factor > 16) factor = 16;
+    const uint8x8_t vf = vdup_n_u8((u8)factor);
+    const uint8x16_t v63 = vdupq_n_u8(63), vff = vdupq_n_u8(0xFF);
+    const bool bright = mode == 1 && factor, dark = mode == 2 && factor;
+    for (u32 i = 0; i < 256; i += 16)
+    {
+        const uint8x16x4_t p = vld4q_u8(reinterpret_cast<const u8*>(src + i));
+        uint8x16_t c[3];
+        for (u32 k = 0; k < 3; ++k)
+        {
+            c[k] = vandq_u8(p.val[k], v63);
+            if (bright) c[k] = Brighten16(c[k], vf, 0);
+            else if (dark) c[k] = Darken16(c[k], vf, 15);
+            c[k] = vorrq_u8(vshlq_n_u8(c[k], 2), vshrq_n_u8(c[k], 4));
+        }
+        const uint8x16x4_t rec = {{c[2], c[1], c[0], vff}};
+        vst4q_u8(reinterpret_cast<u8*>(dst + i), rec);
+    }
+}
+
+// Display capture, source A only: 18-bit records (alpha byte non-zero = opaque) -> BGR555 + bit 15.
+inline void CaptureA15(const u32* src, u32 n, u16* dst)
+{
+    const uint8x16_t v1f = vdupq_n_u8(0x1F);
+    for (u32 i = 0; i < n; i += 16)
+    {
+        const uint8x16x4_t p = vld4q_u8(reinterpret_cast<const u8*>(src + i));
+        const uint8x16_t r = vandq_u8(vshrq_n_u8(p.val[0], 1), v1f);
+        const uint8x16_t g = vandq_u8(vshrq_n_u8(p.val[1], 1), v1f);
+        const uint8x16_t b = vandq_u8(vshrq_n_u8(p.val[2], 1), v1f);
+        const uint8x16_t a = vtstq_u8(p.val[3], p.val[3]);
+        auto half = [&](u32 o, uint8x8_t r8, uint8x8_t g8, uint8x8_t b8, uint8x8_t a8) {
+            uint16x8_t w = vmovl_u8(r8);
+            w = vorrq_u16(w, vshlq_n_u16(vmovl_u8(g8), 5));
+            w = vorrq_u16(w, vshlq_n_u16(vmovl_u8(b8), 10));
+            w = vorrq_u16(w, vshlq_n_u16(vmovl_u8(a8), 15));
+            vst1q_u16(dst + i + o, w);
+        };
+        half(0, vget_low_u8(r), vget_low_u8(g), vget_low_u8(b), vget_low_u8(a));
+        half(8, vget_high_u8(r), vget_high_u8(g), vget_high_u8(b), vget_high_u8(a));
+    }
+}
+
+// Capture blend: A as above, B a BGR555 line (alpha bit 15; null = all transparent). Per channel
+// ((ca*aa*eva)+(cb*ab*evb)+8)>>4 clamped to 31; alpha (eva?aa:0)|(evb?ab:0). eva/evb in 0..16.
+inline void CaptureBlend(const u32* srca, const u16* srcb, u32 n, u32 eva, u32 evb, u16* dst)
+{
+    const uint8x16_t v1f = vdupq_n_u8(0x1F);
+    const uint8x8_t va8 = vdup_n_u8((u8)eva), vb8 = vdup_n_u8((u8)evb);
+    const uint8x16_t ea = vdupq_n_u8(eva ? 0xFF : 0), eb = vdupq_n_u8(evb ? 0xFF : 0);
+    const uint16x8_t bias = vdupq_n_u16(8), v31 = vdupq_n_u16(31), topbit = vdupq_n_u16(0x8000);
+    for (u32 i = 0; i < n; i += 16)
+    {
+        const uint8x16x4_t p = vld4q_u8(reinterpret_cast<const u8*>(srca + i));
+        const uint8x16_t aam = vtstq_u8(p.val[3], p.val[3]);
+        const uint8x16_t ra = vandq_u8(vandq_u8(vshrq_n_u8(p.val[0], 1), v1f), aam);
+        const uint8x16_t ga = vandq_u8(vandq_u8(vshrq_n_u8(p.val[1], 1), v1f), aam);
+        const uint8x16_t ba = vandq_u8(vandq_u8(vshrq_n_u8(p.val[2], 1), v1f), aam);
+        const uint16x8_t w0 = srcb ? vld1q_u16(srcb + i) : vdupq_n_u16(0), w1 = srcb ? vld1q_u16(srcb + i + 8) : vdupq_n_u16(0);
+        const uint8x16_t abm = vcombine_u8(vmovn_u16(vtstq_u16(w0, topbit)), vmovn_u16(vtstq_u16(w1, topbit)));
+        auto bnarrow = [&](uint16x8_t c0, uint16x8_t c1) {
+            return vandq_u8(vandq_u8(vcombine_u8(vmovn_u16(c0), vmovn_u16(c1)), v1f), abm);
+        };
+        const uint8x16_t rb = bnarrow(w0, w1);
+        const uint8x16_t gb = bnarrow(vshrq_n_u16(w0, 5), vshrq_n_u16(w1, 5));
+        const uint8x16_t bb = bnarrow(vshrq_n_u16(w0, 10), vshrq_n_u16(w1, 10));
+        const uint8x16_t ad = vorrq_u8(vandq_u8(aam, ea), vandq_u8(abm, eb));
+        auto half = [&](u32 o, auto lane) {
+            auto blend1 = [&](uint8x16_t ca, uint8x16_t cb) {
+                uint16x8_t s = vmlal_u8(vmull_u8(lane(ca), va8), lane(cb), vb8);
+                return vminq_u16(vshrq_n_u16(vaddq_u16(s, bias), 4), v31);
+            };
+            uint16x8_t w = blend1(ra, rb);
+            w = vorrq_u16(w, vshlq_n_u16(blend1(ga, gb), 5));
+            w = vorrq_u16(w, vshlq_n_u16(blend1(ba, bb), 10));
+            w = vorrq_u16(w, vshlq_n_u16(vmovl_u8(lane(ad)), 15));
+            vst1q_u16(dst + i + o, w);
+        };
+        half(0, [](uint8x16_t v) { return vget_low_u8(v); });
+        half(8, [](uint8x16_t v) { return vget_high_u8(v); });
+    }
+}
 } // namespace S2DPlanes
 
 

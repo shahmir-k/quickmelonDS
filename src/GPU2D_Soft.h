@@ -40,6 +40,10 @@ static inline u32 S2DConvColor(u16 c)
 // layer planes + one select/resolve per line (needs the converted palette and the NEON compositor)
 #define S2D_PLANES 1
 #endif
+#if defined(LITEV_SOFT2D_OUTNEON) && defined(LITEV_SOFT2D_THREADED) && defined(__aarch64__)
+// one-pass NEON output stage: brightness + 6->8 bit expansion, display capture
+#define S2D_OUTNEON 1
+#endif
 class SoftRenderer2D : public Renderer2D
 {
 public:
