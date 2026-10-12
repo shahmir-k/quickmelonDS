@@ -297,7 +297,7 @@ constexpr s32 kWakeCycles = 900;
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
 constexpr int kKinds = 27;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 67108863;    // (bit 16777216: HLELeaf, 33554432: the byte copy loop)
+constexpr u32 kAllHooks = 33554431;    // (bit 16777216: HLELeaf; 33554432, the byte copy loop, default off: see 26.)
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
@@ -1629,6 +1629,10 @@ __attribute__((noinline)) bool RunLz(melonDS::ARMv5* c, State& s, bool jit)
 // the loop leaves there (r1, ip advanced, r2 counted down, r3 the last byte, NZCV of the subs) and back at the loop head,
 // or past the bne when r2 reached 0: IRQs and events are taken between steps, as with hook 6 (a call at the BL instead,
 // HLELeaf, copied 14 KB in one go and moved every event behind it: The Sims 3 then ran +7% more guest code).
+// Default OFF (not in kAllHooks; debug.litev.a9hle=67108863 turns it on): exact in the interpreter (identical states with
+// it on / off), but under the JIT The Sims 3's census scene takes another trajectory with any timing change and then runs
+// +6% more guest code for the same displayed frames (265 distinct frames in 900 either way): measured slower, so off
+// until a device A/B in real play says otherwise.
 constexpr u32 kCopyInstr = 0xE4D13001;      // ldrb r3, [r1], #1 (the loop head)
 constexpr u32 kCopyCode[8] = {0xE1A0C000, 0xE3520000, 0x012FFF1E, 0xE4D13001, 0xE2522001, 0xE4CC3001, 0x1AFFFFFB, 0xE12FFF1E};
 constexpr u32 kCopyHead = 12, kCopyStep = 256;
