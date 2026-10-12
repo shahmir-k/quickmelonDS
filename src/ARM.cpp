@@ -1288,9 +1288,14 @@ void ARM::TriggerIRQ()
     if (CPSR & 0x80)
         return;
 #ifdef LITEV_A9HLE
-    // PW's HBlank IRQ taken natively (registers unchanged); deliver anything still pending
-    if (Num == 0 && A9HLE::Irq((ARMv5*)this, false) && !IRQ)
-        return;
+    // an IRQ taken natively (1: registers unchanged; deliver anything still pending) or entered natively (2: in the
+    // OS IRQ handler now, IRQs off)
+    if (Num == 0)
+    {
+        const int hle = A9HLE::Irq((ARMv5*)this, false);
+        if (hle == 2 || (hle == 1 && !IRQ))
+            return;
+    }
     if (Num == 0 && Halted == 2 && A9HLE::Defer((ARMv5*)this))
         return;
 #endif
@@ -1407,13 +1412,13 @@ void ARMv5::Execute()
         {
             Halted = 0;
 #ifdef LITEV_A9HLE
-            // PW's HBlank IRQ while halted in the OS idle loop: taken natively, and the guest
-            // would halt again right after it with the same registers
-            if (A9HLE::Irq(this, true))
+            // an IRQ while halted in the OS idle loop: taken natively (1: the guest would halt again right after it
+            // with the same registers) or entered natively (2: the ARM9 runs the IRQ handler)
+            if (int hle = A9HLE::Irq(this, true))
             {
                 NDS.ARM9Timestamp += Cycles;
                 Cycles = 0;
-                if (!NDS.HaltInterrupted(0))
+                if (hle == 1 && !NDS.HaltInterrupted(0))
                 {
                     Halted = 1;
                     if (NDS.ARM9Timestamp < NDS.ARM9Target)
