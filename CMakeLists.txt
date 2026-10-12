@@ -237,6 +237,26 @@ option(LITEV_SOFT2D_BITMASK "liteV: DSperate byte-plane masked 2D colour-effect 
 if (LITEV_SOFT2D_BITMASK)
     add_compile_definitions(LITEV_SOFT2D_BITMASK=1)
 endif()
+# LITEV_SOFT2D_BGSPAN: text BG layers drawn a tile at a time (one tilemap + tile-row fetch per 8 px,
+# blank tile rows skipped, no per-pixel window test without windows); extended rotscale BGs reuse
+# the map entry while consecutive pixels stay on it. Same pixels. Inspired by DSperate (f5fa35e).
+option(LITEV_SOFT2D_BGSPAN "liteV: tile-at-a-time text BG with blank tile-row skip" OFF)
+if (LITEV_SOFT2D_BGSPAN)
+    add_compile_definitions(LITEV_SOFT2D_BGSPAN=1)
+endif()
+# LITEV_SOFT2D_PALCONV: the threaded 2D converts each band's palette to the line colour format once
+# per frame (journal replay keeps it in step); text BG spans and sprites read it. Same pixels.
+option(LITEV_SOFT2D_PALCONV "liteV: 2D palette converted once per frame (needs THREADED+DEPTH2)" OFF)
+if (LITEV_SOFT2D_PALCONV)
+    add_compile_definitions(LITEV_SOFT2D_PALCONV=1)
+endif()
+# LITEV_SOFT2D_SPRLIST: the threaded 2D builds per-line sprite candidate lists once per OAM generation
+# (instead of testing 128 sprites per line) and skips sprite interleave passes for priorities no
+# sprite on the line has. Same pixels.
+option(LITEV_SOFT2D_SPRLIST "liteV: 2D sprite candidate lists per OAM generation (needs THREADED+DEPTH2)" OFF)
+if (LITEV_SOFT2D_SPRLIST)
+    add_compile_definitions(LITEV_SOFT2D_SPRLIST=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

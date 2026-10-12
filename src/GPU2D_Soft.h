@@ -24,6 +24,18 @@ namespace melonDS
 {
 class SoftRenderer;
 
+#ifdef LITEV_SOFT2D_PALCONV
+// A BGR555 palette entry in the BGOBJLine colour format (6-bit channels, bit 15 = green LSB), as
+// SoftRenderer2D::DrawPixel converts it. Inspired by DSperate's palette converted once per
+// generation (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
+// src/core/gpu/engine2d.cpp std_pal18).
+static inline u32 S2DConvColor(u16 c)
+{
+    const u32 r = (c & 0x001F) << 1, g = ((c & 0x03E0) >> 4) | ((c & 0x8000) >> 15), b = (c & 0x7C00) >> 9;
+    return r | (g << 8) | (b << 16);
+}
+
+#endif
 class SoftRenderer2D : public Renderer2D
 {
 public:
@@ -111,6 +123,9 @@ public:
 
     u32* Cur3DLine = nullptr;                  // per-line 3D output (replaces Parent.Output3D)
     const u8* CurOAM = nullptr;                // per-line OAM base (replaces GPU.OAM)
+#ifdef LITEV_SOFT2D_SPRLIST
+    const u32* CurOAMGen = nullptr;   // CurOAM content generation (null: unknown, scan all 128 sprites)
+#endif
 
     // Per-scanline snapshots, filled on the emu thread at each LCD scanline event,
     // consumed by the deferred (batched, later banded-threaded) render at VBlank.
@@ -133,6 +148,11 @@ public:
     // (non-threaded/inline path); the async render points it at a per-frame snapshot
     // (PaletteSnap) so frame N's render doesn't race the emu's palette writes in N+1.
     const u8* CurPalette = nullptr;
+#ifdef LITEV_SOFT2D_PALCONV
+    // CurPalette's 1024 entries already in the BGOBJLine colour format (S2DPalConv), or null
+    const u32* CurPalConv = nullptr;
+    static void DrawPixelConv(u32* dst, u32 c) { *(dst+256) = *dst; *dst = c; }
+#endif
 
     // Hybrid renderer (3D on the GPU): engine A emits, per pixel, a 2-word descriptor
     // instead of a final colour whenever DISPCNT bit 3 (BG0 = 3D) is set:
@@ -171,6 +191,12 @@ private:
     alignas(8) u8 OBJWindow[256];
 
     u32 NumSprites;
+#ifdef LITEV_SOFT2D_SPRLIST
+    u32 OBJPrioMask = 0;        // priorities of this line's non-window sprites (InterleaveSprites skip)
+    u32 SprListGen = 0;         // generation SprLines was built for
+    u64 SprLines[192][2];       // per line: sprites whose box covers it
+    void BuildSprLists(const u16* oam);
+#endif
 
     u8* CurBGXMosaicTable;
     array2d<u8, 16, 256> MosaicTable = []() constexpr

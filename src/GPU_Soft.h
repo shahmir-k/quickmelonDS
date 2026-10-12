@@ -20,6 +20,7 @@
 #define GPU_SOFT_H
 
 #include <atomic>
+#include <vector>
 
 #include "GPU.h"
 #include "Platform.h"
@@ -108,6 +109,7 @@ protected:
         // White's battle intro captures its room into VRAM D, then shows D as a BG: the live
         // checks dropped the capture -> white)
         u32 CaptureCnt, VRAMMapLCDC;
+        u32 JMarkLine, JMarkSpr;   // GPU::S2DJ journal position at this line's BG / sprite snapshot
     };
 #ifdef LITEV_SOFT2D_THREADED
     FrameLineSnap FrameSnap[192];
@@ -191,6 +193,26 @@ protected:
 #ifdef LITEV_SOFT2D_DEPTH2
     alignas(8) u8 PaletteSnap[2][2*1024];   // [SnapParity] GPU.Palette snapshot
     alignas(8) u8 OAMSnap[2][2*1024];       // [SnapParity] GPU.OAM snapshot
+    // [SnapParity] this frame's mid-frame write journal (GPU::S2DJ), N = -1: none (VBlank state);
+    // VRAM: it has flat BG/OBJ VRAM entries (replayed into the shared shadow: one band)
+    std::vector<GPU::S2DJEntry> S2DJFrame[2];
+    int S2DJFrameN[2] = {-1, -1};
+    bool S2DJFrameVRAM[2] = {};
+    bool S2DJBegun = false;   // emu: the journal window of the frame being displayed is open
+    alignas(8) u8 S2DJPal[S2D_NBANDS][2*1024];   // per band: palette/OAM seeked to the line
+    alignas(8) u8 S2DJOAM[S2D_NBANDS][2*1024];
+    u64 S2DJStat[6] = {};   // frames, journaled frames, entries, max entries, unusable frames, VRAM frames (LITEV_S2DJ_STATS)
+    void S2DJSeek(int slot, int band, u32& pos, u32 to) noexcept;
+#ifdef LITEV_SOFT2D_SPRLIST
+    u32 S2DOAMGen[S2D_NBANDS] {};   // per band: OAM copy generation (SoftRenderer2D::CurOAMGen)
+#endif
+#ifdef LITEV_SOFT2D_PALCONV
+    // per band: the palette the band draws with, converted once per frame (and per journal entry)
+    // to the BGOBJLine colour format (SoftRenderer2D::CurPalConv)
+    alignas(16) u32 S2DPalConv[S2D_NBANDS][1024];
+#endif
+    void S2DJBegin() noexcept;
+    void S2DJEnd(int slot) noexcept;
 #else
     alignas(8) u8 PaletteSnap[2*1024];   // GPU.Palette snapshot (read by async draws)
     alignas(8) u8 OAMSnap[2*1024];       // GPU.OAM snapshot (read by async draws)

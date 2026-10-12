@@ -132,6 +132,9 @@ void GPU::ResetVRAMCache() noexcept
 
 void GPU::Reset() noexcept
 {
+#if defined(LITEV_SOFT2D_DEPTH2)
+    S2DJOverflow = true; S2DJN = 0;   // the journal no longer describes the frame: VBlank state this frame
+#endif
     ScreensEnabled = false;
     ScreenSwap = false;
 
@@ -213,6 +216,9 @@ void GPU::Stop() noexcept
 
 void GPU::DoSavestate(Savestate* file) noexcept
 {
+#if defined(LITEV_SOFT2D_DEPTH2)
+    S2DJOverflow = true; S2DJN = 0;   // the journal no longer describes the frame: VBlank state this frame
+#endif
     file->Section("GPUG");
 
     Rend->PreSavestate();
@@ -603,6 +609,7 @@ void GPU::MapVRAM_AB(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    LITEV_S2DJ_REMAP();
 
     u8 oldofs = (oldcnt >> 3) & 0x3;
     u8 ofs = (cnt >> 3) & 0x3;
@@ -667,6 +674,7 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    LITEV_S2DJ_REMAP();
 #ifdef LITEV_NETPLAY_CAPTURE
     // a captured bank given to the ARM7 (MST 2): its reads bypass SyncVRAMCaptureBlock
     if ((cnt & 0x87) == 0x82 && ((CaptureTaint >> (bank << 2)) & 0xF) && !CaptureSeen)
@@ -776,6 +784,7 @@ void GPU::MapVRAM_E(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    LITEV_S2DJ_REMAP();
 
     u32 bankmask = 1 << bank;
 
@@ -844,6 +853,7 @@ void GPU::MapVRAM_FG(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    LITEV_S2DJ_REMAP();
 
     u8 oldofs = (oldcnt >> 3) & 0x7;
     u8 ofs = (cnt >> 3) & 0x7;
@@ -952,6 +962,7 @@ void GPU::MapVRAM_H(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    LITEV_S2DJ_REMAP();
 
     u32 bankmask = 1 << bank;
 
@@ -1010,6 +1021,7 @@ void GPU::MapVRAM_I(u32 bank, u8 cnt) noexcept
     VRAMCNT[bank] = cnt;
 
     if (oldcnt == cnt) return;
+    LITEV_S2DJ_REMAP();
 
     u32 bankmask = 1 << bank;
 
