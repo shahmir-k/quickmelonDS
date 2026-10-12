@@ -12,6 +12,7 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <mutex>
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
@@ -177,6 +178,9 @@ State& Get(melonDS::NDS& nds)
     static thread_local const melonDS::NDS* last = nullptr;
     static thread_local State* lastS = nullptr;
     if (&nds == last) return *lastS;
+    // (headless --mp-test / Netplay: a console per thread; the map's insert must not race another thread's)
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
     State& s = g_State[&nds];       // (map nodes are stable)
     last = &nds; lastS = &s;
     return s;
