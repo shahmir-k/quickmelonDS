@@ -1184,6 +1184,181 @@ void TileRenderer3D::SpanFillLocal(BandScratch& bs, const PolyShade& ps, s32 row
             PlotTranslucentTile(bs, idx, col, translDW ? z : -1, idword | (ID_TRANSL << 24));
     }
 }
+
+#if defined(LITEV_TILE_SPANVEC) && defined(__aarch64__)
+// SpanFillLocal (z-buffer, modulate or decal) four pixels at a time: the same per-pixel values in
+// u32/s32/s64 lanes (num/den/the 64-bit depth product step per lane, the divide per lane, the
+// attributes base + ((d * f) >> 8) in u32, s16 texcoords, clamp/repeat/flip, texel gather,
+// modulate/decal, alpha test). Opaque pixels are written as a masked 4-wide store, translucent
+// ones go through PlotTranslucentTile one by one (every pixel of a span has its own index, so the
+// order between them doesn't matter). The last < 4 pixels run in SpanFillLocal.
+// Inspired by DSperate (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
+// src/core/gpu/render3d.cpp span_shade / kernels_neon.cpp span_attrs: NEON span shading). No code copied.
+template<bool TEX, bool DECAL, bool WBUF>
+void TileRenderer3D::SpanVec(BandScratch& bs, const PolyShade& ps, s32 rowbase, s32 x, s32 xlim, s32 xstart,
+                             s32 xdiff, s32 wl, s32 wr, s32 zl, s32 zr, const s32* base, const u32* d, u32 rev)
+{
+    if (x + 3 <= xlim)
+    {
+        u32* const color = bs.Color;
+        u32* const depth = bs.DepthId;
+        const u32 polyalpha = ps.polyalpha;
+        const u32 alpharef = ps.alpharef;
+        const u32 idword = ps.idword;
+        const bool translDW = ps.translDepthWrite;
+        const u32* const tex = TEX ? ps.tex32 : nullptr;
+        const s32 tw = ps.texW, th = ps.texH;
+        const u32 tp = ps.texparam;
+        const bool swrap = tp & (1<<16), sflip = tp & (1<<18), twrap = tp & (1<<17), tflip = tp & (1<<19);
+
+        static const s32 laneIdx[4] = { 0, 1, 2, 3 };
+        const int32x4_t lane = vld1q_s32(laneIdx);
+        const uint32x4_t lane_u = vreinterpretq_u32_s32(lane);
+
+        const s32 xv = x - xstart;
+        const u32 num0 = (u32)(xv * wl) << 8;
+        const u32 den0 = (u32)(xv * wl) + (u32)((xdiff - xv) * wr);
+        const u32 dnum = (u32)wl << 8, dden = (u32)wl - (u32)wr;
+        uint32x4_t numv = vmlaq_n_u32(vdupq_n_u32(num0), lane_u, dnum);
+        uint32x4_t denv = vmlaq_n_u32(vdupq_n_u32(den0), lane_u, dden);
+        const uint32x4_t dnum4 = vdupq_n_u32(dnum * 4), dden4 = vdupq_n_u32(dden * 4);
+
+        s32 zbase = zl; s64 P = 0, dP = 0;
+        // w-buffer: z = zlo + ((zd * (zup ? f : 256 - f)) >> 8); zd < 2^31 and the u32 factor keep the
+        // product below 2^63, so the unsigned 32x32->64 multiply gives the signed product
+        const bool zup = zl < zr;
+        const s64 zd = zup ? (s64)(zr - zl) : (s64)(zl - zr);
+        if (WBUF && zd < 0) { SpanFillLocal<TEX, DECAL ? 1 : 0, true>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, d, rev); return; }
+        const uint32x2_t zdv = vdup_n_u32((u32)zd);
+        const int32x4_t zlov = vdupq_n_s32(zup ? zl : zr);
+        if (!WBUF && zl != zr)
+        {
+            const s32 xrecip_z = (1<<22) / xdiff;
+            s32 disp, factor;
+            if (zl < zr) { zbase = zl; disp = zr - zl; factor = xv; }
+            else         { zbase = zr; disp = zl - zr; factor = xdiff - xv; }
+            disp >>= 9;
+            const s64 K = (s64)disp * xrecip_z;
+            P = K * factor;
+            dP = (zl < zr) ? K : -K;
+        }
+        int64x2_t Plo = { P, P + dP }, Phi = { P + 2*dP, P + 3*dP };
+        const int64x2_t dP4 = vdupq_n_s64(dP * 4);
+        const int32x4_t zbv = vdupq_n_s32(zbase);
+
+        const uint32x4_t m24 = vdupq_n_u32(0x00FFFFFF), m3f = vdupq_n_u32(0x3F), one = vdupq_n_u32(1);
+        const uint32x4_t v256 = vdupq_n_u32(256), v31 = vdupq_n_u32(31), v0 = vdupq_n_u32(0);
+        const uint32x4_t vpa = vdupq_n_u32(polyalpha), vref = vdupq_n_u32(alpharef), vid = vdupq_n_u32(idword);
+        const int32x4_t twm1 = vdupq_n_s32(tw - 1), thm1 = vdupq_n_s32(th - 1), vtw = vdupq_n_s32(tw), vth = vdupq_n_s32(th), zero_s = vdupq_n_s32(0);
+        uint32x4_t bv[5], dv[5];
+        for (int k = 0; k < 5; k++) { bv[k] = vdupq_n_u32((u32)base[k]); dv[k] = vdupq_n_u32(d[k]); }
+
+        for (; x + 3 <= xlim; x += 4)
+        {
+            const uint32x4_t nv = numv, dn = denv;
+            numv = vaddq_u32(numv, dnum4); denv = vaddq_u32(denv, dden4);
+            auto divide = [&]() __attribute__((always_inline)) {
+                u32 na[4], da[4], q[4];
+                vst1q_u32(na, nv); vst1q_u32(da, dn);
+                for (int k = 0; k < 4; k++) q[k] = da[k] ? na[k] / da[k] : 0;
+                return vld1q_u32(q);
+            };
+            const u32 idx = (u32)(rowbase + x);
+            const uint32x4_t dold = vld1q_u32(&depth[idx]);
+            int32x4_t z; uint32x4_t yf;
+            if (WBUF)
+            {
+                yf = divide();
+                if (zl == zr) z = zlov;
+                else
+                {
+                    const uint32x4_t fz = zup ? yf : vsubq_u32(v256, yf);
+                    const uint64x2_t plo = vmull_u32(zdv, vget_low_u32(fz)), phi = vmull_u32(zdv, vget_high_u32(fz));
+                    z = vaddq_s32(zlov, vreinterpretq_s32_u32(vcombine_u32(vmovn_u64(vshrq_n_u64(plo, 8)), vmovn_u64(vshrq_n_u64(phi, 8)))));
+                }
+            }
+            else
+            {
+                z = vaddq_s32(zbv, vcombine_s32(vmovn_s64(vshrq_n_s64(Plo, 13)), vmovn_s64(vshrq_n_s64(Phi, 13))));
+                Plo = vaddq_s64(Plo, dP4); Phi = vaddq_s64(Phi, dP4);
+            }
+            const uint32x4_t pass = vcltq_u32(vreinterpretq_u32_s32(z), vandq_u32(dold, m24));
+            if (vmaxvq_u32(pass) == 0) continue;
+            if (!WBUF) yf = divide();
+            const uint32x4_t yr = vsubq_u32(v256, yf);
+            uint32x4_t att[5];
+            for (int k = 0; k < (TEX ? 5 : 3); k++)
+                att[k] = vaddq_u32(bv[k], vshrq_n_u32(vmulq_u32(dv[k], (rev & (1u << k)) ? yr : yf), 8));
+            const uint32x4_t vr = vandq_u32(vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(att[0]), 3)), m3f);
+            const uint32x4_t vg = vandq_u32(vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(att[1]), 3)), m3f);
+            const uint32x4_t vb = vandq_u32(vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(att[2]), 3)), m3f);
+
+            uint32x4_t r, g, b, a;
+            if constexpr (TEX)
+            {
+                // (s16) then >> 4
+                int32x4_t si = vshrq_n_s32(vshlq_n_s32(vreinterpretq_s32_u32(att[3]), 16), 20);
+                int32x4_t ti = vshrq_n_s32(vshlq_n_s32(vreinterpretq_s32_u32(att[4]), 16), 20);
+                if (swrap)
+                {
+                    const int32x4_t m = vandq_s32(si, twm1);
+                    si = sflip ? vbslq_s32(vtstq_s32(si, vtw), vsubq_s32(twm1, m), m) : m;
+                }
+                else si = vmaxq_s32(vminq_s32(si, twm1), zero_s);
+                if (twrap)
+                {
+                    const int32x4_t m = vandq_s32(ti, thm1);
+                    ti = tflip ? vbslq_s32(vtstq_s32(ti, vth), vsubq_s32(thm1, m), m) : m;
+                }
+                else ti = vmaxq_s32(vminq_s32(ti, thm1), zero_s);
+                const uint32x4_t ti_u = vmlaq_u32(vreinterpretq_u32_s32(si), vreinterpretq_u32_s32(ti), vreinterpretq_u32_s32(vtw));
+                uint32x4_t texel = vdupq_n_u32(tex[vgetq_lane_u32(ti_u, 0)]);
+                texel = vsetq_lane_u32(tex[vgetq_lane_u32(ti_u, 1)], texel, 1);
+                texel = vsetq_lane_u32(tex[vgetq_lane_u32(ti_u, 2)], texel, 2);
+                texel = vsetq_lane_u32(tex[vgetq_lane_u32(ti_u, 3)], texel, 3);
+                const uint32x4_t tr = vandq_u32(texel, m3f), tg = vandq_u32(vshrq_n_u32(texel, 8), m3f);
+                const uint32x4_t tb = vandq_u32(vshrq_n_u32(texel, 16), m3f), ta = vshrq_n_u32(texel, 24);
+                if constexpr (DECAL)
+                {
+                    const uint32x4_t inv = vsubq_u32(v31, ta);
+                    const uint32x4_t a0 = vceqq_u32(ta, v0), a31 = vceqq_u32(ta, v31);
+                    r = vbslq_u32(a0, vr, vbslq_u32(a31, tr, vshrq_n_u32(vmlaq_u32(vmulq_u32(tr, ta), vr, inv), 5)));
+                    g = vbslq_u32(a0, vg, vbslq_u32(a31, tg, vshrq_n_u32(vmlaq_u32(vmulq_u32(tg, ta), vg, inv), 5)));
+                    b = vbslq_u32(a0, vb, vbslq_u32(a31, tb, vshrq_n_u32(vmlaq_u32(vmulq_u32(tb, ta), vb, inv), 5)));
+                    a = vpa;
+                }
+                else
+                {
+                    r = vshrq_n_u32(vsubq_u32(vmulq_u32(vaddq_u32(tr, one), vaddq_u32(vr, one)), one), 6);
+                    g = vshrq_n_u32(vsubq_u32(vmulq_u32(vaddq_u32(tg, one), vaddq_u32(vg, one)), one), 6);
+                    b = vshrq_n_u32(vsubq_u32(vmulq_u32(vaddq_u32(tb, one), vaddq_u32(vb, one)), one), 6);
+                    a = vshrq_n_u32(vsubq_u32(vmulq_u32(vaddq_u32(ta, one), vaddq_u32(vpa, one)), one), 5);
+                }
+            }
+            else { r = vr; g = vg; b = vb; a = vpa; }
+            if (ps.wireframe) a = v31;
+            const uint32x4_t col = vorrq_u32(vorrq_u32(r, vshlq_n_u32(g, 8)), vorrq_u32(vshlq_n_u32(b, 16), vshlq_n_u32(a, 24)));
+            const uint32x4_t ok = vandq_u32(pass, vcgtq_u32(a, vref));
+            const uint32x4_t opq = vandq_u32(ok, vceqq_u32(a, v31));
+            if (vmaxvq_u32(opq))
+            {
+                vst1q_u32(&color[idx], vbslq_u32(opq, col, vld1q_u32(&color[idx])));
+                vst1q_u32(&depth[idx], vbslq_u32(opq, vorrq_u32(vandq_u32(vreinterpretq_u32_s32(z), m24), vid), dold));
+            }
+            const uint32x4_t trl = vbicq_u32(ok, opq);
+            if (vmaxvq_u32(trl))
+            {
+                u32 tm[4], cl[4]; s32 zz[4];
+                vst1q_u32(tm, trl); vst1q_u32(cl, col); vst1q_s32(zz, z);
+                for (int k = 0; k < 4; k++)
+                    if (tm[k]) PlotTranslucentTile(bs, idx + k, cl[k], translDW ? zz[k] : -1, idword | (ID_TRANSL << 24));
+            }
+        }
+    }
+    if (x <= xlim)
+        SpanFillLocal<TEX, DECAL ? 1 : 0, WBUF>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, d, rev);
+}
+#endif
 #endif
 #endif
 
@@ -1258,6 +1433,17 @@ void TileRenderer3D::RenderSpanInTile(BandScratch& bs, const TilePoly& poly, s32
         const s32 xdiff = xend + 1 - xstart;
         if (xdiff != 0)
         {
+#if defined(LITEV_TILE_SPANVEC) && defined(__aarch64__)
+            if (mode < 2)
+            {
+#define SV(T, D) (wbuf ? SpanVec<T, D, true>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev) \
+                       : SpanVec<T, D, false>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev))
+                if (ps.texEnable) { if (mode) SV(true, true); else SV(true, false); }
+                else              { if (mode) SV(false, true); else SV(false, false); }
+#undef SV
+                return;
+            }
+#endif
 #define SFL(T, M) (wbuf ? SpanFillLocal<T, M, true>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev) \
                         : SpanFillLocal<T, M, false>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev))
             switch ((ps.texEnable ? 4 : 0) | mode)
