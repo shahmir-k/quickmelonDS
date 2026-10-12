@@ -28,6 +28,7 @@
 #include <cstring>
 
 #include "HostedMP.h"
+#include "../NDS.h"
 #include "../Platform.h"
 #include "xxhash/xxhash.h"
 
@@ -181,6 +182,20 @@ u16 RecordMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
     return r;
 }
 
+#ifdef LITEV_WIFI_EVT
+int RecordMP::Quiet(void* self, int inst, u64 until, u64* time, int* sender)
+{
+    RecordMP& m = *(RecordMP*)self;
+    int r = LockstepMP::HostQuiet(m.Inner.get(), inst, until, time, sender);
+    u64 ft = r > 0 ? *time : 0;
+    s32 fs = r > 0 ? *sender : 0;
+    u32 call = m.Calls[inst].Count;
+    m.Calls[inst].Add(HostedQuiet, m.Now(inst), r, ft, until, (const u8*)&fs, r > 0 ? sizeof(fs) : 0);
+    if (r) m.Put(inst, HostedQuiet, call, r, ft, (const u8*)&fs, sizeof(fs));
+    return r;
+}
+#endif
+
 // ---- replica: ReplayMP ----
 
 void ReplayMP::Feed(const u8* data, size_t len)
@@ -321,6 +336,33 @@ bool ReplayMP::EndFrame(int frame, u64 state)
     else if (serverState != state) Fail("frame " + std::to_string(frame) + ": state differs (inputs, clock or RAM)");
     return Err.empty();
 }
+
+void ReplayMP::SetWake(NDS& nds)
+{
+#ifdef LITEV_WIFI_EVT
+    nds.MPHostQuiet = &Quiet; nds.MPHostQuietCtx = this; nds.MPHostQuietInst = Inst;
+#endif
+}
+
+#ifdef LITEV_WIFI_EVT
+int ReplayMP::Quiet(void* self, int, u64 until, u64* time, int* sender)
+{
+    ReplayMP& m = *(ReplayMP*)self;
+    Record r;
+    int res = 0;
+    u64 ft = 0;
+    s32 fs = 0;
+    if (m.Take(HostedQuiet, r))
+    {
+        res = r.Result;
+        ft = r.Timestamp;
+        if (r.Data.size() >= sizeof(fs)) memcpy(&fs, r.Data.data(), sizeof(fs));
+        if (res > 0) { *time = ft; *sender = fs; }
+    }
+    m.Calls.Add(HostedQuiet, m.Now(), res, ft, until, (const u8*)&fs, res > 0 ? sizeof(fs) : 0);
+    return res;
+}
+#endif
 
 void ReplayMP::Begin(int)
 {

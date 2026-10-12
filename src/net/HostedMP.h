@@ -57,7 +57,11 @@ namespace melonDS
 enum : u8
 {
     HostedBegin, HostedEnd, HostedSendPacket, HostedRecvPacket, HostedSendCmd, HostedSendReply,
-    HostedSendAck, HostedRecvHost, HostedRecvReplies, HostedFrame = 0xFF
+    HostedSendAck, HostedRecvHost, HostedRecvReplies,
+    // LITEV_WIFI_EVT: a client console's LockstepMP::HostQuiet answer (result, timestamp = time,
+    // bytes = s32 sender), so the replica's Wi-Fi skips the same idle ticks the server's did
+    HostedQuiet,
+    HostedFrame = 0xFF
 };
 
 // The call counter and hash, kept the same way by both sides.
@@ -76,7 +80,14 @@ struct HostedCalls
 class RecordMP : public MPInterface
 {
 public:
-    explicit RecordMP(std::unique_ptr<LockstepMP> link) : Inner(std::move(link)) { Inner->NoQuiet = true; }
+    explicit RecordMP(std::unique_ptr<LockstepMP> link) : Inner(std::move(link))
+    {
+        Inner->Recorded = true;
+#ifdef LITEV_WIFI_EVT
+        Inner->QuietHook = &Quiet;
+        Inner->QuietHookCtx = this;
+#endif
+    }
 
     LockstepMP& Link() { return *Inner; }
     void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = clock; Inner->SetClock(inst, std::move(clock)); }
@@ -110,6 +121,9 @@ private:
     u8 Before[15 * 1024];   // RecvReplies: the reply slots before the call
 
     u64 Now(int inst) const { return Clock[inst] ? Clock[inst]() : 0; }
+#ifdef LITEV_WIFI_EVT
+    static int Quiet(void* self, int inst, u64 until, u64* time, int* sender);
+#endif
     void Put(int inst, u8 kind, u32 call, s32 result, u64 timestamp, const u8* data, size_t len);
 };
 
@@ -121,6 +135,8 @@ public:
     explicit ReplayMP(int inst);
 
     void SetClock(std::function<u64()> clock) { Clock = std::move(clock); }
+    // the replica's console: its Wi-Fi asks HostQuiet here (LITEV_WIFI_EVT; the server's answers)
+    void SetWake(NDS& nds);
     // more of the record stream, in order, in any pieces (any thread)
     void Feed(const u8* data, size_t len);
     // the console finished emulated frame `frame`: waits for the server's marker for it and
@@ -177,6 +193,9 @@ private:
     const u64 CreatedUs;
 
     u64 Now() const { return Clock ? Clock() : 0; }
+#ifdef LITEV_WIFI_EVT
+    static int Quiet(void* self, int inst, u64 until, u64* time, int* sender);
+#endif
     // the record for this call (the next call number) if it returned something, else none
     bool Take(u8 kind, Record& out);
     void WaitLocked(std::unique_lock<std::mutex>& lk);
