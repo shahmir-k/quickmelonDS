@@ -244,6 +244,12 @@ option(LITEV_SOFT2D_BGSPAN "liteV: tile-at-a-time text BG with blank tile-row sk
 if (LITEV_SOFT2D_BGSPAN)
     add_compile_definitions(LITEV_SOFT2D_BGSPAN=1)
 endif()
+# LITEV_SOFT2D_PALCONV: the threaded 2D converts each band's palette to the line colour format once
+# per frame (journal replay keeps it in step); text BG spans and sprites read it. Same pixels.
+option(LITEV_SOFT2D_PALCONV "liteV: 2D palette converted once per frame (needs THREADED+DEPTH2)" OFF)
+if (LITEV_SOFT2D_PALCONV)
+    add_compile_definitions(LITEV_SOFT2D_PALCONV=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

@@ -808,6 +808,9 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
         const u32 bgbit = 1u << bgnum, flag = 0x01000000u << bgnum, yrow = yoff & 7;
         const bool c256 = bgcnt & (1<<7);
         const bool nowin = !(GPU2D.DispCnt & 0xE000);   // WindowMask is all 0xFF (DrawScanline_BGOBJ)
+#ifdef LITEV_SOFT2D_PALCONV
+        const u32* const cv = CurPalConv ? CurPalConv + (GPU2D.Num ? 0x200 : 0) : nullptr;
+#endif
         for (u32 i = 0; i < 256; )
         {
             const u32 xpos = (u16)(xoff + i);
@@ -821,6 +824,27 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
                 u64 px; memcpy(&px, &bgvram[(tilesetaddr + ((tile & 0x03FF) << 6) + (row << 3)) & bgvrammask], 8);
                 if (px)
                 {
+#ifdef LITEV_SOFT2D_PALCONV
+                    if (!extpal && cv)
+                    {
+                        if (n == 8 && nowin && !((px - 0x0101010101010101ull) & ~px & 0x8080808080808080ull))
+                        {
+                            // a whole opaque tile row: no per-pixel tests
+                            u32* d = &BGOBJLine[i];
+                            for (u32 k = 0; k < 8; k++) { d[256+k] = d[k]; d[k] = cv[(px >> ((k ^ hx) * 8)) & 0xFF] | flag; }
+                            i += 8;
+                            continue;
+                        }
+                        for (u32 k = 0; k < n; k++)
+                        {
+                            const u32 color = (px >> (((tx + k) ^ hx) * 8)) & 0xFF;
+                            if (color && (nowin || (WindowMask[i+k] & bgbit)))
+                                DrawPixelConv(&BGOBJLine[i+k], cv[color] | flag);
+                        }
+                        i += n;
+                        continue;
+                    }
+#endif
                     const u16* cp = extpal ? S2D_EXTPAL(extpalslot, tile>>12) : pal;
                     for (u32 k = 0; k < n; k++)
                     {
@@ -835,6 +859,29 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
                 u32 px; memcpy(&px, &bgvram[(tilesetaddr + ((tile & 0x03FF) << 5) + (row << 2)) & bgvrammask], 4);
                 if (px)
                 {
+#ifdef LITEV_SOFT2D_PALCONV
+                    if (cv)
+                    {
+                        const u32* const cc = cv + ((tile & 0xF000) >> 8);
+                        // no zero nibble: a whole opaque tile row, no per-pixel tests
+                        const u32 lo = px & 0x0F0F0F0F, hi = (px >> 4) & 0x0F0F0F0F;
+                        if (n == 8 && nowin && !((lo - 0x01010101) & ~lo & 0x80808080) && !((hi - 0x01010101) & ~hi & 0x80808080))
+                        {
+                            u32* d = &BGOBJLine[i];
+                            for (u32 k = 0; k < 8; k++) { d[256+k] = d[k]; d[k] = cc[(px >> ((k ^ hx) * 4)) & 0xF] | flag; }
+                            i += 8;
+                            continue;
+                        }
+                        for (u32 k = 0; k < n; k++)
+                        {
+                            const u32 color = (px >> (((tx + k) ^ hx) * 4)) & 0xF;
+                            if (color && (nowin || (WindowMask[i+k] & bgbit)))
+                                DrawPixelConv(&BGOBJLine[i+k], cc[color] | flag);
+                        }
+                        i += n;
+                        continue;
+                    }
+#endif
                     const u16* cp = pal + ((tile & 0xF000) >> 8);
                     for (u32 k = 0; k < n; k++)
                     {
@@ -1426,6 +1473,9 @@ void SoftRenderer2D::InterleaveSprites(u32 prio)
     // byte-identical to the scalar path. The palette gather (pal[]/extpal[]) has
     // no NEON equivalent on AArch64 (no gather), so only the reject scan is
     // vectorized. 256 is an exact multiple of 16 (no tail).
+#ifdef LITEV_SOFT2D_PALCONV
+    const u32* const cvo = CurPalConv ? CurPalConv + (GPU2D.Num ? 0x300 : 0x100) : nullptr;
+#endif
     const uint32x4_t vOpaPrio = vdupq_n_u32(OBJ_OpaPrioMask);
     const uint32x4_t vAttr    = vdupq_n_u32(attrmask);
     for (u32 base = 0; base < 256; base += 16)
@@ -1452,6 +1502,13 @@ void SoftRenderer2D::InterleaveSprites(u32 prio)
             u16 color;
             u32 pixel = OBJLine[i];
 
+#ifdef LITEV_SOFT2D_PALCONV
+            if (cvo && (pixel & (OBJ_DirectColor | OBJ_StandardPal)) == OBJ_StandardPal)
+            {
+                DrawPixelConv(&BGOBJLine[i], cvo[pixel & 0xFF] | (pixel & 0xFF000000));
+                continue;
+            }
+#endif
             if (pixel & OBJ_DirectColor)
                 color = pixel & 0x7FFF;
             else if (pixel & OBJ_StandardPal)
