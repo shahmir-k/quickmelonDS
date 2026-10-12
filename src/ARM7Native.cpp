@@ -212,8 +212,9 @@ State& Get(melonDS::NDS& nds)
     if (!p) p = {new State, [](void* q) { delete (State*)q; }};
     return *(State*)p.get();
 }
-// debug.litev.a7hle (unset or 1: the default set): bit 32 the OS call natives (default on), bit 64 the IRQ path (default OFF:
-// RG DS 1, non-PGO, emu-thread CPU vs bit 32 alone: Shrek +2.0%, PW overworld +1.6%, MKDS race -1.7%; Mac -0.3% average)
+// debug.litev.a7hle (unset or 1: the default set): bit 32 the OS call natives (default on), bit 64 the IRQ path, bit 128 the
+// SDK alarm handlers in it (default OFF: RG DS 1, non-PGO, emu-thread CPU vs bit 32 alone, 64+128: PW overworld +1.3%, Shrek
+// +0.2%, MKDS race +1.5%, while the Mac's emu-thread instructions drop 0.4-1.1%: the A55 pays per native run, not per instruction)
 u32 Mask()
 {
 #if defined(__ANDROID__)
