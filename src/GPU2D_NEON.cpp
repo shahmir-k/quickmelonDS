@@ -434,7 +434,7 @@ void ColorCompositeLine(u32* dst, const u32* bgobj, const u8* windowMask,
         // This counter is a deep diagnostic: it performs four contended atomics
         // per compositor vector. Keep the ordinary whole-frame profiler free of
         // that measurement perturbation.
-        return __system_property_get("debug.litev.softprof", value) > 0 && atoi(value) != 0;
+        return __system_property_get("debug.litev.softprof", value) > 0 && atoi(value) >= 2;   // 1: phase timing only
     }();
 #else
     constexpr bool profileCE = false;

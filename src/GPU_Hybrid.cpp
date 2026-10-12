@@ -261,6 +261,7 @@ void HybridRenderer::SetScale(int scale)
 void HybridRenderer::Start3DRendering()
 {
     double t0 = HybNowMs();
+    DrainCaptures();   // a capture into a bank now mapped as texture must land first
     Rend3D->RenderFrame();   // emu: VRAM coherence + post the job
 #ifdef LITEV_FF_CAP_PREFETCH
     // Frameskip (fast-forward) on a screen that uses display capture: the next drawn frame's

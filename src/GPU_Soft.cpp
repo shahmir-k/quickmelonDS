@@ -1117,7 +1117,8 @@ void SoftRenderer::P2RetireOld()
     while (P2InFlight > 0 && VBlankSeq - P2Ring[P2PresentIdx].kickVBlank >= 2)
     {
         const double _t0 = LSP_NOW();
-        LSP_WAIT("s2d-done", GPU.NDS.NumFrames, Platform::Semaphore_Wait(AsyncDone));
+        if (P2Done > 0) P2Done--;   // already waited for (capture landed before a VRAM remap)
+        else LSP_WAIT("s2d-done", GPU.NDS.NumFrames, Platform::Semaphore_Wait(AsyncDone));
         LSP_ADD(EmuBarrier, LSP_NOW() - _t0);
         AsyncPresentBuf = P2Ring[P2PresentIdx].targetBuf;
         P2PresentIdx = (P2PresentIdx + 1) % 3;
@@ -1136,7 +1137,7 @@ void SoftRenderer::FlushAsyncRender()
     while (P2InFlight > 0)
     {
         const double _t0 = LSP_NOW();
-        Platform::Semaphore_Wait(AsyncDone);
+        if (P2Done > 0) P2Done--; else Platform::Semaphore_Wait(AsyncDone);
         LSP_ADD(EmuBarrier, LSP_NOW() - _t0);
         AsyncPresentBuf = P2Ring[P2PresentIdx].targetBuf;
         P2PresentIdx = (P2PresentIdx + 1) % 3;
@@ -1155,6 +1156,26 @@ void SoftRenderer::FlushAsyncRender()
         AsyncEverProduced = true;
         RetireSeq++;
     }
+    AsyncCapBanks = 0;   // nothing in flight
+}
+
+// A 2D render still in flight writes display capture into a VRAM bank the emu side now reads
+// (remapped off LCDC: the BG/OBJ shadows the next VBlank snapshots, textures, the CPU): wait for
+// it first, as on hardware (frame N's capture is in VRAM at its line 191). Depth-2 keeps the
+// renders unpresented (present cadence unchanged: the barrier takes the done ones first).
+void SoftRenderer::DrainCaptures()
+{
+    if (!(AsyncCapBanks & ~GPU.VRAMMap_LCDC)) return;
+#ifdef LITEV_SOFT2D_DEPTH2
+    for (; P2Done < P2InFlight; P2Done++)
+    {
+        const double _t0 = LSP_NOW();
+        Platform::Semaphore_Wait(AsyncDone);
+        LSP_ADD(EmuBarrier, LSP_NOW() - _t0);
+    }
+#endif
+    if (AsyncInFlight) FlushAsyncRender();   // depth-1 (depth-2 never sets it)
+    AsyncCapBanks = 0;
 }
 
 // Depth-1 async VBlank: barrier the previous frame, snapshot the emu-mutable render
@@ -1183,6 +1204,7 @@ void SoftRenderer::VBlank()
         return;
     }
     LSP_EV(EV_VBL_IN);
+    DrainCaptures();   // depth-2: frame N's capture must be in VRAM before frame N+1's snapshots
 
 #ifdef LITEV_SOFT2D_DEPTH2
     // (a) BARRIER. pipedepth cached here (per-VBlank read, cheap). Depth-1: wait the single
@@ -1283,6 +1305,10 @@ void SoftRenderer::VBlank()
         Hyb3DValid[slot] = cap;
         if (cap) HybridReadback3D(Hyb3D[slot]);
     }
+
+    for (int y = 0; y < 192; y++)   // banks this render captures into (DoCapture's own checks)
+        if (FrameSnap[y].Valid && FrameSnap[y].CaptureEnable)
+            AsyncCapBanks |= FrameSnap[y].VRAMMapLCDC & (1u << ((FrameSnap[y].CaptureCnt >> 16) & 0x3));
 
     // (c) SIGNAL the render thread to raster frame N into the current back buffer.
     // Capture the buffer index now: FinishFrame will swap BackBuffer while the render
