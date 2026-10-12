@@ -28,6 +28,9 @@
 #include <cstring>
 #include <thread>   // std::this_thread::yield (brief cross-worker seam wait)
 
+#if (defined(LITEV_TILE_SPANVEC) || defined(LITEV_TILE_POSTVEC)) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #if defined(LITEV_GEOM_NEON2) && defined(__ARM_NEON)
 #include <arm_neon.h>   // BuildFrameGeom vertex-pack (coalesce the per-vertex scatter stores)
 #endif
@@ -93,6 +96,68 @@ static int litevTileProp(const char*, int def) { return def; }
 static int litevTilePropInt(const char*, int def, int, int) { return def; }
 #endif
 
+#ifdef __APPLE__
+extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsystem_kernel: this thread's PMU counts
+#endif
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
+// diagnostic (env LITEV_S3D_CPU=1): thread CPU time (+ instructions on Apple) of the tile workers and
+// the coordinator, per produced 3D frame; printed every 300 frames (same pattern as LITEV_S2D_CPU)
+static const bool s3dCpu = getenv("LITEV_S3D_CPU") != nullptr;
+static std::atomic<unsigned long long> s3dWorkNs{0}, s3dWorkIns{0}, s3dCoordNs{0}, s3dCoordIns{0}, s3dFrames{0}, s3dKept{0}, s3dTexDecodes{0};
+struct S3DCpuScope
+{
+    std::atomic<unsigned long long>& ns; std::atomic<unsigned long long>& ins;
+    timespec c0{}; unsigned long long pc0[2] = {};
+    S3DCpuScope(std::atomic<unsigned long long>& n, std::atomic<unsigned long long>& i) : ns(n), ins(i)
+    {
+        if (!s3dCpu) return;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
+#ifdef __APPLE__
+        thread_selfcounts(1, pc0, sizeof(pc0));
+#endif
+    }
+    ~S3DCpuScope()
+    {
+        if (!s3dCpu) return;
+        timespec c1; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+        unsigned long long pc1[2] = {};
+#ifdef __APPLE__
+        thread_selfcounts(1, pc1, sizeof(pc1));
+#endif
+        ns.fetch_add((unsigned long long)(c1.tv_sec - c0.tv_sec) * 1000000000ull + c1.tv_nsec - c0.tv_nsec, std::memory_order_relaxed);
+        ins.fetch_add(pc1[0] - pc0[0], std::memory_order_relaxed);
+    }
+};
+static void s3dCpuFrame()
+{
+    if (!s3dCpu) return;
+    const unsigned long long f = s3dFrames.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (f % 300 == 0)
+        fprintf(stderr, "S3D_CPU frames=%llu worker_ms_per_frame=%.4f coord_ms_per_frame=%.4f worker_instr_per_frame=%llu coord_instr_per_frame=%llu kept=%llu texdecodes=%llu\n",
+                f, s3dWorkNs.load() / 1e6 / f, s3dCoordNs.load() / 1e6 / f, s3dWorkIns.load() / f, s3dCoordIns.load() / f, s3dKept.load(), s3dTexDecodes.load());
+}
+
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+#define TILE_TEXSH 1
+#ifdef LITEV_TILE_SPANFAST
+#define TILE_SPANFAST 1
+#endif
+#include <algorithm>
+// flat texture / palette VRAM ranges (addresses wrap like ReadVRAMFlat_*)
+static void texFlatCopy(const melonDS::u8* base, melonDS::u32 mask, melonDS::u32 addr, melonDS::u32 len, melonDS::u8* dst)
+{
+    while (len) { const melonDS::u32 a = addr & mask, n = std::min(len, mask + 1 - a); memcpy(dst, base + a, n); dst += n; addr += n; len -= n; }
+}
+static bool texFlatEqual(const melonDS::u8* base, melonDS::u32 mask, melonDS::u32 addr, melonDS::u32 len, const melonDS::u8* src)
+{
+    while (len) { const melonDS::u32 a = addr & mask, n = std::min(len, mask + 1 - a); if (memcmp(src, base + a, n)) return false; src += n; addr += n; len -= n; }
+    return true;
+}
+static const bool texShVerify = getenv("LITEV_TEXSHARED_VERIFY") != nullptr;   // re-decode every hit, abort on a mismatch
+#endif
+
 namespace melonDS
 {
 
@@ -113,11 +178,14 @@ TileRenderer3D::~TileRenderer3D()
     for (int b = 0; b < NBMax; b++)
         delete[] Band[b].Tex.Arena;
     for (int g = 0; g < NGEOM; g++) delete[] VtxArena[g];
+#if defined(LITEV_TILE_SAMEFRAME) && defined(LITEV_TILE_COORD)
+    delete LastCfg; delete[] LastPolys; delete[] LastVtx;
+#endif
 }
 
 bool TileRenderer3D::Init()
 {
-    for (int g = 0; g < NGEOM; g++) if (!VtxArena[g]) VtxArena[g] = new TileVtx[VtxArenaSlots];
+    for (int g = 0; g < NGEOM; g++) if (!VtxArena[g]) VtxArena[g] = new TileVtx[VtxArenaSlots]();
     return true;
 }
 
@@ -133,7 +201,7 @@ void TileRenderer3D::Reset()
             Platform::Semaphore_Wait(Sema_RingFree);
 #endif
     WaitFrameComplete();                 // no worker may be mid-frame while we wipe state
-    for (int g = 0; g < NGEOM; g++) if (!VtxArena[g]) VtxArena[g] = new TileVtx[VtxArenaSlots];
+    for (int g = 0; g < NGEOM; g++) if (!VtxArena[g]) VtxArena[g] = new TileVtx[VtxArenaSlots]();
     memset(ColorOut, 0, sizeof(ColorOut));
     for (int b = 0; b < NB; b++)
     {
@@ -151,6 +219,12 @@ void TileRenderer3D::Reset()
     TexCacheDirty = true;
     GeomWrite = 0; GeomRead = 0;
     for (int g = 0; g < NGEOM; g++) FrameNumPolys[g] = 0;
+#if defined(LITEV_TILE_SAMEFRAME) && defined(LITEV_TILE_COORD)
+    LastValid = false;   // ColorOut was wiped
+#endif
+#ifdef TILE_TEXSH
+    TexSh.clear(); TexShBytes = 0; TexGen++;
+#endif
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -433,6 +507,10 @@ u32 TileRenderer3D::ShadeTexel(const PolyShade& ps, u32 vr, u32 vg, u32 vb, s16 
 
     if (ps.texEnable)
     {
+#ifdef TILE_TEXSH
+        const u32 tp = ps.tex32[TexAddr(ps, s, t)];
+        const u8 tr = tp & 0x3F, tg = (tp >> 8) & 0x3F, tb = (tp >> 16) & 0x3F, talpha = tp >> 24;
+#else
         u16 tcolor; u8 talpha;
         if (ps.texcache)
         {
@@ -448,6 +526,7 @@ u32 TileRenderer3D::ShadeTexel(const PolyShade& ps, u32 vr, u32 vg, u32 vb, s16 
         u8 tr = (tcolor << 1) & 0x3E; if (tr) tr++;
         u8 tg = (tcolor >> 4) & 0x3E; if (tg) tg++;
         u8 tb = (tcolor >> 9) & 0x3E; if (tb) tb++;
+#endif
 
         if (ps.decal)
         {
@@ -772,7 +851,11 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
     const u32 borderDI = Cfg[GeomRead].ClearDepthIdVal;
     const u32 borderC  = Cfg[GeomRead].ClearColorVal;
 
+#if defined(LITEV_TILE_POSTVEC) && defined(__aarch64__)
+    auto pix = [&](int x) __attribute__((always_inline))
+#else
     for (int x = 0; x < OutWidth; x++)
+#endif
     {
         const u32 cdi = depthid[x];
         u32 outc = color[x];
@@ -788,6 +871,12 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
             const u32 rDI = (x < OutWidth-1) ? depthid[x+1] : borderDI;
             const u32 rC  = (x < OutWidth-1) ? color[x+1]   : borderC;
 
+#ifdef LITEV_TILE_POSTFAST
+            // an edge needs a neighbour with another polygon id: none -> the scan below finds nothing
+            if (!(((lDI ^ cdi) | (rDI ^ cdi) | (upDepthId[x] ^ cdi) | (downDepthId[x] ^ cdi)) & (ID_POLY_MASK << 24)))
+                goto postfog;
+#endif
+            {
             u32 nDI[4] = { lDI, rDI, upDepthId[x], downDepthId[x] };
             u32 nC [4] = { lC,  rC,  upColor[x],   downColor[x]   };
 
@@ -823,7 +912,11 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
                          | (outc & 0xFF000000);
                 }
             }
+            }
         }
+#ifdef LITEV_TILE_POSTFAST
+    postfog:
+#endif
 
         if (fog && ((cdi >> 24) & ID_FOG))
         {
@@ -844,7 +937,483 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
 
         dst[x] = outc;
     }
+#if defined(LITEV_TILE_POSTVEC) && defined(__aarch64__)
+    ;
+    // four pixels at a time: a group whose pixels all have no neighbour with another polygon id (or
+    // no edge/AA) and no fog to apply is copied; any other group runs the per-pixel code above
+    const uint32x4_t idm = vdupq_n_u32(ID_POLY_MASK << 24), fogm = vdupq_n_u32((u32)ID_FOG << 24);
+    uint32x4_t prev = vdupq_n_u32(borderDI), cur = vld1q_u32(depthid);
+    for (int x = 0; x < OutWidth; x += 4)
+    {
+        const uint32x4_t next = (x + 4 < OutWidth) ? vld1q_u32(depthid + x + 4) : vdupq_n_u32(borderDI);
+        uint32x4_t bad = fog ? vandq_u32(cur, fogm) : vdupq_n_u32(0);
+        if (detect)
+        {
+            const uint32x4_t l = vextq_u32(prev, cur, 3), r = vextq_u32(cur, next, 1);
+            const uint32x4_t u = vld1q_u32(upDepthId + x), dn = vld1q_u32(downDepthId + x);
+            bad = vorrq_u32(bad, vandq_u32(vorrq_u32(vorrq_u32(veorq_u32(l, cur), veorq_u32(r, cur)),
+                                                     vorrq_u32(veorq_u32(u, cur), veorq_u32(dn, cur))), idm));
+        }
+        if (vmaxvq_u32(bad) == 0) vst1q_u32(dst + x, vld1q_u32(color + x));
+        else for (int k = 0; k < 4; k++) pix(x + k);
+        prev = cur; cur = next;
+    }
+#endif
 }
+
+#ifdef TILE_SPANFAST
+// The span pixel loop of RenderSpanInTile, specialised: TEX = texturing on (shared-cache texels),
+// MODE 0 modulate / 1 decal / 2 toon / 3 highlight. Every value is computed exactly as the generic
+// loop computes it (same expressions and types; ShadeTexel inlined with the texel passed in), with
+// the per-span / per-polygon constants in locals. Attribute k = base[k] + ((d[k] * f) >> 8),
+// f = the perspective factor, or 256 - it when bit k of rev is set: Interpolator<0>::Interpolate's
+// non-linear case (y0 < y1: y0 + (y1-y0)*f; else y1 + (y0-y1)*(256-f); y0 == y1: d = 0).
+template<bool TEX, int MODE>
+void TileRenderer3D::SpanFill(BandScratch& bs, const PolyShade& ps, Interpolator<0>& ix, s32 rowbase, s32 x, s32 xlim,
+                              s32 zl, s32 zr, bool wbuf, const s32* base, const u32* d, u32 rev)
+{
+    u32* const color = bs.Color;
+    u32* const depth = bs.DepthId;
+    const u16* const toontbl = ps.toontbl;
+    const u32 polyalpha = ps.polyalpha;
+    const u8  alpharef = ps.alpharef;
+    const bool wireframe = ps.wireframe;
+    const u32 idword = ps.idword;
+    const bool translDW = ps.translDepthWrite;
+    const u32* const tex = TEX ? ps.tex32 : nullptr;
+    const s32 tw = ps.texW, th = ps.texH;
+    const u32 tp = ps.texparam;
+    const s32 b0 = base[0], b1 = base[1], b2 = base[2], b3 = base[3], b4 = base[4];
+    const u32 d0 = d[0], d1 = d[1], d2 = d[2], d3 = d[3], d4 = d[4];
+
+    for (; x <= xlim; x++)
+    {
+        s32 z;
+        if (wbuf) { ix.SetXPos(x); ix.SetXFactor(); z = ix.InterpolateZ(zl, zr); }
+        else      { ix.SetXPos(x); z = ix.InterpolateZ(zl, zr); }
+        const u32 idx = (u32)(rowbase + x);
+        if (!((u32)z < (depth[idx] & 0x00FFFFFF))) continue;
+        if (!wbuf) ix.SetXFactor();
+
+        const u32 yf = ix.Factor(), yr = 256u - yf;
+        u32 vr = (u32)((s32)((u32)b0 + ((d0 * ((rev & 1)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+        u32 vg = (u32)((s32)((u32)b1 + ((d1 * ((rev & 2)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+        u32 vb = (u32)((s32)((u32)b2 + ((d2 * ((rev & 4)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+
+        u8 r, g, b, a;
+        if constexpr (MODE == 3) { vg = vr; vb = vr; }
+        else if constexpr (MODE == 2)
+        {
+            u16 tc = toontbl[vr >> 1];
+            vr = (tc << 1) & 0x3E; if (vr) vr++;
+            vg = (tc >> 4) & 0x3E; if (vg) vg++;
+            vb = (tc >> 9) & 0x3E; if (vb) vb++;
+        }
+        if constexpr (TEX)
+        {
+            const s16 s = (s16)(s32)((u32)b3 + ((d3 * ((rev & 8)  ? yr : yf)) >> 8));
+            const s16 t = (s16)(s32)((u32)b4 + ((d4 * ((rev & 16) ? yr : yf)) >> 8));
+            s32 si = s >> 4, ti = t >> 4;
+            if (tp & (1<<16))
+            {
+                if (tp & (1<<18)) { if (si & tw) si = (tw-1) - (si & (tw-1)); else si = (si & (tw-1)); }
+                else              si &= tw-1;
+            }
+            else { if (si < 0) si = 0; else if (si >= tw) si = tw-1; }
+            if (tp & (1<<17))
+            {
+                if (tp & (1<<19)) { if (ti & th) ti = (th-1) - (ti & (th-1)); else ti = (ti & (th-1)); }
+                else              ti &= th-1;
+            }
+            else { if (ti < 0) ti = 0; else if (ti >= th) ti = th-1; }
+            const u32 texel = tex[(u32)ti * (u32)tw + (u32)si];
+            const u8 tr = texel & 0x3F, tg = (texel >> 8) & 0x3F, tb = (texel >> 16) & 0x3F, talpha = texel >> 24;
+            if constexpr (MODE == 1)
+            {
+                if (talpha == 0)       { r = vr; g = vg; b = vb; }
+                else if (talpha == 31) { r = tr; g = tg; b = tb; }
+                else
+                {
+                    r = ((tr * talpha) + (vr * (31-talpha))) >> 5;
+                    g = ((tg * talpha) + (vg * (31-talpha))) >> 5;
+                    b = ((tb * talpha) + (vb * (31-talpha))) >> 5;
+                }
+                a = polyalpha;
+            }
+            else
+            {
+                r = ((tr+1) * (vr+1) - 1) >> 6;
+                g = ((tg+1) * (vg+1) - 1) >> 6;
+                b = ((tb+1) * (vb+1) - 1) >> 6;
+                a = ((talpha+1) * (polyalpha+1) - 1) >> 5;
+            }
+        }
+        else { r = vr; g = vg; b = vb; a = polyalpha; }
+        if constexpr (MODE == 3)
+        {
+            u16 tc = toontbl[vr >> 1];
+            u8 hr = (tc << 1) & 0x3E; if (hr) hr++;
+            u8 hg = (tc >> 4) & 0x3E; if (hg) hg++;
+            u8 hb = (tc >> 9) & 0x3E; if (hb) hb++;
+            int rr = r + hr; if (rr > 63) rr = 63; r = (u8)rr;
+            int gg = g + hg; if (gg > 63) gg = 63; g = (u8)gg;
+            int bb = b + hb; if (bb > 63) bb = 63; b = (u8)bb;
+        }
+        if (wireframe) a = 31;
+        const u32 col = r | (g << 8) | (b << 16) | ((u32)a << 24);
+
+        if (a <= alpharef) continue;   // alpha test
+        if (a == 31)
+        {
+            color[idx] = col;
+            depth[idx] = ((u32)z & 0x00FFFFFF) | idword;
+        }
+        else
+            PlotTranslucentTile(bs, idx, col, translDW ? z : -1, idword | (ID_TRANSL << 24));
+    }
+}
+
+#ifdef LITEV_TILE_SPANLOCAL
+// SpanFill with the span's interpolation state in locals (SpanFill reads and writes the Interpolator
+// through memory every pixel: the tile stores may alias it). Same values: xv = x - xstart,
+// num = (u32)(xv * wl) << 8 and den = xv * wl + (xdiff - xv) * wr (u32) step by constants mod 2^32;
+// the z-buffer depth base + ((disp * factor * xrecip_z) >> 13) steps its 64-bit product by
+// +-disp * xrecip_z; the w-buffer depth uses the factor as InterpolateZ does. xdiff != 0, non-linear.
+template<bool TEX, int MODE, bool WBUF>
+void TileRenderer3D::SpanFillLocal(BandScratch& bs, const PolyShade& ps, s32 rowbase, s32 x, s32 xlim, s32 xstart,
+                                   s32 xdiff, s32 wl, s32 wr, s32 zl, s32 zr, const s32* base, const u32* d, u32 rev)
+{
+    u32* const color = bs.Color;
+    u32* const depth = bs.DepthId;
+    const u16* const toontbl = ps.toontbl;
+    const u32 polyalpha = ps.polyalpha;
+    const u8  alpharef = ps.alpharef;
+    const bool wireframe = ps.wireframe;
+    const u32 idword = ps.idword;
+    const bool translDW = ps.translDepthWrite;
+    const u32* const tex = TEX ? ps.tex32 : nullptr;
+    const s32 tw = ps.texW, th = ps.texH;
+    const u32 tp = ps.texparam;
+    const bool swrap = tp & (1<<16), sflip = tp & (1<<18), twrap = tp & (1<<17), tflip = tp & (1<<19);
+    const s32 b0 = base[0], b1 = base[1], b2 = base[2], b3 = base[3], b4 = base[4];
+    const u32 d0 = d[0], d1 = d[1], d2 = d[2], d3 = d[3], d4 = d[4];
+
+    s32 xv = x - xstart;
+    u32 num = (u32)(xv * wl) << 8;
+    u32 den = (u32)(xv * wl) + (u32)((xdiff - xv) * wr);
+    const u32 dnum = (u32)wl << 8, dden = (u32)wl - (u32)wr;
+
+    // z-buffer: z = zbase + (P >> 13), P = disp * xrecip_z * factor (exact in 64 bits)
+    s32 zbase = zl; s64 P = 0, dP = 0;
+    // w-buffer: z = zlo + ((zd * (zup ? f : 256 - f)) >> 8)
+    const bool zup = zl < zr;
+    const s64 zd = zup ? (s64)(zr - zl) : (s64)(zl - zr);
+    const s32 zlo = zup ? zl : zr;
+    if (!WBUF && zl != zr)
+    {
+        const s32 xrecip_z = (1<<22) / xdiff;
+        s32 disp; s32 factor;
+        if (zup) { zbase = zl; disp = zr - zl; factor = xv; }
+        else     { zbase = zr; disp = zl - zr; factor = xdiff - xv; }
+        disp >>= 9;
+        const s64 K = (s64)disp * xrecip_z;
+        P = K * factor;
+        dP = zup ? K : -K;
+    }
+
+    for (; x <= xlim; x++, num += dnum, den += dden, P += dP)
+    {
+        u32 yf = 0;
+        s32 z;
+        if (WBUF)
+        {
+            yf = den ? num / den : 0;
+            z = (zl == zr) ? zl : (s32)(zlo + ((zd * (s64)(zup ? yf : 256u - yf)) >> 8));
+        }
+        else
+            z = (s32)(zbase + (P >> 13));
+        const u32 idx = (u32)(rowbase + x);
+        if (!((u32)z < (depth[idx] & 0x00FFFFFF))) continue;
+        if (!WBUF) yf = den ? num / den : 0;
+
+        const u32 yr = 256u - yf;
+        u32 vr = (u32)((s32)((u32)b0 + ((d0 * ((rev & 1)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+        u32 vg = (u32)((s32)((u32)b1 + ((d1 * ((rev & 2)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+        u32 vb = (u32)((s32)((u32)b2 + ((d2 * ((rev & 4)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+
+        u8 r, g, b, a;
+        if constexpr (MODE == 3) { vg = vr; vb = vr; }
+        else if constexpr (MODE == 2)
+        {
+            u16 tc = toontbl[vr >> 1];
+            vr = (tc << 1) & 0x3E; if (vr) vr++;
+            vg = (tc >> 4) & 0x3E; if (vg) vg++;
+            vb = (tc >> 9) & 0x3E; if (vb) vb++;
+        }
+        if constexpr (TEX)
+        {
+            const s16 s = (s16)(s32)((u32)b3 + ((d3 * ((rev & 8)  ? yr : yf)) >> 8));
+            const s16 t = (s16)(s32)((u32)b4 + ((d4 * ((rev & 16) ? yr : yf)) >> 8));
+            s32 si = s >> 4, ti = t >> 4;
+            if (swrap)
+            {
+                if (sflip) { if (si & tw) si = (tw-1) - (si & (tw-1)); else si = (si & (tw-1)); }
+                else       si &= tw-1;
+            }
+            else { if (si < 0) si = 0; else if (si >= tw) si = tw-1; }
+            if (twrap)
+            {
+                if (tflip) { if (ti & th) ti = (th-1) - (ti & (th-1)); else ti = (ti & (th-1)); }
+                else       ti &= th-1;
+            }
+            else { if (ti < 0) ti = 0; else if (ti >= th) ti = th-1; }
+            const u32 texel = tex[(u32)ti * (u32)tw + (u32)si];
+            const u8 tr = texel & 0x3F, tg = (texel >> 8) & 0x3F, tb = (texel >> 16) & 0x3F, talpha = texel >> 24;
+            if constexpr (MODE == 1)
+            {
+                if (talpha == 0)       { r = vr; g = vg; b = vb; }
+                else if (talpha == 31) { r = tr; g = tg; b = tb; }
+                else
+                {
+                    r = ((tr * talpha) + (vr * (31-talpha))) >> 5;
+                    g = ((tg * talpha) + (vg * (31-talpha))) >> 5;
+                    b = ((tb * talpha) + (vb * (31-talpha))) >> 5;
+                }
+                a = polyalpha;
+            }
+            else
+            {
+                r = ((tr+1) * (vr+1) - 1) >> 6;
+                g = ((tg+1) * (vg+1) - 1) >> 6;
+                b = ((tb+1) * (vb+1) - 1) >> 6;
+                a = ((talpha+1) * (polyalpha+1) - 1) >> 5;
+            }
+        }
+        else { r = vr; g = vg; b = vb; a = polyalpha; }
+        if constexpr (MODE == 3)
+        {
+            u16 tc = toontbl[vr >> 1];
+            u8 hr = (tc << 1) & 0x3E; if (hr) hr++;
+            u8 hg = (tc >> 4) & 0x3E; if (hg) hg++;
+            u8 hb = (tc >> 9) & 0x3E; if (hb) hb++;
+            int rr = r + hr; if (rr > 63) rr = 63; r = (u8)rr;
+            int gg = g + hg; if (gg > 63) gg = 63; g = (u8)gg;
+            int bb = b + hb; if (bb > 63) bb = 63; b = (u8)bb;
+        }
+        if (wireframe) a = 31;
+        const u32 col = r | (g << 8) | (b << 16) | ((u32)a << 24);
+
+        if (a <= alpharef) continue;   // alpha test
+        if (a == 31)
+        {
+            color[idx] = col;
+            depth[idx] = ((u32)z & 0x00FFFFFF) | idword;
+        }
+        else
+            PlotTranslucentTile(bs, idx, col, translDW ? z : -1, idword | (ID_TRANSL << 24));
+    }
+}
+
+#if defined(LITEV_TILE_SPANVEC) && defined(__aarch64__)
+// SpanFillLocal (z-buffer, modulate or decal) four pixels at a time: the same per-pixel values in
+// u32/s32/s64 lanes (num/den/the 64-bit depth product step per lane, the divide per lane, the
+// attributes base + ((d * f) >> 8) in u32, s16 texcoords, clamp/repeat/flip, texel gather,
+// modulate/decal, alpha test). Opaque pixels are written as a masked 4-wide store, translucent
+// ones go through PlotTranslucentTile one by one (every pixel of a span has its own index, so the
+// order between them doesn't matter). The last < 4 pixels run in SpanFillLocal.
+// Inspired by DSperate (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
+// src/core/gpu/render3d.cpp span_shade / kernels_neon.cpp span_attrs: NEON span shading). No code copied.
+template<bool TEX, bool DECAL, bool WBUF>
+void TileRenderer3D::SpanVec(BandScratch& bs, const PolyShade& ps, s32 rowbase, s32 x, s32 xlim, s32 xstart,
+                             s32 xdiff, s32 wl, s32 wr, s32 zl, s32 zr, const s32* base, const u32* d, u32 rev)
+{
+    if (x + 3 <= xlim)
+    {
+        u32* const color = bs.Color;
+        u32* const depth = bs.DepthId;
+        const u32 polyalpha = ps.polyalpha;
+        const u32 alpharef = ps.alpharef;
+        const u32 idword = ps.idword;
+        const bool translDW = ps.translDepthWrite;
+        const u32* const tex = TEX ? ps.tex32 : nullptr;
+        const s32 tw = ps.texW, th = ps.texH;
+        const u32 tp = ps.texparam;
+        const bool swrap = tp & (1<<16), sflip = tp & (1<<18), twrap = tp & (1<<17), tflip = tp & (1<<19);
+
+        static const s32 laneIdx[4] = { 0, 1, 2, 3 };
+        const int32x4_t lane = vld1q_s32(laneIdx);
+        const uint32x4_t lane_u = vreinterpretq_u32_s32(lane);
+
+        const s32 xv = x - xstart;
+        const u32 num0 = (u32)(xv * wl) << 8;
+        const u32 den0 = (u32)(xv * wl) + (u32)((xdiff - xv) * wr);
+        const u32 dnum = (u32)wl << 8, dden = (u32)wl - (u32)wr;
+        uint32x4_t numv = vmlaq_n_u32(vdupq_n_u32(num0), lane_u, dnum);
+        uint32x4_t denv = vmlaq_n_u32(vdupq_n_u32(den0), lane_u, dden);
+        const uint32x4_t dnum4 = vdupq_n_u32(dnum * 4), dden4 = vdupq_n_u32(dden * 4);
+
+        s32 zbase = zl; s64 P = 0, dP = 0;
+        // w-buffer: z = zlo + ((zd * (zup ? f : 256 - f)) >> 8); zd < 2^31 and the u32 factor keep the
+        // product below 2^63, so the unsigned 32x32->64 multiply gives the signed product
+        const bool zup = zl < zr;
+        const s64 zd = zup ? (s64)(zr - zl) : (s64)(zl - zr);
+        if (WBUF && zd < 0) { SpanFillLocal<TEX, DECAL ? 1 : 0, true>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, d, rev); return; }
+        const uint32x2_t zdv = vdup_n_u32((u32)zd);
+        const int32x4_t zlov = vdupq_n_s32(zup ? zl : zr);
+        if (!WBUF && zl != zr)
+        {
+            const s32 xrecip_z = (1<<22) / xdiff;
+            s32 disp, factor;
+            if (zl < zr) { zbase = zl; disp = zr - zl; factor = xv; }
+            else         { zbase = zr; disp = zl - zr; factor = xdiff - xv; }
+            disp >>= 9;
+            const s64 K = (s64)disp * xrecip_z;
+            P = K * factor;
+            dP = (zl < zr) ? K : -K;
+        }
+        int64x2_t Plo = { P, P + dP }, Phi = { P + 2*dP, P + 3*dP };
+        const int64x2_t dP4 = vdupq_n_s64(dP * 4);
+        const int32x4_t zbv = vdupq_n_s32(zbase);
+
+        const uint32x4_t m24 = vdupq_n_u32(0x00FFFFFF), m3f = vdupq_n_u32(0x3F), one = vdupq_n_u32(1);
+        const uint32x4_t v256 = vdupq_n_u32(256), v31 = vdupq_n_u32(31), v0 = vdupq_n_u32(0);
+        const uint32x4_t vpa = vdupq_n_u32(polyalpha), vref = vdupq_n_u32(alpharef), vid = vdupq_n_u32(idword);
+        const int32x4_t twm1 = vdupq_n_s32(tw - 1), thm1 = vdupq_n_s32(th - 1), vtw = vdupq_n_s32(tw), vth = vdupq_n_s32(th), zero_s = vdupq_n_s32(0);
+        uint32x4_t bv[5], dv[5];
+        for (int k = 0; k < 5; k++) { bv[k] = vdupq_n_u32((u32)base[k]); dv[k] = vdupq_n_u32(d[k]); }
+
+        for (; x + 3 <= xlim; x += 4)
+        {
+            const uint32x4_t nv = numv, dn = denv;
+            numv = vaddq_u32(numv, dnum4); denv = vaddq_u32(denv, dden4);
+            auto divide = [&]() __attribute__((always_inline)) {
+#ifdef LITEV_TILE_SPANDIV
+                // float estimate (reciprocal + 2 Newton steps), then one -1/+1 correction against the
+                // exact 64-bit remainder; a lane whose remainder still isn't in [0, den) sends the group
+                // to the integer divide below, so the result is always num / den exactly
+                const uint32x4_t dz = vceqzq_u32(dn), dd = vorrq_u32(dn, vandq_u32(dz, vdupq_n_u32(1)));
+                const float32x4_t fd = vcvtq_f32_u32(dd);
+                float32x4_t rc = vrecpeq_f32(fd);
+                rc = vmulq_f32(vrecpsq_f32(fd, rc), rc);
+                rc = vmulq_f32(vrecpsq_f32(fd, rc), rc);
+                uint32x4_t qe = vcvtq_u32_f32(vmulq_f32(vcvtq_f32_u32(nv), rc));
+                const int64x2_t dlo = vreinterpretq_s64_u64(vmovl_u32(vget_low_u32(dd))), dhi = vreinterpretq_s64_u64(vmovl_high_u32(dd));
+                int64x2_t rlo = vsubq_s64(vreinterpretq_s64_u64(vmovl_u32(vget_low_u32(nv))), vreinterpretq_s64_u64(vmull_u32(vget_low_u32(qe), vget_low_u32(dd))));
+                int64x2_t rhi = vsubq_s64(vreinterpretq_s64_u64(vmovl_high_u32(nv)), vreinterpretq_s64_u64(vmull_high_u32(qe, dd)));
+                const uint64x2_t nlo = vcltzq_s64(rlo), nhi = vcltzq_s64(rhi);       // q one too many
+                rlo = vaddq_s64(rlo, vandq_s64(vreinterpretq_s64_u64(nlo), dlo)); rhi = vaddq_s64(rhi, vandq_s64(vreinterpretq_s64_u64(nhi), dhi));
+                const uint64x2_t blo = vcgeq_s64(rlo, dlo), bhi = vcgeq_s64(rhi, dhi);   // q one too few
+                rlo = vsubq_s64(rlo, vandq_s64(vreinterpretq_s64_u64(blo), dlo)); rhi = vsubq_s64(rhi, vandq_s64(vreinterpretq_s64_u64(bhi), dhi));
+                // -1 on lanes that were over (mask all-ones = -1), +1 on lanes that were under
+                qe = vaddq_u32(qe, vcombine_u32(vmovn_u64(nlo), vmovn_u64(nhi)));
+                qe = vsubq_u32(qe, vcombine_u32(vmovn_u64(blo), vmovn_u64(bhi)));
+                const uint64x2_t badlo = vorrq_u64(vcltzq_s64(rlo), vcgeq_s64(rlo, dlo)), badhi = vorrq_u64(vcltzq_s64(rhi), vcgeq_s64(rhi, dhi));
+                if (vmaxvq_u32(vreinterpretq_u32_u64(vorrq_u64(badlo, badhi))) == 0)
+                    return vbicq_u32(qe, dz);
+#endif
+                u32 na[4], da[4], q[4];
+                vst1q_u32(na, nv); vst1q_u32(da, dn);
+                for (int k = 0; k < 4; k++) q[k] = da[k] ? na[k] / da[k] : 0;
+                return vld1q_u32(q);
+            };
+            const u32 idx = (u32)(rowbase + x);
+            const uint32x4_t dold = vld1q_u32(&depth[idx]);
+            int32x4_t z; uint32x4_t yf;
+            if (WBUF)
+            {
+                yf = divide();
+                if (zl == zr) z = zlov;
+                else
+                {
+                    const uint32x4_t fz = zup ? yf : vsubq_u32(v256, yf);
+                    const uint64x2_t plo = vmull_u32(zdv, vget_low_u32(fz)), phi = vmull_u32(zdv, vget_high_u32(fz));
+                    z = vaddq_s32(zlov, vreinterpretq_s32_u32(vcombine_u32(vmovn_u64(vshrq_n_u64(plo, 8)), vmovn_u64(vshrq_n_u64(phi, 8)))));
+                }
+            }
+            else
+            {
+                z = vaddq_s32(zbv, vcombine_s32(vmovn_s64(vshrq_n_s64(Plo, 13)), vmovn_s64(vshrq_n_s64(Phi, 13))));
+                Plo = vaddq_s64(Plo, dP4); Phi = vaddq_s64(Phi, dP4);
+            }
+            const uint32x4_t pass = vcltq_u32(vreinterpretq_u32_s32(z), vandq_u32(dold, m24));
+            if (vmaxvq_u32(pass) == 0) continue;
+            if (!WBUF) yf = divide();
+            const uint32x4_t yr = vsubq_u32(v256, yf);
+            uint32x4_t att[5];
+            for (int k = 0; k < (TEX ? 5 : 3); k++)
+                att[k] = vaddq_u32(bv[k], vshrq_n_u32(vmulq_u32(dv[k], (rev & (1u << k)) ? yr : yf), 8));
+            const uint32x4_t vr = vandq_u32(vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(att[0]), 3)), m3f);
+            const uint32x4_t vg = vandq_u32(vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(att[1]), 3)), m3f);
+            const uint32x4_t vb = vandq_u32(vreinterpretq_u32_s32(vshrq_n_s32(vreinterpretq_s32_u32(att[2]), 3)), m3f);
+
+            uint32x4_t r, g, b, a;
+            if constexpr (TEX)
+            {
+                // (s16) then >> 4
+                int32x4_t si = vshrq_n_s32(vshlq_n_s32(vreinterpretq_s32_u32(att[3]), 16), 20);
+                int32x4_t ti = vshrq_n_s32(vshlq_n_s32(vreinterpretq_s32_u32(att[4]), 16), 20);
+                if (swrap)
+                {
+                    const int32x4_t m = vandq_s32(si, twm1);
+                    si = sflip ? vbslq_s32(vtstq_s32(si, vtw), vsubq_s32(twm1, m), m) : m;
+                }
+                else si = vmaxq_s32(vminq_s32(si, twm1), zero_s);
+                if (twrap)
+                {
+                    const int32x4_t m = vandq_s32(ti, thm1);
+                    ti = tflip ? vbslq_s32(vtstq_s32(ti, vth), vsubq_s32(thm1, m), m) : m;
+                }
+                else ti = vmaxq_s32(vminq_s32(ti, thm1), zero_s);
+                const uint32x4_t ti_u = vmlaq_u32(vreinterpretq_u32_s32(si), vreinterpretq_u32_s32(ti), vreinterpretq_u32_s32(vtw));
+                uint32x4_t texel = vdupq_n_u32(tex[vgetq_lane_u32(ti_u, 0)]);
+                texel = vsetq_lane_u32(tex[vgetq_lane_u32(ti_u, 1)], texel, 1);
+                texel = vsetq_lane_u32(tex[vgetq_lane_u32(ti_u, 2)], texel, 2);
+                texel = vsetq_lane_u32(tex[vgetq_lane_u32(ti_u, 3)], texel, 3);
+                const uint32x4_t tr = vandq_u32(texel, m3f), tg = vandq_u32(vshrq_n_u32(texel, 8), m3f);
+                const uint32x4_t tb = vandq_u32(vshrq_n_u32(texel, 16), m3f), ta = vshrq_n_u32(texel, 24);
+                if constexpr (DECAL)
+                {
+                    const uint32x4_t inv = vsubq_u32(v31, ta);
+                    const uint32x4_t a0 = vceqq_u32(ta, v0), a31 = vceqq_u32(ta, v31);
+                    r = vbslq_u32(a0, vr, vbslq_u32(a31, tr, vshrq_n_u32(vmlaq_u32(vmulq_u32(tr, ta), vr, inv), 5)));
+                    g = vbslq_u32(a0, vg, vbslq_u32(a31, tg, vshrq_n_u32(vmlaq_u32(vmulq_u32(tg, ta), vg, inv), 5)));
+                    b = vbslq_u32(a0, vb, vbslq_u32(a31, tb, vshrq_n_u32(vmlaq_u32(vmulq_u32(tb, ta), vb, inv), 5)));
+                    a = vpa;
+                }
+                else
+                {
+                    r = vshrq_n_u32(vsubq_u32(vmulq_u32(vaddq_u32(tr, one), vaddq_u32(vr, one)), one), 6);
+                    g = vshrq_n_u32(vsubq_u32(vmulq_u32(vaddq_u32(tg, one), vaddq_u32(vg, one)), one), 6);
+                    b = vshrq_n_u32(vsubq_u32(vmulq_u32(vaddq_u32(tb, one), vaddq_u32(vb, one)), one), 6);
+                    a = vshrq_n_u32(vsubq_u32(vmulq_u32(vaddq_u32(ta, one), vaddq_u32(vpa, one)), one), 5);
+                }
+            }
+            else { r = vr; g = vg; b = vb; a = vpa; }
+            if (ps.wireframe) a = v31;
+            const uint32x4_t col = vorrq_u32(vorrq_u32(r, vshlq_n_u32(g, 8)), vorrq_u32(vshlq_n_u32(b, 16), vshlq_n_u32(a, 24)));
+            const uint32x4_t ok = vandq_u32(pass, vcgtq_u32(a, vref));
+            const uint32x4_t opq = vandq_u32(ok, vceqq_u32(a, v31));
+            if (vmaxvq_u32(opq))
+            {
+                vst1q_u32(&color[idx], vbslq_u32(opq, col, vld1q_u32(&color[idx])));
+                vst1q_u32(&depth[idx], vbslq_u32(opq, vorrq_u32(vandq_u32(vreinterpretq_u32_s32(z), m24), vid), dold));
+            }
+            const uint32x4_t trl = vbicq_u32(ok, opq);
+            if (vmaxvq_u32(trl))
+            {
+                u32 tm[4], cl[4]; s32 zz[4];
+                vst1q_u32(tm, trl); vst1q_u32(cl, col); vst1q_s32(zz, z);
+                for (int k = 0; k < 4; k++)
+                    if (tm[k]) PlotTranslucentTile(bs, idx + k, cl[k], translDW ? zz[k] : -1, idword | (ID_TRANSL << 24));
+            }
+        }
+    }
+    if (x <= xlim)
+        SpanFillLocal<TEX, DECAL ? 1 : 0, WBUF>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, d, rev);
+}
+#endif
+#endif
+#endif
 
 // Span fill for one scanline of one polygon into the 2-plane tile. Perspective-correct S/T and
 // colour interpolation, per-pixel alpha test, less-than depth test. Opaque -> write colour + (depth
@@ -902,6 +1471,63 @@ void TileRenderer3D::RenderSpanInTile(BandScratch& bs, const TilePoly& poly, s32
     s32 xlim = xend; if (xlim > OutWidth - 1) xlim = OutWidth - 1;
 
     const s32 rowbase = (y - ty0) * OutWidth;
+#ifdef TILE_SPANFAST
+    if (!ix.Linear())
+    {
+        s32 base[5]; u32 dd[5]; u32 rev = 0;
+        const s32 y0s[5] = { rl, gl, bl, sl_s, sl_t }, y1s[5] = { rr, gr, br, sr_s, sr_t };
+        for (int k = 0; k < 5; k++)
+        {
+            if (y0s[k] <= y1s[k]) { base[k] = y0s[k]; dd[k] = (u32)(y1s[k] - y0s[k]); }
+            else                  { base[k] = y1s[k]; dd[k] = (u32)(y0s[k] - y1s[k]); rev |= 1u << k; }
+        }
+        const int mode = ps.decal ? 1 : ps.toon ? (ps.highlight ? 3 : 2) : 0;
+#ifdef LITEV_TILE_SPANLOCAL
+        const s32 xdiff = xend + 1 - xstart;
+        if (xdiff != 0)
+        {
+#if defined(LITEV_TILE_SPANVEC) && defined(__aarch64__)
+            if (mode < 2)
+            {
+#define SV(T, D) (wbuf ? SpanVec<T, D, true>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev) \
+                       : SpanVec<T, D, false>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev))
+                if (ps.texEnable) { if (mode) SV(true, true); else SV(true, false); }
+                else              { if (mode) SV(false, true); else SV(false, false); }
+#undef SV
+                return;
+            }
+#endif
+#define SFL(T, M) (wbuf ? SpanFillLocal<T, M, true>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev) \
+                        : SpanFillLocal<T, M, false>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev))
+            switch ((ps.texEnable ? 4 : 0) | mode)
+            {
+            case 0: SFL(false, 0); break;
+            case 1: SFL(false, 1); break;
+            case 2: SFL(false, 2); break;
+            case 3: SFL(false, 3); break;
+            case 4: SFL(true, 0); break;
+            case 5: SFL(true, 1); break;
+            case 6: SFL(true, 2); break;
+            default: SFL(true, 3); break;
+            }
+#undef SFL
+            return;
+        }
+#endif
+        switch ((ps.texEnable ? 4 : 0) | mode)
+        {
+        case 0: SpanFill<false, 0>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 1: SpanFill<false, 1>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 2: SpanFill<false, 2>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 3: SpanFill<false, 3>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 4: SpanFill<true, 0>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 5: SpanFill<true, 1>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 6: SpanFill<true, 2>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        default: SpanFill<true, 3>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        }
+        return;
+    }
+#endif
     for (; x <= xlim; x++)
     {
         ix.SetX(x);
@@ -992,8 +1618,17 @@ void TileRenderer3D::RasterPolyInTile(BandScratch& bs, const TilePoly& poly, s32
         ps.texW = 0; ps.texH = 0;
         // the cache keeps 1 bit of alpha: the graded-alpha formats (A3I5 = 1, A5I3 = 6) look texels
         // up directly, else their soft alpha became opaque (Pokemon White's town mist: white blobs)
+#ifdef TILE_TEXSH
+        if (ps.texEnable)
+        {
+            ps.tex32 = PolyTex[&poly - FramePolys[GeomRead]];
+            ps.texW = 8 << ((ps.texparam >> 20) & 0x7);
+            ps.texH = 8 << ((ps.texparam >> 23) & 0x7);
+        }
+#else
         if (ps.texEnable && texfmt != 1 && texfmt != 6)
             ps.texcache = ResolveTexCache(bs.Tex, ps.texparam, ps.texpal, &ps.texW, &ps.texH);
+#endif
     }
 
     auto advL = [&](s32 yy) -> s32
@@ -1296,7 +1931,10 @@ void TileRenderer3D::BandWorkerFunc(int idx)
         if (!PoolRunning.load(std::memory_order_relaxed))
             return;
 
-        WorkerRender(idx);
+        {
+            S3DCpuScope cs(s3dWorkNs, s3dWorkIns);
+            WorkerRender(idx);
+        }
 
         // Barrier-free frame completion: each worker already finished its own (idx|idx+1) seam early
         // (in WorkerRender), so the LAST worker to arrive (acq_rel fetch_sub reads 1) only publishes
@@ -1367,6 +2005,13 @@ void TileRenderer3D::RenderFrame()
 
     BuildFrameGeom(GeomWrite);   // compact vertex snapshot + per-block buckets (emu thread)
     ComputeClearConfig();   // clear vals + DoPost/NeedHalo + border (emu thread)
+#ifdef LITEV_TILE_SAMEFRAME
+    Cfg[GeomWrite].TexDirty = TexCacheDirty;
+#endif
+#ifdef TILE_TEXSH
+    if (TexCacheDirty) TexGen++;
+    Cfg[GeomWrite].TexGen = TexGen;
+#endif
 
 #ifdef LITEV_TILE_COORD
     // DraStic decouple: the emu HANDS OFF the built frame to the coordinator thread and returns
@@ -1417,8 +2062,192 @@ void TileRenderer3D::RenderFrame()
 // The coordinator publishes one queued frame to the 2D consumer, dispatches the 3 band workers,
 // and blocks (on THIS thread, not the emu) until they finish. Same sequence the single-frame
 // RenderFrame did — just owned by the coordinator so the emu never waits on the raster.
+#ifdef TILE_TEXSH
+// Decode one texture into e (exact: the per-texel DecodeTexel, expanded as ShadeTexel expands it)
+// and record the VRAM byte ranges the decode read (a superset is fine: it only costs a re-decode).
+void TileRenderer3D::DecodeTexShared(TexShEntry& e, u32 texparam, u32 texpal) const
+{
+    const s32 W = 8 << ((texparam >> 20) & 0x7), H = 8 << ((texparam >> 23) & 0x7);
+    const u32 fmt = (texparam >> 26) & 0x7, addr = (texparam & 0xFFFF) << 3, n = (u32)W * (u32)H;
+    e.texels.resize(n);
+    u32* out = e.texels.data();
+    for (s32 t = 0; t < H; t++)
+        for (s32 x = 0; x < W; x++)
+        {
+            u16 c; u8 a;
+            DecodeTexel(texparam, texpal, x, t, &c, &a);
+            u32 r = (c << 1) & 0x3E; if (r) r++;
+            u32 g = (c >> 4) & 0x3E; if (g) g++;
+            u32 b = (c >> 9) & 0x3E; if (b) b++;
+            *out++ = r | (g << 8) | (b << 16) | ((u32)a << 24);
+        }
+    e.ranges.clear();
+    auto tex = [&](u32 a, u32 len) { e.ranges.push_back({a, len, false}); };
+    auto pal = [&](u32 a, u32 len) { e.ranges.push_back({a, len, true}); };
+    switch (fmt)
+    {
+    case 1: tex(addr, n);     pal(texpal << 4, 64);  break;   // A3I5
+    case 2: tex(addr, n / 4); pal(texpal << 3, 8);   break;   // 4-colour
+    case 3: tex(addr, n / 2); pal(texpal << 4, 32);  break;   // 16-colour
+    case 4: tex(addr, n);     pal(texpal << 4, 512); break;   // 256-colour
+    case 6: tex(addr, n);     pal(texpal << 4, 16);  break;   // A5I3
+    case 7: tex(addr, n * 2); break;                          // direct
+    case 5:   // 4x4: the bounds of every texel / slot-1 / palette address DecodeTexel reads
+    {
+        u32 vlo = ~0u, vhi = 0, slo = ~0u, shi = 0, plo = ~0u, phi = 0;
+        for (s32 t = 0; t < H; t += 1)
+            for (s32 x = 0; x < W; x += 4)   // the 4 texels of a block row share va / slot1
+            {
+                u32 va = (addr + ((t & 0x3FC) * (W >> 2)) + (x & 0x3FC) + (t & 0x3)) & 0x7FFFF;
+                u32 s1 = 0x20000 + ((va & 0x1FFFC) >> 1);
+                if (va >= 0x40000) s1 += 0x10000;
+                const u32 po = (GPU.ReadVRAMFlat_Texture<u16>(s1) & 0x3FFF) << 2;
+                vlo = std::min(vlo, va); vhi = std::max(vhi, va);
+                slo = std::min(slo, s1); shi = std::max(shi, s1);
+                plo = std::min(plo, po); phi = std::max(phi, po);
+            }
+        tex(vlo, vhi - vlo + 1);
+        tex(slo, shi - slo + 2);
+        pal((texpal << 4) + plo, phi - plo + 8);
+        break;
+    }
+    }
+    size_t total = 0;
+    for (const TexRange& r : e.ranges) total += r.len;
+    e.src.resize(total);
+    u8* d = e.src.data();
+    for (const TexRange& r : e.ranges)
+    {
+        texFlatCopy(r.pal ? GPU.VRAMFlat_TexPal : GPU.VRAMFlat_Texture, r.pal ? 0x1FFFF : 0x7FFFF, r.addr, r.len, d);
+        d += r.len;
+    }
+}
+
+// Coordinator, before the workers start: a texel pointer for every textured polygon of frame gi.
+void TileRenderer3D::ResolveTexShared(int gi)
+{
+    TexShDecodes = 0;
+    TexShFrame++;
+    if (TexShBytes > TexShBudget)   // over budget: drop what the last frame didn't use, then anything older than this frame
+        for (int pass = 0; pass < 2 && TexShBytes > TexShBudget; pass++)
+            for (auto it = TexSh.begin(); it != TexSh.end();)
+                if (it->second.used + (pass == 0 ? 1 : 0) < TexShFrame)
+                {
+                    TexShBytes -= it->second.texels.size() * 4 + it->second.src.size();
+                    it = TexSh.erase(it);
+                }
+                else ++it;
+
+    const FrameCfg& cfg = Cfg[gi];
+    if (!(cfg.DispCnt & 1)) return;   // texturing off: no polygon reads PolyTex
+    const TilePoly* polys = FramePolys[gi];
+    const u32 n = FrameNumPolys[gi];
+    u64 lastKey = ~0ull;
+    const u32* lastTex = nullptr;
+    for (u32 i = 0; i < n; i++)
+    {
+        const u32 tp = polys[i].texparam, fmt = (tp >> 26) & 0x7;
+        if (!fmt) continue;
+        const u64 key = (tp & 0x3FF0FFFF) | ((u64)(fmt == 7 ? 0 : polys[i].texpal) << 32);
+        if (key == lastKey) { PolyTex[i] = lastTex; continue; }
+        auto [it, fresh] = TexSh.try_emplace(key);
+        TexShEntry& e = it->second;
+        bool decode = fresh;
+        if (!fresh && e.gen != cfg.TexGen)
+        {
+            const u8* sp = e.src.data();
+            for (const TexRange& r : e.ranges)
+            {
+                if (!texFlatEqual(r.pal ? GPU.VRAMFlat_TexPal : GPU.VRAMFlat_Texture, r.pal ? 0x1FFFF : 0x7FFFF, r.addr, r.len, sp)) { decode = true; break; }
+                sp += r.len;
+            }
+        }
+        if (decode)
+        {
+            TexShBytes -= e.texels.size() * 4 + e.src.size();
+            DecodeTexShared(e, tp, polys[i].texpal);
+            TexShBytes += e.texels.size() * 4 + e.src.size();
+            TexShDecodes++;
+            if (s3dCpu) s3dTexDecodes.fetch_add(1, std::memory_order_relaxed);
+        }
+        else if (texShVerify)
+        {
+            TexShEntry chk;
+            DecodeTexShared(chk, tp, polys[i].texpal);
+            if (chk.texels != e.texels)
+            {
+                fprintf(stderr, "LITEV_TEXSHARED_VERIFY: stale entry texparam %08x pal %04x (gen %u/%u)\n", tp, polys[i].texpal, e.gen, cfg.TexGen);
+                abort();
+            }
+        }
+        e.gen = cfg.TexGen;
+        e.used = TexShFrame;
+        PolyTex[i] = lastTex = e.texels.data();
+        lastKey = key;
+    }
+}
+#endif
+
+#ifdef LITEV_TILE_SAMEFRAME
+// Does frame gi repeat the last kept frame's inputs? Everything the raster reads: the compact
+// polygons and vertices (bucket lists derive from them) and the per-frame render state. Textures:
+// TexDirtySinceLast (no texture VRAM rewrite since that frame was rastered).
+bool TileRenderer3D::SameAsLast(int gi, u32 nvtx) const
+{
+    const u32 n = FrameNumPolys[gi];
+    if (!LastValid || n != LastNumPolys || nvtx != LastNumVtx) return false;
+    const FrameCfg& a = Cfg[gi];
+    const FrameCfg& b = *LastCfg;
+    if (a.ClearColorVal != b.ClearColorVal || a.ClearDepthIdVal != b.ClearDepthIdVal || a.DispCnt != b.DispCnt
+        || a.AlphaRef != b.AlphaRef || a.FogColor != b.FogColor || a.FogOffset != b.FogOffset || a.FogShift != b.FogShift
+        || memcmp(a.ToonTable, b.ToonTable, sizeof(a.ToonTable)) || memcmp(a.EdgeTable, b.EdgeTable, sizeof(a.EdgeTable))
+        || memcmp(a.FogDensityTable, b.FogDensityTable, sizeof(a.FogDensityTable)))
+        return false;
+    return !memcmp(FramePolys[gi], LastPolys, n * sizeof(TilePoly))
+        && !memcmp(VtxArena[gi], LastVtx, nvtx * sizeof(TileVtx));   // arenas are zeroed: padding compares equal
+}
+
+void TileRenderer3D::SaveLast(int gi, u32 nvtx, int col)
+{
+    if (!LastCfg) { LastCfg = new FrameCfg; LastPolys = new TilePoly[MaxPolys]; LastVtx = new TileVtx[VtxArenaSlots](); }
+    *LastCfg = Cfg[gi];
+    memcpy(LastPolys, FramePolys[gi], FrameNumPolys[gi] * sizeof(TilePoly));
+    memcpy(LastVtx, VtxArena[gi], nvtx * sizeof(TileVtx));
+    LastNumPolys = FrameNumPolys[gi];
+    LastNumVtx = nvtx;
+    LastCol = col;
+    LastValid = true;
+    TexDirtySinceLast = false;
+}
+#endif
+
 void TileRenderer3D::CoordDispatch(int geomIdx, int colIdx)
 {
+#ifdef TILE_TEXSH
+    ResolveTexShared(geomIdx);
+#endif
+#ifdef LITEV_TILE_SAMEFRAME
+    const u32 np = FrameNumPolys[geomIdx];
+    const u32 nvtx = np ? FramePolys[geomIdx][np - 1].vtxBase + FramePolys[geomIdx][np - 1].numVerts : 0;
+#ifdef TILE_TEXSH
+    // every texel the frame reads comes from the shared cache: unchanged unless an entry was
+    // (re)decoded, and a frame that decodes is rastered, so no decode since the kept frame
+    TexDirtySinceLast = TexShDecodes != 0;
+#else
+    TexDirtySinceLast |= Cfg[geomIdx].TexDirty;
+#endif
+    if (!TexDirtySinceLast && SameAsLast(geomIdx, nvtx))
+    {
+        // same inputs -> same picture: copy the kept output, every row ready at once
+        memcpy(ColorOut[colIdx], ColorOut[LastCol], sizeof(ColorOut[0]));
+        LastCol = colIdx;
+        DisplayIdx.store(colIdx, std::memory_order_release);
+        for (int y = 0; y < OutHeight; y++) RowReady[colIdx][y].store(1, std::memory_order_release);
+        Platform::Semaphore_Post(Sema_RowPub, OutHeight);
+        if (s3dCpu) s3dKept.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+#endif
     GeomRead = geomIdx;
     WorkerColIdx = colIdx;
     for (int b = 0; b < NB; b++) SeamFirstReady[b].store(0, std::memory_order_relaxed);
@@ -1437,6 +2266,9 @@ void TileRenderer3D::CoordDispatch(int geomIdx, int colIdx)
     for (int b = 0; b < NB; b++)
         Platform::Semaphore_Post(BandStartSema[b]);
     WaitFrameComplete();                             // block for the workers (coordinator thread)
+#ifdef LITEV_TILE_SAMEFRAME
+    SaveLast(geomIdx, nvtx, colIdx);
+#endif
 }
 
 void TileRenderer3D::CoordFunc()
@@ -1448,7 +2280,11 @@ void TileRenderer3D::CoordFunc()
         if (!CoordRunning.load(std::memory_order_acquire)) return;
         const u32 c = FrameConsumed.load(std::memory_order_acquire);
         const PendFrame pf = PendRing[c % NCOL];
-        CoordDispatch(pf.geomIdx, pf.colIdx);
+        {
+            S3DCpuScope cs(s3dCoordNs, s3dCoordIns);
+            CoordDispatch(pf.geomIdx, pf.colIdx);
+        }
+        s3dCpuFrame();
         FrameConsumed.fetch_add(1, std::memory_order_release);
         Platform::Semaphore_Post(Sema_RingFree);     // a ring slot freed -> unblock a waiting emu
     }

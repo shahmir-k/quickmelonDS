@@ -19,6 +19,10 @@
 #pragma once
 
 #include <atomic>
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+#include <unordered_map>
+#include <vector>
+#endif
 
 #include "GPU3D.h"     // Renderer3D, GPU3D, Vertex, Polygon, s32/s64/u32/u16
 #include "Platform.h"  // Thread / Semaphore (band-worker pool, DraStic-style)
@@ -136,6 +140,24 @@ private:
                 else          yfactor = num / den;
             }
         }
+
+#ifdef LITEV_TILE_SPANFAST
+        bool Linear() const { return linear; }
+        u32  Factor() const { return yfactor; }
+        // SetX split in two: the position (all InterpolateZ needs without a w-buffer), then the
+        // perspective factor (exactly SetX's), so a z-buffered span divides only for visible pixels
+        void SetXPos(s32 x) { this->x = x - x0; }
+        void SetXFactor()
+        {
+            if ((xdiff != 0) && ((!linear) || wbuffer))
+            {
+                u32 num = (x * w0n) << shift;
+                u32 den = (x * w0d) + ((xdiff-x) * w1d);
+                if (den == 0) yfactor = 0;
+                else          yfactor = num / den;
+            }
+        }
+#endif
 
         constexpr s32 Interpolate(s32 y0, s32 y1) const
         {
@@ -343,7 +365,13 @@ private:
     // 2 * 16 * 256 * 4 = 32KB -> fits ONE A55 core's 32KB L1D. There is ONE tile PER WORKER thread
     // (each pinned to its own core), so each core rasters into its own L1D-resident 32KB tile --
     // the DraStic per-band-worker private-tile model. 3 workers => 96KB total across 3 cores' L1D.
+#ifdef LITEV_TILE_H8
+    // 8-row tiles: colour + depth/id + translucent-id = 16.5 KB, inside the A55's 32 KB L1D with
+    // room for texels (16 rows = 33 KB missed the L1 on every tile pass)
+    static constexpr int TileH = 8;
+#else
     static constexpr int TileH = 16;
+#endif
     static constexpr int NumBlocks = OutHeight / TileH;   // 12
 #ifdef LITEV_TOPO_PIN
     // Band-worker count from the topology (the fastest non-emu cluster; RG DS 3, Thor 4),
@@ -404,6 +432,12 @@ private:
         u16  EdgeTable[8] = {};
         u32  FogColor = 0, FogOffset = 0, FogShift = 0;
         u8   FogDensityTable[34] = {};
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+        u32  TexGen = 0;          // texture VRAM generation (bumped when texture / palette VRAM is rewritten)
+#endif
+#ifdef LITEV_TILE_SAMEFRAME
+        bool TexDirty = false;    // texture / texture-palette VRAM was rewritten at this frame's render
+#endif
     };
     FrameCfg Cfg[NGEOM];
 
@@ -516,6 +550,7 @@ private:
         u32 attr;             // poly->Attr
         u32 texparam, texpal;
     };
+    static_assert(sizeof(TilePoly) == 28, "TilePoly has no padding (compared with memcmp)");
     TilePoly FramePolys[NGEOM][MaxPolys];
     u32 FrameNumPolys[NGEOM] = {};
 
@@ -523,6 +558,51 @@ private:
     u16 Bucket[NGEOM][NumBlocks][MaxPolys];
     u16 BucketCount[NGEOM][NumBlocks];
 
+#if defined(LITEV_TILE_SAMEFRAME) && defined(LITEV_TILE_COORD)
+    // Coordinator-only: the inputs of the last frame whose output is in ColorOut[LastCol]. A frame
+    // with the same polygons, vertices, render state and texture inputs gets a copy of that output
+    // instead of a raster (games resubmit identical lists while the camera stands still).
+    // Inspired by DSperate (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
+    // src/core/gpu/gpu3d.cpp list_same_, render3d.cpp kept frames).
+    bool     LastValid = false;
+    bool     TexDirtySinceLast = false;
+    int      LastCol = 0;
+    u32      LastNumPolys = 0, LastNumVtx = 0;
+    FrameCfg* LastCfg = nullptr;
+    TilePoly* LastPolys = nullptr;
+    TileVtx*  LastVtx = nullptr;
+    bool SameAsLast(int gi, u32 nvtx) const;
+    void SaveLast(int gi, u32 nvtx, int col);
+#endif
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+    // ONE shared texture cache (was: a private 4MB arena per worker, each decoding every texture
+    // it met, wiped on any texture VRAM write, and A3I5/A5I3 decoded per pixel). The coordinator
+    // resolves every textured polygon before it dispatches the workers (they only read). An entry
+    // holds the texels pre-expanded for ShadeTexel (6-bit r|g|b, 5-bit alpha) and a copy of the
+    // VRAM bytes it was decoded from: valid while the texture VRAM generation is unchanged, else
+    // compared byte for byte and decoded again only if they differ. The key leaves out the
+    // wrap/flip bits (decode doesn't depend on them).
+    // Based on DSperate (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
+    // src/core/gpu/texcache.{h,cpp}).
+    struct TexRange { u32 addr, len; bool pal; };
+    struct TexShEntry
+    {
+        std::vector<u32> texels;
+        std::vector<u8> src;
+        std::vector<TexRange> ranges;
+        u32 gen = 0;
+        u64 used = 0;
+    };
+    static constexpr size_t TexShBudget = 16u << 20;
+    std::unordered_map<u64, TexShEntry> TexSh;
+    size_t TexShBytes = 0;
+    u64 TexShFrame = 0;
+    u32 TexGen = 1;          // emu thread
+    u32 TexShDecodes = 0;    // decodes in the frame being resolved
+    const u32* PolyTex[MaxPolys] = {};   // per FramePolys[GeomRead] index, set by the coordinator
+    void ResolveTexShared(int gi);
+    void DecodeTexShared(TexShEntry& e, u32 texparam, u32 texpal) const;
+#endif
     void BuildFrameGeom(int gi);   // build compact verts + per-block buckets into buffer gi
 
     // ---- texture (P3) -- reused melonDS decode-once cache (per-worker; see BandScratch::Tex) ----
@@ -531,6 +611,9 @@ private:
     struct PolyShade
     {
         const u16* texcache;
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+        const u32* tex32;       // shared cache texels (r6 | g6<<8 | b6<<16 | a5<<24)
+#endif
         s32  texW, texH;
         u32  texparam, texpal;
         const u16* toontbl;
@@ -558,6 +641,21 @@ private:
                           Slope<0>& sl, Slope<1>& sr,
                           u32 cvl, u32 nvl, u32 cvr, u32 nvr, s32 xl, s32 xr, s32 y);
     void FlushTile(BandScratch& bs, u32* out, s32 ty0);
+#if defined(LITEV_TILE_SPANFAST) && defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+    template<bool TEX, int MODE>
+    void SpanFill(BandScratch& bs, const PolyShade& ps, Interpolator<0>& ix, s32 rowbase, s32 x, s32 xlim,
+                  s32 zl, s32 zr, bool wbuf, const s32* base, const u32* d, u32 rev);
+#ifdef LITEV_TILE_SPANLOCAL
+    template<bool TEX, int MODE, bool WBUF>
+    void SpanFillLocal(BandScratch& bs, const PolyShade& ps, s32 rowbase, s32 x, s32 xlim, s32 xstart, s32 xdiff,
+                       s32 wl, s32 wr, s32 zl, s32 zr, const s32* base, const u32* d, u32 rev);
+#if defined(LITEV_TILE_SPANVEC) && defined(__aarch64__)
+    template<bool TEX, bool DECAL, bool WBUF>
+    void SpanVec(BandScratch& bs, const PolyShade& ps, s32 rowbase, s32 x, s32 xlim, s32 xstart, s32 xdiff,
+                 s32 wl, s32 wr, s32 zl, s32 zr, const s32* base, const u32* d, u32 rev);
+#endif
+#endif
+#endif
 };
 
 }
