@@ -27,7 +27,7 @@
 #include <arm_neon.h>
 #endif
 
-#ifdef S2D_PLANES
+#if defined(S2D_PLANES) || defined(S2D_OBJROW)
 #include "GPU2D_Planes.h"
 #endif
 
@@ -2446,12 +2446,26 @@ void SoftRenderer2D::DrawSprites(u32 line)
         }
     }
 
+#ifdef S2D_OBJROW
+    // the OBJ buffers are only written by a drawn sprite (counted in NumSprites): a line after one
+    // with none is still clear
+    if (NumSprites)
+    {
+        memset(OBJLine, 0, sizeof(OBJLine));
+        memset(OBJWindow, 0, sizeof(OBJWindow));
+    }
+    NumSprites = 0;
+#ifdef LITEV_SOFT2D_SPRLIST
+    OBJPrioMask = 0;
+#endif
+#else
     NumSprites = 0;
 #ifdef LITEV_SOFT2D_SPRLIST
     OBJPrioMask = 0;
 #endif
     memset(OBJLine, 0, sizeof(OBJLine));
     memset(OBJWindow, 0, sizeof(OBJWindow));
+#endif
 
     if (!GPU2D.OBJEnable)
         return;
@@ -2786,6 +2800,21 @@ void SoftRenderer2D::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheigh
     }
 }
 
+#ifdef S2D_OBJROW
+// texels [xoff, xend) of a decoded sprite row (mirrored when hflip) plotted from screen x xpos
+void SoftRenderer2D::S2DPlotSpriteRow(const u8* tex, u8* row, u32 width, bool hflip, u32 xoff, u32 xend, s32 xpos, u32 pixelattr)
+{
+    const u32 cnt = xend - xoff;
+    const u8* r = tex + xoff;
+    if (hflip)
+    {
+        for (u32 k = 0; k < cnt; k++) row[k] = tex[width - 1 - (xoff + k)];
+        r = row;
+    }
+    for (u32 j = S2DPlanes::PlotObjRow(r, cnt, pixelattr, &OBJLine[xpos]); j < cnt; j++)
+        DrawSpritePixel<false>(r[j] ? r[j] : -1, pixelattr, xpos + j);
+}
+#endif
 
 template<bool window>
 void SoftRenderer2D::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos)
@@ -2929,6 +2958,16 @@ void SoftRenderer2D::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos,
                 else
                     pixelattr |= ((attrib[2] & 0xF000) >> 4);
             }
+#ifdef S2D_OBJROW
+            if (!window)
+            {
+                // the whole texel row (tile rows of 8 bytes, 64 apart), then the visible part
+                alignas(16) u8 tex[64], row[64];
+                for (u32 t = 0; t < width; t += 8) memcpy(tex + t, &objvram[(pixelsaddr + (t << 3)) & objvrammask], 8);
+                S2DPlotSpriteRow(tex, row, width, attrib[1] & (1<<12), xoff, xend, xpos, pixelattr);
+                return;
+            }
+#endif
 
             if (attrib[1] & (1<<12)) // xflip
             {
@@ -2970,6 +3009,21 @@ void SoftRenderer2D::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos,
                 pixelattr |= OBJ_StandardPal;
                 pixelattr |= ((attrib[2] & 0xF000) >> 8);
             }
+#ifdef S2D_OBJROW
+            if (!window)
+            {
+                // the whole texel row (tile rows of 4 bytes, 32 apart, low nibble first)
+                alignas(16) u8 tex[64], row[64];
+                for (u32 t = 0; t < width; t += 8)
+                {
+                    u32 w; memcpy(&w, &objvram[(pixelsaddr + (t << 2)) & objvrammask], 4);
+                    const uint8x8_t raw = vreinterpret_u8_u32(vdup_n_u32(w));
+                    vst1_u8(tex + t, vzip_u8(vand_u8(raw, vdup_n_u8(0xF)), vshr_n_u8(raw, 4)).val[0]);
+                }
+                S2DPlotSpriteRow(tex, row, width, attrib[1] & (1<<12), xoff, xend, xpos, pixelattr);
+                return;
+            }
+#endif
 
             // TODO: optimize VRAM access!!
             // TODO: do xflip better? the 'two pixels per byte' thing makes it a bit shitty

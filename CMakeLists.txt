@@ -276,6 +276,14 @@ option(LITEV_SOFT2D_OUTNEON "liteV: one-pass NEON 2D output stage + NEON display
 if (LITEV_SOFT2D_OUTNEON)
     add_compile_definitions(LITEV_SOFT2D_OUTNEON=1)
 endif()
+# LITEV_SOFT2D_OBJROW: a regular (non-affine, paletted, non-window) sprite's row is decoded a tile
+# row at a time and plotted into the OBJ line 4 pixels at a time (NEON, same priority/stamp rule as
+# DrawSpritePixel); a line after one with no sprite skips clearing the (still clear) OBJ buffers.
+# Render-only, exact. AArch64. Inspired by DSperate's obj_row_idx16.
+option(LITEV_SOFT2D_OBJROW "liteV: NEON sprite row plot for the software 2D" OFF)
+if (LITEV_SOFT2D_OBJROW)
+    add_compile_definitions(LITEV_SOFT2D_OBJROW=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

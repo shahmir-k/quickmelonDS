@@ -44,6 +44,10 @@ static inline u32 S2DConvColor(u16 c)
 // one-pass NEON output stage: brightness + 6->8 bit expansion, display capture
 #define S2D_OUTNEON 1
 #endif
+#if defined(LITEV_SOFT2D_OBJROW) && defined(__aarch64__)
+// sprite rows decoded a tile row at a time and plotted 4 pixels at a time
+#define S2D_OBJROW 1
+#endif
 class SoftRenderer2D : public Renderer2D
 {
 public:
@@ -281,6 +285,9 @@ private:
     template<bool window> void DrawSpritePixel(int color, u32 pixelattr, s32 xpos);
     template<bool window> void DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight, u32 width, u32 height, s32 xpos, s32 ypos);
     template<bool window> void DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos);
+#ifdef S2D_OBJROW
+    void S2DPlotSpriteRow(const u8* tex, u8* row, u32 width, bool hflip, u32 xoff, u32 xend, s32 xpos, u32 pixelattr);
+#endif
 };
 
 }

@@ -17,11 +17,11 @@
 */
 
 // NEON line kernels of the software 2D: layer planes (LITEV_SOFT2D_PLANES), output stage
-// (LITEV_SOFT2D_OUTNEON). Ported from / based on DSperate
+// (LITEV_SOFT2D_OUTNEON), sprite rows (LITEV_SOFT2D_OBJROW). Ported from / based on DSperate
 // (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
 // src/core/gpu/kernels_neon.cpp: text_ctl, text_pair, text_one, text_row_16, text_row_256,
 // merge16/select16, brighten16/darken16, composite_line_fade, output_line, capture_a15,
-// capture_blend), adapted to melonDS's line formats (OBJLine attribute words, 3D line,
+// capture_blend, obj_plot16), adapted to melonDS's line formats (OBJLine attribute words, 3D line,
 // BGOBJLine colour records):
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -262,6 +262,36 @@ inline void FadeLine(const u32* top, const u8* win, u32 bc, u32 evy, u32* out)
         o.val[3] = vbslq_u8(fx, vdupq_n_u8(0xFF), f1);
         vst4q_u8(reinterpret_cast<u8*>(out + i), o);
     }
+}
+
+// ---- sprite rows (LITEV_SOFT2D_OBJROW) ---------------------------------------------------------
+// One sprite's decoded row (cnt texel indices in screen order, 0 = transparent) plotted into the
+// OBJLine words, 4 at a time, with SoftRenderer2D::DrawSpritePixel<false>'s rule: an opaque pixel
+// wins over a transparent one or one of a lower priority; a transparent pixel over a transparent
+// one stamps its sprite/mosaic/priority bits. Inspired by DSperate's obj_plot16.
+// opaque = 1<<18, prio = 3<<16, sprite = 1<<19, mosaic = 1<<20 (SoftRenderer2D OBJ_* bits)
+inline u32 PlotObjRow(const u8* row, u32 cnt, u32 attr, u32* line)
+{
+    const uint32x4_t vattr = vdupq_n_u32(attr), vop = vdupq_n_u32(1u << 18), vpm = vdupq_n_u32(3u << 16);
+    const uint32x4_t vprio = vdupq_n_u32(attr & (3u << 16));
+    const uint32x4_t vkeep = vdupq_n_u32(~((1u << 20) | (3u << 16)));
+    const uint32x4_t vstamp = vdupq_n_u32(attr & ((1u << 19) | (1u << 20) | (3u << 16)));
+    u32 j = 0;
+    for (; j + 4 <= cnt; j += 4)
+    {
+        u32 w; memcpy(&w, row + j, 4);
+        const uint32x4_t c = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(w)))));
+        const uint32x4_t newop = vtstq_u32(c, c);
+        const uint32x4_t old = vld1q_u32(line + j);
+        const uint32x4_t oldop = vtstq_u32(old, vop);
+        const uint32x4_t lt = vcltq_u32(vprio, vandq_u32(old, vpm));
+        const uint32x4_t win = vandq_u32(newop, vorrq_u32(vmvnq_u32(oldop), lt));
+        const uint32x4_t stamp = vbicq_u32(vmvnq_u32(newop), oldop);
+        uint32x4_t r = vbslq_u32(stamp, vorrq_u32(vandq_u32(old, vkeep), vstamp), old);
+        r = vbslq_u32(win, vorrq_u32(c, vattr), r);
+        vst1q_u32(line + j, r);
+    }
+    return j;   // the caller plots the tail
 }
 
 // ---- output stage (LITEV_SOFT2D_OUTNEON) --------------------------------------------------------
