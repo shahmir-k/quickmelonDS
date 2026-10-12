@@ -1318,6 +1318,12 @@ option(LITEV_JIT_DP_TARGETED "JIT: an invalidation reverts only the direct patch
 if (LITEV_JIT_DP_TARGETED)
     add_compile_definitions(LITEV_JIT_DP_TARGETED=1)
 endif()
+# REVIVE: park-and-revive at dispatch (DSperate https://github.com/beebono/DSperate, GPL-3.0-or-later,
+# commit f5fa35e, cpu/jit/runtime.cpp:323-360). Category B (see ARMJIT::ReviveParked); runtime debug.litev.jitrevive
+option(LITEV_JIT_REVIVE "JIT: a killed block whose guest bytes match again is revived at dispatch, no recompile (category B)" OFF)
+if (LITEV_JIT_REVIVE)
+    add_compile_definitions(LITEV_JIT_REVIVE=1)
+endif()
 option(LITEV_JIT_DP_REVERTLIST "JIT: DIRECTPATCH revert-all walks a list of promoted sites, not all 2x16383 slots (exact)" OFF)
 if (LITEV_JIT_DP_REVERTLIST)
     add_compile_definitions(LITEV_JIT_DP_REVERTLIST=1)

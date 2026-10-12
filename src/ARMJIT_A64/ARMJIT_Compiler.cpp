@@ -1275,6 +1275,7 @@ bool Compiler::CanCompile(bool thumb, u16 kind)
 #ifdef LITEV_JIT_DIRECTPATCH
 // C-ABI trampolines the dispatcher BLs into (baked Compiler* as arg0). Defined after
 // the Compiler methods below; forward-declared so Gen_Dispatcher can take their address.
+extern u64 JitRecompileSame[8];
 static void LiteV_DirectPatchPromote(Compiler* c, u32 num, u32 site, u32 guestTarget, u64 hostEntry);
 static void LiteV_DirectPatchDemote(Compiler* c, u32 num, u32 site);
 #endif
@@ -2390,8 +2391,10 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
         e._dp0 |= 2; e._dp1 = guestTarget & ~1u;
         DPByTarget[num].emplace(guestTarget & ~1u, site);
     }
-#elif defined(LITEV_JIT_DP_REVERTLIST)
-    if (!e._dp0) { e._dp0 = 1; DirectPatchListed[num].push_back(site); }
+#endif
+#ifdef LITEV_JIT_DP_REVERTLIST
+    // (bit 0 = listed; with DP_TARGETED bit 1 = indexed by target: RevertAll must still find every site)
+    if (!(e._dp0 & 1)) { e._dp0 |= 1; DirectPatchListed[num].push_back(site); }
 #endif
 #if LITEV_PROFILE
     melonDS::LiteProfile::g_Frame.DirectPromotions.fetch_add(1, std::memory_order_relaxed);
@@ -2425,6 +2428,7 @@ void Compiler::DirectPatchDemote(u32 num, u32 site)
 // (single-block invalidations ~4/3400f); over-reverting is harmless (sites re-promote).
 void Compiler::DirectPatchRevertAll()
 {
+    JitRecompileSame[7]++;   // (EmitLock taken by an invalidation; headless jit_compiles line)
 #ifdef LITEV_JIT_BGEMIT
     std::lock_guard<std::recursive_mutex> lk(EmitLock);
 #endif
@@ -2450,6 +2454,9 @@ void Compiler::DirectPatchRevertAll()
             }
         }
         DirectPatchListed[num].clear();
+#ifdef LITEV_JIT_DP_TARGETED
+        DPByTarget[num].clear();   // (_dp0 = 0 above unindexed every site)
+#endif
         continue;
 #endif
         u32 n = ICacheNextSite;   // only [1, ICacheNextSite) were ever handed out
@@ -2482,8 +2489,11 @@ void Compiler::DirectPatchRevertAll()
 void Compiler::DirectPatchRevertTargets(u32 num, const u32* addrs, int n)
 {
     if (!ICacheTable[num] || DPByTarget[num].empty()) return;
+    // DPByTarget and ICacheEntry::promoted change only on this (the emulator) thread, so the lookup
+    // needs no lock; EmitLock (the background emitter holds it for a whole block) only around a patch.
+    // Taking it per invalidation was ~20% of the Golden Sun emu thread on the Mac (mutex wait).
 #ifdef LITEV_JIT_BGEMIT
-    std::lock_guard<std::recursive_mutex> lk(EmitLock);
+    std::unique_lock<std::recursive_mutex> lk(EmitLock, std::defer_lock);
 #endif
     bool write = false;
     const u32 dispOff = (u32)((u8*)DispatcherEntry[num] - GetRXBase());
@@ -2497,7 +2507,14 @@ void Compiler::DirectPatchRevertTargets(u32 num, const u32* addrs, int n)
             if (!(e._dp0 & 2) || (u32)e._dp1 != a) continue;   // indexed under another target since
             e._dp0 &= ~2ull;
             if (!e.promoted) continue;
-            if (!write) { NDS.JIT.JitEnableWrite(); write = true; }
+            if (!write)
+            {
+#ifdef LITEV_JIT_BGEMIT
+                lk.lock();
+#endif
+                JitRecompileSame[7]++;
+                NDS.JIT.JitEnableWrite(); write = true;
+            }
             DirectPatchWriteBranch(e.patchOff, dispOff);
             e.promoted = 0;
             e.hitCount = 0;

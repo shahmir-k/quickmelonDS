@@ -1579,6 +1579,9 @@ void ARMv5::Execute()
                         if (IdleLoop)
                             melonDS::LiteProfile::AddAtomic(melonDS::LiteProfile::g_Frame.ARM9IdleHits);
 #endif
+#ifdef LITEV_IDLE_CENSUS
+                        if (IdleLoop) IdleCensus(2, R[15], NDS.NumFrames);
+#endif
                         Cycles = 0;
                         NDS.ARM9Timestamp = NDS.ARM9Target;
                     }
@@ -1813,6 +1816,9 @@ void ARMv4::Execute()
 #if LITEV_PROFILE
                         if (IdleLoop)
                             melonDS::LiteProfile::AddAtomic(melonDS::LiteProfile::g_Frame.ARM7IdleHits);
+#endif
+#ifdef LITEV_IDLE_CENSUS
+                        if (IdleLoop) IdleCensus(3, R[15], NDS.NumFrames);
 #endif
                         Cycles = 0;
                         NDS.ARM7Timestamp = NDS.ARM7Target;

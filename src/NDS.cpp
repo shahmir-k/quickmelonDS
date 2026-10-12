@@ -68,17 +68,18 @@ namespace melonDS
 // (kind 1) per guest PC; the top PCs per kind are printed at exit (reads per frame).
 void IdleCensus(int kind, u32 pc, u32 frame)
 {
-    static std::map<u64, u64> counts[2];
+    static std::map<u64, u64> counts[4];   // SPICNT reads, GXSTAT reads, ARM9 / ARM7 idle-loop skips
     static u32 frames = 0;
     static bool reg = (atexit([] {
-        for (int k = 0; k < 2; k++)
+        static const char* kn[4] = {"SPICNT", "GXSTAT", "IDLE9", "IDLE7"};
+        for (int k = 0; k < 4; k++)
         {
             std::vector<std::pair<u64, u64>> v(counts[k].begin(), counts[k].end());
             std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
             u64 tot = 0; for (auto& e : v) tot += e.second;
-            fprintf(stderr, "IDLECENSUS %s total %.1f/frame (%u frames)\n", k ? "GXSTAT" : "SPICNT", frames ? (double)tot / frames : 0.0, frames);
+            fprintf(stderr, "IDLECENSUS %s total %.1f/frame (%u frames)\n", kn[k], frames ? (double)tot / frames : 0.0, frames);
             for (size_t i = 0; i < v.size() && i < 6; i++)
-                fprintf(stderr, "IDLECENSUS   %s pc %08x %.1f/frame\n", k ? "GXSTAT" : "SPICNT", (u32)v[i].first, frames ? (double)v[i].second / frames : 0.0);
+                fprintf(stderr, "IDLECENSUS   %s pc %08x %.1f/frame\n", kn[k], (u32)v[i].first, frames ? (double)v[i].second / frames : 0.0);
         }
     }), true);
     (void)reg;
