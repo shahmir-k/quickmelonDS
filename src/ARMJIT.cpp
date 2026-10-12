@@ -1560,8 +1560,8 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
         if (int hook = cpu->Num == 1 && !thumb ? A7HLE::IsHook(NDS, instrs[i].Addr, instrs[i].Instr) : 0)
         {
             // verified now; the block depends on the hooked code (no per-call compare in Run)
-            A7HLE::Range dep[4];
-            int nd = A7HLE::Deps(instrs[i].Addr, instrs[i].Instr, dep);
+            A7HLE::Range dep[64];
+            int nd = A7HLE::Deps(NDS, instrs[i].Addr, instrs[i].Instr, dep, 64);
             for (int d = 0; d < nd; d++) addDeps(1, dep[d].a, dep[d].b);
             if (hook == 1)
             {

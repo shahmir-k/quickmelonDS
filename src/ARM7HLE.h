@@ -50,7 +50,7 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr);
 // guest code the hook at addr depends on: ARMJIT adds these to the hook block's code ranges, so a
 // write there invalidates the block and the recompile re-verifies (as for A9HLE)
 struct Range { u32 a, b; };
-int Deps(u32 addr, u32 instr, Range* out);   // up to 4
+int Deps(melonDS::NDS& nds, u32 addr, u32 instr, Range* out, int max);
 // Execute the hooked function at R15-8 (native, or the guest instruction on fallback).
 // jit: reached from a JIT-compiled hook (code verified at compile); else compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).
