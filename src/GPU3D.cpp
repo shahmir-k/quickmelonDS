@@ -26,6 +26,9 @@
 #include "Platform.h"
 #include "GPU3D.h"
 #include "LiteProfile.h"
+#ifdef LITEV_REMOTE_GX_SINKMEMO
+#include "xxhash/xxhash.h"
+#endif
 // LITEV_GXFIFO_DMA_INLINE: single-source inline bodies for the GXFIFO producer path. Included here
 // so the public WriteToGXFIFO/CmdFIFOWrite delegate to the SAME code DMA.cpp inlines (no duplication).
 // The extern decl inside also gives CmdNumParams (defined below) external linkage for other TUs.
@@ -4412,6 +4415,9 @@ __attribute__((noinline)) void GPU3D::SinkCmd(u32 cmd, u32 val) noexcept
         break;
     case 0x29: PolygonAttr = val; break;
     case 0x40:
+#ifdef LITEV_REMOTE_GX_SINKMEMO
+        SinkBegan = true;
+#endif
         PolygonMode = val & 0x3;
         VertexNum = 0; VertexNumInPoly = 0; NumConsecutivePolygons = 0; LastStripPolygon = NULL;
         CurPolygonAttr = PolygonAttr;
@@ -4519,6 +4525,72 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
 }
 #endif
 
+#ifdef LITEV_REMOTE_GX_SINKMEMO
+// LITEV_REMOTE_GX_SINKMEMO: a remote's display lists repeat frame after frame (MKDS 8P race: 99.5%
+// of the DMA chunks a sink copy decodes were decoded before with the same engine state), so keep
+// SinkWords' effect per chunk. The key is everything SinkWords reads: the words (compared in full,
+// not by hash) and the state below; the stored effect is everything it writes. VertexNum and
+// NumConsecutivePolygons are only counted up (their parity is all SinkWords reads) unless a BEGIN
+// resets them: stored as a delta, or as the final value after a BEGIN. Exact: the same state as
+// running SinkWords. Off: env LITEV_GXSINKMEMO=0, debug.litev.gxsinkmemo=0.
+static const bool GXSinkMemoOn = [] {
+    if (const char* e = getenv("LITEV_GXSINKMEMO")) return atoi(e) != 0;
+#if defined(__ANDROID__)
+    return litevGxPropDefault("debug.litev.gxsinkmemo", 1) != 0;
+#else
+    return true;
+#endif
+}();
+
+static constexpr u32 kSinkMemoSize = 1024;   // direct-mapped (MKDS race: ~260 distinct chunks per frame)
+
+u32 GPU3D::SinkMemo(const u32* words, u32 n, bool& ran) noexcept
+{
+    if (!SinkMemoTab) SinkMemoTab.reset(new SinkMemoEntry[kSinkMemoSize]());
+    const u32 st[15] = {n, NumCommands, CurCommand, ParamCount, TotalParams, ExecParamCount, MatrixMode, PolygonAttr,
+                        CurPolygonAttr, PolygonMode, VertexNumInPoly, NumConsecutivePolygons & 1,
+                        (u32)ProjMatrixStackPointer, (u32)TexMatrixStackPointer, (u32)PosMatrixStackPointer};
+    SinkMemoEntry& e = SinkMemoTab[(XXH3_64bits_withSeed(words, n * 4, XXH3_64bits(st, sizeof st))) & (kSinkMemoSize - 1)];
+    if (e.n == n && e.numCmds == st[1] && e.cur == st[2] && e.pc == st[3] && e.tp == st[4] && e.epc == st[5] && e.mm == st[6]
+        && e.pattr == st[7] && e.cpattr == st[8] && e.pmode == st[9] && e.vnip == st[10] && e.ncpOdd == st[11]
+        && e.projSP == ProjMatrixStackPointer && e.texSP == TexMatrixStackPointer && e.posSP == PosMatrixStackPointer
+        && !memcmp(e.words, words, n * 4))
+    {
+        NumCommands = e.oNumCmds; CurCommand = e.oCur; ParamCount = e.oPc; TotalParams = e.oTp; ExecParamCount = e.oEpc;
+        MatrixMode = e.oMm; PolygonAttr = e.oPattr; CurPolygonAttr = e.oCpattr; PolygonMode = e.oPmode; VertexNumInPoly = e.oVnip;
+        ProjMatrixStackPointer = e.oProjSP; TexMatrixStackPointer = e.oTexSP; PosMatrixStackPointer = e.oPosSP;
+        GXStat |= e.statOr;
+        CycleCount += e.cyc;
+        if (e.began) { VertexNum = e.vnum; NumConsecutivePolygons = e.ncp; LastStripPolygon = NULL; }
+        else { VertexNum += e.vnum; NumConsecutivePolygons += e.ncp; }
+        if (e.ran) ran = true;
+        return e.k;
+    }
+    const u32 vnum0 = VertexNum, ncp0 = NumConsecutivePolygons, bit15 = GXStat & (1<<15);
+    const s32 cyc0 = CycleCount;
+    bool r = false;
+    SinkBegan = false;
+    GXStat &= ~(1<<15);   // the only GXStat bit SinkWords touches (ORs in): record what it sets
+    const u32 k = SinkWords(words, n, r);
+    e.statOr = GXStat & (1<<15);
+    GXStat |= bit15;
+    e.n = n; e.numCmds = st[1]; e.cur = st[2]; e.pc = st[3]; e.tp = st[4]; e.epc = st[5]; e.mm = st[6];
+    e.pattr = st[7]; e.cpattr = st[8]; e.pmode = st[9]; e.vnip = st[10]; e.ncpOdd = st[11];
+    e.projSP = (s32)st[12]; e.texSP = (s32)st[13]; e.posSP = (s32)st[14];
+    memcpy(e.words, words, n * 4);
+    e.k = k; e.oNumCmds = NumCommands; e.oCur = CurCommand; e.oPc = ParamCount; e.oTp = TotalParams; e.oEpc = ExecParamCount;
+    e.oMm = MatrixMode; e.oPattr = PolygonAttr; e.oCpattr = CurPolygonAttr; e.oPmode = PolygonMode; e.oVnip = VertexNumInPoly;
+    e.oProjSP = ProjMatrixStackPointer; e.oTexSP = TexMatrixStackPointer; e.oPosSP = PosMatrixStackPointer;
+    e.cyc = CycleCount - cyc0;
+    e.began = SinkBegan;
+    e.vnum = SinkBegan ? VertexNum : VertexNum - vnum0;
+    e.ncp = SinkBegan ? NumConsecutivePolygons : NumConsecutivePolygons - ncp0;
+    e.ran = r;
+    if (r) ran = true;
+    return k;
+}
+#endif
+
 void GPU3D::BulkWords(const u32* words, u32 n) noexcept
 {
     // contract: n <= 64 (the decode buffer below; after a SWAP_BUFFERS the rest goes to the 260-entry FIFO). A larger
@@ -4533,7 +4605,16 @@ void GPU3D::BulkWords(const u32* words, u32 n) noexcept
     if (Sink && GXUntimedOn && GXFastSinkOn)
     {
         bool ran = false;
+#ifdef LITEV_REMOTE_GX_SINKMEMO
+#ifdef LITEV_FF_HEADLESS3D
+        const bool memo = GXSinkMemoOn && LITEV_HEADLESS(Headless) && !FFHeadlessNow;   // SinkWords' lightCycles
+#else
+        const bool memo = GXSinkMemoOn && LITEV_HEADLESS(Headless);
+#endif
+        const u32 k = memo ? SinkMemo(words, n, ran) : SinkWords(words, n, ran);
+#else
         const u32 k = SinkWords(words, n, ran);
+#endif
         if (k == n)
         {
             // as the queue path's tail for a batch of entries (the executor ran them)
