@@ -1653,7 +1653,7 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
             if (nh > 0)
             {
                 for (int d = 0; d < nh; d++) addDeps(1, la[d], lb[d]);
-                instrs[i].Info = ARMInstrInfo::Decode(false, 1, 0xE7F000F0, false);
+                if (!A7Native::HookGuardOnly(NDS)) instrs[i].Info = ARMInstrInfo::Decode(false, 1, 0xE7F000F0, false);
                 a7Hook = true;
                 a7nAt = instrs[i].Addr;
             }
