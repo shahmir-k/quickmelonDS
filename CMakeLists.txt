@@ -299,6 +299,13 @@ option(LITEV_SOFT2D_AFFNEON "liteV: NEON tile gather for affine/extended BG cell
 if (LITEV_SOFT2D_AFFNEON)
     add_compile_definitions(LITEV_SOFT2D_AFFNEON=1)
 endif()
+# LITEV_SOFT2D_VRAMDISP: an engine A VRAM-display line (display mode 2, e.g. capture-fed screens) goes
+# to the framebuffer in one NEON pass like a regular line (BGR555 -> records, then OutputLine) instead
+# of the scalar convert + brightness + expand. Render-only, exact. Needs OUTNEON (AArch64).
+option(LITEV_SOFT2D_VRAMDISP "liteV: one-pass NEON VRAM-display output line" OFF)
+if (LITEV_SOFT2D_VRAMDISP)
+    add_compile_definitions(LITEV_SOFT2D_VRAMDISP=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

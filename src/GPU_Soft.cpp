@@ -483,6 +483,25 @@ void SoftRenderer::InitBands()
 #endif
 }
 
+#ifdef LITEV_SOFT2D_VRAMDISP
+// BGR555 -> the 2D line record (r = (c & 0x1F) << 1, g = (c & 0x3E0) >> 4, b = (c & 0x7C00) >> 9,
+// alpha 0), as DrawScanlineA's VRAM display; NEON, 8 pixels at a time
+static void S2DVramDispLine(const u16* src, u32* out)
+{
+    const uint16x8_t m3e = vdupq_n_u16(0x3E);
+    for (u32 i = 0; i < 256; i += 8)
+    {
+        const uint16x8_t c = vld1q_u16(src + i);
+        uint8x8x4_t px;
+        px.val[0] = vmovn_u16(vandq_u16(vshlq_n_u16(c, 1), m3e));
+        px.val[1] = vmovn_u16(vandq_u16(vshrq_n_u16(c, 4), m3e));
+        px.val[2] = vmovn_u16(vandq_u16(vshrq_n_u16(c, 9), m3e));
+        px.val[3] = vdup_n_u8(0);
+        vst4_u8((u8*)(out + i), px);
+    }
+}
+#endif
+
 // Render a disjoint line range [y0,y1) for BOTH engines into BandOut2D, using this
 // band's PRIVATE units/renderers, reading the shared main snapshots. Runs on a
 // helper thread; no shared mutable render state with the other bands.
@@ -714,6 +733,22 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         // a regular-display line goes to the framebuffer in one pass (brightness + expansion)
         const bool fuseA = f.ScreensEnabled && ((f.DispCntA >> 16) & 0x3) == 1;
         const bool fuseB = f.ScreensEnabled && ((f.DispCntB >> 16) & 0x1) == 1;
+#ifdef LITEV_SOFT2D_VRAMDISP
+        // a VRAM-display line (engine A display mode 2) also in one pass: the bank's BGR555 line
+        // converted to 6-bit records (DrawScanlineA case 2, same live LCDC check), then OutputLine
+        const bool vramA = !fuseA && f.ScreensEnabled && ((f.DispCntA >> 16) & 0x3) == 2;
+        if (vramA)
+        {
+            alignas(16) u32 rec[256];
+            const u32 bank = (f.DispCntA >> 18) & 0x3;
+            if (GPU.VRAMMap_LCDC & (1 << bank)) S2DVramDispLine(&((const u16*)GPU.VRAM[bank])[line * 256], rec);
+            else memset(rec, 0, sizeof(rec));
+            S2DPlanes::OutputLine(rec, f.MasterBrightnessA, dstA);
+        }
+        else
+#else
+        const bool vramA = false;
+#endif
         if (fuseA) S2DPlanes::OutputLine(BandOut2D[0][line], f.MasterBrightnessA, dstA);
         else DrawScanlineA(line, dstA, BandOut2D[0][line], f.DispCntA, f.MasterBrightnessA);
         if (fuseB) S2DPlanes::OutputLine(BandOut2D[1][line], f.MasterBrightnessB, dstB);
@@ -729,7 +764,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         if (f.ScreensEnabled)
         {
 #ifdef S2D_OUTNEON
-            if (!fuseA) ExpandColor(dstA);
+            if (!fuseA && !vramA) ExpandColor(dstA);
             if (!fuseB) ExpandColor(dstB);
 #else
             ExpandColor(dstA);
