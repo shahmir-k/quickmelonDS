@@ -111,7 +111,18 @@ struct Variant
     Range shpCode[3];
     u64 shpSig;
     const MatT* matT;           // 8. in Thumb (W2)
+    // NTR SDK OS build of 2005-2006 (Castlevania: Portrait of Ruin, Mario Kart DS; only 1.): CP_Save/RestoreContext push
+    // nothing, OS_LoadContext returns straight into the thread (no TWL divider check, no push on its SVC stack), the
+    // scheduler's objects are separate globals around OSThreadInfo. 0: the PW/PB/W2 build.
+    u8 n6;
+    u32 irqQueue, irqCheck, irqTable;   // OS_IrqThreadQueue, the IRQ check flags, OS_IRQTable (0: PW/PB/W2's DTCM addresses)
+    u8 oLock, oCb, oCur, oDepth;        // offsets from osi: reschedule lock (u32), switch callback, &current pointer, IRQ
+                                        // depth / reschedule-disable (u16) (n6 only; PW: 4, 0, 8, 0x1E)
+    s32 wakeCyc;                        // 1.'s cycle estimate (0: kWakeCycles)
 };
+inline u32 IrqQueueOf(const Variant& v);
+inline u32 IrqCheckOf(const Variant& v);
+inline u32 IrqTableOf(const Variant& v);
 constexpr Variant kPW = {
     "PW", 0x01FF8160, 0x0208478C, 0x02084830, 0x02082864,
     {
@@ -239,7 +250,34 @@ constexpr Variant kW2 = {
     0x396f02a263a36a88ull,
     &kW2Mat,
 };
+// NTR SDK 2005-2006 OS build (Castlevania: Portrait of Ruin, Mario Kart DS, ...): found in any game by signature (OsScan,
+// below), so this is only the template of what the scan fills in. Its main thread waits for VBlank in OS_WaitIrq with HBlank
+// IRQs on in Castlevania PoR: 242 spurious wake round trips a frame (PW's pattern) = ~68% of its ARM9 guest instructions in
+// the menus. Only the wake hook (1.): the HBlank callbacks are the games' own code.
+constexpr Variant kN6 = {
+    "NTR2006", 0, 0, 0, 0,
+    {},
+    {0, 0},
+    0, 0, 0,
+    0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, {}, 0, {}, 0, 0, {}, 0, nullptr,
+    1, 0, 0, 0, 0x00, 0x08, 0x0C, 0x16, 1467,     // (1467: check-mode guest average, CV 144k round trips; MKDS 1.7k: 5008)
+};
 constexpr const Variant* kVariants[] = {&kPW, &kPB, &kW2};
+
+// ---- signature scan of an OS build (FLIRT-style): the wake hook's variant in any game --------------------------------
+// A recipe row per code range (tools/hle/osscan.py from the reference: Castlevania PoR): its length, its masked FNV-1a 64
+// (branches out of the range: offset zeroed; the pointer literals it loads: zeroed) and how to find it: the hook's range
+// (hook - off), a literal (range r, word w), a BL target (range r, word w), or a scan of main RAM (its first three masked
+// words, then the masked FNV; exactly one match). Run once, when the JIT first compiles a candidate wake-loop instruction.
+struct OsRange { u32 len; u64 mfnv; u8 how, r; u16 w; s32 off; u32 w0, w1, w2; };
+#include "A9HLEOsScan.inc"
+constexpr int kOsN6Code[10] = {0, 1, 2, 4, 5, 6, 7, 8, 10, 11};    // Variant::code index of each row
+inline u32 IrqQueueOf(const Variant& v) { return v.irqQueue ? v.irqQueue : kIrqQueue; }
+inline u32 IrqCheckOf(const Variant& v) { return v.irqCheck ? v.irqCheck : kIrqCheck; }
+inline u32 IrqTableOf(const Variant& v) { return v.irqTable ? v.irqTable : kIrqTable; }
 constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
 // hook kind of (addr, instr) in variant v: 0 wake, 1 set, 2 get, 5 GX send, -1 none (thumb: a Thumb entry, instr the halfword)
 inline int Kind(const Variant& v, u32 addr, u32 instr, bool thumb = false)
@@ -258,8 +296,8 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 26;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 16777215;
+constexpr int kKinds = 27;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 33554431;    // (bit 16777216: HLELeaf; 33554432, the byte copy loop, default off: see 26.)
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
@@ -277,6 +315,7 @@ struct State
     u32 anmDef = 0; bool anmOk = false;
     u32 sbcLive = 0;                // 18.: what was verified with the loop's hook block (SbcVerify)     // 17. (ARM build): the code of MAT_InternalDefault at anmDef verified at the last compile
     std::vector<u8> matTCode;
+    Variant scanned = {};           // the wake hook's variant found by OsScan (v == &scanned)
     bool hbLive = false, dmaLive = false;   // 3. / 11. verified when the wake hook block (A9HLEGuard) was compiled
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
     u64 calls[kKinds] = {}, native[kKinds] = {}, fallback[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, irqDuring[kKinds] = {};
@@ -303,9 +342,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc", "mkbp", "mkshp"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc", "mkbp", "mkshp", "copy8"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : k == 24 ? 4194304 : k == 25 ? 8388608 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : k == 24 ? 4194304 : k == 25 ? 8388608 : k == 26 ? 33554432 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -476,16 +515,122 @@ __attribute__((noinline, cold)) State& Init(melonDS::ARMv5* c)
     return s;
 }
 inline State& St(melonDS::ARMv5* c) { return c->A9HLEState ? *(State*)c->A9HLEState : Init(c); }
+}
+bool MaskOn(melonDS::NDS& nds, u32 bit) { State& s = St(&nds.ARM9); return s.on && (s.mask & bit); }
+namespace
+{
+
+u32 RdCode(melonDS::ARMv5* c, u32 a, bool& ok) { const u8* p = CodePtr(c, a); ok = ok && p; return p ? R32(p) : 0; }
+// masked FNV of [a, a + len) (as tools/hle/osscan.py); ok cleared if unreadable
+u64 MaskedFnv(melonDS::ARMv5* c, u32 a, u32 len, bool& ok)
+{
+    u32 w[0x200 / 4];
+    const u32 n = len / 4;
+    if (n > 0x80) { ok = false; return 0; }
+    for (u32 i = 0; i < n; i++) w[i] = RdCode(c, a + 4 * i, ok);
+    bool lit[0x80] = {};
+    for (u32 i = 0; i < n; i++)
+        if ((w[i] & 0x0F7F0000) == 0x051F0000 && (w[i] >> 28) != 0xF)
+        {
+            const u32 imm = w[i] & 0xFFF, la = a + 4 * i + 8 + ((w[i] >> 23 & 1) ? imm : -imm);
+            if (la >= a && la < a + len) lit[(la - a) / 4] = true;
+        }
+    u64 h = 0xcbf29ce484222325ull;
+    for (u32 i = 0; i < n; i++)
+    {
+        u32 x = w[i];
+        if ((x >> 25 & 7) == 5)
+        {
+            const u32 t = a + 4 * i + 8 + (u32)((s32)(x << 8) >> 6) + ((x >> 28) == 0xF ? (x >> 23 & 2) : 0);
+            if (t < a || t >= a + len) x &= 0xFF000000;
+        }
+        else if (lit[i] && x >= 0x01FF8000 && x < 0x04000000) x = 0;
+        for (int k = 0; k < 4; k++) h = (h ^ ((x >> (8 * k)) & 0xFF)) * 0x100000001b3ull;
+    }
+    return h;
+}
+// the NTR 2005-2006 OS build around a wake-loop candidate at hook: v filled (addresses, data from the literals) if every
+// range is found and matches
+__attribute__((noinline, cold)) bool OsScan(melonDS::ARMv5* c, u32 hook, Variant& v)
+{
+    constexpr int N = sizeof(kOsN6) / sizeof(kOsN6[0]);
+    u32 loc[N] = {};
+    bool got[N] = {}, ok = true;
+    for (bool more = true; more;)
+    {
+        more = false;
+        for (int k = 0; k < N; k++)
+        {
+            if (got[k]) continue;
+            const OsRange& r = kOsN6[k];
+            u32 at = 0;
+            if (r.how == 0) at = hook - r.off;
+            else if (r.how == 3)
+            {
+                // main RAM (4 MB): the three first words, then the masked code; one match only
+                int hits = 0;
+                for (u32 a = 0x02000000; a < 0x02400000 - r.len; a += 4)
+                {
+                    const u32 x = R32(&c->NDS.MainRAM[a & c->NDS.MainRAMMask]);
+                    if (x != r.w0 || R32(&c->NDS.MainRAM[(a + 4) & c->NDS.MainRAMMask]) != r.w1
+                        || R32(&c->NDS.MainRAM[(a + 8) & c->NDS.MainRAMMask]) != r.w2) continue;
+                    bool o = true;
+                    if (MaskedFnv(c, a, r.len, o) == r.mfnv && o) { at = a; hits++; }
+                }
+                if (hits != 1) return false;
+            }
+            else
+            {
+                if (!got[r.r]) continue;
+                const u32 wa = loc[r.r] + 4 * r.w, w = RdCode(c, wa, ok);
+                if (r.how == 1) at = w;
+                else if ((w >> 24) == 0xEB) at = wa + 8 + (u32)((s32)(w << 8) >> 6);
+                else return false;
+            }
+            loc[k] = at; got[k] = true; more = true;
+            if (MaskedFnv(c, at, r.len, ok) != r.mfnv || !ok) return false;
+        }
+    }
+    for (int k = 0; k < N; k++) if (!got[k]) return false;
+    // data from the literals (the reference's slots): queue, table, OSThreadInfo (IRQ handler), the DTCM base (OS_WaitIrq), the
+    // scheduler's globals (OS_RescheduleThread), checked against each other
+    auto lit = [&](int k, int w) { return RdCode(c, loc[k] + 4 * w, ok); };
+    v = kN6;
+    v.wake = hook;
+    for (int k = 0; k < N; k++) v.code[kOsN6Code[k]] = {loc[k], loc[k] + kOsN6[k].len};
+    v.irqTable = lit(0, 20); v.irqQueue = lit(0, 105); v.info = lit(0, 106); v.irqCheck = lit(2, 29) + 0x3FF8;
+    v.osi = lit(4, 55);
+    if (!ok || lit(4, 56) != v.info || lit(4, 57) != v.osi + v.oCur || lit(4, 58) != v.osi + v.oCb || lit(5, 20) != v.osi + v.oCur
+        || lit(6, 10) != v.info || lit(2, 31) != v.irqQueue || v.info - v.osi > 0x40) return false;
+    v.ctxPc = loc[7] + 0x48; v.ctxLr = loc[4] + 0x84; v.retSleep = loc[5] + 0x40; v.retWait = loc[2] + 0x60; v.retLoad = loc[4] + 0xD4;
+    std::vector<u8> code;
+    CodeBytes(c, code, v.code, 0, kNumWake);
+    v.sig = Fnv(code);
+    if (g_Stats) fprintf(stderr, "A9HLE: OS scan: %s at %08x (OS_WaitIrq %08x, OSThreadInfo %08x, IRQ queue %08x)\n", v.name, hook, loc[2], v.info, v.irqQueue);
+    return true;
+}
 
 __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 instr, bool thumb)
 {
     State& s = St(c);
     if (s.status != 0) return s;
-    for (int i = 0; i < kNumVariants; i++)
+    const Variant* cand[kNumVariants + 1];
+    for (int i = 0; i < kNumVariants; i++) cand[i] = kVariants[i];
+    cand[kNumVariants] = nullptr;
+    constexpr u32 kScanBit = 1u << kNumVariants;
+    if (!thumb && instr == kWakeInstr && !(s.tried & kScanBit))
     {
-        const Variant& v = *kVariants[i];
-        if ((s.tried >> i & 1) || Kind(v, addr, instr, thumb) < 0) continue;
-        s.tried |= 1u << i;
+        s.tried |= kScanBit;
+        if (OsScan(c, addr, s.scanned)) cand[kNumVariants] = &s.scanned;
+        if (g_Stats) fprintf(stderr, "A9HLE: OS scan at %08x: %s (Kind %d)\n", addr, cand[kNumVariants] ? "found" : "no", cand[kNumVariants] ? Kind(s.scanned, addr, instr, thumb) : -9);
+    }
+    for (int i = 0; i <= kNumVariants; i++)
+    {
+        if (!cand[i]) continue;
+        const Variant& v = *cand[i];
+        if (i < kNumVariants && (s.tried >> i & 1)) continue;
+        if (Kind(v, addr, instr, thumb) < 0) continue;
+        if (i < kNumVariants) s.tried |= 1u << i;
         std::vector<u8> code;
         CodeBytes(c, code, v.code, 0, kNumWake);
         const u64 h = Fnv(code);
@@ -521,7 +666,7 @@ __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 in
         }
         break;
     }
-    if (!s.status && s.tried == (1u << kNumVariants) - 1) s.status = -1;    // no variant matches
+    if (!s.status && s.tried == (kScanBit << 1) - 1) s.status = -1;    // no variant matches (the scan included)
     return s;
 }
 // the console's state for a hook entry (addr, instr): probes the variants with a hook there
@@ -611,10 +756,10 @@ __attribute__((noinline)) bool Refix(melonDS::ARMv5* c, State& s, Mem& m)
 {
     s.fkey[0] = c->DTCMBase; s.fkey[1] = c->DTCMMask; s.fkey[2] = c->ITCMSize;
     const Variant& v = *s.v;
-    Obj q = m.O(kIrqQueue, 8), chk = m.O(kIrqCheck, 4), osi = m.O(v.osi, v.info + 0x10 - v.osi);
-    Obj hp = m.O(c->DTCMBase + 0x3FFC, 4), tb = m.O(kIrqTable + 4, 4), op = m.O(v.hbObjPtr + v.hbObjOff, 4);
+    Obj q = m.O(IrqQueueOf(v), 8), chk = m.O(IrqCheckOf(v), 4), osi = m.O(v.osi, v.info + 0x10 - v.osi);
+    Obj hp = m.O(c->DTCMBase + 0x3FFC, 4), tb = m.O(IrqTableOf(v) + 4, 4), op = m.O(v.hbObjPtr + v.hbObjOff, 4);
     s.fq = q.p; s.fchk = chk.p; s.fosi = osi.p; s.fhp = hp.p; s.ftb = tb.p; s.fop = op.p;
-    Obj t1 = m.O(kIrqTable, 128), t2 = m.O(v.irqTable2, 12 * 12);
+    Obj t1 = m.O(IrqTableOf(v), 128), t2 = m.O(v.irqTable2, 12 * 12);
     s.ftab = t1.p; s.ftabD = t1.dtcm; s.ftab2 = t2.p; s.ftab2D = t2.dtcm;
     return q && chk && osi;
 }
@@ -629,6 +774,7 @@ struct Expect
 {
     u32 R[16]; u32 CPSR; u32 IRQ[3]; u32 SVC[3]; bool banks = false;
     u32 retPc = 0; u32 cur = 0;     // cur: wake check also requires this current thread
+    s32 cyc = 0;                    // 1.: the cycle estimate
 };
 #ifdef LITEV_HLE_DIAG
 // ---- check mode -----------------------------------------------------------------------------
@@ -773,19 +919,22 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     if (!t || in.ip != t || R32(s.fq + 4) != t) return false;
     const Variant& v = *s.v;
     const u32 info = v.info - v.osi;
-    if (R16(osi + info) || R32(osi + info + 0xC) || R32(osi) || R32(osi + 4) || R16(osi + 0x1E) || R32(osi + 8) != v.info + 4) return false;
+    if (!v.n6 ? (R16(osi + info) || R32(osi + info + 0xC) || R32(osi) || R32(osi + 4) || R16(osi + 0x1E) || R32(osi + 8) != v.info + 4)
+              : (R16(osi + info) || R32(osi + info + 0xC) || R32(osi + v.oCb) || R32(osi + v.oLock) || R16(osi + v.oDepth)
+                 || R32(osi + v.oCur) != v.info + 4)) return false;
     const u32 cur = R32(osi + info + 4);
     if (!cur || cur == t) return false;
     Obj tp = m.O(t, 0x84), cp = m.O(cur, 0x64);
     if (!tp || !cp) return false;
     __builtin_prefetch(tp.p); __builtin_prefetch(tp.p + 64); __builtin_prefetch(cp.p); __builtin_prefetch(cp.p + 64);
     // t asleep in OS_WaitIrq on this queue, flags not satisfied
-    if (tp.r(0x80) || tp.r(0x7C) || tp.r(0x64) != 0 || tp.r(0x78) != kIrqQueue || tp.r(0x40) != v.ctxPc || tp.r(0x3C) != v.ctxLr)
+    const u32 queue = IrqQueueOf(v), check = IrqCheckOf(v);
+    if (tp.r(0x80) || tp.r(0x7C) || tp.r(0x64) != 0 || tp.r(0x78) != queue || tp.r(0x40) != v.ctxPc || tp.r(0x3C) != v.ctxLr)
         return false;
     const u32 tsp = tp.r(0x38);
     Obj ts = m.O(tsp - 12, 44);
     if (!ts) return false;
-    if (ts.r(24) != v.retSleep || ts.r(40) != v.retWait || ts.r(32) != kIrqQueue || ts.r(36) != kIrqCheck) return false;
+    if (ts.r(24) != v.retSleep || ts.r(40) != v.retWait || ts.r(32) != queue || ts.r(36) != check) return false;
     if (ts.r(28) & R32(s.fchk)) return false;                     // real wake-up
     tcpsr = tp.r(0);
     tpc = v.ctxPc;
@@ -821,7 +970,8 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     }
     u32 f[6];
     for (int i = 0; i < 6; i++) f[i] = in.queued ? in.f[i] : fr.r(16 + i * 4);
-    const u32 tf[6] = {tp.r(4), tp.r(8), tp.r(0xC), tp.r(0x10), tp.r(0x34), v.ctxPc};
+    // (2005-2006 build: its ldmib r1!, {r0-r14}^ writes the base back, so the BIOS returns into t with r1 = t + 0x3C)
+    const u32 tf[6] = {tp.r(4), v.n6 ? t + 0x3C : tp.r(8), tp.r(0xC), tp.r(0x10), tp.r(0x34), v.ctxPc};
 
     // interrupted thread's context, as the IRQ path saves it
     m.W(cp, 0x00, spsr);
@@ -837,8 +987,8 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     u32 cpx[7];
     nds.A9HLECpContext(cpx);
     for (int i = 0; i < 7; i++) m.W(cp, 0x48 + i * 4, cpx[i]);
-    // IRQ stack below the frame: CP_SaveContext's push {r4}, push {r0 = C, r1 = t}
-    m.W(fr, 0, c->R[4]);
+    // IRQ stack below the frame: CP_SaveContext's push {r4} (not in the 2005-2006 build), push {r0 = C, r1 = t}
+    if (!v.n6) m.W(fr, 0, c->R[4]);
     m.W(fr, 4, cur);
     m.W(fr, 8, t);
     // the IRQ frame rewritten with t's registers (the BIOS returned into t with them)
@@ -847,11 +997,12 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     // OS_LoadContext's push {r0 = cur, lr} and CP_RestoreContext's push {r4 = OS_RescheduleThread's
     // r4: OSThreadInfo, TWL build: the current thread t}
     m.W(tp, 0x18, cur);
-    m.W(ts, 0, v.twl ? t : v.info);
+    if (!v.n6) m.W(ts, 0, v.twl ? t : v.info);
     m.W(ts, 4, cur);
     m.W(ts, 8, v.retLoad);
-    // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack
-    for (int i = 0; i < 6; i++) m.W(sv, i * 4, f[i]);
+    // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack (PW/PB/W2: its TWL divider check)
+    if (!v.n6)
+        for (int i = 0; i < 6; i++) m.W(sv, i * 4, f[i]);
     m.Flush();
 
     // registers after the guest's return into cur
@@ -866,6 +1017,7 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     e.banks = true;
     e.retPc = (f[5] - 4) & ((spsr & 0x20) ? ~1u : ~3u);
     e.cur = cur;
+    e.cyc = v.wakeCyc ? v.wakeCyc : kWakeCycles;
     return true;
 }
 
@@ -877,7 +1029,7 @@ void WakeCommit(melonDS::ARMv5* c, const Expect& e)
     c->R[12] = e.R[12];
     c->R[13] = e.IRQ[0];
     c->R[14] = e.SVC[1];
-    c->Cycles += kWakeCycles;
+    c->Cycles += e.cyc;
     c->JumpTo(e.SVC[1] - 4, true);      // subs pc, lr, #4: CPSR = SPSR_irq, IRQ bank out
     c->R_IRQ[1] = e.IRQ[1];
     c->R_IRQ[2] = e.IRQ[2];
@@ -1157,7 +1309,7 @@ __attribute__((noinline)) bool DmaIrqNative(melonDS::ARMv5* c, State& s, Mem& m,
     m.W(tab, 21 * 4, P.r(0x1C));
     m.W(P, 0, 0);
     if (ucb) m.W(A, 0, 0);
-    Obj chk{(u8*)s.fchk, kIrqCheck, true};
+    Obj chk{(u8*)s.fchk, IrqCheckOf(*s.v), true};
     m.W(chk, 0, R32(s.fchk) | 1u << bit);
     const u32 gxstat = nds.ARM9Read32(0x04000600), gxw = (gxstat & ~0xC0000000u) | (P.r(0x18) << 30);
     for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
@@ -1467,6 +1619,70 @@ __attribute__((noinline)) bool RunLz(melonDS::ARMv5* c, State& s, bool jit)
     c->CPSR = z.cpsr;
     c->Cycles += z.cyc;
     c->JumpTo(z.pc);
+    return true;
+}
+
+// ---- 26. the C runtime's byte memcpy loop: 256 bytes per native step --------------------------------------------
+// mov ip, r0; cmp r2, #0; bxeq lr; loop: ldrb r3, [r1], #1; subs r2, r2, #1; strb r3, [ip], #1; bne loop; bx lr (8 exact
+// words, position independent; The Sims 3 moves ~14 KB heap blocks with it, ~3.9% of its ARM9 guest instructions). At the
+// loop head: up to 256 bytes forward, byte by byte (an overlap copies what the loop copies), then the registers / flags
+// the loop leaves there (r1, ip advanced, r2 counted down, r3 the last byte, NZCV of the subs) and back at the loop head,
+// or past the bne when r2 reached 0: IRQs and events are taken between steps, as with hook 6 (a call at the BL instead,
+// HLELeaf, copied 14 KB in one go and moved every event behind it: The Sims 3 then ran +7% more guest code).
+// Default OFF (not in kAllHooks; debug.litev.a9hle=67108863 turns it on): exact in the interpreter (identical states with
+// it on / off), but under the JIT The Sims 3's census scene takes another trajectory with any timing change and then runs
+// +6% more guest code for the same displayed frames (265 distinct frames in 900 either way): measured slower, so off
+// until a device A/B in real play says otherwise.
+constexpr u32 kCopyInstr = 0xE4D13001;      // ldrb r3, [r1], #1 (the loop head)
+constexpr u32 kCopyCode[8] = {0xE1A0C000, 0xE3520000, 0x012FFF1E, 0xE4D13001, 0xE2522001, 0xE4CC3001, 0x1AFFFFFB, 0xE12FFF1E};
+constexpr u32 kCopyHead = 12, kCopyStep = 256;
+constexpr s32 kCopyCycByte = 11;            // (exact for every checked call: 8 + 11 per byte from the entry)
+bool CopyCodeAt(melonDS::ARMv5* c, u32 head)
+{
+    for (u32 i = 0; i < 8; i++)
+    {
+        const u8* p = CodePtr(c, head - kCopyHead + 4 * i);
+        if (!p || R32(p) != kCopyCode[i]) return false;
+    }
+    return true;
+}
+__attribute__((noinline)) bool RunCopy(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 head = c->R[15] - 8;
+    if (!jit && !CopyCodeAt(c, head)) return false;
+    s.calls[26]++;
+    const u32 src = c->R[1], dst = c->R[12], left = c->R[2];
+    const u32 n = left < kCopyStep ? left : kCopyStep;
+    Mem m(c, false);
+    u8 *d = nullptr, *q = nullptr;
+    if (n && !CheckPending)
+    {
+        const u32 dl = ((dst & 3) + n + 3) & ~3u, sl = ((src & 3) + n + 3) & ~3u;
+        Obj od = m.O(dst & ~3u, dl), os = m.O(src & ~3u, sl);
+        if (od && os) { d = od.p + (dst & 3); q = os.p + (src & 3); }
+        if (d && od.dtcm) d = nullptr;      // (main RAM only: the JIT check below)
+    }
+    if (!d)
+    {
+        s.fallback[26]++;
+        GuestFallback(c);
+        return true;
+    }
+    for (u32 i = 0; i < n; i++) d[i] = q[i];
+    for (u32 a = dst & ~15u; a < dst + n; a += 16)
+        c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(a);
+    s.native[26]++;
+    c->R[1] = src + n; c->R[12] = dst + n; c->R[2] = left - n; c->R[3] = d[n - 1];
+    // NZCV of the last subs r2, r2, #1 (from a value >= 1: no borrow, no overflow below 0x80000001)
+    const u32 r = left - n;
+    c->CPSR = (c->CPSR & 0x0FFFFFFF) | (r & 0x80000000) | ((r == 0) << 30) | (1u << 29) | ((left - n + 1 == 0x80000000u) << 28);
+    s32 cpb = kCopyCycByte;
+#ifdef LITEV_HLE_DIAG
+    static const s32 ov = getenv("LITEV_A9HLE_COPYCYC") ? atoi(getenv("LITEV_A9HLE_COPYCYC")) : -1;
+    if (ov >= 0) cpb = ov;
+#endif
+    c->Cycles += cpb * (s32)n;
+    c->JumpTo(r ? head : head + 16);
     return true;
 }
 
@@ -4330,8 +4546,19 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
     State& s = *(State*)c->A9HLEState;
     s32 vi = -1;
     for (int i = 0; i < kNumVariants; i++) if (s.v == kVariants[i]) vi = i;
+    if (s.v && s.v == &s.scanned) vi = kNumVariants;
     f->Var32((u32*)&vi);
     if (!f->Saving) s.v = vi >= 0 && vi < kNumVariants ? kVariants[vi] : nullptr;
+    if (vi == kNumVariants)
+    {
+        // the scanned variant (OsScan): its addresses (the rest is kN6's)
+        if (!f->Saving) { s.scanned = kN6; s.v = &s.scanned; }
+        Variant& v = s.scanned;
+        for (u32* p : {&v.wake, &v.info, &v.osi, &v.ctxPc, &v.ctxLr, &v.retSleep, &v.retWait, &v.retLoad, &v.irqQueue, &v.irqCheck, &v.irqTable})
+            f->Var32(p);
+        for (Range& r : v.code) { f->Var32(&r.a); f->Var32(&r.b); }
+        f->Var64(&v.sig);
+    }
     f->Var32((u32*)&s.status);
     f->Var32(&s.tried);
     f->VarBool(&s.init);
@@ -4573,6 +4800,13 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         r = &sd;
         return 1;
     }
+    if (instr == kCopyInstr)
+    {
+        static thread_local Range cp;
+        cp = {addr - kCopyHead, addr - kCopyHead + 8 * 4};
+        r = &cp;
+        return 1;
+    }
     if (instr == kLzInstr)
     {
         static thread_local Range lz;
@@ -4621,6 +4855,20 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     return 1;
 }
 
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb);
+int CallableHook(melonDS::NDS& nds, u32 t, const Range*& r)
+{
+    if (t & 3) return -1;
+    const u8* p = CodePtr(&nds.ARM9, t);
+    if (!p) return -1;
+    const u32 w = R32(p);
+    // leaf functions whose natives return with the guest's full state (Return): _ll_sdiv (9), VEC_Normalize (14), the MKDS
+    // stereo effect (16) / OS_SetIrqFunction (2), OS_GetIrqFunction (4), NNS_G2dMakeCellToOams (19), the MKDS broad phase (24)
+    const bool ok = w == kSdivInstr || w == kVecInstr || w == kSetInstr || w == kGetInstr
+                    || (w == kNodeInstr && (t == kBpEntry || OamAt(&nds.ARM9, t)));
+    if (!ok || IsHook(nds, t, w, false) != 1) return -1;
+    return Deps(nds, t, w, r);
+}
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
 {
     if (thumb)
@@ -4749,6 +4997,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         // position independent: the code bytes around addr
         State& s = St(&nds.ARM9);
         return s.on && (s.mask & 64) && LzCodeAt(&nds.ARM9, addr) ? 1 : 0;
+    }
+    if (instr == kCopyInstr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 33554432) && CopyCodeAt(&nds.ARM9, addr) ? 1 : 0;
     }
     State& s = Get(&nds.ARM9, addr, instr);
     if (s.status != 1) return 0;
@@ -5754,6 +6007,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
     {
         State& s = St(c);
         return s.on && (s.mask & 64) && RunLz(c, s, jit);
+    }
+    if (in == kCopyInstr)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 33554432) && RunCopy(c, s, jit);
     }
 #ifdef LITEV_GX_BULK
     if (in == kSbcInstr)

@@ -7,6 +7,7 @@
 #include "NDS.h"
 #include "ARMInterpreter.h"
 #include "FreeBIOS.h"
+#include "HLESig.h"
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
@@ -55,7 +56,18 @@ constexpr ExVar kEx[] = {
     {"MKDS", 0x037FCE24, 0xE92D4FF0 /* push {r4-r11, lr} */,
      {{0x037FBBD8, 0x037FD128}, {0x03801210, 0x0380121C}, {0x0380697C, 0x03806D38}}, 0x74d99b93607adcfdull,
      0x03807ECC, 0x03806F40, 0x03806F1C, false, false, 394, 507},
+    // NTR SDK build of 2006 (Shrek Smash n' Crash, Castlevania: Portrait of Ruin: the same driver at the same ARM7 WRAM
+    // addresses): MKDS's code layout (no DSi-BIOS check) with PW's "volume > -0x8000" gate on a volume LFO; the decibel
+    // table's first entry is -0x8000 (MKDS -723). Ranges: as MKDS's (ExChannelMain + helpers, the Thumb SVC stubs, the
+    // divides) with the whole literal pool
+    {"NTR2006", 0x038001EC, 0xE92D4FF0 /* push {r4-r11, lr} */,
+     {{0x037FEFD0, 0x03800504}, {0x03804434, 0x03804440}, {0x03807710, 0x03807ACC}}, 0,
+     0x03808AA8, 0x03807CD4, 0x03807CB0, false, true, 405, 504},     // check-mode fit (Shrek + CV, 3.4k calls, p95 1.5%)
 };
+// relocation recipes (HLESig, tools/hle/reloc.py): the same driver build at other addresses (e.g. The Sims 3: PW's
+// driver 0x64 bytes higher)
+#include "A7HLERecipes.inc"
+constexpr const HLESig::Recipe* kExRec[] = {&kRecExPW, &kRecExMK, &kRecExN6};
 
 // FreeBIOS ARM7 tables used by SVC 0x1B GetPitchTable (u16 x 768) and 0x1C GetVolumeTable
 // (u8 x 724). A loaded BIOS must contain the same bytes (the real tables) or the HLE stays off.
@@ -67,13 +79,19 @@ struct State
     int status = 0;                 // 0 unprobed, 1 active, -1 off
     bool on = true;
     int copyOn = -1;                // MI_CpuCopy32 hook, latched separately (no signature probe)
-    const ExVar* v = nullptr;       // the matching build
+    const ExVar* v = nullptr;       // the matching build (a kEx entry, or rel)
+    ExVar rel = {};                 // kEx[relIdx] relocated to this game's addresses (HLESig)
+    s32 relIdx = -1;
+    std::vector<Range3> ranges;     // the code it replaces (v->code, or the relocated chunks)
+    std::vector<u32> tried;         // candidate entries whose relocation failed
     std::vector<u8> code;           // snapshot of its ranges (per-call memcmp)
     u16 pitch[768] = {};
     u8 vol[724] = {};
     u64 copies = 0, calls = 0, native = 0, fallbacks = 0, checks = 0, checkDiffs = 0;
     int hw = 0;                     // SND hardware commit: 0 unprobed, 1 on, -1 off
     std::vector<u8> hwCode;
+    std::vector<Range3> hwRanges;   // the code the commit replaces (static or relocated)
+    s32 hwRel = -1;                 // relocated: index of the reference HwVar (hv then points into g_HwRel)
     const HwVar* hv = nullptr;      // the matching build
     u64 hwN[6] = {};                // calls, native, fallback, checks, check diffs, charged cycles (diag)
 };
@@ -133,23 +151,86 @@ bool ReadOn(u32 bit)
     return (m == 1 ? 31u : m) & bit;
 }
 
-void Probe(melonDS::NDS& nds, State& s)
+// guest word for HLESig::Relocate: main RAM or ARM7 / shared WRAM, nothing else (no bus side effects)
+bool Rd7(void* ctx, u32 a, u32& v)
 {
-    s.status = -1;
-    s.on = ReadOn(1);
-    if (!s.on) return;
-    std::vector<u8> code;
+    melonDS::NDS& nds = *(melonDS::NDS*)ctx;
+    if ((a >> 24) == 0x02) { v = R32(&nds.MainRAM[a & nds.MainRAMMask & ~3u]); return true; }
+    if (a >= 0x037F8000 && a < 0x03810000) { v = R32(P7(nds, a)); return true; }
+    return false;
+}
+// a candidate entry (instruction instr at addr) of a variant in table tab with recipes rec: its index, relocated into rel
+// with the code ranges in ranges (the chunks, adjacent ones merged), or -1. Fields: the variant's address fields, mapped.
+template <class V, size_t N, class F>
+int Relocated(melonDS::NDS& nds, const V (&tab)[N], const HLESig::Recipe* const (&rec)[N], u32 addr, u32 instr,
+              V& rel, std::vector<Range3>& ranges, F fields)
+{
+    for (size_t i = 0; i < N; i++)
+    {
+        const HLESig::Recipe& r = *rec[i];
+        u32 w1;
+        if (instr != r.w0 || !Rd7(&nds, addr + 4, w1) || w1 != r.w1) continue;
+        HLESig::Map m;
+        if (!HLESig::Relocate(r, addr, Rd7, &nds, m))
+        {
+            if (g_Stats) fprintf(stderr, "A7HLE: %s candidate %08x: no match\n", tab[i].name, addr);
+            continue;
+        }
+        rel = tab[i];
+        if (!fields(rel, m)) continue;
+        m.Ranges(ranges);
+        std::sort(ranges.begin(), ranges.end(), [](const Range3& x, const Range3& y) { return x.a < y.a; });
+        size_t n = 0;
+        for (const Range3& q : ranges)
+            if (n && ranges[n - 1].b == q.a) ranges[n - 1].b = q.b; else ranges[n++] = q;
+        ranges.resize(n);
+        if (g_Stats) fprintf(stderr, "A7HLE: %s relocated to %08x (%zu ranges)\n", tab[i].name, addr, n);
+        return (int)i;
+    }
+    return -1;
+}
+// ExChannelMain at addr (instruction instr): a static variant there with its exact bytes, or one relocated there
+bool ExMatch(melonDS::NDS& nds, State& s, u32 addr, u32 instr)
+{
     for (const ExVar& v : kEx)
     {
-        code.clear();
-        for (const Range3& r : v.code)
-            for (u32 a = r.a; a < r.b; a++) code.push_back(*P7(nds, a));
+        if (addr != v.entry || instr != v.instr || !v.sig) continue;
         u64 h = 0xcbf29ce484222325ull;
-        for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
+        for (const Range3& r : v.code)
+            for (u32 a = r.a; a < r.b; a++) h = (h ^ *P7(nds, a)) * 0x100000001b3ull;
         if (g_Stats) fprintf(stderr, "A7HLE: ExChannelMain %s signature %016llx\n", v.name, (unsigned long long)h);
-        if (h == v.sig) { s.v = &v; break; }
+        if (h != v.sig) continue;
+        s.v = &v; s.relIdx = -1;
+        s.ranges.assign(std::begin(v.code), std::end(v.code));
+        return true;
     }
-    if (!s.v) return;
+    if (std::find(s.tried.begin(), s.tried.end(), addr) != s.tried.end()) return false;
+    int i = Relocated(nds, kEx, kExRec, addr, instr, s.rel, s.ranges, [](ExVar& v, const HLESig::Map& m)
+        { v.entry = m(v.entry); v.chans = m(v.chans); v.dbSq = m(v.dbSq); v.sin = m(v.sin); return v.chans && v.dbSq && v.sin; });
+    if (i < 0) { s.tried.push_back(addr); return false; }
+    s.relIdx = i; s.v = &s.rel;
+    return true;
+}
+// a possible ExChannelMain entry (the pre-filter: a variant's first two words)
+inline bool ExCand(melonDS::NDS& nds, u32 addr, u32 instr)
+{
+    for (const HLESig::Recipe* r : kExRec)
+    {
+        u32 w1;
+        if (instr == r->w0 && Rd7(&nds, addr + 4, w1) && w1 == r->w1) return true;
+    }
+    return false;
+}
+
+void Probe(melonDS::NDS& nds, State& s, u32 addr, u32 instr)
+{
+    s.on = ReadOn(1);
+    if (!s.on) { s.status = -1; return; }
+    if (!ExMatch(nds, s, addr, instr)) return;     // (status stays 0: another candidate may match)
+    s.status = -1;
+    std::vector<u8> code;
+    for (const Range3& r : s.ranges)
+        for (u32 a = r.a; a < r.b; a++) code.push_back(*P7(nds, a));
 
     // BIOS tables: take FreeBIOS's, require the loaded ARM7 BIOS to hold the same bytes.
     auto fb = FreeBIOSGetNtrArm7();
@@ -382,7 +463,7 @@ bool ExChannelMain(melonDS::NDS& nds, const State& s, u8* chans, bool step)
 bool CodeIntact(melonDS::NDS& nds, const State& s)
 {
     const u8* c = s.code.data();
-    for (const Range3& r : s.v->code)
+    for (const Range3& r : s.ranges)
     {
         for (u32 a = r.a; a < r.b; a++, c++)
             if (*P7(nds, a) != *c) return false;
@@ -434,12 +515,22 @@ constexpr SeqVar kSeqV[] = {
     {"MKDS", 0x037FEEB4, 0xE92D47F0 /* push {r4-r10, lr} */,
      {{0x037FBF70, 0x037FEF54}, {0x0380697C, 0x03806D38}, {0x03806F40, 0x03807040}, {0x03807054, 0x03807067}}, 0x7e34b2b9c5282c13ull,
      0x03807EAC, 0x038075A0, 0x03806F40, 0x03807054, false, false, 249, 70, 154, 313, 42, 752},   // 87k calls, p95 15%
+    // NTR 2006 build (Shrek, Castlevania PoR): MKDS's code layout, but TrackUpdateChannel clamps to -0x8000 and 0xD7 (mute)
+    // exists (the C0-D7 jump table), as PW's
+    {"NTR2006", 0x03802318, 0xE92D47F0 /* push {r4-r10, lr} */,
+     {{0x037FF368, 0x038023B8}, {0x03807710, 0x03807ACC}, {0x03807CD4, 0x03807DD4}, {0x03807DE8, 0x03807DFC}}, 0,
+     0x03808A88, 0x038081A0, 0x03807CD4, 0x03807DE8, true, true, 433, 107, 155, 183, 39, 433},   // fit: Shrek + CV 3.6k calls, p95 15%
 };
+constexpr const HLESig::Recipe* kSeqRec[] = {&kRecSeqPW, &kRecSeqMK, &kRecSeqN6};
 
 struct SeqState
 {
     int status = 0;
     const SeqVar* v = nullptr;
+    SeqVar rel = {};                // relocated (HLESig), as State::rel
+    s32 relIdx = -1;
+    std::vector<Range3> ranges;
+    std::vector<u32> tried;
     std::vector<u8> code;
     u64 calls = 0, native = 0, fallbacks = 0, checks = 0, checkDiffs = 0, cyc = 0;
 };
@@ -450,31 +541,58 @@ SeqState& GetSeq(melonDS::NDS& nds)
     static const melonDS::NDS* last = nullptr;
     static SeqState* lastS = nullptr;
     if (&nds != last) { last = &nds; lastS = &g_Seq[&nds]; }
-    SeqState& s = *lastS;
-    if (s.status != 0) return s;   // (0 again after a savestate load reset it: probe again)
-    s.status = -1;
-    if (!ReadOn(2)) return s;
-    std::vector<u8> code;
+    return *lastS;
+}
+// SeqMain at addr (instruction instr): a static variant there with its exact bytes, or one relocated there (status 1);
+// status -1 if off
+void SeqProbe(melonDS::NDS& nds, SeqState& s, u32 addr, u32 instr)
+{
+    if (!ReadOn(2)) { s.status = -1; return; }
+    s.v = nullptr;
     for (const SeqVar& v : kSeqV)
     {
-        code.clear();
-        for (const Range3& r : v.code)
-            for (u32 a = r.a; a < r.b; a++) code.push_back(*P7(nds, a));
+        if (addr != v.entry || instr != v.instr || !v.sig) continue;
         u64 h = 0xcbf29ce484222325ull;
-        for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
+        for (const Range3& r : v.code)
+            for (u32 a = r.a; a < r.b; a++) h = (h ^ *P7(nds, a)) * 0x100000001b3ull;
         if (g_Stats) fprintf(stderr, "A7HLE: SeqMain %s signature %016llx\n", v.name, (unsigned long long)h);
-        if (h == v.sig) { s.v = &v; break; }
+        if (h != v.sig) continue;
+        s.v = &v; s.relIdx = -1;
+        s.ranges.clear();
+        for (const Range3& r : v.code) if (r.b > r.a) s.ranges.push_back(r);
+        break;
     }
-    if (!s.v || (s.v != &kSeqV[0] && !ReadOn(16))) { s.v = nullptr; return s; }
-    s.code = std::move(code);
+    if (!s.v && std::find(s.tried.begin(), s.tried.end(), addr) == s.tried.end())
+    {
+        int i = Relocated(nds, kSeqV, kSeqRec, addr, instr, s.rel, s.ranges, [](SeqVar& v, const HLESig::Map& m)
+            { v.entry = m(v.entry); v.work = m(v.work); v.rnd = m(v.rnd); v.dbSq = m(v.dbSq); v.attack = m(v.attack);
+              return v.work && v.rnd && v.dbSq && v.attack; });
+        if (i < 0) s.tried.push_back(addr);
+        else { s.relIdx = i; s.v = &s.rel; }
+    }
+    if (!s.v) return;
+    // the 2005-2006 driver builds only with bit 16 (MKDS 8P session sensitivity, see ReadOn)
+    if (!(s.relIdx == 0 || s.v == &kSeqV[0]) && !ReadOn(16)) { s.v = nullptr; s.status = -1; return; }
+    s.code.clear();
+    for (const Range3& r : s.ranges)
+        for (u32 a = r.a; a < r.b; a++) s.code.push_back(*P7(nds, a));
     s.status = 1;
-    return s;
+}
+// a possible entry of any SeqVar / ExVar / HwVar build (the recipes' two-word pre-filter)
+template <size_t N> inline bool Cand(melonDS::NDS& nds, const HLESig::Recipe* const (&rec)[N], u32 addr, u32 instr)
+{
+    for (const HLESig::Recipe* r : rec)
+    {
+        u32 w1;
+        if (instr == r->w0 && Rd7(&nds, addr + 4, w1) && w1 == r->w1) return true;
+    }
+    return false;
 }
 
 bool SeqCodeIntact(melonDS::NDS& nds, const SeqState& s)
 {
     const u8* c = s.code.data();
-    for (const Range3& r : s.v->code)
+    for (const Range3& r : s.ranges)
         for (u32 a = r.a; a < r.b; a++, c++)
             if (*P7(nds, a) != *c) return false;
     return true;
@@ -1149,7 +1267,9 @@ __attribute__((noinline)) bool RunSeq(melonDS::ARM* cpu, bool jit)
 {
     melonDS::NDS& nds = cpu->NDS;
     SeqState& s = GetSeq(nds);
-    if (s.status != 1 || cpu->R[15] - 8 != s.v->entry) return false;
+    const u32 pc = cpu->R[15] - 8;
+    if (s.status == 0 && Cand(nds, kSeqRec, pc, cpu->CurInstr)) SeqProbe(nds, s, pc, cpu->CurInstr);
+    if (s.status != 1 || pc != s.v->entry || cpu->CurInstr != s.v->instr) return false;
     s.calls++;
     Seq q(nds, *s.v);
     int tracks = 0;
@@ -1233,33 +1353,50 @@ constexpr HwVar kHwV[] = {
      0x52806648b3d4f885ull, 0x03807ECC, 0x0380796C, 0x03807980, 0x03807970, 0x0380759C, true, 0x037FD290, 0x037FD2B0,
      482, 39, 66, 15, 18},  // 88k calls (8-console menus), p95 0.4%
 };
+// (MKDS's commit relocates to the NTR 2006 build: Shrek, Castlevania PoR)
+constexpr const HLESig::Recipe* kHwRec[] = {&kRecHwPW, &kRecHwMK};
+std::unordered_map<const melonDS::NDS*, HwVar> g_HwRel;    // State::hv when relocated (State::hwRel >= 0)
 }
-int HwProbe(melonDS::NDS& nds)
+// the SND commit at addr (instruction instr): static variant with its exact bytes, or relocated (HLESig); s.hw 1 on a match
+void HwMatch(melonDS::NDS& nds, State& s, u32 addr, u32 instr)
 {
-    State& s = Get(nds);
-    if (s.hw) return s.hw;
-    s.hw = -1;
-    if (!ReadOn(8)) return s.hw;
-    std::vector<u8> code;
+    if (!ReadOn(8)) { s.hw = -1; return; }
+    s.hv = nullptr;
     for (const HwVar& v : kHwV)
     {
-        code.clear();
-        for (const Range3& r : v.code)
-            for (u32 a = r.a; a < r.b; a++) code.push_back(*P7(nds, a));
+        if (addr != v.entry || instr != v.instr) continue;
         u64 h = 0xcbf29ce484222325ull;
-        for (u8 b : code) h = (h ^ b) * 0x100000001b3ull;
+        for (const Range3& r : v.code)
+            for (u32 a = r.a; a < r.b; a++) h = (h ^ *P7(nds, a)) * 0x100000001b3ull;
         if (g_Stats) fprintf(stderr, "A7HLE: SND hw commit %s signature %016llx\n", v.name, (unsigned long long)h);
-        if (h == v.sig) { s.hv = &v; break; }
+        if (h != v.sig) continue;
+        s.hv = &v; s.hwRel = -1;
+        s.hwRanges.assign(std::begin(v.code), std::end(v.code));
+        break;
     }
-    if (!s.hv || (s.hv != &kHwV[0] && !ReadOn(16))) { s.hv = nullptr; return s.hw; }
-    s.hwCode = std::move(code);
-    return s.hw = 1;
+    if (!s.hv && std::find(s.tried.begin(), s.tried.end(), addr | 1) == s.tried.end())
+    {
+        HwVar& rel = g_HwRel[&nds];
+        int i = Relocated(nds, kHwV, kHwRec, addr, instr, rel, s.hwRanges, [](HwVar& v, const HLESig::Map& m)
+            { v.entry = m(v.entry); v.chans = m(v.chans); v.fx = m(v.fx); v.vol = m(v.vol); v.pan = m(v.pan); v.panOvr = m(v.panOvr);
+              v.retVol = m(v.retVol); v.retPan = m(v.retPan);
+              return v.chans && v.fx && v.vol && v.pan && v.panOvr && v.retVol && v.retPan; });
+        if (i < 0) s.tried.push_back(addr | 1);     // (bit 0: tried as a commit)
+        else { s.hwRel = i; s.hv = &rel; }
+    }
+    if (!s.hv) return;
+    if (!(s.hv == &kHwV[0] || s.hwRel == 0) && !ReadOn(16)) { s.hv = nullptr; s.hw = -1; return; }
+    s.hwCode.clear();
+    for (const Range3& r : s.hwRanges)
+        for (u32 a = r.a; a < r.b; a++) s.hwCode.push_back(*P7(nds, a));
+    s.hw = 1;
 }
+int HwProbe(melonDS::NDS& nds) { return Get(nds).hw; }
 bool HwIntact(melonDS::NDS& nds)
 {
     const State& s = Get(nds);
     const u8* c = s.hwCode.data();
-    for (const Range3& r : s.hv->code)
+    for (const Range3& r : s.hwRanges)
         for (u32 a = r.a; a < r.b; a++, c++)
             if (*P7(nds, a) != *c) return false;
     return true;
@@ -1268,10 +1405,15 @@ bool HwIntact(melonDS::NDS& nds)
 __attribute__((noinline)) bool RunHw(melonDS::ARM* cpu, bool jit)
 {
     melonDS::NDS& nds = cpu->NDS;
+    {
+        State& s = Get(nds);
+        const u32 pc = cpu->R[15] - 8;
+        if (s.hw == 0 && Cand(nds, kHwRec, pc, cpu->CurInstr)) HwMatch(nds, s, pc, cpu->CurInstr);
+    }
     if (HwProbe(nds) != 1) return false;
     State& S = Get(nds);
     const HwVar& V = *S.hv;
-    if (cpu->R[15] - 8 != V.entry) return false;
+    if (cpu->R[15] - 8 != V.entry || cpu->CurInstr != V.instr) return false;
     u64* g_Hw = S.hwN;
     g_Hw[0]++;
     const u32 sp = cpu->R[13];
@@ -1480,6 +1622,36 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
         if (v >= (s32)std::size(kEx) || hv >= (s32)std::size(kHwV) || qv >= (s32)std::size(kSeqV)) { f->Error = true; return; }
         s.v = v >= 0 ? &kEx[v] : nullptr; s.hv = hv >= 0 ? &kHwV[hv] : nullptr; q.v = qv >= 0 ? &kSeqV[qv] : nullptr;
     }
+    // ExChannelMain relocated (HLESig): which reference, its mapped addresses and code ranges
+    f->Var32((u32*)&s.relIdx);
+    if (s.relIdx >= (s32)std::size(kEx)) { f->Error = true; return; }
+    if (s.relIdx >= 0)
+    {
+        if (!f->Saving) { s.rel = kEx[s.relIdx]; s.v = &s.rel; }
+        f->Var32(&s.rel.entry); f->Var32(&s.rel.chans); f->Var32(&s.rel.dbSq); f->Var32(&s.rel.sin);
+    }
+    // SeqMain / SND commit relocated: the same
+    f->Var32((u32*)&q.relIdx);
+    f->Var32((u32*)&s.hwRel);
+    if (q.relIdx >= (s32)std::size(kSeqV) || s.hwRel >= (s32)std::size(kHwV)) { f->Error = true; return; }
+    if (q.relIdx >= 0)
+    {
+        if (!f->Saving) { q.rel = kSeqV[q.relIdx]; q.v = &q.rel; }
+        for (u32* p : {&q.rel.entry, &q.rel.work, &q.rel.rnd, &q.rel.dbSq, &q.rel.attack}) f->Var32(p);
+    }
+    if (s.hwRel >= 0)
+    {
+        HwVar& h = g_HwRel[&nds];
+        if (!f->Saving) { h = kHwV[s.hwRel]; s.hv = &h; }
+        for (u32* p : {&h.entry, &h.chans, &h.fx, &h.vol, &h.pan, &h.panOvr, &h.retVol, &h.retPan}) f->Var32(p);
+    }
+    for (std::vector<Range3>* rs : {&s.ranges, &q.ranges, &s.hwRanges})
+    {
+        u32 n = rs->size();
+        f->Var32(&n);
+        if (!f->Saving) rs->resize(n);
+        for (Range3& r : *rs) { f->Var32(&r.a); f->Var32(&r.b); }
+    }
     f->Var32((u32*)&s.status);
     f->VarBool(&s.on);
     f->Var32((u32*)&s.copyOn);
@@ -1498,34 +1670,39 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
 
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr)
 {
-    if ((addr == kHwV[0].entry && instr == kHwV[0].instr) || (addr == kHwV[1].entry && instr == kHwV[1].instr))
-        return HwProbe(nds) != 1 || addr != Get(nds).hv->entry ? 0 : HwIntact(nds) ? 1 : 2;
     if (instr == kCopy32[0]) return CopyOn(nds) && IsCopy32(nds, addr) ? 1 : 0;
-    if ((addr == kSeqV[0].entry && instr == kSeqV[0].instr) || (addr == kSeqV[1].entry && instr == kSeqV[1].instr))
-    {
-        SeqState& s = GetSeq(nds);
-        return s.status != 1 || addr != s.v->entry ? 0 : SeqCodeIntact(nds, s) ? 1 : 2;
-    }
-    if (!((addr == kEx[0].entry && instr == kEx[0].instr) || (addr == kEx[1].entry && instr == kEx[1].instr))) return 0;
     State& s = Get(nds);
-    if (s.status == 0) Probe(nds, s);              // (at its entry: the driver is loaded)
+    SeqState& q = GetSeq(nds);
+    // matched builds (static or relocated, HLESig): their entries
+    if (s.hw == 1 && addr == s.hv->entry && instr == s.hv->instr) return HwIntact(nds) ? 1 : 2;
+    if (q.status == 1 && addr == q.v->entry && instr == q.v->instr) return SeqCodeIntact(nds, q) ? 1 : 2;
+    if (s.status == 1) return !(s.on && addr == s.v->entry && instr == s.v->instr) ? 0 : CodeIntact(nds, s) ? 1 : 2;
+    // not matched yet: a candidate entry (two-word pre-filter) is probed when the JIT first compiles it (the driver is loaded)
+    if (s.hw == 0 && Cand(nds, kHwRec, addr, instr))
+    {
+        HwMatch(nds, s, addr, instr);
+        if (s.hw == 1 && addr == s.hv->entry) return HwIntact(nds) ? 1 : 2;
+    }
+    if (q.status == 0 && Cand(nds, kSeqRec, addr, instr))
+    {
+        SeqProbe(nds, q, addr, instr);
+        if (q.status == 1 && addr == q.v->entry) return SeqCodeIntact(nds, q) ? 1 : 2;
+    }
+    if (s.status != 0 || !ExCand(nds, addr, instr)) return 0;
+    Probe(nds, s, addr, instr);
     return !(s.status == 1 && s.on && addr == s.v->entry) ? 0 : CodeIntact(nds, s) ? 1 : 2;
 }
-int Deps(u32 addr, u32 instr, Range* out)
+int Deps(melonDS::NDS& nds, u32 addr, u32 instr, Range* out, int max)
 {
     if (instr == kCopy32[0]) { out[0] = {addr, addr + 24}; return 1; }
-    for (const HwVar& v : kHwV)
-        if (addr == v.entry) { out[0] = {v.code[0].a, v.code[0].b}; out[1] = {v.code[1].a, v.code[1].b}; return 2; }
-    for (const SeqVar& v : kSeqV)
-        if (addr == v.entry)
-        {
-            int n = 0;
-            for (const Range3& r : v.code) if (r.b > r.a) out[n++] = {r.a, r.b};
-            return n;
-        }
-    const ExVar& v = addr == kEx[1].entry ? kEx[1] : kEx[0];
-    for (int i = 0; i < 3; i++) out[i] = {v.code[i].a, v.code[i].b};
-    return 3;
+    const State& s = Get(nds);
+    const SeqState& q = GetSeq(nds);
+    const std::vector<Range3>* rs = s.hw == 1 && addr == s.hv->entry ? &s.hwRanges
+                                  : q.status == 1 && addr == q.v->entry ? &q.ranges
+                                  : s.status == 1 && addr == s.v->entry ? &s.ranges : nullptr;
+    int n = 0;
+    if (rs) for (const Range3& r : *rs) if (n < max && r.b > r.a) out[n++] = {r.a, r.b};
+    return n;
 }
 
 bool Run(melonDS::ARM* cpu, bool jit)
@@ -1543,14 +1720,17 @@ bool Run(melonDS::ARM* cpu, bool jit)
         Copy32(cpu);
         return true;
     }
-    if ((pc == kSeqV[0].entry && cpu->CurInstr == kSeqV[0].instr) || (pc == kSeqV[1].entry && cpu->CurInstr == kSeqV[1].instr))
-        return RunSeq(cpu, jit);
-    if ((pc == kHwV[0].entry && cpu->CurInstr == kHwV[0].instr) || (pc == kHwV[1].entry && cpu->CurInstr == kHwV[1].instr))
-        return RunHw(cpu, jit);
-    if (!((pc == kEx[0].entry && cpu->CurInstr == kEx[0].instr) || (pc == kEx[1].entry && cpu->CurInstr == kEx[1].instr))) return false;
+    {
+        const SeqState& q = GetSeq(nds);
+        if (((q.status == 1 && pc == q.v->entry) || (q.status == 0 && Cand(nds, kSeqRec, pc, cpu->CurInstr))) && RunSeq(cpu, jit))
+            return true;
+        const State& h = Get(nds);
+        if (((h.hw == 1 && pc == h.hv->entry) || (h.hw == 0 && Cand(nds, kHwRec, pc, cpu->CurInstr))) && RunHw(cpu, jit))
+            return true;
+    }
     State& s = Get(nds);
-    if (s.status == 0) Probe(nds, s);
-    if (s.status != 1 || !s.on || pc != s.v->entry) return false;
+    if (s.status == 0 && ExCand(nds, pc, cpu->CurInstr)) Probe(nds, s, pc, cpu->CurInstr);
+    if (s.status != 1 || !s.on || pc != s.v->entry || cpu->CurInstr != s.v->instr) return false;
     s.calls++;
 
     u8 chans[16 * kChanSize];
