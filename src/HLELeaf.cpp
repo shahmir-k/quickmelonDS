@@ -10,6 +10,9 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 namespace melonDS::HLELeaf
 {
@@ -25,14 +28,14 @@ u32 Code(melonDS::ARMv5* c, u32 a)
     return 0;
 }
 
-enum Kind { kNone, kDcFlush, kDcStore, kDcInv, kMtx, kKinds };
+enum Kind { kNone, kDcFlush, kDcStore, kDcInv, kMtx, kHook, kKinds };
 constexpr u32 kDcFlushCode[9] = {0xE3A0C000, 0xE0811000, 0xE3C0001F, 0xEE07CF9A, 0xEE070F3E, 0xE2800020, 0xE1500001, 0xBAFFFFFA, 0xE12FFF1E};
 // DC_StoreRange (c7, c10, 1) / DC_InvalidateRange (c7, c6, 1): the same loop without the drain
 constexpr u32 kDcRangeCode[7] = {0xE0811000, 0xE3C0001F, 0, 0xE2800020, 0xE1500001, 0xBAFFFFFB, 0xE12FFF1E};
 constexpr u32 kMcrStore = 0xEE070F3A, kMcrInv = 0xEE070F36;
 // ponytail: cycles per call (BL to return) = base + per 32-byte line, fitted from check mode
-constexpr s32 kCyc0[kKinds] = {0, 4, 7, 6, 0}, kCycLine[kKinds] = {0, 14, 11, 10, 0};   // (7 games, 45k calls: total within 0.1%, p95 14%)
-const char* const kName[kKinds] = {"", "DC_FlushRange", "DC_StoreRange", "DC_InvalidateRange", "MTX 4x3*4x4"};
+constexpr s32 kCyc0[kKinds] = {0, 4, 7, 6, 0, 0}, kCycLine[kKinds] = {0, 14, 11, 10, 0, 0};   // (7 games, 45k calls: total within 0.1%, p95 14%)
+const char* const kName[kKinds] = {"", "DC_FlushRange", "DC_StoreRange", "DC_InvalidateRange", "MTX 4x3*4x4", "A9HLE hook"};
 // a straight-line fx32 matrix product (Shrek Smash n' Crash: 97 calls a frame, ~7.6% of its ARM9 guest instructions):
 // o(r0) = a(r1) * b(r2) for a 4x3 (rows of 4 words, 3 used) and an affine 4x4 b (row 3 added), 64-bit sums >> 12.
 // push {r4-r11, lr} .. pop {r4-r11, pc}, 164 words, no literals / branches: exact code (FNV), anywhere.
@@ -172,11 +175,21 @@ bool Native(melonDS::ARMv5* c, int k, Out& o, u32 ret)
 
 // the guest function from the call to its return, in the interpreter (target: bit 0 = Thumb; ret: the caller's next
 // instruction, bit 0 = Thumb caller). The caller's lr is set as the call would.
-void Guest(melonDS::ARMv5* c, u32 target, u32 ret)
+void Guest(melonDS::ARMv5* c, u32 target, u32 ret, bool started = false)
 {
-    c->R[14] = ret;
-    c->SetupCodeMem(target & ~1u);
-    c->JumpTo(target);
+    if (started)
+    {
+        // an A9HLE hook ran the function's first instruction (its fallback): go on from there (a pipeline refill)
+        const u32 pc = (c->CPSR & 0x20) ? (c->R[15] - 2) | 1 : c->R[15] - 4;
+        c->SetupCodeMem(pc & ~1u);
+        c->JumpTo(pc);
+    }
+    else
+    {
+        c->R[14] = ret;
+        c->SetupCodeMem(target & ~1u);
+        c->JumpTo(target);
+    }
     const bool rt = ret & 1; const u32 ra = ret & ~1u;
     for (u64 n = 0; n < 4000000; n++)
     {
@@ -187,6 +200,7 @@ void Guest(melonDS::ARMv5* c, u32 target, u32 ret)
             c->NextInstr[0] = c->NextInstr[1];
             if (c->R[15] & 2) { c->NextInstr[1] >>= 16; c->CodeCycles = 0; }
             else c->NextInstr[1] = c->CodeRead32(c->R[15], false);
+            if (melonDS::A9HLE::CheckPending) melonDS::A9HLE::CheckAt(c, c->R[15] - 4);   // (A9HLE compare mode)
             if (rt && c->R[15] - 4 == ra) return;
             ARMInterpreter::THUMBInstrTable[(c->CurInstr >> 6) & 0x3FF](c);
         }
@@ -196,6 +210,7 @@ void Guest(melonDS::ARMv5* c, u32 target, u32 ret)
             c->CurInstr = c->NextInstr[0];
             c->NextInstr[0] = c->NextInstr[1];
             c->NextInstr[1] = c->CodeRead32(c->R[15], false);
+            if (melonDS::A9HLE::CheckPending) melonDS::A9HLE::CheckAt(c, c->R[15] - 8);
             if (!rt && c->R[15] - 8 == ra) return;
             if (c->CheckCondition(c->CurInstr >> 28))
                 ARMInterpreter::ARMInstrTable[((c->CurInstr >> 4) & 0xF) | ((c->CurInstr >> 16) & 0xFF0)](c);
@@ -216,9 +231,20 @@ void Call(melonDS::ARMv5* c, u32 target, u32 ret, u32 r15)
     const u32 codeRegion = c->CodeRegion, cpsrT = c->CPSR & 0x20;
     const s32 codeCycles = c->CodeCycles, regionCycles = c->RegionCodeCycles;
     const u32 next0 = c->NextInstr[0], next1 = c->NextInstr[1];
-    g_St.calls[k]++;
+    g_St.calls[k ? k : kHook]++;
     Out o;
-    if (k && melonDS::A9HLE::MaskOn(c->NDS, 16777216) && Native(c, k, o, ret))
+    if (!k)
+    {
+        // an A9HLE hook entry (CallableHook at compile time): its native runs as at its JIT hook block, the BL done first
+        c->R[14] = ret;
+        c->CPSR &= ~0x20u;
+        c->R[15] = target + 8;
+        c->CurInstr = Code(c, target);
+        if (!melonDS::A9HLE::Run(c, true)) Guest(c, target, ret);
+        else if (c->R[15] != (ret & 1 ? (ret & ~1u) + 2 : ret + 4)) Guest(c, target, ret, true);
+        else g_St.native[kHook]++;
+    }
+    else if (melonDS::A9HLE::MaskOn(c->NDS, 16777216) && Native(c, k, o, ret))
     {
         if (g_Check)
         {
@@ -262,13 +288,28 @@ void Call(melonDS::ARMv5* c, u32 target, u32 ret, u32 r15)
 }
 }
 
-int At(melonDS::NDS& nds, u32 target, u32& a, u32& b)
+int At(melonDS::NDS& nds, u32 target, u32* a, u32* b, int max)
 {
     if (!melonDS::A9HLE::MaskOn(nds, 16777216)) return 0;
     u32 len = 0;
     const int k = KindAt(&nds.ARM9, target, len);
-    if (k) { a = target & ~1u; b = a + len; }
-    return k;
+    if (k) { a[0] = target & ~1u; b[0] = a[0] + len; return 1; }
+    // A/B: hooks through their block exits instead (Android: debug.litev.hlehooks=0, else env LITEV_HLELEAF_NOHOOKS=1)
+    static const bool noHooks = []
+    {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return __system_property_get("debug.litev.hlehooks", b) > 0 && atoi(b) == 0;
+#else
+        return getenv("LITEV_HLELEAF_NOHOOKS") != nullptr;
+#endif
+    }();
+    if (noHooks) return 0;
+    const melonDS::A9HLE::Range* r;
+    const int n = melonDS::A9HLE::CallableHook(nds, target, r);
+    if (n < 0 || n > max) return 0;
+    for (int i = 0; i < n; i++) { a[i] = r[i].a; b[i] = r[i].b; }
+    return n ? n : 0;
 }
 
 void CallA(melonDS::ARM* cpu)

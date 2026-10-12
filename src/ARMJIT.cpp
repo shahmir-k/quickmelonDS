@@ -1587,10 +1587,11 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
                 tgt = (w2 & (1 << 12)) ? tgt | 1 : tgt & ~3u;
                 call = true;
             }
-            u32 la, lb;
-            if (call && HLELeaf::At(NDS, tgt, la, lb))
+            u32 la[16], lb[16];
+            int nl = call ? HLELeaf::At(NDS, tgt, la, lb, 16) : 0;
+            if (nl > 0)
             {
-                addDeps(0, la, lb);
+                for (int d = 0; d < nl; d++) addDeps(0, la[d], lb[d]);
                 ARMInstrInfo::Info& in = instrs[i].Info;
                 in.Kind = thumb ? ARMInstrInfo::tk_HLECALL : ARMInstrInfo::ak_HLECALL;
                 in.SrcRegs = 0x7FFF; in.DstRegs = 0x500F; in.NotStrictlyNeeded = 0;

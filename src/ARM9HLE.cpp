@@ -4692,6 +4692,20 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     return 1;
 }
 
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb);
+int CallableHook(melonDS::NDS& nds, u32 t, const Range*& r)
+{
+    if (t & 3) return -1;
+    const u8* p = CodePtr(&nds.ARM9, t);
+    if (!p) return -1;
+    const u32 w = R32(p);
+    // leaf functions whose natives return with the guest's full state (Return): _ll_sdiv (9), VEC_Normalize (14), the MKDS
+    // stereo effect (16) / OS_SetIrqFunction (2), OS_GetIrqFunction (4), NNS_G2dMakeCellToOams (19), the MKDS broad phase (24)
+    const bool ok = w == kSdivInstr || w == kVecInstr || w == kSetInstr || w == kGetInstr
+                    || (w == kNodeInstr && (t == kBpEntry || OamAt(&nds.ARM9, t)));
+    if (!ok || IsHook(nds, t, w, false) != 1) return -1;
+    return Deps(nds, t, w, r);
+}
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
 {
     if (thumb)

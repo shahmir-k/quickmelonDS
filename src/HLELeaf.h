@@ -26,7 +26,8 @@ namespace melonDS::HLELeaf
 {
 // JIT decode of an ARM9 BL / BLX imm (ARM) or the second half of a Thumb BL pair at addr: the leaf function it calls, if
 // verified now (0: none). target: the call's destination (bit 0 = Thumb). a/b: the code the block must depend on.
-int At(melonDS::NDS& nds, u32 target, u32& a, u32& b);
+// Also A9HLE hooks that are leaf functions (A9HLE::CallableHook): their native runs at the BL instead of a block exit.
+int At(melonDS::NDS& nds, u32 target, u32* a, u32* b, int max);   // number of ranges [a, b) (0: no leaf)
 // ak_HLECALL (ARM BL / BLX imm at R15-8) / tk_HLECALL (Thumb BL pair, this half at R15-4, the first half already set lr)
 void CallA(melonDS::ARM* cpu);
 void CallT(melonDS::ARM* cpu);

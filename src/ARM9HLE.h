@@ -121,6 +121,9 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb = false);
 struct Range { u32 a, b; };
 constexpr int kNumCode = 17;
 int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r);
+// a hook entry at t (ARM) that HLELeaf may run at a BL (a leaf whose native returns with the guest's full state), verified
+// now: its dependency ranges (as Deps), else -1
+int CallableHook(melonDS::NDS& nds, u32 t, const Range*& r);
 // Execute the hook at R15-8 (R15-4 in Thumb) (native, or the guest instruction on fallback). jit: reached from a
 // JIT-compiled hook (code already verified); else the code is compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).
