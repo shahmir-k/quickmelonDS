@@ -257,6 +257,33 @@ option(LITEV_SOFT2D_SPRLIST "liteV: 2D sprite candidate lists per OAM generation
 if (LITEV_SOFT2D_SPRLIST)
     add_compile_definitions(LITEV_SOFT2D_SPRLIST=1)
 endif()
+# LITEV_SOFT2D_PLANES: the threaded 2D draws each BG into its own plane (u16 table indices, text
+# rows expanded with NEON), then one priority select per line keeps the top (and, only when a colour
+# effect can read it, the second) layer per pixel and resolves those through the converted palettes.
+# Extended palettes converted once per change; affine BGs drawn a map cell at a time; identity-matrix
+# bitmap rows copied; lines no colour effect can touch skip the composite, brightness-only lines take
+# a NEON fade pass. Render-only, exact. Needs THREADED + PALCONV + NEON (AArch64). Inspired by
+# DSperate's layer planes (src/core/gpu/engine2d.cpp).
+option(LITEV_SOFT2D_PLANES "liteV: plane-based 2D (layer planes + one select/composite pass per line)" OFF)
+if (LITEV_SOFT2D_PLANES)
+    add_compile_definitions(LITEV_SOFT2D_PLANES=1)
+endif()
+# LITEV_SOFT2D_OUTNEON: the threaded 2D's output stage in NEON: a regular-display line goes to the
+# framebuffer in one pass (master brightness + 6->8 bit expansion, no copy), and display capture
+# (source A, A+B blend) 16 pixels at a time. Render-only, exact. AArch64. Inspired by DSperate's
+# output_line / capture_a15 / capture_blend (src/core/gpu/kernels_neon.cpp).
+option(LITEV_SOFT2D_OUTNEON "liteV: one-pass NEON 2D output stage + NEON display capture" OFF)
+if (LITEV_SOFT2D_OUTNEON)
+    add_compile_definitions(LITEV_SOFT2D_OUTNEON=1)
+endif()
+# LITEV_SOFT2D_OBJROW: a regular (non-affine, paletted, non-window) sprite's row is decoded a tile
+# row at a time and plotted into the OBJ line 4 pixels at a time (NEON, same priority/stamp rule as
+# DrawSpritePixel); a line after one with no sprite skips clearing the (still clear) OBJ buffers.
+# Render-only, exact. AArch64. Inspired by DSperate's obj_row_idx16.
+option(LITEV_SOFT2D_OBJROW "liteV: NEON sprite row plot for the software 2D" OFF)
+if (LITEV_SOFT2D_OBJROW)
+    add_compile_definitions(LITEV_SOFT2D_OBJROW=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

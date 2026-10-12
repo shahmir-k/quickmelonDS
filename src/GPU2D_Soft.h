@@ -36,6 +36,18 @@ static inline u32 S2DConvColor(u16 c)
 }
 
 #endif
+#if defined(LITEV_SOFT2D_PLANES) && defined(LITEV_SOFT2D_THREADED) && defined(LITEV_SOFT2D_PALCONV) && defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
+// layer planes + one select/resolve per line (needs the converted palette and the NEON compositor)
+#define S2D_PLANES 1
+#endif
+#if defined(LITEV_SOFT2D_OUTNEON) && defined(LITEV_SOFT2D_THREADED) && defined(__aarch64__)
+// one-pass NEON output stage: brightness + 6->8 bit expansion, display capture
+#define S2D_OUTNEON 1
+#endif
+#if defined(LITEV_SOFT2D_OBJROW) && defined(__aarch64__)
+// sprite rows decoded a tile row at a time and plotted 4 pixels at a time
+#define S2D_OBJROW 1
+#endif
 class SoftRenderer2D : public Renderer2D
 {
 public:
@@ -167,6 +179,10 @@ public:
     bool HybridDesc = false;
     bool LastLineHas3D = false;
     static u32 HybridResolvePixel(u32 val1, u32 val2, u32 c3d);
+#ifdef S2D_PLANES
+    // a new frame: the extended palettes are revalidated on first use
+    void PlanesBeginFrame() { BGExtChecked = 0; OBJExtChecked = 0; }
+#endif
 
 private:
     SoftRenderer& Parent;
@@ -196,6 +212,39 @@ private:
     u32 SprListGen = 0;         // generation SprLines was built for
     u64 SprLines[192][2];       // per line: sprites whose box covers it
     void BuildSprLists(const u16* oam);
+#endif
+
+#ifdef S2D_PLANES
+    // LITEV_SOFT2D_PLANES: each BG draws into its own plane of u16 values (bit 15 opaque, bits 0-14
+    // the index into the layer's colour table), then one priority select per line picks the top
+    // (and, when a colour effect can read it, the second) layer per pixel and resolves only those
+    // through the tables. Inspired by DSperate's layer planes and select pass
+    // (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
+    // src/core/gpu/engine2d.cpp render_line / select_layers).
+    enum { TID_OBJ = 4, TID_BACKDROP = 5, TID_3D = 6, TID_NONE = 7 };
+    alignas(16) u16 PlaneBuf[4][8 + 264 + 8];   // text rows land at -scroll, 33 tiles wide
+    u16* PlaneV(int n) { return &PlaneBuf[n][8]; }
+    const u32* PlaneTab[4] {};
+    alignas(16) u32 DirCol[4][256];   // direct-colour BG: colours by position
+    alignas(16) u32 ObjCol[256];      // opaque sprite pixels' colour records by position
+    bool PlaneAny[4] {};
+    alignas(16) u16 Top16[256], Sec16[256];
+    alignas(16) u8 TopTid[256], SecTid[256];
+    // extended palettes in the line colour format, revalidated (compared with the copy they were
+    // converted from) on first use in a frame
+    alignas(16) u32 BGExtConv[4][4096];
+    u16 BGExtCopy[4][4096];
+    u64 BGExtChecked = 0, BGExtHave = 0;   // bit slot * 16 + palette
+    alignas(16) u32 OBJExtConv[4096];
+    u16 OBJExtCopy[4096];
+    u32 OBJExtChecked = 0, OBJExtHave = 0;
+    void ValidateBGExt(u32 slot, u32 palmask);
+    void ValidateOBJExt(u32 pal);
+    void DrawScanlinePlanes(u32 line, u32* dst);
+    template<bool mosaic> void PlaneBG_Text(u32 line, u32 bgnum);
+    template<bool mosaic> void PlaneBG_Affine(u32 bgnum);
+    template<bool mosaic> void PlaneBG_Extended(u32 bgnum);
+    template<bool mosaic> void PlaneBG_Large();
 #endif
 
     u8* CurBGXMosaicTable;
@@ -236,6 +285,9 @@ private:
     template<bool window> void DrawSpritePixel(int color, u32 pixelattr, s32 xpos);
     template<bool window> void DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight, u32 width, u32 height, s32 xpos, s32 ypos);
     template<bool window> void DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos);
+#ifdef S2D_OBJROW
+    void S2DPlotSpriteRow(const u8* tex, u8* row, u32 width, bool hflip, u32 xoff, u32 xend, s32 xpos, u32 pixelattr);
+#endif
 };
 
 }
