@@ -1113,6 +1113,9 @@ void ARMv5::JumpTo(u32 addr, bool restorecpsr)
 #else
 #define FT_R7 0
 #endif
+#ifdef LITEV_A7HLE
+s32 ARMv4::VectorFetchCycles() const { return LITEV_FT ? FT_R7 : NDS.ARM7MemTimings[0][2] + NDS.ARM7MemTimings[0][3]; }
+#endif
 void ARMv4::JumpTo(u32 addr, bool restorecpsr)
 {
     if (restorecpsr)
@@ -1304,6 +1307,12 @@ void ARM::TriggerIRQ()
     // liteDS-v2 Unit 2 (shadow, inert): an IRQ being delivered forces the slice to
     // end so the dispatcher re-enters C++. Currently redundant with StopExecution.
     ForceExecutionExit();
+
+#ifdef LITEV_A7HLE
+    // the TM1 alarm IRQ natively without entering the vector (A7Native bit 2048: the state as after the BIOS return)
+    if (Num == 1 && A7Native::IrqPre(this))
+        return;
+#endif
 
     u32 oldcpsr = CPSR;
     CPSR &= ~0xFF;

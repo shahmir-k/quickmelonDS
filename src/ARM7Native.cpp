@@ -151,7 +151,8 @@ const char* const kSegName[kSegs] = {"bios-in", "bios-ret", "irqh", "stub", "icb
 const char* KindName(u8 k) { return k == kGetTick ? "OS_GetTick" : k == kSetTimer ? "OSi_SetTimer" : k == kInsertAlarm ? "OSi_InsertAlarm" : "?"; }
 struct State
 {
-    int on = -1, irqOn = -1, handOn = -1, wholeOn = -1, fastOn = -1;
+    int on = -1, irqOn = -1, handOn = -1, wholeOn = -1, fastOn = -1, leanOn = -1, preOn = -1;
+    int preR = 0; bool preSet = false;   // (IrqPre tried this IRQ: its result, for Irq)
     std::vector<Entry> ents;
     std::vector<Fn> fns;
     std::vector<Fn> neg;                // addresses that are not that function: the code that decided it (unchanged: still not)
@@ -170,6 +171,7 @@ struct State
         u32 gen = ~0u, h = 0, stub = 0, sw[4] = {}, aw = 0;
         const Fn *fh = nullptr, *fi = nullptr, *fa = nullptr, *ft = nullptr, *fs = nullptr;
         u32 hand[2] = {}; const Fn* handF[2] = {}; bool handPad[2] = {};     // the alarm handlers seen (PAD / sound)
+        u32 guestH[2] = {};             // ... and ones that are neither (the guest runs those IRQs: always exact)
     } plan;
     int bios = 0; u32 biosRet = 0;  // ARM7 BIOS IRQ vector: 0 unchecked, 1 the standard one (return stub at biosRet), -1 other
     u64 calls[kKinds] = {}, native[kKinds] = {}, guest[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, timing[kKinds] = {};
@@ -203,7 +205,13 @@ u64 g_Gap0 = 0; u32 g_GapPc = 0;
 std::map<u32, std::vector<u64>> g_Gaps;
 struct GapDump { ~GapDump() { for (auto& [pc, v] : g_Gaps) { std::sort(v.begin(), v.end()); fprintf(stderr, "A7N gap %08x: %zu, median %llu p25 %llu p75 %llu host instr\n", pc, v.size(), (unsigned long long)v[v.size() / 2], (unsigned long long)v[v.size() / 4], (unsigned long long)v[v.size() * 3 / 4]); } } } g_GapDump;
 u32 g_LastStop = 0;
+// LITEV_A7N_PMU=7: Fast's checkpoints (host instr between consecutive ones, minus a counter read)
+u64 g_CpI[16] = {}, g_CpN[16] = {}, g_CpL = 0; int g_CpK = -1;
+inline void Cp(int k) { if (g_PmuLvl != 7) return; u64 c[2]; thread_selfcounts(1, c, sizeof(c)); if (g_CpK >= 0 && k > 0) { g_CpI[k] += c[0] - g_CpL; g_CpN[k]++; } g_CpK = k; thread_selfcounts(1, c, sizeof(c)); g_CpL = c[0]; }
+struct CpDump { ~CpDump() { if (g_PmuLvl == 7) for (int i = 1; i < 16; i++) if (g_CpN[i]) fprintf(stderr, "A7N cp %d: %llu, %.0f host instr each (incl. one counter read)\n", i, (unsigned long long)g_CpN[i], (double)g_CpI[i] / g_CpN[i]); } } g_CpDump;
+#define A7N_CP(k) Cp(k)
 #else
+#define A7N_CP(k)
 #define A7N_PMU(k)
 #endif
 const bool g_Stats = getenv("LITEV_A7HLE_STATS") && atoi(getenv("LITEV_A7HLE_STATS"));
@@ -244,6 +252,11 @@ bool HandOn(State& s) { if (s.handOn < 0) s.handOn = Mask() & 128 ? 1 : 0; retur
 bool FastOn(State& s) { if (s.fastOn < 0) s.fastOn = (Mask() & 960) == 960 ? 1 : 0; return s.fastOn == 1; }
 // bit 256: whole runs only (needs 64 + 128): a native run starts only for a TM1 alarm IRQ and is kept only when it reaches the
 // BIOS return (else undone: the guest runs the IRQ from the vector); no exit hooks run (their blocks only guard the code)
+// bit 1024 (needs 512): Fast's lean stores: the IO in one loop at the end (TM1 / RCNT directly, one UpdateIRQ), the TWL
+// register save and the context switch's thread save written last without the undo log (nothing can fail after them)
+bool LeanOn(State& s) { if (s.leanOn < 0) s.leanOn = (Mask() & 1984) == 1984 ? 1 : 0; return s.leanOn == 1; }
+// bit 2048 (needs 1024): the TM1 alarm IRQ from ARM::TriggerIRQ before the vector entry (IrqPre)
+bool PreOn(State& s) { if (s.preOn < 0) s.preOn = (Mask() & 4032) == 4032 ? 1 : 0; return s.preOn == 1; }
 bool WholeOn(State& s) { if (s.wholeOn < 0) s.wholeOn = (Mask() & 448) == 448 ? 1 : 0; return s.wholeOn == 1; }
 
 
@@ -901,12 +914,13 @@ constexpr HandCyc kHandCyc[6] = {
     {60, 40, 140, 3, 43, 12, 30},   // T5 (no handler of its own: as TWL)
     {56, 40, 153, 3, 43, 12, 30},   // S2 (Brain Age, Nintendogs: the 2005 sound alarm with the 2.x OS_SendMessage)
 };
-s32 HandPad(Run& R, const Fn* f)
+s32 HandPad(Run& R, const Fn* f, bool lean = false)
 {
     melonDS::NDS& nds = R.nds;
     Ctx c{nds, f->e, R.x, R.t0, R.interp};
     const HandCyc& k = kHandCyc[f->e.kf[kPadAlarm]];
-    const u32 rc = nds.ARM7Read16(0x04000134), key = nds.ARM7Read16(0x04000136);
+    // (lean: the registers' values as ARM7IORead16 returns them, without the bus dispatch)
+    const u32 rc = lean ? nds.RCnt : nds.ARM7Read16(0x04000134), key = lean ? (u16)(nds.KeyInput >> 16) : nds.ARM7Read16(0x04000136);
     if (!Io(c, 0x04000134, (rc & ~0xC000u) | 0x8000, 0) || !Wr16(c, f->e.f[f_pad], (key & 0x80 ? 0x8000 : 0) | (key & 0xB) << 10))
         return -2;
     return k.pad;
@@ -1428,6 +1442,19 @@ void Apply(melonDS::ARM* cpu, const St& st)
     cpu->Cycles = cyc;                              // (the fetch is in the fitted cycles)
 }
 
+// IrqPre's end: the state Apply + the BIOS return leave, from the interrupted (USR / SYS) mode without the entry; the vector
+// fetch's cycles as JumpTo(0x18) charges them
+void ApplyPre(melonDS::ARM* cpu, const St& st)
+{
+    for (int i = 0; i < 13; i++) cpu->R[i] = st.r[i];
+    cpu->R[13] = st.usr13; cpu->R[14] = st.usr14;
+    cpu->R_IRQ[0] = st.r[13]; cpu->R_IRQ[1] = st.r[14]; cpu->R_IRQ[2] = st.spsr; cpu->R_SVC[0] = st.svc13;
+    cpu->CPSR = st.spsr | 0x10;        // (RestoreCPSR)
+    const s32 cyc = cpu->Cycles + ((melonDS::ARMv4*)cpu)->VectorFetchCycles();
+    cpu->JumpTo(cpu->CPSR & 0x20 ? st.r[15] | 1 : st.r[15] & ~1u);
+    cpu->Cycles = cyc;
+}
+
 // step from the CPU's state at pc; n segments stepped (0: nothing ran)
 int Chain(melonDS::ARM* cpu, State& s, u32 pc, u8 want, St& st, Txn& x, bool interp, u64 t0)
 {
@@ -1488,15 +1515,61 @@ const A7NSig* SigAt(u8 kind, u8 fam, u32 w0)
     for (int j = 0; j < kByKind.n[kind]; j++) { const A7NSig& g = kSigs[kByKind.i[kind][j]]; if (g.w0 == w0 && g.fam == fam) return &g; }
     return nullptr;
 }
-int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
+// lean: n words at a written now, no undo (the caller writes them after everything that can fail); Span checks they are one
+// host block first
+u8* Span(melonDS::NDS& nds, u32 a, int n, u8& reg)
+{
+    u8 r1;
+    u8* p = Host(nds, a, reg);
+    const u8* q = Host(nds, a + 4 * (n - 1), r1);
+    return p && q && q - p == 4 * (n - 1) ? p : nullptr;
+}
+void Put(melonDS::NDS& nds, u8* p, u8 reg, u32 a, const u32* v, int n)
+{
+    for (int i = 0; i < n; i++)
+        if (R32(p + 4 * i) != v[i]) { Inval(nds, a + 4 * i, reg); memcpy(p + 4 * i, &v[i], 4); }
+}
+// lean: the run's IO at once (JIT: all at the run's time, in order: a timer start runs the timers, whose overflow IRQs
+// may set IF again after the acknowledge), TM1 reload / control and RCNT directly (as ARM7IOWrite16), one UpdateIRQ
+void FlushLean(melonDS::NDS& nds, const Txn& x)
+{
+    u32& ie = nds.IE[1];
+    u32& fl = nds.IF[1];
+    for (u32 i = 0; i < x.nio; i++)
+    {
+        const Txn::Io& o = x.io[i];
+        switch (o.op)
+        {
+        case 0:
+            if (o.a == 0x04000104) nds.Timers[5].Reload = (u16)o.v;
+            else if (o.a == 0x04000106) nds.A7NTimerStart(5, (u16)o.v);
+            else if (o.a == 0x04000134) nds.RCnt = (u16)o.v;
+            else nds.ARM7Write16(o.a, (u16)o.v);
+            break;
+        case 1: ie |= o.v; break;
+        case 2: ie &= ~o.v; break;
+        case 3: fl &= ~o.v; break;
+        }
+    }
+    nds.UpdateIRQ(1);
+}
+// L (bit 1024): the lean run, plan only (every lookup done by an earlier generic run): 2 = not planned (the caller undoes it
+// and runs the generic Fast<false>, which plans); a compact function of its own (the generic one is cold)
+template <bool L>
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0, const St& in, bool pre)
 {
     melonDS::NDS& nds = cpu->NDS;
+    A7N_CP(1);
     State::Plan& P = s.plan;
     const u32 g0 = s.gen;
     u32 h, w0;
     if (s.bios <= 0 || !Word(nds, 0x03FFFFFC, h)) return 0;
     // (the plan: the functions of the last fast run, all guarded by JIT blocks, none gone since: no lookups)
     bool pl = P.gen == g0 && P.h == h;
+    if constexpr (L) if (!pl) return 2;
     // the BIOS vector: its frame (r0-r3, r12, lr) is the interrupted code's registers at the return
     const Fn* fh = P.fh;
     if (!pl && (!Word(nds, h, w0) || !(fh = Chk(nds, s, h, kIrqHandler)) || !SigAt(kIrqHandler, fh->e.kf[kIrqHandler], w0))) return 0;
@@ -1505,21 +1578,28 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
     const Cyc2& kh = Cyc2Of(eh.fam);
     x.t = kh.biosIn;
     // OS_IrqHandler: IME on, the lowest pending bit TM1 (Irq checked it)
-    const u32 sp0 = cpu->R[13];
+    const u32 sp0 = in.r[13];
     Ctx ch{nds, eh, x, t0, false};
     u32 stub;
     if (!Rd(ch, eh.f[f_table] + 4 * melonDS::IRQ_Timer1, stub)) return 0;
+    u8* svP = nullptr; u8 svReg = 0;
     if (fam == famTWL)
     {
-        const u32 sv[9] = {cpu->R[4], cpu->R[5], cpu->R[6], cpu->R[7], cpu->R[8], cpu->R[9], cpu->R[10], cpu->R[11], sp0 - 28};
+        if (L) { if (!(svP = Span(nds, eh.f[f_save], 9, svReg))) return 0; }     // (written at the end)
+        else
+        {
+        const u32 sv[9] = {in.r[4], in.r[5], in.r[6], in.r[7], in.r[8], in.r[9], in.r[10], in.r[11], sp0 - 28};
         for (int i = 0; i < 9; i++) if (!Wr(ch, eh.f[f_save] + 4 * i, sv[i])) return 0;
+        }
     }
     if (!Io(ch, 0x04000214, 1u << melonDS::IRQ_Timer1, 3)) return 0;
     x.t += Cyc2Of(fam).irqh + Cyc2Of(fam).irqhBit * melonDS::IRQ_Timer1 + (fam == famTWL ? Cyc2Of(fam).irqhSave : 0);
+    A7N_CP(2);
     // the IRQ table stub -> the IRQ callback dispatcher
     u32 sw[4];
     if ((stub & 3) || !Word(nds, stub, sw[0]) || !Word(nds, stub + 4, sw[1]) || !Word(nds, stub + 8, sw[2]) || !Word(nds, stub + 12, sw[3])) return 0;
     pl = pl && stub == P.stub && !memcmp(sw, P.sw, sizeof(sw));
+    if constexpr (L) if (!pl) return 2;
     const bool stw = sw[0] == 0xE59FC004;
     const u32 mv = stw ? sw[1] : sw[0], icbA = sw[3];
     const Fn* fi = P.fi;
@@ -1543,8 +1623,10 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
     const u32 mask = 1u << (bit & 31);
     if (!Wr(ci, icbf + 12 * n, 0)) return 0;
     x.t += ki.icbPre;
+    A7N_CP(3);
     // OSi_AlarmHandler -> OSi_ArrangeTimer
     pl = pl && aw == P.aw;
+    if constexpr (L) if (!pl) return 2;
     const Fn* fa = P.fa;
     u32 wa;
     if (!pl && (!(fa = Chk(nds, s, aw, kAlarmWrap)) || !Word(nds, aw, wa) || !SigAt(kAlarmWrap, fa->e.kf[kAlarmWrap], wa))) return 0;
@@ -1579,6 +1661,7 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
         x.t = t;
     }
     if (!Wr(ct, 0x0380FFF8, flag | 0x10)) return 0;
+    A7N_CP(4);
     if (!due)
     {
         x.t += kt.arrSet;
@@ -1595,15 +1678,20 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
         Run R{nds, s, x, t0, false, dummy, wNone};
         const int hi = !pl ? -1 : P.hand[0] == handler ? 0 : P.hand[1] == handler ? 1 : -1;
         s32 hc;
-        if (hi >= 0) hc = P.handPad[hi] ? HandPad(R, P.handF[hi]) : HandSnd(R, P.handF[hi]);
+        if (hi >= 0) hc = P.handPad[hi] ? HandPad(R, P.handF[hi], L) : HandSnd(R, P.handF[hi]);
+        else if constexpr (L) return P.guestH[0] == handler || P.guestH[1] == handler ? -1 : 2;
         else
         {
             const Fn* f = Chk(nds, s, handler, kPadAlarm);
             const bool pad = f;
             if (!pad) f = Chk(nds, s, handler, kSndAlarm);
-            if (!f) return s.gen == g0 ? -1 : 0;
+            if (!f)
+            {
+                if (pl && s.gen == g0) P.guestH[P.guestH[0] ? 1 : 0] = handler;
+                return s.gen == g0 ? -1 : 0;
+            }
             if (s.gen != g0) return 0;
-            hc = pad ? HandPad(R, f) : HandSnd(R, f);
+            hc = pad ? HandPad(R, f, L) : HandSnd(R, f);
             if (pl && f->guard)
             {
                 const int k = P.hand[0] ? 1 : 0;
@@ -1612,6 +1700,7 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
         }
         if (hc < 0) return hc == -1 ? -1 : 0;
         x.t += hc;
+        A7N_CP(5);
         // the rest of OSi_ArrangeTimer: re-insert a periodic alarm, re-arm the timer
         if (!Rd(ct, alarm + 0x1C, plo) || !Rd(ct, alarm + 0x20, phi)) return 0;
         x.t += kt.arrPost;
@@ -1622,11 +1711,13 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
             if (!InsertAlarm(ct, alarm, 0)) return 0;
         }
         else x.t += kt.arrNoIns;
+        A7N_CP(6);
         u32 hd;
         if (!Rd(ct, head, hd)) return 0;
         if (hd) { x.t += kt.arrHead; if (!SetTimer(ct, hd)) return 0; }
         x.t += kt.arrEnd;
     }
+    A7N_CP(7);
     x.t += Cyc2Of(famA).awPost - (famA == famNTR05);
     // the IRQ callback dispatcher after the callback: the IRQ check flag, the IRQ off unless the callback is kept
     {
@@ -1636,6 +1727,7 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
         if (!en) { if (!Io(ci, 0, mask, 2)) return 0; cyc += ki.icbDis; }
         x.t += cyc;
     }
+    A7N_CP(8);
     // the thread switch (OS_IrqHandler's return goes through it)
     const u32 tsA = eh.f[f_ts];
     const Fn* fs = P.fs;
@@ -1700,8 +1792,8 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
         if (to && to != cur && (!Rd(cs, ti + 0xC + o, cb) || cb)) return 0;
         if (!Wr16(cs, ti, 0)) return 0;
     }
-    St st;
-    Load(cpu, st, cpu->R[14] - 4);     // (the BIOS return: subs pc, lr, #4)
+    St st = in;
+    st.r[15] = in.r[14] - 4;            // (the BIOS return: subs pc, lr, #4)
     st.ret = true;
     if (!resched || !to || to == cur) x.t += cyc;
     else
@@ -1709,10 +1801,25 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
         // the context switch: the interrupted thread's registers into its OSThread, the next thread's loaded
         const u32 old[18] = {st.spsr, st.r[0], st.r[1], st.r[2], st.r[3], st.r[4], st.r[5], st.r[6], st.r[7], st.r[8], st.r[9], st.r[10],
                              st.r[11], st.r[12], st.usr13, st.usr14, st.r[14], st.svc13};
+        u32 nw[18];
+        if (L)
+        {
+            // (the next thread's registers first: then nothing can fail, the old thread's are written without the undo log)
+            u8 rc, rt, rn;
+            const u8* pt = Span(nds, to, 18, rt);
+            u8* pc = Span(nds, cur, 18, rc);
+            u8* pn = Span(nds, ti + 4 + o, 1, rn);
+            if (!pt || !pc || !pn || !(to + 72 <= cur || cur + 72 <= to) || ti + 4 + o - to < 72) return 0;
+            for (int i = 0; i < 18; i++) nw[i] = R32(pt + 4 * i);
+            Put(nds, pn, rn, ti + 4 + o, &to, 1);
+            Put(nds, pc, rc, cur, old, 18);
+        }
+        else
+        {
         if (!Wr(cs, ti + 4 + o, to)) return 0;
         for (int i = 0; i < 18; i++) if (!Wr(cs, cur + 4 * i, old[i])) return 0;
-        u32 nw[18];
         for (int i = 0; i < 18; i++) if (!Rd(cs, to + 4 * i, nw[i])) return 0;
+        }
         st.spsr = (st.spsr & 0x00FFFF00) | (nw[0] & 0xFF0000FF);
         st.svc13 = nw[17];
         for (int i = 0; i < 13; i++) st.r[i] = nw[1 + i];
@@ -1722,18 +1829,60 @@ int Fast(melonDS::ARM* cpu, State& s, Txn& x, u64 t0)
     }
     x.t += kCyc2[0].biosRet;
     s.fast++;
-    if (!pl && fh->guard && fi->guard && fa->guard && ft->guard && fs->guard)
+    if (!L && !pl && fh->guard && fi->guard && fa->guard && ft->guard && fs->guard)
     {
         // every function of this run is guarded by a JIT block (unchanged while it lives; s.gen moves when one goes)
         P = State::Plan{};
         P.gen = g0; P.h = h; P.stub = stub; memcpy(P.sw, sw, sizeof(sw)); P.aw = aw;
         P.fh = fh; P.fi = fi; P.fa = fa; P.ft = ft; P.fs = fs;
     }
-    IoFlush(nds, x, t0, false);
-    Apply(cpu, st);
+    // (pre: the run ends in the interrupted mode's bank, USR / SYS; another (a context switch into one): the vector entry first)
+    if (pre && (st.spsr & 0x1F) != 0x10 && (st.spsr & 0x1F) != 0x1F) return 0;
+    A7N_CP(9);
+    if (L)
+    {
+        if (svP)
+        {
+            const u32 sv[9] = {in.r[4], in.r[5], in.r[6], in.r[7], in.r[8], in.r[9], in.r[10], in.r[11], sp0 - 28};
+            Put(nds, svP, svReg, eh.f[f_save], sv, 9);
+        }
+        FlushLean(nds, x);
+    }
+    else IoFlush(nds, x, t0, false);
+    A7N_CP(10);
+    if (pre) ApplyPre(cpu, st);
+    else Apply(cpu, st);
+    A7N_CP(11);
     cpu->Cycles += x.t;
     return 1;
 }
+}
+
+// the generic run (plans the lean one): its own transaction, undone unless applied
+#if defined(__GNUC__)
+__attribute__((noinline, cold))
+#endif
+static int Slow(melonDS::ARM* cpu, State& s, u64 t0, const St& in, bool pre)
+{
+    Txn x;
+    const int r = Fast<false>(cpu, s, x, t0, in, pre);
+    if (r != 1) Undo(cpu->NDS, x, 0);
+    return r;
+}
+
+// the TM1 alarm IRQ as one run: the lean one, else the generic one (plans it); 1 applied, -1 the guest runs it, 0 the chain decides
+int TryFast(melonDS::ARM* cpu, State& s, const St& in, bool pre)
+{
+    melonDS::NDS& nds = cpu->NDS;
+    int r = 2;
+    if (LeanOn(s))
+    {
+        Txn x;
+        r = Fast<true>(cpu, s, x, nds.ARM7Timestamp, in, pre);
+        if (r != 1) Undo(nds, x, 0);    // (nothing issued: the IO comes at the end)
+    }
+    if (r == 2) r = Slow(cpu, s, nds.ARM7Timestamp, in, pre);
+    return r;
 }
 
 // ---- entry points ----------------------------------------------------------------------------------------------------
@@ -2136,6 +2285,13 @@ void Irq(melonDS::ARM* cpu)
     if (cpu->Num != 1 || CheckPending) return;
     State& s = Get(cpu->NDS);
     if (!IrqOn(s)) return;
+    if (s.preSet)
+    {
+        // (IrqPre ran this IRQ: counted, guards checked; 0 = it could not apply: the usual path)
+        s.preSet = false;
+        if (s.preR < 0) { s.stops[kSegs]++; return; }
+        s.irqs--;
+    }
     s.irqs++;
     if (s.reguard)
     {
@@ -2169,10 +2325,11 @@ void Irq(melonDS::ARM* cpu)
             if (FastOn(s) && nds.IsJITEnabled() && nds.PeekTimer7(4, nds.ARM7Timestamp, tm0))
             {
                 A7N_PMU(0);
-                Txn x;
-                const int r = Fast(cpu, s, x, nds.ARM7Timestamp);
-                if (r > 0) { s.irqNative++; return; }
-                Undo(nds, x, 0);                // (nothing issued: the IO comes at the end)
+                A7N_CP(0);
+                St in;
+                Load(cpu, in, cpu->R[14] - 4);
+                const int r = TryFast(cpu, s, in, false);
+                if (r > 0) { A7N_CP(12); s.irqNative++; return; }
                 if (r < 0) { s.stops[kSegs]++; return; }
             }
         }
@@ -2184,6 +2341,36 @@ void Irq(melonDS::ARM* cpu)
 #if defined(__APPLE__) && defined(LITEV_HLE_DIAG)
     if (g_PmuLvl == 4 && g_LastStop) { g_GapPc = g_LastStop; g_LastStop = 0; u64 c[2]; thread_selfcounts(1, c, sizeof(c)); g_Gap0 = c[0]; }
 #endif
+}
+
+bool IrqPre(melonDS::ARM* cpu)
+{
+    if (CheckPending) return false;
+    State& s = Get(cpu->NDS);
+    melonDS::NDS& nds = cpu->NDS;
+    if (!IrqOn(s) || !PreOn(s) || !nds.IsJITEnabled() || ((cpu->CPSR & 0x1F) != 0x10 && (cpu->CPSR & 0x1F) != 0x1F)) return false;
+    const u32 pend = nds.IME[1] ? nds.IE[1] & nds.IF[1] : 0;
+    u16 tm0;
+    if ((pend & (0u - pend)) != (1u << melonDS::IRQ_Timer1) || !nds.PeekTimer7(4, nds.ARM7Timestamp, tm0)) return false;
+    s.irqs++;
+    if (s.reguard)
+    {
+        s.reguard = false;
+        u8 reg;
+        if (s.tsBlock && Host(nds, s.tsHook, reg)) Inval(nds, s.tsHook, reg);
+    }
+    A7N_PMU(0);
+    A7N_CP(0);
+    // the state at the vector entry (IRQ mode view), without entering it
+    St in;
+    for (int i = 0; i < 13; i++) in.r[i] = cpu->R[i];
+    in.r[13] = cpu->R_IRQ[0]; in.r[14] = cpu->R[15] + (cpu->CPSR & 0x20 ? 2 : 0); in.r[15] = in.r[14] - 4;
+    in.usr13 = cpu->R[13]; in.usr14 = cpu->R[14]; in.svc13 = cpu->R_SVC[0]; in.spsr = cpu->CPSR;
+    in.cpsr = (cpu->CPSR & ~0xFFu) | 0xD2; in.ret = false;
+    const int r = TryFast(cpu, s, in, true);
+    if (r > 0) { A7N_CP(12); s.irqNative++; return true; }
+    s.preSet = true; s.preR = r;
+    return false;
 }
 
 // the IRQ vector's target may be an SDK OS_IrqHandler (its first word)

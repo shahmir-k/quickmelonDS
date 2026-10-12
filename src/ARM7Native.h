@@ -38,6 +38,9 @@ bool Interp(melonDS::ARM* cpu, bool thumb);
 // functions return to on that path (the thread switch, the IRQ callback dispatcher's and OSi_ArrangeTimer's post-call
 // instruction) are JIT hooks (IsHook at compile: their code ranges into a / b; Hook at run: false if not one)
 void Irq(melonDS::ARM* cpu);
+// bit 2048: ARM::TriggerIRQ before the vector entry (interrupted mode USR / SYS): the TM1 alarm IRQ natively from the
+// interrupted state to the state after the BIOS return (no entry / return mode switches, no vector fetch); true if applied
+bool IrqPre(melonDS::ARM* cpu);
 bool MaybeExit(u32 instr);
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, u32* a, u32* b, int max);
 bool Hook(melonDS::ARM* cpu, bool jit);
