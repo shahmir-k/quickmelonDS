@@ -28,7 +28,7 @@
 // 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ,
 // 2048 G3D shape (needs 512), 4096 VEC_Normalize, 8192 G3D node (NODEDESC),
 // 16384 MKDS stereo sample effect, 32768 G3D material animation (needs 128), 65536 G3D SBC loop,
-// 131072 NNS_G2dMakeCellToOams, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase, 8388608 MKDS G3D shape; 8 needs 1)
+// 131072 NNS_G2dMakeCellToOams, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase, 8388608 MKDS G3D shape, 16777216 SDK leaf functions at their BL (HLELeaf.h); 8 needs 1)
 // for A/B of single hooks.
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
@@ -125,6 +125,8 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r);
 // JIT-compiled hook (code already verified); else the code is compared per call.
 // Returns false if cpu is not at a hook (caller does its normal thing).
 bool Run(melonDS::ARM* cpu, bool jit);
+// is A9HLE on with mask bit `bit` for this console (debug.litev.a9hle / LITEV_A9HLE_ONLY)
+bool MaskOn(melonDS::NDS& nds, u32 bit);
 // IRQ delivery to the ARM9 (TriggerIRQ, IRQs enabled). halted: the ARM9 is waking from a halt.
 // true: taken natively (registers unchanged, Cycles added); the caller then delivers any IRQ that
 // is still pending as usual (and a halted ARM9 in the OS idle loop stays halted if none is).

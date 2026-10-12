@@ -259,7 +259,7 @@ constexpr s32 kWakeCycles = 900;
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
 constexpr int kKinds = 26;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 16777215;
+constexpr u32 kAllHooks = 33554431;    // (bit 16777216: HLELeaf)
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
@@ -476,6 +476,10 @@ __attribute__((noinline, cold)) State& Init(melonDS::ARMv5* c)
     return s;
 }
 inline State& St(melonDS::ARMv5* c) { return c->A9HLEState ? *(State*)c->A9HLEState : Init(c); }
+}
+bool MaskOn(melonDS::NDS& nds, u32 bit) { State& s = St(&nds.ARM9); return s.on && (s.mask & bit); }
+namespace
+{
 
 __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 instr, bool thumb)
 {

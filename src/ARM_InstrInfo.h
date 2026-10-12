@@ -159,6 +159,9 @@ enum
 
     ak_Nop,
 
+    // not a real instruction: a BL / BLX imm to an SDK leaf function run natively at the call (LITEV_A9HLE, HLELeaf.h)
+    ak_HLECALL,
+
     ak_Count,
 
     tk_LSL_IMM = 0,
@@ -234,6 +237,8 @@ enum
 
     // not a real instruction
     tk_BL_LONG,
+    // not a real instruction: the second half of a BL pair to an SDK leaf function (LITEV_A9HLE, HLELeaf.h)
+    tk_HLECALL,
 
     tk_Count
 };

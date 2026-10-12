@@ -26,6 +26,7 @@
 #endif
 #include "ARM7HLE.h"
 #include "ARM9HLE.h"
+#include "HLELeaf.h"
 #include "ARMJIT_Memory.h"
 #include <string.h>
 #include <assert.h>
@@ -726,7 +727,12 @@ InterpreterFunc InterpretARM[ARMInstrInfo::ak_Count] =
 
     F(B), F(BL), F(BLX_IMM), F(BX), F(BLX_REG),
     F(UNK), F(MSR_IMM), F(MSR_REG), F(MRS), F(MCR), F(MRC), F(SVC),
-    NOP
+    NOP,
+#ifdef LITEV_A9HLE
+    HLELeaf::CallA,
+#else
+    NULL,
+#endif
 };
 #undef F_ALU
 #undef F_MEM_WB
@@ -757,7 +763,12 @@ InterpreterFunc InterpretTHUMB[ARMInstrInfo::tk_Count] =
     F(PUSH), F(POP), F(LDMIA), F(STMIA),
     F(BCOND), F(BX), F(BLX_REG), F(B), F(BL_LONG_1), F(BL_LONG_2),
     F(UNK), F(SVC),
-    T_BL_LONG // BL_LONG psudo opcode
+    T_BL_LONG, // BL_LONG psudo opcode
+#ifdef LITEV_A9HLE
+    HLELeaf::CallT,
+#else
+    NULL,
+#endif
 };
 #undef F
 
@@ -1553,6 +1564,40 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
             instrs[i].CodeCycles = cpu->CodeCycles;
         }
         instrs[i].Info = ARMInstrInfo::Decode(thumb, cpu->Num, instrs[i].Instr, LiteralOptimizations);
+#ifdef LITEV_A9HLE
+        // a call (ARM BL / BLX imm, or the second half of a Thumb BL pair whose first half is in this block) to a verified
+        // SDK leaf function: a non-branching fallback that runs it natively at the call (HLELeaf.h); the block depends on
+        // the callee's code and goes on after the call
+        if (cpu->Num == 0)
+        {
+            u32 tgt = 0;
+            bool call = false;
+            // (ARM: BL only; BLX imm calls Thumb code, and its cond field 0xF would make the fallback a no-op)
+            if (!thumb && instrs[i].Info.Kind == ARMInstrInfo::ak_BL)
+            {
+                const u32 w = instrs[i].Instr;
+                tgt = instrs[i].Addr + 8 + (u32)((s32)(w << 8) >> 6);
+                call = true;
+            }
+            else if (thumb && instrs[i].Info.Kind == ARMInstrInfo::tk_BL_LONG_2 && i > 0
+                && instrs[i - 1].Info.Kind == ARMInstrInfo::tk_BL_LONG_1 && instrs[i - 1].Addr + 2 == instrs[i].Addr)
+            {
+                const u32 w1 = instrs[i - 1].Instr, w2 = instrs[i].Instr;
+                tgt = instrs[i].Addr + 2 + (u32)((s32)((w1 & 0x7FF) << 21) >> 9) + ((w2 & 0x7FF) << 1);
+                tgt = (w2 & (1 << 12)) ? tgt | 1 : tgt & ~3u;
+                call = true;
+            }
+            u32 la, lb;
+            if (call && HLELeaf::At(NDS, tgt, la, lb))
+            {
+                addDeps(0, la, lb);
+                ARMInstrInfo::Info& in = instrs[i].Info;
+                in.Kind = thumb ? ARMInstrInfo::tk_HLECALL : ARMInstrInfo::ak_HLECALL;
+                in.SrcRegs = 0x7FFF; in.DstRegs = 0x500F; in.NotStrictlyNeeded = 0;
+                in.SpecialKind = 0; in.ReadFlags = 0; in.WriteFlags = 0xF; in.EndBlock = false;
+            }
+        }
+#endif
 #ifdef LITEV_A7HLE
         // HLE'd ARM7 function entry: compile it as an interpreter fallback that ends the block
         // (decoded as an undefined instruction); A_UNK runs the native function or the original
@@ -1631,7 +1676,7 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
                 assert(InterpretARM[instrs[i].Info.Kind] == ARMInterpreter::ARMInstrTable[icode]
                     || instrs[i].Info.Kind == ARMInstrInfo::ak_MOV_REG_LSL_IMM
                     || instrs[i].Info.Kind == ARMInstrInfo::ak_Nop
-                    || instrs[i].Info.Kind == ARMInstrInfo::ak_UNK);
+                    || instrs[i].Info.Kind == ARMInstrInfo::ak_UNK || instrs[i].Info.Kind == ARMInstrInfo::ak_HLECALL);
                 if (cpu->CheckCondition(instrs[i].Cond()))
                     InterpretARM[instrs[i].Info.Kind](cpu);
                 else
