@@ -1107,6 +1107,27 @@ void SoftRenderer::StopAsyncThread()
 
 // Barrier: wait for the in-flight render (frame N-1) to finish, then publish the
 // buffer it wrote as the present buffer. Safe to call when nothing is in flight.
+#ifdef LITEV_SOFT2D_DEPTH2
+// Depth-2, every VBlank (drawn or not): retire (wait for) the passes kicked 2 or more VBlanks
+// ago, oldest first. With every frame drawn that is the oldest of 2 in flight (the old count
+// rule); with skipped frames it keeps the same bound, so a frame is always presented 2 VBlanks
+// after its kick and no pass outlives the 3D frames that follow it.
+void SoftRenderer::P2RetireOld()
+{
+    while (P2InFlight > 0 && VBlankSeq - P2Ring[P2PresentIdx].kickVBlank >= 2)
+    {
+        const double _t0 = LSP_NOW();
+        LSP_WAIT("s2d-done", GPU.NDS.NumFrames, Platform::Semaphore_Wait(AsyncDone));
+        LSP_ADD(EmuBarrier, LSP_NOW() - _t0);
+        AsyncPresentBuf = P2Ring[P2PresentIdx].targetBuf;
+        P2PresentIdx = (P2PresentIdx + 1) % 3;
+        P2InFlight--;
+        AsyncEverProduced = true;
+        RetireSeq++;
+    }
+}
+#endif
+
 void SoftRenderer::FlushAsyncRender()
 {
 #ifdef LITEV_SOFT2D_DEPTH2
@@ -1121,6 +1142,7 @@ void SoftRenderer::FlushAsyncRender()
         P2PresentIdx = (P2PresentIdx + 1) % 3;
         P2InFlight--;
         AsyncEverProduced = true;
+        RetireSeq++;
     }
 #endif
     if (AsyncInFlight)
@@ -1131,6 +1153,7 @@ void SoftRenderer::FlushAsyncRender()
         AsyncInFlight = false;
         AsyncPresentBuf = AsyncTargetBuf;
         AsyncEverProduced = true;
+        RetireSeq++;
     }
 }
 
@@ -1139,12 +1162,25 @@ void SoftRenderer::FlushAsyncRender()
 // emu can start frame N+1. emu frame time -> max(emu, render) instead of emu+render.
 void SoftRenderer::VBlank()
 {
+    VBlankSeq++;
     if (!S2DDeferActive)
     {
 #ifdef LITEV_SOFT2D_DEPTH2
         S2DJEnd(-1);
+        // Nothing was snapshotted this frame (frameskip, skip-repeat): retire passes by the same
+        // age rule as a drawn VBlank (P2RetireOld). Skipped VBlanks used to retire nothing, so a
+        // run of them left passes unretired: the next 3D frames (capture frames render 3D every
+        // frame) could reuse the colour buffer a pass or its present still read (torn 3D/2D),
+        // and a finished frame waited for the next DRAWN VBlank to be presented (up to 8 frames
+        // at frameskip 3; at skip-repeat's 30 Hz 2 or 4 frames as the pattern changed). Now
+        // every frame is presented 2 VBlanks after its kick, drawn or not (the app presents a
+        // frame retired on a skipped frame: RetiredFrames).
+        if (PipeDepth == 2)
+            P2RetireOld();
+        else if (PipeDepth == 1)
+            FlushAsyncRender();
 #endif
-        return;   // nothing was snapshotted this frame (e.g. frameskip)
+        return;
     }
     LSP_EV(EV_VBL_IN);
 
@@ -1163,18 +1199,7 @@ void SoftRenderer::VBlank()
         Platform::Log(Platform::Info, "LITEV_PIPEDEPTH resolved=%d\n", PipeDepth);
     }
     if (PipeDepth == 2)
-    {
-        if (P2InFlight >= 2)
-        {
-            const double _t0 = LSP_NOW();
-            LSP_WAIT("s2d-done", GPU.NDS.NumFrames, Platform::Semaphore_Wait(AsyncDone));
-            LSP_ADD(EmuBarrier, LSP_NOW() - _t0);
-            AsyncPresentBuf = P2Ring[P2PresentIdx].targetBuf;
-            P2PresentIdx = (P2PresentIdx + 1) % 3;
-            P2InFlight--;
-            AsyncEverProduced = true;
-        }
-    }
+        P2RetireOld();   // every frame drawn: the oldest of 2 in flight, as before
     else
         FlushAsyncRender();
 #else
@@ -1294,7 +1319,7 @@ void SoftRenderer::VBlank()
         // tile renderer: the colour buffer of the newest produced 3D frame (VCount 215 of N-1)
         if (auto* tile = dynamic_cast<TileRenderer3D*>(Rend3D.get())) consume3DParity = tile->ProducedColIdx();
 #endif
-        P2Ring[P2PushIdx] = { freshBuf, SnapParity, consume3DParity };
+        P2Ring[P2PushIdx] = { freshBuf, SnapParity, consume3DParity, VBlankSeq };
         P2PushIdx = (P2PushIdx + 1) % 3;
         P2InFlight++;
         S2DDeferActive = false;
