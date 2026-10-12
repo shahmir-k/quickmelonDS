@@ -111,7 +111,18 @@ struct Variant
     Range shpCode[3];
     u64 shpSig;
     const MatT* matT;           // 8. in Thumb (W2)
+    // NTR SDK OS build of 2005-2006 (Castlevania: Portrait of Ruin, Mario Kart DS; only 1.): CP_Save/RestoreContext push
+    // nothing, OS_LoadContext returns straight into the thread (no TWL divider check, no push on its SVC stack), the
+    // scheduler's objects are separate globals around OSThreadInfo. 0: the PW/PB/W2 build.
+    u8 n6;
+    u32 irqQueue, irqCheck, irqTable;   // OS_IrqThreadQueue, the IRQ check flags, OS_IRQTable (0: PW/PB/W2's DTCM addresses)
+    u8 oLock, oCb, oCur, oDepth;        // offsets from osi: reschedule lock (u32), switch callback, &current pointer, IRQ
+                                        // depth / reschedule-disable (u16) (n6 only; PW: 4, 0, 8, 0x1E)
+    s32 wakeCyc;                        // 1.'s cycle estimate (0: kWakeCycles)
 };
+inline u32 IrqQueueOf(const Variant& v);
+inline u32 IrqCheckOf(const Variant& v);
+inline u32 IrqTableOf(const Variant& v);
 constexpr Variant kPW = {
     "PW", 0x01FF8160, 0x0208478C, 0x02084830, 0x02082864,
     {
@@ -239,7 +250,56 @@ constexpr Variant kW2 = {
     0x396f02a263a36a88ull,
     &kW2Mat,
 };
-constexpr const Variant* kVariants[] = {&kPW, &kPB, &kW2};
+// Castlevania: Portrait of Ruin (USA): NTR SDK 2005-2006 OS. Its main thread waits for VBlank in OS_WaitIrq with HBlank IRQs
+// on: 242 spurious wake round trips a frame (PW's pattern) = ~68% of its ARM9 guest instructions in the menus. Only the
+// wake hook (1.): the HBlank callbacks are the game's own code.
+constexpr Variant kCV = {
+    "CV-PoR", 0x01FFE150, 0, 0, 0,
+    {
+        {0x01FFE0E0, 0x01FFE294},   // OS_IrqHandler + OS_IrqHandler_ThreadSwitch (ITCM) with the literal pool
+        {0x020A38B4, 0x020A3994},   // CP_RestoreContext, CP_SaveContext (no push) with literals
+        {0x0209A348, 0x0209A3C8},   // OS_WaitIrq
+        {0, 0},                     // (OS_Set/GetIrqFunction: not hooked)
+        {0x0209C14C, 0x0209C1C4},   // thread queue insert
+        {0x0209B91C, 0x0209BA08},   // OS_RescheduleThread with literals
+        {0x0209BAE8, 0x0209BB3C},   // OS_SleepThread
+        {0x0209BA08, 0x0209BA34},   // select runnable thread
+        {0x0209C248, 0x0209C2D8},   // OS_SaveContext, OS_LoadContext
+        {0, 0},                     // (no TWL divider check)
+        {0x0209D85C, 0x0209D888},   // OS_DisableInterrupts, OS_RestoreInterrupts
+        {0x0209D8B4, 0x0209D8C0},   // OS_GetProcMode
+        {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0},   // (no native HBlank IRQ)
+    },
+    {0, 0},
+    0xbbaec1652d47b819ull, 0, 0,    // sig (wake ranges), no HBlank path / GX send
+    0, 0x021C9E6C, 0x021C9E58, 0, 0,
+    0x0209C290, 0x0209B9A0, 0x0209BB28, 0x0209A3A8, 0x0209B9F0,
+    0, 0, 0, 0, 0, 0, 0,
+    0, {}, 0, {}, 0, 0, {}, 0, nullptr,
+    1, 0x027C15E0, 0x027C3FF8, 0x027C1580, 0x00, 0x08, 0x0C, 0x16, 1467,     // (check-mode guest average, 28.9k round trips)
+};
+// Mario Kart DS (USA): the same OS build (located from kCV with tools/hle/findfn.py: every range's masked code matches; its
+// IRQ queue is at the DTCM base). ~11 spurious wakes a frame in the race.
+constexpr Variant kMK = {
+    "MKDS", 0x01FF8070, 0, 0, 0,
+    {
+        {0x01FF8000, 0x01FF81B4}, {0x02146BB8, 0x02146C98}, {0x0200C894, 0x0200C914}, {0, 0}, {0x0200E5F8, 0x0200E670},
+        {0x0200DE50, 0x0200DF3C}, {0x0200E01C, 0x0200E070}, {0x0200DF3C, 0x0200DF68}, {0x0200E6EC, 0x0200E77C}, {0, 0},
+        {0x0200FCA0, 0x0200FCCC}, {0x0200FCF8, 0x0200FD04},
+        {0, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0},
+    },
+    {0, 0},
+    0x1d1be65d3b009998ull, 0, 0,
+    0, 0x0216FF3C, 0x0216FF28, 0, 0,
+    0x0200E734, 0x0200DED4, 0x0200E05C, 0x0200C8F4, 0x0200DF24,
+    0, 0, 0, 0, 0, 0, 0,
+    0, {}, 0, {}, 0, 0, {}, 0, nullptr,
+    1, 0x027E0000, 0x027E3FF8, 0x027E0008, 0x00, 0x08, 0x0C, 0x16, 5008,     // (check-mode guest average, 1.7k round trips)
+};
+constexpr const Variant* kVariants[] = {&kPW, &kPB, &kW2, &kCV, &kMK};
+inline u32 IrqQueueOf(const Variant& v) { return v.irqQueue ? v.irqQueue : kIrqQueue; }
+inline u32 IrqCheckOf(const Variant& v) { return v.irqCheck ? v.irqCheck : kIrqCheck; }
+inline u32 IrqTableOf(const Variant& v) { return v.irqTable ? v.irqTable : kIrqTable; }
 constexpr int kNumVariants = sizeof(kVariants) / sizeof(kVariants[0]);
 // hook kind of (addr, instr) in variant v: 0 wake, 1 set, 2 get, 5 GX send, -1 none (thumb: a Thumb entry, instr the halfword)
 inline int Kind(const Variant& v, u32 addr, u32 instr, bool thumb = false)
@@ -615,10 +675,10 @@ __attribute__((noinline)) bool Refix(melonDS::ARMv5* c, State& s, Mem& m)
 {
     s.fkey[0] = c->DTCMBase; s.fkey[1] = c->DTCMMask; s.fkey[2] = c->ITCMSize;
     const Variant& v = *s.v;
-    Obj q = m.O(kIrqQueue, 8), chk = m.O(kIrqCheck, 4), osi = m.O(v.osi, v.info + 0x10 - v.osi);
-    Obj hp = m.O(c->DTCMBase + 0x3FFC, 4), tb = m.O(kIrqTable + 4, 4), op = m.O(v.hbObjPtr + v.hbObjOff, 4);
+    Obj q = m.O(IrqQueueOf(v), 8), chk = m.O(IrqCheckOf(v), 4), osi = m.O(v.osi, v.info + 0x10 - v.osi);
+    Obj hp = m.O(c->DTCMBase + 0x3FFC, 4), tb = m.O(IrqTableOf(v) + 4, 4), op = m.O(v.hbObjPtr + v.hbObjOff, 4);
     s.fq = q.p; s.fchk = chk.p; s.fosi = osi.p; s.fhp = hp.p; s.ftb = tb.p; s.fop = op.p;
-    Obj t1 = m.O(kIrqTable, 128), t2 = m.O(v.irqTable2, 12 * 12);
+    Obj t1 = m.O(IrqTableOf(v), 128), t2 = m.O(v.irqTable2, 12 * 12);
     s.ftab = t1.p; s.ftabD = t1.dtcm; s.ftab2 = t2.p; s.ftab2D = t2.dtcm;
     return q && chk && osi;
 }
@@ -633,6 +693,7 @@ struct Expect
 {
     u32 R[16]; u32 CPSR; u32 IRQ[3]; u32 SVC[3]; bool banks = false;
     u32 retPc = 0; u32 cur = 0;     // cur: wake check also requires this current thread
+    s32 cyc = 0;                    // 1.: the cycle estimate
 };
 #ifdef LITEV_HLE_DIAG
 // ---- check mode -----------------------------------------------------------------------------
@@ -777,19 +838,22 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     if (!t || in.ip != t || R32(s.fq + 4) != t) return false;
     const Variant& v = *s.v;
     const u32 info = v.info - v.osi;
-    if (R16(osi + info) || R32(osi + info + 0xC) || R32(osi) || R32(osi + 4) || R16(osi + 0x1E) || R32(osi + 8) != v.info + 4) return false;
+    if (!v.n6 ? (R16(osi + info) || R32(osi + info + 0xC) || R32(osi) || R32(osi + 4) || R16(osi + 0x1E) || R32(osi + 8) != v.info + 4)
+              : (R16(osi + info) || R32(osi + info + 0xC) || R32(osi + v.oCb) || R32(osi + v.oLock) || R16(osi + v.oDepth)
+                 || R32(osi + v.oCur) != v.info + 4)) return false;
     const u32 cur = R32(osi + info + 4);
     if (!cur || cur == t) return false;
     Obj tp = m.O(t, 0x84), cp = m.O(cur, 0x64);
     if (!tp || !cp) return false;
     __builtin_prefetch(tp.p); __builtin_prefetch(tp.p + 64); __builtin_prefetch(cp.p); __builtin_prefetch(cp.p + 64);
     // t asleep in OS_WaitIrq on this queue, flags not satisfied
-    if (tp.r(0x80) || tp.r(0x7C) || tp.r(0x64) != 0 || tp.r(0x78) != kIrqQueue || tp.r(0x40) != v.ctxPc || tp.r(0x3C) != v.ctxLr)
+    const u32 queue = IrqQueueOf(v), check = IrqCheckOf(v);
+    if (tp.r(0x80) || tp.r(0x7C) || tp.r(0x64) != 0 || tp.r(0x78) != queue || tp.r(0x40) != v.ctxPc || tp.r(0x3C) != v.ctxLr)
         return false;
     const u32 tsp = tp.r(0x38);
     Obj ts = m.O(tsp - 12, 44);
     if (!ts) return false;
-    if (ts.r(24) != v.retSleep || ts.r(40) != v.retWait || ts.r(32) != kIrqQueue || ts.r(36) != kIrqCheck) return false;
+    if (ts.r(24) != v.retSleep || ts.r(40) != v.retWait || ts.r(32) != queue || ts.r(36) != check) return false;
     if (ts.r(28) & R32(s.fchk)) return false;                     // real wake-up
     tcpsr = tp.r(0);
     tpc = v.ctxPc;
@@ -825,7 +889,8 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     }
     u32 f[6];
     for (int i = 0; i < 6; i++) f[i] = in.queued ? in.f[i] : fr.r(16 + i * 4);
-    const u32 tf[6] = {tp.r(4), tp.r(8), tp.r(0xC), tp.r(0x10), tp.r(0x34), v.ctxPc};
+    // (2005-2006 build: its ldmib r1!, {r0-r14}^ writes the base back, so the BIOS returns into t with r1 = t + 0x3C)
+    const u32 tf[6] = {tp.r(4), v.n6 ? t + 0x3C : tp.r(8), tp.r(0xC), tp.r(0x10), tp.r(0x34), v.ctxPc};
 
     // interrupted thread's context, as the IRQ path saves it
     m.W(cp, 0x00, spsr);
@@ -841,8 +906,8 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     u32 cpx[7];
     nds.A9HLECpContext(cpx);
     for (int i = 0; i < 7; i++) m.W(cp, 0x48 + i * 4, cpx[i]);
-    // IRQ stack below the frame: CP_SaveContext's push {r4}, push {r0 = C, r1 = t}
-    m.W(fr, 0, c->R[4]);
+    // IRQ stack below the frame: CP_SaveContext's push {r4} (not in the 2005-2006 build), push {r0 = C, r1 = t}
+    if (!v.n6) m.W(fr, 0, c->R[4]);
     m.W(fr, 4, cur);
     m.W(fr, 8, t);
     // the IRQ frame rewritten with t's registers (the BIOS returned into t with them)
@@ -851,11 +916,12 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     // OS_LoadContext's push {r0 = cur, lr} and CP_RestoreContext's push {r4 = OS_RescheduleThread's
     // r4: OSThreadInfo, TWL build: the current thread t}
     m.W(tp, 0x18, cur);
-    m.W(ts, 0, v.twl ? t : v.info);
+    if (!v.n6) m.W(ts, 0, v.twl ? t : v.info);
     m.W(ts, 4, cur);
     m.W(ts, 8, v.retLoad);
-    // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack
-    for (int i = 0; i < 6; i++) m.W(sv, i * 4, f[i]);
+    // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack (PW/PB/W2: its TWL divider check)
+    if (!v.n6)
+        for (int i = 0; i < 6; i++) m.W(sv, i * 4, f[i]);
     m.Flush();
 
     // registers after the guest's return into cur
@@ -870,6 +936,7 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     e.banks = true;
     e.retPc = (f[5] - 4) & ((spsr & 0x20) ? ~1u : ~3u);
     e.cur = cur;
+    e.cyc = v.wakeCyc ? v.wakeCyc : kWakeCycles;
     return true;
 }
 
@@ -881,7 +948,7 @@ void WakeCommit(melonDS::ARMv5* c, const Expect& e)
     c->R[12] = e.R[12];
     c->R[13] = e.IRQ[0];
     c->R[14] = e.SVC[1];
-    c->Cycles += kWakeCycles;
+    c->Cycles += e.cyc;
     c->JumpTo(e.SVC[1] - 4, true);      // subs pc, lr, #4: CPSR = SPSR_irq, IRQ bank out
     c->R_IRQ[1] = e.IRQ[1];
     c->R_IRQ[2] = e.IRQ[2];
@@ -1161,7 +1228,7 @@ __attribute__((noinline)) bool DmaIrqNative(melonDS::ARMv5* c, State& s, Mem& m,
     m.W(tab, 21 * 4, P.r(0x1C));
     m.W(P, 0, 0);
     if (ucb) m.W(A, 0, 0);
-    Obj chk{(u8*)s.fchk, kIrqCheck, true};
+    Obj chk{(u8*)s.fchk, IrqCheckOf(*s.v), true};
     m.W(chk, 0, R32(s.fchk) | 1u << bit);
     const u32 gxstat = nds.ARM9Read32(0x04000600), gxw = (gxstat & ~0xC0000000u) | (P.r(0x18) << 30);
     for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
