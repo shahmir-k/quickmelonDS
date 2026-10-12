@@ -690,6 +690,8 @@ void GPU::MapVRAM_CD(u32 bank, u8 cnt) noexcept
     }
 #endif
 
+    if ((cnt & 0x87) == 0x82 && (Rend->AsyncCapBanks & (1u << bank)))
+        Rend->WaitCaptures();   // ARM7 VRAM reads bypass SyncVRAMCaptureBlock
     VRAMSTAT &= ~(1 << (bank-2));
 
     u8 oldofs = (oldcnt >> 3) & 0x7;
@@ -2058,6 +2060,8 @@ void GPU::CheckCaptureEnd()
 
 void GPU::SyncVRAMCaptureBlock(u32 block, bool write)
 {
+    if (Rend->AsyncCapBanks & (1u << (block >> 2))) [[unlikely]]
+        Rend->WaitCaptures();   // an async render still captures into this bank
 #ifdef LITEV_NETPLAY_CAPTURE
     if (!write && (CaptureTaint & (1u << block)) && !CaptureSeen)
     {
