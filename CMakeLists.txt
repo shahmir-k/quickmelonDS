@@ -1495,6 +1495,13 @@ option(LITEV_WIFI_EVT "Event-driven Wi-Fi: no 8 us tick events while idle (categ
 if (LITEV_WIFI_EVT)
     add_compile_definitions(LITEV_WIFI_EVT=1)
 endif()
+option(LITEV_WIFI_EVT_DIRECT "Event-driven Wi-Fi: the idle-tick walks (next event search, counter catch-up) in closed form while no transfer runs; exact (debug.litev.wifidirect=0: off)" OFF)
+if (LITEV_WIFI_EVT_DIRECT)
+    if (NOT LITEV_WIFI_EVT)
+        message(FATAL_ERROR "LITEV_WIFI_EVT_DIRECT requires LITEV_WIFI_EVT.")
+    endif()
+    add_compile_definitions(LITEV_WIFI_EVT_DIRECT=1)
+endif()
 # LITEV_LCD_EVT (exact): no Event_LCD; the LCD half-line steps run from RunSystem and still end every slice, except
 # while both CPUs are halted: then the slice runs to the next step something observes (VBlank, 3D start, frame end,
 # enabled HBlank/VCount IRQ, HBlank/display-start DMA9, display FIFO, capture, VCOUNT write). GPU::LcdEvt (default
