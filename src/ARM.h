@@ -542,6 +542,8 @@ public:
 #ifdef LITEV_A7HLE
     // A7Native's per-console state (owned here, defined in ARM7Native.cpp)
     std::unique_ptr<void, void (*)(void*)> A7NState{nullptr, nullptr};
+    // the cycles JumpTo(0x18) (the IRQ vector entry) adds: A7Native's IRQ run taken before the entry charges them
+    s32 VectorFetchCycles() const;
 #endif
 
     void FillPipeline() override;
