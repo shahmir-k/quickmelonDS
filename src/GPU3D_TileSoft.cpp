@@ -1287,6 +1287,30 @@ void TileRenderer3D::SpanVec(BandScratch& bs, const PolyShade& ps, s32 rowbase, 
             const uint32x4_t nv = numv, dn = denv;
             numv = vaddq_u32(numv, dnum4); denv = vaddq_u32(denv, dden4);
             auto divide = [&]() __attribute__((always_inline)) {
+#ifdef LITEV_TILE_SPANDIV
+                // float estimate (reciprocal + 2 Newton steps), then one -1/+1 correction against the
+                // exact 64-bit remainder; a lane whose remainder still isn't in [0, den) sends the group
+                // to the integer divide below, so the result is always num / den exactly
+                const uint32x4_t dz = vceqzq_u32(dn), dd = vorrq_u32(dn, vandq_u32(dz, vdupq_n_u32(1)));
+                const float32x4_t fd = vcvtq_f32_u32(dd);
+                float32x4_t rc = vrecpeq_f32(fd);
+                rc = vmulq_f32(vrecpsq_f32(fd, rc), rc);
+                rc = vmulq_f32(vrecpsq_f32(fd, rc), rc);
+                uint32x4_t qe = vcvtq_u32_f32(vmulq_f32(vcvtq_f32_u32(nv), rc));
+                const int64x2_t dlo = vreinterpretq_s64_u64(vmovl_u32(vget_low_u32(dd))), dhi = vreinterpretq_s64_u64(vmovl_high_u32(dd));
+                int64x2_t rlo = vsubq_s64(vreinterpretq_s64_u64(vmovl_u32(vget_low_u32(nv))), vreinterpretq_s64_u64(vmull_u32(vget_low_u32(qe), vget_low_u32(dd))));
+                int64x2_t rhi = vsubq_s64(vreinterpretq_s64_u64(vmovl_high_u32(nv)), vreinterpretq_s64_u64(vmull_high_u32(qe, dd)));
+                const uint64x2_t nlo = vcltzq_s64(rlo), nhi = vcltzq_s64(rhi);       // q one too many
+                rlo = vaddq_s64(rlo, vandq_s64(vreinterpretq_s64_u64(nlo), dlo)); rhi = vaddq_s64(rhi, vandq_s64(vreinterpretq_s64_u64(nhi), dhi));
+                const uint64x2_t blo = vcgeq_s64(rlo, dlo), bhi = vcgeq_s64(rhi, dhi);   // q one too few
+                rlo = vsubq_s64(rlo, vandq_s64(vreinterpretq_s64_u64(blo), dlo)); rhi = vsubq_s64(rhi, vandq_s64(vreinterpretq_s64_u64(bhi), dhi));
+                // -1 on lanes that were over (mask all-ones = -1), +1 on lanes that were under
+                qe = vaddq_u32(qe, vcombine_u32(vmovn_u64(nlo), vmovn_u64(nhi)));
+                qe = vsubq_u32(qe, vcombine_u32(vmovn_u64(blo), vmovn_u64(bhi)));
+                const uint64x2_t badlo = vorrq_u64(vcltzq_s64(rlo), vcgeq_s64(rlo, dlo)), badhi = vorrq_u64(vcltzq_s64(rhi), vcgeq_s64(rhi, dhi));
+                if (vmaxvq_u32(vreinterpretq_u32_u64(vorrq_u64(badlo, badhi))) == 0)
+                    return vbicq_u32(qe, dz);
+#endif
                 u32 na[4], da[4], q[4];
                 vst1q_u32(na, nv); vst1q_u32(da, dn);
                 for (int k = 0; k < 4; k++) q[k] = da[k] ? na[k] / da[k] : 0;
