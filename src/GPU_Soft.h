@@ -104,6 +104,7 @@ protected:
         u8  CaptureEnable;
         u8  Valid;
         u16 XPos3D;          // BG0HOFS as seen by the 3D layer (hybrid merge)
+        u8  Abort3D;         // GPU3D.AbortFrame on this line (tile renderer: blank 3D line)
         // display capture as the console had it on this line: the async render runs frames
         // later, when the game may have remapped the destination bank for display (Pokemon
         // White's battle intro captures its room into VRAM D, then shows D as a BG: the live
