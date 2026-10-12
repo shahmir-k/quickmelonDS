@@ -138,16 +138,12 @@ public:
 #ifdef LITEV_REMOTE_GX_SINKMEMO
     // LITEV_REMOTE_GX_SINKMEMO: SinkWords' effect per (words, the engine state it reads), memoized
     u32 SinkMemo(const u32* words, u32 n, bool& ran) noexcept;
-    struct SinkMemoEntry
+    struct alignas(64) SinkMemoEntry   // one cache line
     {
-        // key (state read): decoder + engine state; n == 0: empty slot
-        u32 n, numCmds, cur, pc, tp, epc, mm, pattr, cpattr, pmode, vnip, ncpOdd;
-        s32 projSP, texSP, posSP;
-        // effect
-        u32 k, oNumCmds, oCur, oPc, oTp, oEpc, oMm, oPattr, oCpattr, oPmode, oVnip, vnum, ncp, statOr;
-        s32 oProjSP, oTexSP, oPosSP, cyc;
-        bool ran, began;
-        u32 words[64];   // last: a lookup reads n of them, next to the fields above
+        u64 h0, h1;   // XXH3-128 of the words and the state read (the key)
+        u32 cur, pattr, cpattr, vnum, ncp;
+        s32 cyc;
+        u8 k, numCmds, pc, tp, epc, mm, pmode, vnip, projSP, texSP, posSP, flags;   // flags: 1 ran, 2 began, 4 GXSTAT bit 15, 8 valid
     };
     std::unique_ptr<SinkMemoEntry[]> SinkMemoTab;
     bool SinkBegan = false;   // a BEGIN_VTXS ran (SinkCmd), for the memo

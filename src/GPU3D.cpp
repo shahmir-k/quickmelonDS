@@ -4528,11 +4528,13 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
 #ifdef LITEV_REMOTE_GX_SINKMEMO
 // LITEV_REMOTE_GX_SINKMEMO: a remote's display lists repeat frame after frame (MKDS 8P race: 99.5%
 // of the DMA chunks a sink copy decodes were decoded before with the same engine state), so keep
-// SinkWords' effect per chunk. The key is everything SinkWords reads: the words (compared in full,
-// not by hash) and the state below; the stored effect is everything it writes. VertexNum and
-// NumConsecutivePolygons are only counted up (their parity is all SinkWords reads) unless a BEGIN
-// resets them: stored as a delta, or as the final value after a BEGIN. Exact: the same state as
-// running SinkWords. Off: env LITEV_GXSINKMEMO=0, debug.litev.gxsinkmemo=0.
+// SinkWords' effect per chunk. The key is everything SinkWords reads: the words and the state below,
+// as their XXH3-128 hash (one 64-byte entry per chunk: a first version that kept the words for a full
+// compare, 1.5 MB per console, was slower on the RG DS than decoding); the stored effect is everything
+// it writes. VertexNum and NumConsecutivePolygons are only counted up (their parity is all SinkWords
+// reads) unless a BEGIN resets them: stored as a delta, or as the final value after a BEGIN. Exact
+// (the same state as running SinkWords) barring a 128-bit hash collision.
+// Off: env LITEV_GXSINKMEMO=0, debug.litev.gxsinkmemo=0.
 static const bool GXSinkMemoOn = [] {
     if (const char* e = getenv("LITEV_GXSINKMEMO")) return atoi(e) != 0;
 #if defined(__ANDROID__)
@@ -4542,28 +4544,29 @@ static const bool GXSinkMemoOn = [] {
 #endif
 }();
 
-static constexpr u32 kSinkMemoSize = 4096;   // direct-mapped, ~1.5 MB (MKDS race: ~270 chunks per frame, misses 23% at 1024 entries, 6.5% at 4096)
+static constexpr u32 kSinkMemoSize = 4096;   // direct-mapped, 64 B entries: 256 KB (MKDS race: ~270 chunks per frame, misses 23% at 1024 entries, 6.5% at 4096)
 
 u32 GPU3D::SinkMemo(const u32* words, u32 n, bool& ran) noexcept
 {
     if (!SinkMemoTab) SinkMemoTab.reset(new SinkMemoEntry[kSinkMemoSize]());
+    u32 key[64 + 15];
+    memcpy(key, words, n * 4);
     const u32 st[15] = {n, NumCommands, CurCommand, ParamCount, TotalParams, ExecParamCount, MatrixMode, PolygonAttr,
                         CurPolygonAttr, PolygonMode, VertexNumInPoly, NumConsecutivePolygons & 1,
                         (u32)ProjMatrixStackPointer, (u32)TexMatrixStackPointer, (u32)PosMatrixStackPointer};
-    SinkMemoEntry& e = SinkMemoTab[(XXH3_64bits_withSeed(words, n * 4, XXH3_64bits(st, sizeof st))) & (kSinkMemoSize - 1)];
-    if (e.n == n && e.numCmds == st[1] && e.cur == st[2] && e.pc == st[3] && e.tp == st[4] && e.epc == st[5] && e.mm == st[6]
-        && e.pattr == st[7] && e.cpattr == st[8] && e.pmode == st[9] && e.vnip == st[10] && e.ncpOdd == st[11]
-        && e.projSP == ProjMatrixStackPointer && e.texSP == TexMatrixStackPointer && e.posSP == PosMatrixStackPointer
-        && !memcmp(e.words, words, n * 4))
+    memcpy(key + n, st, sizeof st);
+    const XXH128_hash_t h = XXH3_128bits(key, n * 4 + sizeof st);
+    SinkMemoEntry& e = SinkMemoTab[h.low64 & (kSinkMemoSize - 1)];
+    if ((e.flags & 8) && e.h0 == h.low64 && e.h1 == h.high64)
     {
-        NumCommands = e.oNumCmds; CurCommand = e.oCur; ParamCount = e.oPc; TotalParams = e.oTp; ExecParamCount = e.oEpc;
-        MatrixMode = e.oMm; PolygonAttr = e.oPattr; CurPolygonAttr = e.oCpattr; PolygonMode = e.oPmode; VertexNumInPoly = e.oVnip;
-        ProjMatrixStackPointer = e.oProjSP; TexMatrixStackPointer = e.oTexSP; PosMatrixStackPointer = e.oPosSP;
-        GXStat |= e.statOr;
+        NumCommands = e.numCmds; CurCommand = e.cur; ParamCount = e.pc; TotalParams = e.tp; ExecParamCount = e.epc;
+        MatrixMode = e.mm; PolygonAttr = e.pattr; CurPolygonAttr = e.cpattr; PolygonMode = e.pmode; VertexNumInPoly = e.vnip;
+        ProjMatrixStackPointer = e.projSP; TexMatrixStackPointer = e.texSP; PosMatrixStackPointer = e.posSP;
+        if (e.flags & 4) GXStat |= (1<<15);
         CycleCount += e.cyc;
-        if (e.began) { VertexNum = e.vnum; NumConsecutivePolygons = e.ncp; LastStripPolygon = NULL; }
+        if (e.flags & 2) { VertexNum = e.vnum; NumConsecutivePolygons = e.ncp; LastStripPolygon = NULL; }
         else { VertexNum += e.vnum; NumConsecutivePolygons += e.ncp; }
-        if (e.ran) ran = true;
+        if (e.flags & 1) ran = true;
         return e.k;
     }
     const u32 vnum0 = VertexNum, ncp0 = NumConsecutivePolygons, bit15 = GXStat & (1<<15);
@@ -4572,20 +4575,16 @@ u32 GPU3D::SinkMemo(const u32* words, u32 n, bool& ran) noexcept
     SinkBegan = false;
     GXStat &= ~(1<<15);   // the only GXStat bit SinkWords touches (ORs in): record what it sets
     const u32 k = SinkWords(words, n, r);
-    e.statOr = GXStat & (1<<15);
+    const bool set15 = GXStat & (1<<15);
     GXStat |= bit15;
-    e.n = n; e.numCmds = st[1]; e.cur = st[2]; e.pc = st[3]; e.tp = st[4]; e.epc = st[5]; e.mm = st[6];
-    e.pattr = st[7]; e.cpattr = st[8]; e.pmode = st[9]; e.vnip = st[10]; e.ncpOdd = st[11];
-    e.projSP = (s32)st[12]; e.texSP = (s32)st[13]; e.posSP = (s32)st[14];
-    memcpy(e.words, words, n * 4);
-    e.k = k; e.oNumCmds = NumCommands; e.oCur = CurCommand; e.oPc = ParamCount; e.oTp = TotalParams; e.oEpc = ExecParamCount;
-    e.oMm = MatrixMode; e.oPattr = PolygonAttr; e.oCpattr = CurPolygonAttr; e.oPmode = PolygonMode; e.oVnip = VertexNumInPoly;
-    e.oProjSP = ProjMatrixStackPointer; e.oTexSP = TexMatrixStackPointer; e.oPosSP = PosMatrixStackPointer;
+    e.h0 = h.low64; e.h1 = h.high64;
+    e.k = k; e.numCmds = NumCommands; e.cur = CurCommand; e.pc = ParamCount; e.tp = TotalParams; e.epc = ExecParamCount;
+    e.mm = MatrixMode; e.pattr = PolygonAttr; e.cpattr = CurPolygonAttr; e.pmode = PolygonMode; e.vnip = VertexNumInPoly;
+    e.projSP = ProjMatrixStackPointer; e.texSP = TexMatrixStackPointer; e.posSP = PosMatrixStackPointer;
     e.cyc = CycleCount - cyc0;
-    e.began = SinkBegan;
     e.vnum = SinkBegan ? VertexNum : VertexNum - vnum0;
     e.ncp = SinkBegan ? NumConsecutivePolygons : NumConsecutivePolygons - ncp0;
-    e.ran = r;
+    e.flags = 8 | (r ? 1 : 0) | (SinkBegan ? 2 : 0) | (set15 ? 4 : 0);
     if (r) ran = true;
     return k;
 }
