@@ -2,7 +2,7 @@
 // kinds: 0 DisInt 1 ResInt 2 TwlIsTwl 3 TwlXIF 4 GetTick 5 DisIME 6 EnIrqMask 7 DisIrqMask 8 TimerCb 9 Udiv32 10 Udiv64 11 SetTimer 12 InsertAlarm 13 ThreadSwitch 14 IrqHandler 15 IrqCallback 16 ArrangeTimer 17 AlarmWrap
 enum A7NKind : u8 { kDisInt, kResInt, kTwlIsTwl, kTwlXIF, kGetTick, kDisIME, kEnIrqMask, kDisIrqMask, kTimerCb, kUdiv32, kUdiv64, kSetTimer, kInsertAlarm, kThreadSwitch, kIrqHandler, kIrqCallback, kArrangeTimer, kAlarmWrap, kKinds };
 enum A7NField : u8 { f_flags, f_handler, f_soft, f_tc, f_cbf, f_cbe, f_cba, f_ah, f_q, f_irqq, f_tinfo, f_table, f_table2, f_save, f_ts, f_icbf, f_ibits, f_icba, f_icbe, kFields };
-enum A7NFam : u8 { famTWL, famNTR, famNTR05 };
+enum A7NFam : u8 { famTWL, famNTR, famV4, famNTR05 };
 constexpr u8 kPtrKind[kFields] = {kKinds, kKinds, kKinds, kKinds, kKinds, kKinds, kKinds, kAlarmWrap, kKinds, kKinds, kKinds, kKinds, kKinds, kKinds, kThreadSwitch, kKinds, kKinds, kKinds, kKinds};   // code-pointer fields: their function kind
 constexpr s16 kR0[][2] = {{0, 5}};
 constexpr A7NMask kM0[] = {{0, 2, 0}};
@@ -62,8 +62,22 @@ constexpr s16 kR27[][2] = {{0, 37}};
 constexpr A7NMask kM27[] = {{28, 0, 7}, {32, 1, 16}, {33, 1, 15}, {34, 1, 17}, {36, 1, 18}};
 constexpr s16 kR28[][2] = {{0, 64}};
 constexpr A7NMask kM28[] = {{6, 0, 7}, {11, 0, 4}, {22, 0, 11}, {52, 0, 12}, {57, 0, 11}, {63, 1, 8}};
-constexpr s16 kR29[][2] = {{0, 4}};
-constexpr A7NMask kM29[] = {{1, 0, 16}};
+constexpr s16 kR29[][2] = {{0, 41}};
+constexpr A7NMask kM29[] = {{2, 0, 0}, {27, 0, 1}, {39, 1, 3}};
+constexpr s16 kR30[][2] = {{0, 19}};
+constexpr A7NMask kM30[] = {{10, 0, 6}, {16, 1, 4}, {17, 1, 6}, {18, 1, 5}};
+constexpr s16 kR31[][2] = {{0, 35}};
+constexpr A7NMask kM31[] = {{2, 0, 4}, {12, 0, 8}, {28, 0, 6}, {32, 3, 7}};
+constexpr s16 kR32[][2] = {{0, 75}};
+constexpr A7NMask kM32[] = {{9, 0, 4}, {21, 0, 10}, {54, 0, 11}, {71, 0, 11}, {74, 1, 8}};
+constexpr s16 kR33[][2] = {{0, 81}};
+constexpr A7NMask kM33[] = {{79, 1, 9}, {80, 1, 10}};
+constexpr s16 kR34[][2] = {{0, 27}};
+constexpr A7NMask kM34[] = {{25, 1, 11}, {26, 3, 14}};
+constexpr s16 kR35[][2] = {{0, 61}};
+constexpr A7NMask kM35[] = {{5, 0, 7}, {10, 0, 4}, {21, 0, 11}, {50, 0, 12}, {55, 0, 11}, {60, 1, 8}};
+constexpr s16 kR36[][2] = {{0, 4}};
+constexpr A7NMask kM36[] = {{1, 0, 16}};
 constexpr A7NSig kSigs[] = {
     {"TWL DisInt", kDisInt, famTWL, 0xE10F0000, 0x08bf6b6fa8b89a42ull, 1, kR0, 0, kM0, 0, 0x00000000},   // ref 037fef5c, 5 words
     {"TWL ResInt", kResInt, famTWL, 0xE10F1000, 0xfd3c9de99740f980ull, 1, kR1, 0, kM1, 0, 0x00000000},   // ref 037fef70, 6 words
@@ -94,5 +108,12 @@ constexpr A7NSig kSigs[] = {
     {"NTR IrqHandler", kIrqHandler, famNTR, 0xE92D4000, 0xddab5a67394d6e40ull, 1, kR26, 2, kM26, 0, 0x00000000},   // ref 037fb8f4, 21 words
     {"NTR IrqCallback", kIrqCallback, famNTR, 0xE92D4030, 0x2e3d2ceb41e5c108ull, 1, kR27, 5, kM27, 76, 0xE59F1038},   // ref 037fbb44, 37 words
     {"NTR ArrangeTimer", kArrangeTimer, famNTR, 0xE92D4030, 0x3a61d2624dcb89b6ull, 1, kR28, 6, kM28, 172, 0xE594201C},   // ref 037fd898, 64 words
-    {"NTR05 AlarmWrap", kAlarmWrap, famNTR05, 0xE92D4000, 0x1c0dd7852bd04984ull, 1, kR29, 1, kM29, 8, 0xE8BD4000},   // ref 037fa454, 4 words
+    {"V4 GetTick", kGetTick, famV4, 0xE92D4000, 0x0ae236f1de9284caull, 1, kR29, 3, kM29, 0, 0x00000000},   // ref 037fd21c, 41 words
+    {"V4 TimerCb", kTimerCb, famV4, 0xE92D4010, 0xde9d0fdf0237de25ull, 1, kR30, 4, kM30, 0, 0x00000000},   // ref 037fb858, 19 words
+    {"V4 SetTimer", kSetTimer, famV4, 0xE92D4038, 0x4a7be30ee5489a2bull, 1, kR31, 4, kM31, 0, 0x00000000},   // ref 037fd2c0, 35 words
+    {"V4 InsertAlarm", kInsertAlarm, famV4, 0xE92D41F0, 0x856c80491aada6e6ull, 1, kR32, 5, kM32, 0, 0x00000000},   // ref 037fd3b0, 75 words
+    {"V4 ThreadSwitch", kThreadSwitch, famV4, 0xE59FC134, 0xd7c73ab523fd64feull, 1, kR33, 2, kM33, 228, 0xE8BD1003},   // ref 037fb4f4, 81 words
+    {"V4 IrqHandler", kIrqHandler, famV4, 0xE92D4000, 0x490e9cbee84ecf0eull, 1, kR34, 2, kM34, 0, 0x00000000},   // ref 037fb488, 27 words
+    {"V4 ArrangeTimer", kArrangeTimer, famV4, 0xE92D4038, 0x7dbd7af128d38bf3ull, 1, kR35, 6, kM35, 164, 0xE5940020},   // ref 037fd658, 61 words
+    {"NTR05 AlarmWrap", kAlarmWrap, famNTR05, 0xE92D4000, 0x1c0dd7852bd04984ull, 1, kR36, 1, kM36, 8, 0xE8BD4000},   // ref 037fa454, 4 words
 };
