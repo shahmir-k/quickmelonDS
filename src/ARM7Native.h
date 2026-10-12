@@ -13,7 +13,7 @@
 // the flags are not written (dead after a call), the stack bytes below sp are not written.
 // Runtime: debug.litev.a7hle (unset or 1: all on) bit 32 the OS call natives, bit 64 the IRQ path (Irq / IsHook / Hook), 128 the
 // SDK alarm handlers in it, 256 whole runs only (the TM1 alarm IRQ to the BIOS return or the guest), 512 that run as one function
-// (see Mask()).
+// (see Mask()), 1024 its lean plan-only form, 2048 that run from ARM::TriggerIRQ before the vector entry (IrqPre).
 // Diagnostics (LITEV_HLE_DIAG): LITEV_A7N_CHECK=1 in --mode interp: native result computed, the guest runs, compared at its
 // return (memory, return registers, timer / IE state); LITEV_A7N_FIT=1 prints the guest cycles per call (cycle fits).
 // LITEV_A7HLE_STATS=1: per-kind call counts.
