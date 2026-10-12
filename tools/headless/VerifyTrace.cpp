@@ -1010,6 +1010,10 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         for (int k = 0; k < n; k++) b[k].nds->GPU.GPU3D.TimingModel = b[k].nds->GPU.GPU3D.TimingFixed = true;
 #endif
 #endif
+#ifdef LITEV_LCD_EVT
+    if (getenv("LITEV_MP_LCDEVT"))   // A/B (exact: default on for every console)
+        for (int k = 0; k < n; k++) b[k].nds->GPU.LcdEvt = atoi(getenv("LITEV_MP_LCDEVT")) != 0;
+#endif
 #ifdef LITEV_NP_SCHED
     if (getenv("LITEV_MP_NPSCHED"))   // Netplay timing model; bit k = console k (Netplay sets every console)
         for (int k = 0; k < n; k++) b[k].nds->NPSched = (strtoul(getenv("LITEV_MP_NPSCHED"), nullptr, 0) >> k) & 1;
@@ -1357,6 +1361,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                         for (int e = 0; e < Event_MAX; e++) if (st.Ev[e]) printf(" %d:%.1f", e, st.Ev[e] / fr);
                         if (st.Native[0]) printf(" | native exits %.0f same-slice %.0f next-slice %.0f", st.Native[0] / fr, st.Native[1] / fr, st.Native[2] / fr);
                         printf(" | wifiwhy"); for (int q = 0; q < 8; q++) printf(" %.1f", st.WifiWhy[q] / fr);
+                        printf(" | lcdwhy"); for (int q = 0; q < 8; q++) printf(" %.1f", st.LcdWhy[q] / fr);
                         for (int c = 0; c < 2; c++) { printf(" | irq%d", c ? 7 : 9); for (int q = 0; q < 32; q++) if (st.Irq[c][q]) printf(" %d:%.1f", q, st.Irq[c][q] / fr); }
                         printf("\n");
                         st = {};

@@ -1446,6 +1446,14 @@ option(LITEV_WIFI_EVT "Event-driven Wi-Fi: no 8 us tick events while idle (categ
 if (LITEV_WIFI_EVT)
     add_compile_definitions(LITEV_WIFI_EVT=1)
 endif()
+# LITEV_LCD_EVT (exact): no Event_LCD; the LCD half-line steps run from RunSystem and still end every slice, except
+# while both CPUs are halted: then the slice runs to the next step something observes (VBlank, 3D start, frame end,
+# enabled HBlank/VCount IRQ, HBlank/display-start DMA9, display FIFO, capture, VCOUNT write). GPU::LcdEvt (default
+# on) = false is the stock path (A/B: LITEV_LCDEVT / LITEV_MP_LCDEVT in the headless harness).
+option(LITEV_LCD_EVT "LCD steps without Event_LCD; merge both-CPUs-halted slices up to the next observable step (exact)" OFF)
+if (LITEV_LCD_EVT)
+    add_compile_definitions(LITEV_LCD_EVT=1)
+endif()
 option(LITEV_NETPLAY_HEADLESS "Netplay: GPU::Headless/GPU3D::Headless/SPU::Silent consoles skip render- and audio-only work (else the members are ignored)" OFF)
 if (LITEV_NETPLAY_HEADLESS)
     add_compile_definitions(LITEV_NETPLAY_HEADLESS=1)

@@ -212,6 +212,11 @@ void DMA::WriteCnt(u32 val)
 #ifdef LITEV_DMA_ARMED_MASK
     SyncArmed();
 #endif
+#ifdef LITEV_LCD_EVT
+    // an HBlank / display-start DMA9 makes those LCD steps observable
+    if (CPU == 0 && NDS.GPU.LcdEvt && (val & 0x80000000) && !(oldcnt & 0x80000000) && (StartMode == 0x02 || StartMode == 0x03))
+        NDS.GPU.LcdPlan();
+#endif
 }
 
 void DMA::Start()

@@ -623,6 +623,25 @@ public:
     void SetDispStat(u32 cpu, u16 val, u16 mask) noexcept;
     void SetVCount(u16 val, u16 mask) noexcept;
 
+#ifdef LITEV_LCD_EVT
+    // LITEV_LCD_EVT (exact): no Event_LCD. The half-line steps (StartScanline / StartHBlank / FinishFrame,
+    // stock code) run from NDS::RunSystem when due (LcdRun), and NDS::NextTarget ends a slice at the next
+    // step as Event_LCD would, EXCEPT while both CPUs are halted (nothing can observe the LCD then): those
+    // slices run to the next step something can observe (LcdSchedTs: VBlank, 3D start, frame end, an
+    // enabled HBlank/VCount IRQ, an armed HBlank/display-start DMA9, display FIFO, capture, a pending
+    // VCOUNT write) and the steps skipped run there, in order. Exact (guest state and timing as stock),
+    // so on for every console; LcdEvt = false (set only between frames) is the stock Event_LCD path.
+    bool LcdEvt = true;
+    enum : u8 { LcdNone = 0xFF };
+    u8 LcdNextKind = LcdNone;   // the next step not run yet (LCD_StartHBlank/StartScanline/FinishFrame)
+    u32 LcdNextParam = 0;
+    u64 LcdNextTs = 0;          // its time (the stock Event_LCD time)
+    u64 LcdCurTs = 0;           // the last step's time (the periodic grid base)
+    u64 LcdSchedTs = 0;         // the first step from LcdNext on something can observe
+    void LcdPlan() noexcept;    // recompute LcdSchedTs (after a write that can change it)
+    void LcdRun(u64 ts, bool all) noexcept;   // run the step due at ts (all: every step due)
+#endif
+
     bool MakeVRAMFlat_ABGCoherent(NonStupidBitField<512*1024/VRAMDirtyGranularity>& dirty) noexcept;
     bool MakeVRAMFlat_BBGCoherent(NonStupidBitField<128*1024/VRAMDirtyGranularity>& dirty) noexcept;
 
@@ -1046,6 +1065,9 @@ private:
 
     bool VCountOverride = false;
     u16 NextVCount = 0;
+#ifdef LITEV_LCD_EVT
+    void LcdSetNext(u32 kind, u32 param, s32 delay) noexcept;
+#endif
 
     bool RunFIFO = false;
 
