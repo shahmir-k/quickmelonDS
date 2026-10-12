@@ -51,6 +51,10 @@
 
 namespace melonDS
 {
+#ifdef LITEV_SPU_SILENT_CAPTURE
+// off: env LITEV_SILENTCAPTURE=0 (headless A/B)
+static const bool SilentCaptureOn = [] { const char* e = getenv("LITEV_SILENTCAPTURE"); return !e || atoi(e) != 0; }();
+#endif
 using Platform::Log;
 using Platform::LogLevel;
 
@@ -1909,6 +1913,16 @@ void SPU::MixSamples(u32 spucycles)
 
             Capture[1].Run(spucycles, val);
         }
+#ifdef LITEV_SPU_SILENT_CAPTURE
+        // a console nobody hears (Netplay's other players) with sound capture on: the mix was for the
+        // capture; the speaker output (output select, master volume, bias, the blip buffers) is not
+        // needed, as for a quiet console without capture
+        if (LITEV_HEADLESS(Silent) && NDS.ConsoleType == 0 && SilentCaptureOn)
+        {
+            NDS.Mic.Advance(mixcyc << 1);
+            goto mixed;
+        }
+#endif
 
         // final output
 
