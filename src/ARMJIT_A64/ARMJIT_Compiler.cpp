@@ -3417,7 +3417,11 @@ bool Compiler::NearlyFull()
     // compiled from its profiles), reached well before the host one. ponytail: a game whose
     // blocks run larger than the estimate on average could still reach the host check first
     // (a reset at a host-dependent moment); raise the per-instruction estimate if one does.
+#ifdef LITEV_JIT_LIMIT
+    return LogicalSize > LogicalLimit;
+#else
     return LogicalSize > (u64)JitMemMainSize - 6 * 1024 * 1024;
+#endif
 }
 
 #ifdef LITEV_JIT_ICACHE
@@ -3535,13 +3539,26 @@ void Compiler::Reset()
     litev_perfmap::BeginEpoch();
 #endif
 
+    const u32 brk_0 = 0xD4200000;
+#ifdef LITEV_JIT_LIMIT
+    // the block memory starts zero (fresh / madvised slice; zero = UDF, traps like BRK): refill only
+    // what was written, which keeps the untouched rest of the 64 MB slice non-resident.
+    // (first Reset: GetCodeOffset() is 0 and OtherCodeRegion not yet set)
+    NearHigh = std::max(NearHigh, (ptrdiff_t)GetCodeOffset());
+    if (OtherCodeRegion > (ptrdiff_t)JitMemMainSize && OtherCodeRegion <= (ptrdiff_t)(JitMemMainSize + JitMemSecondarySize))
+        FarHigh = std::max(FarHigh, OtherCodeRegion);
+    SetCodePtr(0);
+    OtherCodeRegion = JitMemMainSize;
+    std::fill_n((u32*)GetRWPtr(), NearHigh / 4, brk_0);
+    if (FarHigh)
+        std::fill_n((u32*)GetRWPtr() + JitMemMainSize / 4, (FarHigh - JitMemMainSize) / 4, brk_0);
+#else
     SetCodePtr(0);
     OtherCodeRegion = JitMemMainSize;
 
-    const u32 brk_0 = 0xD4200000;
-
     for (int i = 0; i < (JitMemMainSize + JitMemSecondarySize) / 4; i++)
         *(((u32*)GetRWPtr()) + i) = brk_0;
+#endif
 
 #ifdef LITEV_JIT_DISPATCH
     // Generate the per-CPU dispatchers at the very start of the (now-brk-filled)

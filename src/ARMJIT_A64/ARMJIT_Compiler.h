@@ -276,6 +276,18 @@ public:
     u64 LogicalSize = 0;
     // time to reset the block cache (checked before a block is looked up / compiled)
     bool NearlyFull();
+#ifdef LITEV_JIT_LIMIT
+    // the LogicalSize limit: a constant, so every console resets at the same guest instruction
+    // (the old limit derived from JitMemMainSize, which depends on the host code before the block
+    // region (host pointers) and on the background-emission layout). ~0.55-0.6x of it is real near
+    // code (Shrek, PW, MKDS, Sims 3), well inside the 64 MB slice's ~56 MB near region.
+#ifndef LITEV_JIT_LIMIT_MB
+#define LITEV_JIT_LIMIT_MB 48   // (gate builds pass a small one, -DLITEV_JIT_LIMIT_MB=8: resets in short runs)
+#endif
+    static constexpr u64 LogicalLimit = (u64)LITEV_JIT_LIMIT_MB * 1024 * 1024;
+    // highest near / far offsets written since the code memory was last zero: Reset refills only these
+    ptrdiff_t NearHigh = 0, FarHigh = 0;
+#endif
 
     void PushRegs(bool saveHiRegs, bool saveRegsToBeChanged, bool allowUnload = true);
     void PopRegs(bool saveHiRegs, bool saveRegsToBeChanged);

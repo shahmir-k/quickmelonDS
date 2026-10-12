@@ -29,7 +29,11 @@ namespace melonDS
 namespace ARMJIT_Global
 {
 
+#ifdef LITEV_JIT_LIMIT
+static constexpr size_t CodeMemorySliceSize = 1024*1024*64;   // room for Compiler::LogicalLimit
+#else
 static constexpr size_t CodeMemorySliceSize = 1024*1024*32;
+#endif
 
 void Init();
 void DeInit();

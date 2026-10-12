@@ -2431,6 +2431,13 @@ template void ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWR
 void ARMJIT::ResetBlockCache() noexcept
 {
     Log(LogLevel::Debug, "Resetting JIT block cache...\n");
+#ifdef __aarch64__
+    static const bool resetLog = getenv("LITEV_JITRESET_LOG") != nullptr;   // when / how full (diagnosis)
+    if (resetLog)
+        fprintf(stderr, "JITRESET nds %p frame %u logical %llu near %u/%u far %u blocks %zu\n", (void*)&NDS, NDS.NumFrames,
+                (unsigned long long)JITCompiler.LogicalSize, (unsigned)JITCompiler.GetCodeOffset(), JITCompiler.JitMemMainSize,
+                (unsigned)(JITCompiler.OtherCodeRegion - JITCompiler.JitMemMainSize), JitBlocks9.size() + JitBlocks7.size());
+#endif
 #ifdef LITEV_JIT_BGEMIT
     // nothing may still be emitting into the code memory being wiped
     if (BgMode)
