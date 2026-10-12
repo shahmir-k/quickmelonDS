@@ -639,6 +639,11 @@ private:
     template<bool TEX, int MODE>
     void SpanFill(BandScratch& bs, const PolyShade& ps, Interpolator<0>& ix, s32 rowbase, s32 x, s32 xlim,
                   s32 zl, s32 zr, bool wbuf, const s32* base, const u32* d, u32 rev);
+#ifdef LITEV_TILE_SPANLOCAL
+    template<bool TEX, int MODE, bool WBUF>
+    void SpanFillLocal(BandScratch& bs, const PolyShade& ps, s32 rowbase, s32 x, s32 xlim, s32 xstart, s32 xdiff,
+                       s32 wl, s32 wr, s32 zl, s32 zr, const s32* base, const u32* d, u32 rev);
+#endif
 #endif
 };
 

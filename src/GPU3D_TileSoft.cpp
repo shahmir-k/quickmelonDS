@@ -1043,6 +1043,148 @@ void TileRenderer3D::SpanFill(BandScratch& bs, const PolyShade& ps, Interpolator
             PlotTranslucentTile(bs, idx, col, translDW ? z : -1, idword | (ID_TRANSL << 24));
     }
 }
+
+#ifdef LITEV_TILE_SPANLOCAL
+// SpanFill with the span's interpolation state in locals (SpanFill reads and writes the Interpolator
+// through memory every pixel: the tile stores may alias it). Same values: xv = x - xstart,
+// num = (u32)(xv * wl) << 8 and den = xv * wl + (xdiff - xv) * wr (u32) step by constants mod 2^32;
+// the z-buffer depth base + ((disp * factor * xrecip_z) >> 13) steps its 64-bit product by
+// +-disp * xrecip_z; the w-buffer depth uses the factor as InterpolateZ does. xdiff != 0, non-linear.
+template<bool TEX, int MODE, bool WBUF>
+void TileRenderer3D::SpanFillLocal(BandScratch& bs, const PolyShade& ps, s32 rowbase, s32 x, s32 xlim, s32 xstart,
+                                   s32 xdiff, s32 wl, s32 wr, s32 zl, s32 zr, const s32* base, const u32* d, u32 rev)
+{
+    u32* const color = bs.Color;
+    u32* const depth = bs.DepthId;
+    const u16* const toontbl = ps.toontbl;
+    const u32 polyalpha = ps.polyalpha;
+    const u8  alpharef = ps.alpharef;
+    const bool wireframe = ps.wireframe;
+    const u32 idword = ps.idword;
+    const bool translDW = ps.translDepthWrite;
+    const u32* const tex = TEX ? ps.tex32 : nullptr;
+    const s32 tw = ps.texW, th = ps.texH;
+    const u32 tp = ps.texparam;
+    const bool swrap = tp & (1<<16), sflip = tp & (1<<18), twrap = tp & (1<<17), tflip = tp & (1<<19);
+    const s32 b0 = base[0], b1 = base[1], b2 = base[2], b3 = base[3], b4 = base[4];
+    const u32 d0 = d[0], d1 = d[1], d2 = d[2], d3 = d[3], d4 = d[4];
+
+    s32 xv = x - xstart;
+    u32 num = (u32)(xv * wl) << 8;
+    u32 den = (u32)(xv * wl) + (u32)((xdiff - xv) * wr);
+    const u32 dnum = (u32)wl << 8, dden = (u32)wl - (u32)wr;
+
+    // z-buffer: z = zbase + (P >> 13), P = disp * xrecip_z * factor (exact in 64 bits)
+    s32 zbase = zl; s64 P = 0, dP = 0;
+    // w-buffer: z = zlo + ((zd * (zup ? f : 256 - f)) >> 8)
+    const bool zup = zl < zr;
+    const s64 zd = zup ? (s64)(zr - zl) : (s64)(zl - zr);
+    const s32 zlo = zup ? zl : zr;
+    if (!WBUF && zl != zr)
+    {
+        const s32 xrecip_z = (1<<22) / xdiff;
+        s32 disp; s32 factor;
+        if (zup) { zbase = zl; disp = zr - zl; factor = xv; }
+        else     { zbase = zr; disp = zl - zr; factor = xdiff - xv; }
+        disp >>= 9;
+        const s64 K = (s64)disp * xrecip_z;
+        P = K * factor;
+        dP = zup ? K : -K;
+    }
+
+    for (; x <= xlim; x++, num += dnum, den += dden, P += dP)
+    {
+        u32 yf = 0;
+        s32 z;
+        if (WBUF)
+        {
+            yf = den ? num / den : 0;
+            z = (zl == zr) ? zl : (s32)(zlo + ((zd * (s64)(zup ? yf : 256u - yf)) >> 8));
+        }
+        else
+            z = (s32)(zbase + (P >> 13));
+        const u32 idx = (u32)(rowbase + x);
+        if (!((u32)z < (depth[idx] & 0x00FFFFFF))) continue;
+        if (!WBUF) yf = den ? num / den : 0;
+
+        const u32 yr = 256u - yf;
+        u32 vr = (u32)((s32)((u32)b0 + ((d0 * ((rev & 1)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+        u32 vg = (u32)((s32)((u32)b1 + ((d1 * ((rev & 2)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+        u32 vb = (u32)((s32)((u32)b2 + ((d2 * ((rev & 4)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+
+        u8 r, g, b, a;
+        if constexpr (MODE == 3) { vg = vr; vb = vr; }
+        else if constexpr (MODE == 2)
+        {
+            u16 tc = toontbl[vr >> 1];
+            vr = (tc << 1) & 0x3E; if (vr) vr++;
+            vg = (tc >> 4) & 0x3E; if (vg) vg++;
+            vb = (tc >> 9) & 0x3E; if (vb) vb++;
+        }
+        if constexpr (TEX)
+        {
+            const s16 s = (s16)(s32)((u32)b3 + ((d3 * ((rev & 8)  ? yr : yf)) >> 8));
+            const s16 t = (s16)(s32)((u32)b4 + ((d4 * ((rev & 16) ? yr : yf)) >> 8));
+            s32 si = s >> 4, ti = t >> 4;
+            if (swrap)
+            {
+                if (sflip) { if (si & tw) si = (tw-1) - (si & (tw-1)); else si = (si & (tw-1)); }
+                else       si &= tw-1;
+            }
+            else { if (si < 0) si = 0; else if (si >= tw) si = tw-1; }
+            if (twrap)
+            {
+                if (tflip) { if (ti & th) ti = (th-1) - (ti & (th-1)); else ti = (ti & (th-1)); }
+                else       ti &= th-1;
+            }
+            else { if (ti < 0) ti = 0; else if (ti >= th) ti = th-1; }
+            const u32 texel = tex[(u32)ti * (u32)tw + (u32)si];
+            const u8 tr = texel & 0x3F, tg = (texel >> 8) & 0x3F, tb = (texel >> 16) & 0x3F, talpha = texel >> 24;
+            if constexpr (MODE == 1)
+            {
+                if (talpha == 0)       { r = vr; g = vg; b = vb; }
+                else if (talpha == 31) { r = tr; g = tg; b = tb; }
+                else
+                {
+                    r = ((tr * talpha) + (vr * (31-talpha))) >> 5;
+                    g = ((tg * talpha) + (vg * (31-talpha))) >> 5;
+                    b = ((tb * talpha) + (vb * (31-talpha))) >> 5;
+                }
+                a = polyalpha;
+            }
+            else
+            {
+                r = ((tr+1) * (vr+1) - 1) >> 6;
+                g = ((tg+1) * (vg+1) - 1) >> 6;
+                b = ((tb+1) * (vb+1) - 1) >> 6;
+                a = ((talpha+1) * (polyalpha+1) - 1) >> 5;
+            }
+        }
+        else { r = vr; g = vg; b = vb; a = polyalpha; }
+        if constexpr (MODE == 3)
+        {
+            u16 tc = toontbl[vr >> 1];
+            u8 hr = (tc << 1) & 0x3E; if (hr) hr++;
+            u8 hg = (tc >> 4) & 0x3E; if (hg) hg++;
+            u8 hb = (tc >> 9) & 0x3E; if (hb) hb++;
+            int rr = r + hr; if (rr > 63) rr = 63; r = (u8)rr;
+            int gg = g + hg; if (gg > 63) gg = 63; g = (u8)gg;
+            int bb = b + hb; if (bb > 63) bb = 63; b = (u8)bb;
+        }
+        if (wireframe) a = 31;
+        const u32 col = r | (g << 8) | (b << 16) | ((u32)a << 24);
+
+        if (a <= alpharef) continue;   // alpha test
+        if (a == 31)
+        {
+            color[idx] = col;
+            depth[idx] = ((u32)z & 0x00FFFFFF) | idword;
+        }
+        else
+            PlotTranslucentTile(bs, idx, col, translDW ? z : -1, idword | (ID_TRANSL << 24));
+    }
+}
+#endif
 #endif
 
 // Span fill for one scanline of one polygon into the 2-plane tile. Perspective-correct S/T and
@@ -1112,6 +1254,27 @@ void TileRenderer3D::RenderSpanInTile(BandScratch& bs, const TilePoly& poly, s32
             else                  { base[k] = y1s[k]; dd[k] = (u32)(y0s[k] - y1s[k]); rev |= 1u << k; }
         }
         const int mode = ps.decal ? 1 : ps.toon ? (ps.highlight ? 3 : 2) : 0;
+#ifdef LITEV_TILE_SPANLOCAL
+        const s32 xdiff = xend + 1 - xstart;
+        if (xdiff != 0)
+        {
+#define SFL(T, M) (wbuf ? SpanFillLocal<T, M, true>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev) \
+                        : SpanFillLocal<T, M, false>(bs, ps, rowbase, x, xlim, xstart, xdiff, wl, wr, zl, zr, base, dd, rev))
+            switch ((ps.texEnable ? 4 : 0) | mode)
+            {
+            case 0: SFL(false, 0); break;
+            case 1: SFL(false, 1); break;
+            case 2: SFL(false, 2); break;
+            case 3: SFL(false, 3); break;
+            case 4: SFL(true, 0); break;
+            case 5: SFL(true, 1); break;
+            case 6: SFL(true, 2); break;
+            default: SFL(true, 3); break;
+            }
+#undef SFL
+            return;
+        }
+#endif
         switch ((ps.texEnable ? 4 : 0) | mode)
         {
         case 0: SpanFill<false, 0>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
