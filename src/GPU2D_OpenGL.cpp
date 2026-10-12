@@ -55,6 +55,12 @@ using Platform::LogLevel;
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
+#ifdef LITEV_GLHI_DEFER
+}
+#include "GLDeferCalls.h"
+namespace melonDS
+{
+#endif
 
 
 
@@ -1924,7 +1930,7 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
         glActiveTexture(GL_TEXTURE0 + i);
 
         if ((i == 0) && (DispCnt & (1<<3)) && !(OpenGL::GLSkip() & 128))
-            glBindTexture(GL_TEXTURE_2D, Parent.Get3DTex());
+            Parent.Bind3DTex();
         else
             glBindTexture(GL_TEXTURE_2D, BGLayerTex[i]);
 
