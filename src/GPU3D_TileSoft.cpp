@@ -28,6 +28,9 @@
 #include <cstring>
 #include <thread>   // std::this_thread::yield (brief cross-worker seam wait)
 
+#if (defined(LITEV_TILE_SPANVEC) || defined(LITEV_TILE_POSTVEC)) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #if defined(LITEV_GEOM_NEON2) && defined(__ARM_NEON)
 #include <arm_neon.h>   // BuildFrameGeom vertex-pack (coalesce the per-vertex scatter stores)
 #endif
@@ -848,7 +851,11 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
     const u32 borderDI = Cfg[GeomRead].ClearDepthIdVal;
     const u32 borderC  = Cfg[GeomRead].ClearColorVal;
 
+#if defined(LITEV_TILE_POSTVEC) && defined(__aarch64__)
+    auto pix = [&](int x) __attribute__((always_inline))
+#else
     for (int x = 0; x < OutWidth; x++)
+#endif
     {
         const u32 cdi = depthid[x];
         u32 outc = color[x];
@@ -930,6 +937,28 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
 
         dst[x] = outc;
     }
+#if defined(LITEV_TILE_POSTVEC) && defined(__aarch64__)
+    ;
+    // four pixels at a time: a group whose pixels all have no neighbour with another polygon id (or
+    // no edge/AA) and no fog to apply is copied; any other group runs the per-pixel code above
+    const uint32x4_t idm = vdupq_n_u32(ID_POLY_MASK << 24), fogm = vdupq_n_u32((u32)ID_FOG << 24);
+    uint32x4_t prev = vdupq_n_u32(borderDI), cur = vld1q_u32(depthid);
+    for (int x = 0; x < OutWidth; x += 4)
+    {
+        const uint32x4_t next = (x + 4 < OutWidth) ? vld1q_u32(depthid + x + 4) : vdupq_n_u32(borderDI);
+        uint32x4_t bad = fog ? vandq_u32(cur, fogm) : vdupq_n_u32(0);
+        if (detect)
+        {
+            const uint32x4_t l = vextq_u32(prev, cur, 3), r = vextq_u32(cur, next, 1);
+            const uint32x4_t u = vld1q_u32(upDepthId + x), dn = vld1q_u32(downDepthId + x);
+            bad = vorrq_u32(bad, vandq_u32(vorrq_u32(vorrq_u32(veorq_u32(l, cur), veorq_u32(r, cur)),
+                                                     vorrq_u32(veorq_u32(u, cur), veorq_u32(dn, cur))), idm));
+        }
+        if (vmaxvq_u32(bad) == 0) vst1q_u32(dst + x, vld1q_u32(color + x));
+        else for (int k = 0; k < 4; k++) pix(x + k);
+        prev = cur; cur = next;
+    }
+#endif
 }
 
 #ifdef TILE_SPANFAST
