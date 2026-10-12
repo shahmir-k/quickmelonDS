@@ -11,6 +11,8 @@
 // reference address of the variant (code: through its chunk; data: through the pointer literal at or below it) to the
 // candidate build, so a variant's address fields can be rewritten and its native code runs unchanged.
 //
+// Thumb chunks (16-bit units: BL / BLX pairs, B, B<cond>, literal loads), chunks at the reference distance from a found one
+// (same object file) and a chunk found by its one match in ARM9 main RAM (A9HLE's OS groups) are supported too.
 // Cost: only when the JIT compiles a block whose instruction passes the variant's two-word pre-filter (entry instruction
 // + the next word); nothing per frame. The result is then verified like a static variant (exact bytes of the relocated
 // chunks at compile time, the JIT block depends on them).
@@ -26,13 +28,16 @@ struct Chunk
 {
     u32 a, b;               // reference range [a, b)
     u64 mfnv;               // masked FNV-1a 64 of its words
-    u8 how;                 // 0 entry chunk (entry - a = off), 1 via word `word` of chunk `src` (a branch's target or a
-                            // literal's value, minus `off`), 2 right after chunk `src`, 3 right before chunk `src`
+    u8 how;                 // 0 entry chunk (entry - a = off), 1 via unit `word` of chunk `src` (a branch's target or a
+                            // literal's value, minus `off`), 2 right after chunk `src`, 3 right before chunk `src`, 4 at the
+                            // reference distance `off` from chunk `src` (same object file), 5 the one place in ARM9 main RAM
+                            // whose masked code matches (pre-filter: first unit == `off`; two or more matches: no match)
     u8 src; u16 word; s32 off;
+    u8 thumb;               // Thumb code: 16-bit units (BL / BLX pairs, B, B<cond>, literal loads); else ARM words
 };
 struct Link
 {
-    u16 chunk, word;        // the word (in chunk order: Recipe::l sorted by chunk)
+    u16 chunk, word;        // the unit (word, or halfword in a Thumb chunk; in chunk order: Recipe::l sorted by chunk)
     u8 kind;                // 0 branch into chunk `to` (offset masked), 1 literal pointer into chunk `to`, 2 literal pointer into data,
                             // 3 branch out of the variant's code (offset masked; the target is not checked, as exact bytes do not)
     u8 to;                  // (0 / 1) the chunk it lands in
@@ -40,7 +45,7 @@ struct Link
 };
 struct Recipe
 {
-    u32 entry, w0, w1;      // reference entry and its first two words (pre-filter)
+    u32 entry, w0, w1;      // reference entry and its first two units (pre-filter; halfwords for a Thumb entry)
     u16 nc; const Chunk* c;
     u16 nl; const Link* l;
 };
@@ -54,6 +59,8 @@ struct Map
     std::vector<std::pair<u32, s32>> data;          // reference pointer value -> delta (sorted)
     // candidate address of a reference address of the variant; 0 if it is in no chunk and near no pointer literal
     u32 operator()(u32 ref) const;
+    // the one delta of the pointer literals in [base, base + size) (false: none, or two different ones)
+    bool Delta(u32 base, u32 size, s32& d) const;
     // the candidate chunk ranges (code the native version replaces: snapshot + JIT dependencies)
     template <class R> void Ranges(std::vector<R>& out) const
     {
@@ -61,7 +68,11 @@ struct Map
         for (u32 i = 0; i < loc.size(); i++) out.push_back({loc[i], loc[i] + (r->c[i].b - r->c[i].a)});
     }
 };
-// relocate recipe r to the candidate entry (Thumb bit clear); true and m filled if every check passes
-bool Relocate(const Recipe& r, u32 entry, Rd rd, void* ctx, Map& m);
+// the cheap first check of Relocate: the entry chunk's masked code at the candidate entry (no allocation)
+bool EntryOk(const Recipe& r, u32 entry, Rd rd, void* ctx);
+// relocate recipe r to the candidate entry (Thumb bit clear); true and m filled if every check passes. ram: the host copy of
+// ARM9 main RAM from 0x02000000, ramLen bytes of it searched by the main-RAM scans (how 5); nullptr: none (those recipes do
+// not match)
+bool Relocate(const Recipe& r, u32 entry, Rd rd, void* ctx, Map& m, const u8* ram = nullptr, u32 ramLen = 0);
 }
 #endif

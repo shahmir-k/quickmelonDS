@@ -52,6 +52,7 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);
 static uint64_t EmuThreadInstr = 0, EmuThreadCycles = 0;
 #include "LiteProfile.h"
 #include "VerifyTrace.h"
+#include "ARM9HLE.h"
 #include "InputScript.h"
 namespace melonDS { extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults, JitStoreRepromotions; }
 #ifdef LITEV_JIT_COMPILE_STATS
@@ -1042,6 +1043,9 @@ int main(int argc, char** argv)
     u64 audioHash = XXH3_64bits_digest(audioHashState);
     XXH3_freeState(audioHashState);
 
+#if defined(LITEV_A9HLE) && defined(LITEV_HLE_DIAG)
+    if (getenv("LITEV_HLESIG_SCAN")) melonDS::A9HLE::SigScan(*nds);
+#endif
     printf("=== liteDS-headless summary ===\n");
     printf("mode:        %s\n", opt.jit ? "jit" : "interp");
     printf("frames:      %d\n", opt.frames);

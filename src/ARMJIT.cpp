@@ -2384,7 +2384,7 @@ void ARMJIT::ResetBlockCache() noexcept
 
     InvalidLiterals.Clear();
 #ifdef LITEV_A9HLE
-    NDS.ARM9.A9HLEGuard = nullptr;
+    A9HLE::BlockGone(NDS, nullptr);     // (all of them)
 #endif
     for (int i = 0; i < ARMJIT_Memory::memregions_Count; i++)
     {

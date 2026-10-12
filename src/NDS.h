@@ -371,6 +371,8 @@ public: // TODO: Encapsulate the rest of these members
         out[4] = SqrtVal[0]; out[5] = SqrtVal[1]; out[6] = (u32)(DivCnt & 3) | ((u32)(SqrtCnt & 1) << 16);
     }
     u32 A9HLEDmaCnt(u32 n) const noexcept { return DMAs[n].Cnt; }   // ARM9 DMA n control
+    bool A9HLEDmaWritesIo() const noexcept      // every running ARM9 DMA writes IO
+    { for (int i = 0; i < 4; i++) if (DMAs[i].IsRunning() && (DMAs[i].DstAddr >> 24) != 0x04) return false; return true; }
 #endif
 #if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
     // per-console A9HLE (0) / A7HLE (1) state, created and typed by ARM9HLE.cpp / ARM7HLE.cpp (never shared between

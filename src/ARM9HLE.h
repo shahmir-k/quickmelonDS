@@ -1,4 +1,4 @@
-// LITEV_A9HLE: high-level emulation of hot NitroSDK ARM9 OS functions in Pokemon Black/White.
+// LITEV_A9HLE: high-level emulation of hot NitroSDK / NitroSystem ARM9 functions (found by signature in any game).
 //
 // 1. Spurious OS_WaitIrq wake-ups. NitroSDK's IRQ handler wakes every thread waiting in
 //    OS_WaitIrq on ANY interrupt. PW's main thread waits for VBlank with HBlank IRQs on, so
@@ -13,36 +13,35 @@
 //    instructions in PW towns): native, same memory writes, registers and flags. Small host win
 //    (-0.5% emu-thread instructions in town): the JIT already runs these ALU loops cheaply.
 //
-// Detected by a code signature (exact bytes of every function involved). Under the JIT the code
-// is checked when the hook block is compiled and the block depends on all those bytes (a write
-// there invalidates it, the recompile re-checks); the interpreter compares per call. Anything
-// outside the handled case runs the guest code. The native path reads/writes guest memory
-// through host pointers and writes only words that change (the in-order A55 pays for every
-// extra cache line and call).
+// Found by signature (ARM9HLE.cpp "signature groups", HLESig.h): one recipe per SDK / NitroSystem build and hook group
+// (masked code, the links between its functions and their callees' first blocks, its data objects from the literal pools),
+// matched where the JIT compiles the group's entry or by the OS group's one scan; no per-game addresses. Under the JIT the
+// code is checked when the hook block is compiled and the block depends on all those bytes (a write there invalidates it,
+// the recompile re-checks); the interpreter compares per call. Anything outside the handled case runs the guest code. The
+// native path reads/writes guest memory through host pointers and writes only words that change (the in-order A55 pays
+// for every extra cache line and call).
 // Category B: guest memory and registers are what the guest code would leave; the call takes
 // a fixed estimated number of ARM9 cycles instead of the real count (and an IRQ that would
 // have arrived inside the elided round trip is taken right after it). Deterministic.
 // Runtime: debug.litev.a9hle (prop on Android, env elsewhere; default on), latched per NDS:
 // 0 off, 1 all, other values = the mask below.
-// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material,
+// Env LITEV_A9HLE_ONLY=<mask> (1 wake, 2 set, 4 get, 8 IRQ entry / tail (3.), 16 GX send, 32 card read, 64 LZ, 128 G3D material,
 // 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ,
 // 2048 G3D shape (needs 512), 4096 VEC_Normalize, 8192 G3D node (NODEDESC),
 // 16384 MKDS stereo sample effect, 32768 G3D material animation (needs 128), 65536 G3D SBC loop,
 // 131072 NNS_G2dMakeCellToOams, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase, 8388608 MKDS G3D shape, 16777216 SDK leaf functions at their BL (HLELeaf.h), 33554432 the byte memcpy loop (default off); 8 needs 1)
 // for A/B of single hooks.
-// Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
-// probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
-// W2 (TWL SDK build) has the same IRQ handler / context switch code but its thread functions and
-// OS_Set/GetIrqFunction / MIi_FIFOCallback are Thumb: hooks 1-5 (2, 4, 5 Thumb entries).
+// Hooks 1-5, 10, 11, 13 (and the Thumb build's 8, 15, 17, 18) belong to an OS build found by its signature groups: the TWL
+// ARM build (Pokemon Black / White) and the TWL Thumb build (Pokemon White 2: thread functions, OS_Set/GetIrqFunction,
+// MIi_FIFOCallback, NNS G3D in Thumb); the NTR 2005-2006 OS build by OsScan (only 1.); hook 6 is position independent.
 //
-// 3. Whole HBlank IRQs (~265 a frame on PW, ~3.8k Mac host instructions each through the JIT
-//    even with 1. native; ~1.7k native): when the only pending enabled IRQ is HBlank and the game's HBlank callback
-//    list is empty, the IRQ is taken natively at delivery: BIOS frame, OS_IrqHandler, the IF
-//    acknowledge, the (empty) callback, then either the empty-queue return or the wake-skip of
-//    1., then the BIOS return. Nothing changes in the interrupted registers; guest memory and the
-//    banked IRQ/SVC registers get what the guest path leaves. When the ARM9 was halted in the
-//    OS idle loop it stays halted. Code verified at JIT compile of the wake hook block (which
-//    depends on all of it: ARMv5::A9HLEGuard), BIOS once; anything else runs the guest path.
+// 3. IRQs (~265 HBlank IRQs a frame on PW): a. at delivery the exception entry, the BIOS IRQ entry and OS_IrqHandler up to
+//    its OS_IRQTable call natively (any IRQ but a display list's DMA end, 11.); c. the table entry (the game's callback or
+//    the SDK's) replayed from a recorded run when its inputs are the same (all registers it reads, its code, every value
+//    it loads; registers it only saves / restores are free), else interpreted once from the idle thread's halt and
+//    recorded, else run by the JIT; b. OS_IrqHandler's tail natively (a JIT hook too): the BIOS return or 1.'s wake skip,
+//    back into the idle thread's halt halted again. Generic: no game code is assumed (the game-specific version, PW's
+//    empty HBlank callback list, is gone: see PATH-TO-HLE 2m).
 //
 // 5. MI_SendGXCommandAsync display lists (with LITEV_GX_BULK): MIi_FIFOCallback sends a list in
 //    118-word immediate DMAs, the next one from the GXFIFO "less than half" IRQ; with the bulk
@@ -106,7 +105,8 @@ namespace melonDS::A9HLE
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
 inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE4D13001 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001 || instr == 0xE5942000
                                         || instr == 0xE92D4010 || instr == 0xE92D58F0 || instr == 0xE92D4FF8 || instr == 0xE92D4FF0
-                                        || instr == 0xE5941008 || instr == 0xE3540000 || instr == 0xE92D4070 || instr == 0xE59D102C || instr == 0xE5941000 || instr == 0xE92D4030; }
+                                        || instr == 0xE5941008 || instr == 0xE3540000 || instr == 0xE92D4070 || instr == 0xE59D102C || instr == 0xE5941000 || instr == 0xE92D4030
+                                        || instr == 0xE59FC148; }
 // Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4} / MIi_FIFOCallback
 // push {r3-r7, lr} / SBC MAT push {r4-r6, lr}); instr: the halfword
 inline bool MaybeHookT(u32 instr) { instr &= 0xFFFF; return instr == 0xB4F0 || instr == 0xB418 || instr == 0xB5F8 || instr == 0xB570 || instr == 0xB5F0
@@ -131,9 +131,11 @@ bool Run(melonDS::ARM* cpu, bool jit);
 // is A9HLE on with mask bit `bit` for this console (debug.litev.a9hle / LITEV_A9HLE_ONLY)
 bool MaskOn(melonDS::NDS& nds, u32 bit);
 // IRQ delivery to the ARM9 (TriggerIRQ, IRQs enabled). halted: the ARM9 is waking from a halt.
-// true: taken natively (registers unchanged, Cycles added); the caller then delivers any IRQ that
-// is still pending as usual (and a halted ARM9 in the OS idle loop stays halted if none is).
-bool Irq(melonDS::ARMv5* c, bool halted);
+// 0: not taken. 1: taken natively (registers unchanged, Cycles added); the caller then delivers any IRQ that
+// is still pending as usual (and a halted ARM9 in the OS idle loop stays halted if none is). 2: entered natively (3a.):
+// the CPU is in the IRQ handler (IRQ mode, IRQs off) at the IRQ's OS_IRQTable entry; the caller delivers nothing more and
+// a halted ARM9 runs.
+int Irq(melonDS::ARMv5* c, bool halted);
 // IRQ delivery (TriggerIRQ) while an ARM9 DMA is about to stop the CPU (Halted == 2): true = deliver it after the
 // DMA instead (A9HLEDefer; the guest enters the vector now but runs no instruction before the DMA, so its handler
 // sees the IF bits the DMA raised). Used for the GXFIFO IRQ of 11.: after the list's DMA its end IRQ is the lowest
@@ -141,7 +143,7 @@ bool Irq(melonDS::ARMv5* c, bool halted);
 bool Defer(melonDS::ARMv5* c);
 // ARMJIT: a block compiled with the wake hook (code verified, IsHook == 1) at addr
 void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
-// ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted)
+// ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted); nullptr: all of them (block cache reset)
 void BlockGone(melonDS::NDS& nds, const void* block);
 // Savestate section "A9HL" (loaded before the JIT's blocks are rebuilt): the per-console state the JIT
 // paths trust (variant, code snapshots, the checks made when hook blocks were compiled) and a
@@ -152,6 +154,9 @@ void HookRestored(melonDS::NDS& nds, u32 addr, const void* block);
 // interpreter check mode: called before every ARM9 instruction while a check is pending
 // (compiled out without LITEV_HLE_DIAG)
 #ifdef LITEV_HLE_DIAG
+// the signature groups' reliability scan (headless, env LITEV_HLESIG_SCAN): every group at every pre-filter candidate in
+// main RAM and ITCM (matches, their fields), and for each match every code unit mutated in turn (a near miss must not match)
+void SigScan(melonDS::NDS& nds);
 extern thread_local bool CheckPending;   // (per thread: headless --mp-test runs a console per thread)
 void CheckAt(melonDS::ARM* cpu, u32 pc);
 #else
