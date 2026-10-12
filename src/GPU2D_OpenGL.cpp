@@ -1869,10 +1869,12 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
     // non-rotscaled sprites are drawn as whole native pixels into the OBJ layer, and windows,
     // mosaic and blending use native coordinates. So composite it at 1x and blit it up
     // (nearest): same pixels, 1/scale^2 of the shading.
-    static const bool comp1x = GLProp("debug.litev.glhi1x", 1) != 0;
+    // (=2: diagnostic, every screen at 1x: wrong pixels where it has hi-res content)
+    static const int comp1x = GLProp("debug.litev.glhi1x", 1);
     bool low = comp1x && ScaleFactor > 1 && !SpriteAffine && !AffineUncomposited && !CompositorRef && !(OpenGL::GLSkip() & 260);
     for (int l = 0; l < 4 && low; l++)
         if ((LayerEnable & (1 << l)) && LayerConfig.uBGConfig[l].Type >= 2) low = false;
+    if (comp1x == 2 && ScaleFactor > 1 && !CompositorRef) low = true;
     AffineUncomposited = false;
     CompSF = low ? 1 : ScaleFactor;
     if (low)
@@ -1961,9 +1963,53 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glViewport(0, 0, ScreenW, ScreenH);
+        static const bool check = GLProp("debug.litev.glhi1xcheck", 0) != 0;
+        if (check) Check1x(ystart, yend);
     }
 
     glDisable(GL_SCISSOR_TEST);
+}
+
+// debug.litev.glhi1xcheck=1: every 4th 1x composite, also composite the region at full scale
+// (CompositorShader) and count the pixels that differ from the blitted 1x result (LITEV_HI1XCHECK)
+void GLRenderer2D::Check1x(int ystart, int yend)
+{
+    static int calls = 0, checks = 0;
+    static long px = 0, bad = 0;
+    if (++calls % 4) return;
+    static GLuint fb = 0, tex = 0;
+    static int w = 0;
+    if (!fb || w != ScreenW)
+    {
+        if (!fb) { glGenFramebuffers(1, &fb); glGenTextures(1, &tex); }
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        w = ScreenW;
+    }
+    const int y0 = ystart * ScaleFactor, h = (yend - ystart) * ScaleFactor;
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, y0, ScreenW, h);
+    glUseProgram(CompositorShader);
+    glDrawArrays(GL_TRIANGLES, 0, 2*3);
+    glDisable(GL_SCISSOR_TEST);
+    std::vector<u8> a((size_t)ScreenW * h * 4), r((size_t)ScreenW * h * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB);
+    glReadPixels(0, y0, ScreenW, h, GL_RGBA, GL_UNSIGNED_BYTE, a.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+    glReadPixels(0, y0, ScreenW, h, GL_RGBA, GL_UNSIGNED_BYTE, r.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+    for (size_t i = 0; i < a.size(); i += 4)
+        if (memcmp(&a[i], &r[i], 3)) bad++;
+    px += a.size() / 4;
+    if (++checks % 20 == 0)
+    {
+        Platform::Log(Platform::Info, "LITEV_HI1XCHECK %d checks: %ld px, %ld differ\n", checks, px, bad);
+        px = bad = 0;
+    }
 }
 
 // Split [ystart, yend) into runs of lines whose scanline config is the first line's plus

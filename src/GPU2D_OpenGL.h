@@ -163,6 +163,7 @@ private:
     bool AffineUncomposited = true; // ... or was, in an OAM list used since the last composite
     GLuint LowFB = 0, LowTex = 0;   // native-resolution compositor target (debug.litev.glhi1x)
     int CompSF = 1;                 // scale of the compositor's current target
+    void Check1x(int ystart, int yend);
     GLint ObjMosULoc[2] = {-1, -1};
 
     struct sScanlineConfig
