@@ -1452,6 +1452,13 @@ u32 NDS::RunFrame()
     NumFrames++;
     if (LagFrameFlag)
         NumLagFrames++;
+#ifdef LITEV_BLOCKPROF
+    {   // profiling only: lag frames (no keypad read) + per-frame ARM9 busy histogram (deciles); see ARM.cpp FTActive
+        extern u64 FTActive[2]; extern u64 FTBusyHist[12];
+        static u64 last; const u64 d = FTActive[0] - last; last = FTActive[0];
+        FTBusyHist[std::min<u64>(d * 10 / 1120380, 10)]++; if (LagFrameFlag) FTBusyHist[11]++;
+    }
+#endif
 
     if (Running)
         return GPU.TotalScanlines;

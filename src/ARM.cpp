@@ -56,6 +56,13 @@ namespace melonDS
 {
 using Platform::Log;
 using Platform::LogLevel;
+#ifdef LITEV_BLOCKPROF
+// profiling only: executed (JIT dispatch + compile-interpret) cycles per CPU, ARM9 in ARM9 clock units.
+// Waiting share = 1 - active / elapsed (run with LITEV_JIT_NATIVE_LOOP_OFF=1: the native slice loop runs past this accounting).
+u64 FTActive[2], FTBusyHist[12];
+static const bool FTActiveReg = (atexit([] { fprintf(stderr, "ft_active_cycles a9 %llu a7 %llu\nft_busy_hist", (unsigned long long)FTActive[0], (unsigned long long)FTActive[1]);
+    for (u64 h : FTBusyHist) fprintf(stderr, " %llu", (unsigned long long)h); fprintf(stderr, "\n"); }), true);
+#endif
 
 #ifdef LITEV_FAST_TIMING
 // FastTiming.h. Constants: DSperate src/core/cpu/timing_mode.h (FastTiming {0, 5, 2, 4, 2}).
@@ -1478,6 +1485,9 @@ void ARMv5::Execute()
 #ifdef LITEV_A7PROF
             const u64 a9t0 = NDS.ARM9Timestamp;
 #endif
+#ifdef LITEV_BLOCKPROF
+            const u64 ftT0 = NDS.ARM9Timestamp;
+#endif
 
             // liteDS-v2 Unit 2 (shadow): maintain the slice budget in the exact same
             // unit as Cycles. The loop guarantees ARM9Timestamp < ARM9Target here, so
@@ -1529,6 +1539,9 @@ void ARMv5::Execute()
             }
 #ifdef LITEV_A7PROF
             if (&NDS == A7Prof::Target) A7Prof::g9.Jit(block != nullptr, (NDS.ARM9Timestamp - a9t0) >> NDS.ARM9ClockShift);
+#endif
+#ifdef LITEV_BLOCKPROF
+            FTActive[0] += NDS.ARM9Timestamp - ftT0;   // profiling only: executed (non-waiting) ARM9 cycles
 #endif
 
 #if defined(LITEV_SHADOW_ASSERT)
@@ -1761,6 +1774,9 @@ void ARMv4::Execute()
 #ifdef LITEV_A7PROF
             const u64 a7t0 = NDS.ARM7Timestamp + Cycles;
 #endif
+#ifdef LITEV_BLOCKPROF
+            const u64 ftT7 = NDS.ARM7Timestamp + Cycles;
+#endif
 #ifdef LITEV_NPSCHED_STATS
             NDS.SchedStats.Disp[1]++;
 #endif
@@ -1785,6 +1801,9 @@ void ARMv4::Execute()
 
 #ifdef LITEV_A7PROF
             if (&NDS == A7Prof::Target) A7Prof::g.Jit(block != nullptr, NDS.ARM7Timestamp + Cycles - a7t0);
+#endif
+#ifdef LITEV_BLOCKPROF
+            FTActive[1] += NDS.ARM7Timestamp + Cycles - ftT7;
 #endif
 #if defined(LITEV_SHADOW_ASSERT)
             LiteV_ShadowAssertBudget("ARM7", Cycles, CyclesBudget,
