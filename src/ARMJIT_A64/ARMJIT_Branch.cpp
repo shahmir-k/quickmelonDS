@@ -351,24 +351,103 @@ void Compiler::Comp_JumpTo(u32 addr, bool forceNonConstantCycles)
 }
 
 
+#ifdef LITEV_REFILL_CHECK
+// Diagnostic (-DLITEV_REFILL_CHECK=1): every indirect-jump stub run is compared with the refill the
+// interpreter's ARMv5/ARMv4::JumpTo charges for the same target (cycles, and ARM9 RegionCodeCycles).
+struct { u32 Addr; s32 C0; u32 Mode; } RefillDiag;   // Mode: 0 ARM, 1 Thumb, 2 from bit 0
+static u64 RefillN[2], RefillBad[2];
+static struct RefillPrint { ~RefillPrint() { fprintf(stderr, "refill_check arm9 %llu jumps %llu mismatches, arm7 %llu jumps %llu mismatches\n",
+    (unsigned long long)RefillN[0], (unsigned long long)RefillBad[0], (unsigned long long)RefillN[1], (unsigned long long)RefillBad[1]); } } RefillPrintAtExit;
+
+static void RefillCheck9(ARMv5* cpu, s32 cycles)
+{
+    u32 a = RefillDiag.Addr;
+    bool thumb = RefillDiag.Mode == 2 ? (a & 1) : RefillDiag.Mode;
+    const s32 got = cycles - RefillDiag.C0, stubRcc = cpu->RegionCodeCycles, cc = cpu->CodeCycles;
+    cpu->RegionCodeCycles = cpu->MemTimings[a >> 12][0];
+    s32 exp = 0;
+    if (thumb)
+    {
+        a &= ~1u;
+        if (a & 2) { cpu->CodeRead32(a-2, true); exp += cpu->CodeCycles; cpu->CodeRead32(a+2, false); exp += cpu->CodeCycles; }
+        else       { cpu->CodeRead32(a, true); exp += cpu->CodeCycles; }
+    }
+    else
+    {
+        a &= ~3u;
+        cpu->CodeRead32(a, true); exp += cpu->CodeCycles; cpu->CodeRead32(a+4, false); exp += cpu->CodeCycles;
+    }
+    RefillN[0]++;
+    if (exp != got || stubRcc != cpu->RegionCodeCycles) RefillBad[0]++;
+    cpu->RegionCodeCycles = stubRcc; cpu->CodeCycles = cc;
+}
+
+static void RefillCheck7(ARMv4* cpu, s32 cycles)
+{
+    const u32 a = RefillDiag.Addr;
+    const bool thumb = RefillDiag.Mode == 2 ? (a & 1) : RefillDiag.Mode;
+    const u8* t = cpu->NDS.ARM7MemTimings[a >> 15];
+    const s32 exp = thumb ? t[0] + t[1] : t[2] + t[3];
+    RefillN[1]++;
+    if (exp != cycles - RefillDiag.C0) RefillBad[1]++;
+}
+#define REFILL_ENTRY(k) { MOVP2R(X16, &RefillDiag); STR(INDEX_UNSIGNED, W0, X16, 0); STR(INDEX_UNSIGNED, RCycles, X16, 4); \
+    MOVI2R(W17, (k) == 0 ? 2 : (k) == 1 ? 0 : 1); STR(INDEX_UNSIGNED, W17, X16, 8); }
+#define REFILL_CALL(fn) { SUB(SP, SP, 160); \
+    STP(INDEX_SIGNED, X0, X1, SP, 0); STP(INDEX_SIGNED, X2, X3, SP, 16); STP(INDEX_SIGNED, X4, X5, SP, 32); \
+    STP(INDEX_SIGNED, X6, X7, SP, 48); STP(INDEX_SIGNED, X8, X9, SP, 64); STP(INDEX_SIGNED, X10, X11, SP, 80); \
+    STP(INDEX_SIGNED, X12, X13, SP, 96); STP(INDEX_SIGNED, X14, X15, SP, 112); STP(INDEX_SIGNED, X16, X17, SP, 128); \
+    STP(INDEX_SIGNED, X18, X30, SP, 144); \
+    MOV(W1, RCycles); MOV(X0, RCPU); MOVP2R(X16, (void*)fn); BLR(X16); \
+    LDP(INDEX_SIGNED, X0, X1, SP, 0); LDP(INDEX_SIGNED, X2, X3, SP, 16); LDP(INDEX_SIGNED, X4, X5, SP, 32); \
+    LDP(INDEX_SIGNED, X6, X7, SP, 48); LDP(INDEX_SIGNED, X8, X9, SP, 64); LDP(INDEX_SIGNED, X10, X11, SP, 80); \
+    LDP(INDEX_SIGNED, X12, X13, SP, 96); LDP(INDEX_SIGNED, X14, X15, SP, 112); LDP(INDEX_SIGNED, X16, X17, SP, 128); \
+    LDP(INDEX_SIGNED, X18, X30, SP, 144); ADD(SP, SP, 160); }
+#else
+#define REFILL_ENTRY(k)
+#define REFILL_CALL(fn)
+#endif
+
+// Fetch cost of ARMv5::CodeRead32(a, false) for the second refill word, added to RCycles:
+//   a < ITCMSize ? 1 : raw == 0xFF ? (a & 0x1F ? 1 : kCodeCacheTiming) : raw
+// in: W0 = a, W1 = raw (MemTimings[target >> 12][0]), W2 = ITCMSize; clobbers W3, flags.
+void Compiler::Gen_JumpTo9SeqFetch()
+{
+    MOVI2R(W3, kCodeCacheTiming);
+    TSTI2R(W0, 0x1F);
+    CSINC(W3, W3, WZR, CC_EQ);          // line start ? 3 : 1
+    CMP(W1, 0xFF);
+    CSEL(W3, W3, W1, CC_EQ);            // cached ? that : raw
+    CMP(W0, W2);
+    CSINC(W3, W3, WZR, CC_HS);          // ITCM ? 1
+    ADD(RCycles, RCycles, W3);
+}
+
+// Indirect jump refill, charged exactly as ARMv5::JumpTo (two CodeRead32 for ARM and for an
+// unaligned Thumb target, one for an aligned Thumb target; ARMv5::CodeRead32's fetch cost each).
+// The upstream stub read MemTimings without the x4 row scaling (a different page's byte), charged
+// the branch-fetch cost twice for ARM (6 instead of 3 + 1 in cached memory) and the Thumb x2 on
+// the aligned instead of the unaligned target.
 void* Compiler::Gen_JumpTo9(int kind)
 {
     AlignCode16();
     void* res = GetRXPtr();
+    REFILL_ENTRY(kind);
 
+    // W1 = raw = MemTimings[addr >> 12][0]
 #ifdef LITEV_JIT_REFILL_FAST
-    // The same byte (RCPU + MemTimings + (addr >> 12)) in 3 instructions instead of 4. X0 >> 12 ==
-    // W0 >> 12: the only caller (Comp_JumpTo) hands the target over in W0 from a 32-bit write,
-    // which zeroes bits 63:32.
+    // X1 = RCPU + (addr >> 12) * 4 in 2 instructions (bits 63:32 of X1 are zero after the W write).
     {
         constexpr u32 mt = offsetof(ARMv5, MemTimings);
         static_assert(mt < 0x1000000, "MemTimings offset must fit ADD imm12 lsl 12 + LDRB imm12");
-        ADD(X1, RCPU, X0, ArithOption(X0, ST_LSR, 12));
+        ANDI2R(W1, W0, 0xFFFFF000);
+        ADD(X1, RCPU, X1, ArithOption(X1, ST_LSR, 10));
         ADD(X1, X1, mt >> 12, true);
         LDRB(INDEX_UNSIGNED, W1, X1, mt & 0xFFF);
     }
 #else
     LSR(W1, W0, 12);
+    LSL(W1, W1, 2);
     ADDI2R(W1, W1, offsetof(ARMv5, MemTimings), W2);
     LDRB(W1, RCPU, W1);
 #endif
@@ -377,13 +456,20 @@ void* Compiler::Gen_JumpTo9(int kind)
 
     STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARMv5, RegionCodeCycles));
 
-    if (!LITEV_FT)   // fast timing: the refill is a constant, no fetch-cost lookup
+    // first word (CodeRead32(addr & ~3, true)): addr < ITCMSize ? 1 : raw == 0xFF ? 3 : raw
+    // (ITCMSize is a multiple of 512, so the low address bits do not change the compare)
+#ifdef LITEV_FAST_TIMING
+    if (LITEV_FT)   // fast timing: the refill is a constant, no fetch-cost lookup
+        ADD(RCycles, RCycles, FastTiming.R9);
+    else
+#endif
     {
     CMP(W1, 0xFF);
     MOVI2R(W3, kCodeCacheTiming);
-    CSEL(W1, W3, W1, CC_EQ);
+    CSEL(W3, W3, W1, CC_EQ);
     CMP(W0, W2);
-    CSINC(W1, W1, WZR, CC_HS);
+    CSINC(W3, W3, WZR, CC_HS);
+    ADD(RCycles, RCycles, W3);
     }
 
     FixupBranch switchToThumb;
@@ -396,9 +482,9 @@ void* Compiler::Gen_JumpTo9(int kind)
         if (kind == 0)
 #ifdef LITEV_JIT_LAZYFLAGS
         {
-            // Clear guest T-bit in ARM::CPSR memory (RCPSR is gone / is guest r7 at runtime).
-            // W3 (kCodeCacheTiming) is dead here; the caller (Comp_JumpTo reg) already
-            // materialized host NZCV so the word is canonical and only the T-bit changes.
+            // Clear guest T-bit in ARM::CPSR memory. W3 is dead here (the first-word cost is
+            // added); the caller (Comp_JumpTo reg) already materialized host NZCV so the word is
+            // canonical and only the T-bit changes.
             LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, CPSR));
             ANDI2R(W3, W3, ~0x20);
             STR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, CPSR));
@@ -411,19 +497,12 @@ void* Compiler::Gen_JumpTo9(int kind)
         ADD(W0, W0, 4);
         STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARMv5, R[15]));
 
+        // second word: CodeRead32(addr + 4, false), W0 == addr + 4
 #ifdef LITEV_FAST_TIMING
-        if (LITEV_FT) ADD(RCycles, RCycles, FastTiming.R9);
-        else
+        if (!LITEV_FT)
 #endif
-        {
-#ifdef LITEV_JIT_REFILL_FAST
-        ADD(RCycles, RCycles, W1, ArithOption(W1, ST_LSL, 1));   // += 2 * W1
-#else
-        ADD(W1, W1, W1);
-        ADD(RCycles, RCycles, W1);
-#endif
-        }
-        RET();
+        Gen_JumpTo9SeqFetch();
+        REFILL_CALL(RefillCheck9); RET();
     }
 
     if (kind == 0 || kind == 2)
@@ -445,30 +524,26 @@ void* Compiler::Gen_JumpTo9(int kind)
         ADD(W0, W0, 2);
         STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARMv5, R[15]));
 
+        // an unaligned target (addr & 2) also fetches the next word: CodeRead32(addr + 2, false).
+        // W0 == addr + 2 here, so it is unaligned exactly when W0 & 2 is clear, and then W0 is
+        // that word's address.
 #ifdef LITEV_FAST_TIMING
-        if (LITEV_FT) ADD(RCycles, RCycles, FastTiming.R9);
-        else
+        if (!LITEV_FT)
 #endif
         {
-#ifdef LITEV_JIT_REFILL_FAST
-        UBFX(W2, W0, 1, 1);      // (W0 & 2) ? 2 * W1 : W1, as a shift
-        LSLV(W1, W1, W2);
-#else
-        ADD(W2, W1, W1);
-        TSTI2R(W0, 0x2);
-        CSEL(W1, W1, W2, CC_EQ);
-#endif
-        ADD(RCycles, RCycles, W1);
+        FixupBranch aligned = TBNZ(W0, 1);
+        Gen_JumpTo9SeqFetch();
+        SetJumpTarget(aligned);
         }
-        RET();
+        REFILL_CALL(RefillCheck9); RET();
     }
 
     return res;
 }
-
 void* Compiler::Gen_JumpTo7(int kind)
 {
     void* res = GetRXPtr();
+    REFILL_ENTRY(kind);
 
     LSR(W1, W0, 24);
     STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CodeRegion));
@@ -497,9 +572,14 @@ void* Compiler::Gen_JumpTo7(int kind)
         else
 #endif
         {
-        UBFX(W2, W3, 0, 8);
-        UBFX(W3, W3, 8, 8);
+        // ARMv4::JumpTo: ARM refill = N32 + S32 (bytes 2 and 3; upstream added the 16-bit pair)
+        UBFX(W2, W3, 16, 8);
+#ifdef LITEV_JIT_REFILL_FAST
+        ADD(W2, W2, W3, ArithOption(W3, ST_LSR, 24));   // byte 2 + byte 3
+#else
+        UBFX(W3, W3, 24, 8);
         ADD(W2, W3, W2);
+#endif
         ADD(RCycles, RCycles, W2);
         }
 
@@ -520,7 +600,7 @@ void* Compiler::Gen_JumpTo7(int kind)
         ADD(W3, W0, 4);
         STR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, R[15]));
 
-        RET();
+        REFILL_CALL(RefillCheck7); RET();
     }
     if (kind == 0 || kind == 2)
     {
@@ -543,13 +623,10 @@ void* Compiler::Gen_JumpTo7(int kind)
         else
 #endif
         {
-        UBFX(W2, W3, 16, 8);
-#ifdef LITEV_JIT_REFILL_FAST
-        ADD(W2, W2, W3, ArithOption(W3, ST_LSR, 24));   // byte 2 + byte 3
-#else
-        UBFX(W3, W3, 24, 8);
+        // ARMv4::JumpTo: Thumb refill = N16 + S16 (bytes 0 and 1; upstream added the 32-bit pair)
+        UBFX(W2, W3, 0, 8);
+        UBFX(W3, W3, 8, 8);
         ADD(W2, W3, W2);
-#endif
         ADD(RCycles, RCycles, W2);
         }
 
@@ -558,7 +635,7 @@ void* Compiler::Gen_JumpTo7(int kind)
         ADD(W3, W0, 2);
         STR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, R[15]));
 
-        RET();
+        REFILL_CALL(RefillCheck7); RET();
     }
 
     return res;

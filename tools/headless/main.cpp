@@ -1098,6 +1098,7 @@ int main(int argc, char** argv)
     printf("fb_changing: %s\n", anyChange ? "yes" : "no");
     printf("audio_hash:  %016llx\n", (unsigned long long)audioHash);
     printf("audio_samples: %llu\n", (unsigned long long)audioSampleCount);
+    printf("lag_frames:  %u\n", nds->NumLagFrames);   // frames the game did not read the keys (game-speed proxy)
 #ifdef __APPLE__
     // emulation thread only (RunFrame), so render/worker threads don't dilute A/B deltas
     printf("jit_compiles: %llu restored: %llu same-bytes recompiles: restored %llu not %llu (nocand %llu addr %llu lit %llu ranges %llu) resets %llu revert-locks %llu\n", (unsigned long long)melonDS::JitCompileCount, (unsigned long long)melonDS::JitRestoreCount, (unsigned long long)melonDS::JitRecompileSame[0], (unsigned long long)melonDS::JitRecompileSame[1], (unsigned long long)melonDS::JitRecompileSame[2], (unsigned long long)melonDS::JitRecompileSame[3], (unsigned long long)melonDS::JitRecompileSame[4], (unsigned long long)melonDS::JitRecompileSame[5], (unsigned long long)melonDS::JitRecompileSame[6], (unsigned long long)melonDS::JitRecompileSame[7]);

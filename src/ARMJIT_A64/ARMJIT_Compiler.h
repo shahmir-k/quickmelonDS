@@ -562,6 +562,7 @@ public:
 
     // 0 = switch mode, 1 = stay arm, 2 = stay thumb
     void* Gen_JumpTo9(int kind);
+    void Gen_JumpTo9SeqFetch();
     void* Gen_JumpTo7(int kind);
 
 #ifdef LITEV_JIT_DISPATCH
