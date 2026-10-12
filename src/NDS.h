@@ -270,7 +270,7 @@ public: // TODO: Encapsulate the rest of these members
 #endif
 #ifdef LITEV_NPSCHED_STATS
     // diagnostic: per frame window, read and reset by the headless harness
-    struct SchedStatsT { u64 Iter = 0, Both = 0, A9Only = 0, Exec[2] = {}, HaltedSkip[2] = {}, Disp[2] = {}, Ev[Event_MAX] = {}, Irq[2][32] = {}; } SchedStats;
+    struct SchedStatsT { u64 Iter = 0, Both = 0, A9Only = 0, Exec[2] = {}, HaltedSkip[2] = {}, Disp[2] = {}, Ev[Event_MAX] = {}, Irq[2][32] = {}, Native[3] = {}; } SchedStats;
 #endif
     u8 ARM9MemTimings[0x40000][8];
     u32 ARM9Regions[0x40000];
@@ -640,8 +640,22 @@ protected:
     void EnterSleepMode();
     template <CPUExecuteMode cpuMode>
     u32 RunFrame();
+    // The scheduler iteration's ARM9 step and its tail (ARM7 catch-up, events), split so the JIT's
+    // native slice loop (LITEV_JIT_NATIVE_LOOP) runs exactly the same code. Always inlined.
+    template <CPUExecuteMode cpuMode> void RunArm9Step();
+    template <CPUExecuteMode cpuMode> bool RunSliceTail();
 
 public:
+#ifdef LITEV_JIT_NATIVE_LOOP
+    // LITEV_JIT_NATIVE_LOOP: called by the ARM9 dispatcher when a slice's budget runs out.
+    // Runs what Execute and RunFrame would run next up to the next ARM9 dispatch and returns
+    // that slice's budget (the dispatcher goes on with the next block), or 0 (back to C++).
+    s32 NativeSliceNext();
+    s32 NativeDispatch();
+    // 1: NativeSliceNext ran the rest of the iteration RunFrame is in, 2: and it ended in sleep
+    // mode. Set when it hands back to C++ after that; RunFrame then skips its own tail.
+    u8 NativeTailDone = 0;
+#endif
     NDS(NDSArgs&& args, void* userdata = nullptr) noexcept : NDS(std::move(args), 0, userdata) {}
     NDS() noexcept;
     virtual ~NDS() noexcept;

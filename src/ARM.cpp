@@ -1501,6 +1501,12 @@ void ARMv5::Execute()
                 // below does SPSR = CPSR).
                 CPSR = (CPSR & 0x0FFFFFFF) | (JitNZCV & 0xF0000000);
 #endif
+#ifdef LITEV_JIT_NATIVE_LOOP
+                // the native slice loop ran on past this slice and handed back after an
+                // iteration's tail: RunFrame goes on from there (see NDS::NativeSliceNext)
+                if (NDS.NativeTailDone)
+                    return;
+#endif
             }
 #ifdef LITEV_A7PROF
             if (&NDS == A7Prof::Target) A7Prof::g9.Jit(block != nullptr, (NDS.ARM9Timestamp - a9t0) >> NDS.ARM9ClockShift);

@@ -1278,6 +1278,27 @@ bool Compiler::CanCompile(bool thumb, u16 kind)
 static void LiteV_DirectPatchPromote(Compiler* c, u32 num, u32 site, u32 guestTarget, u64 hostEntry);
 static void LiteV_DirectPatchDemote(Compiler* c, u32 num, u32 site);
 #endif
+#ifdef LITEV_JIT_NATIVE_LOOP
+// LITEV_JIT_NATIVE_LOOP (see NDS::NativeSliceNext): the ARM9 dispatcher's budget exit calls this
+// and, given a new budget, goes on with the next block instead of returning to C++.
+// Headless A/B in one binary: LITEV_JIT_NATIVE_LOOP_OFF=1; Android: debug.litev.nativeloop=0.
+static bool NativeLoopOn()
+{
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return __system_property_get("debug.litev.nativeloop", b) > 0 ? atoi(b) != 0 : true;
+#else
+        return !getenv("LITEV_JIT_NATIVE_LOOP_OFF");
+#endif
+    }();
+    return on;
+}
+static s32 LiteV_NativeSlice9(melonDS::NDS* nds)
+{
+    return nds->NativeSliceNext();
+}
+#endif
 void* Compiler::Gen_Dispatcher(u32 num)
 {
     AlignCode16();
@@ -1345,6 +1366,9 @@ void* Compiler::Gen_Dispatcher(u32 num)
     FixupBranch exitBudget = B(CC_LE);
 #endif
 
+#ifdef LITEV_JIT_NATIVE_LOOP
+    const void* lookupEntry = GetRXPtr();   // the native slice loop's re-entry
+#endif
     // (d) instrAddr = R[15] - ((CPSR&0x20)?2:4) == (R[15] - 4) + (thumb << 1), as in the loop
     LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
 #ifdef LITEV_JIT_LAZYFLAGS
@@ -1646,11 +1670,39 @@ void* Compiler::Gen_Dispatcher(u32 num)
     BR(X5);
 #endif
 
+#if defined(LITEV_JIT_NATIVE_LOOP) && defined(LITEV_JIT_BUDGET_REG)
+    if (num == 0 && NativeLoopOn())
+    {
+        // The slice is over: spill as for C++ (Timestamp, CyclesBudget), then let the native
+        // slice loop run the scheduler up to the next ARM9 slice. W0 = its budget (> 0: go on
+        // with the block at R[15], skipping the per-site caches as a C++ entry does), 0 = C++.
+        // The guest registers pinned in callee-saved host registers stay live across the call.
+        SetJumpTarget(exitBudget);
+        EmitBudgetSpill(X1, X2, X3);
+        MOVP2R(X0, (void*)&NDS);
+        ARM64XEmitter::QuickCallFunction(X16, (void*)&LiteV_NativeSlice9);
+        FixupBranch toCpp = CBZ(W0);
+        MOV(RBudget, W0);
+  #ifdef LITEV_JIT_ICACHE
+        MOVI2R(W9, 0);
+  #endif
+  #ifdef LITEV_JIT_RAS
+        if (RasOn)
+            MOVI2R(W10, 0);
+  #endif
+        B(lookupEntry);
+        SetJumpTarget(toCpp);
+        QuickTailCall(X0, ARM_Ret);
+    }
+    else
+        SetJumpTarget(exitBudget);
+#else
+    SetJumpTarget(exitBudget);
+#endif
     SetJumpTarget(exitStop);
 #ifdef LITEV_JIT_IRQMASK_CONT
     SetJumpTarget(exitStopUnmasked);
 #endif
-    SetJumpTarget(exitBudget);
     SetJumpTarget(exitRegion);
     SetJumpTarget(miss);
 #ifdef LITEV_JIT_BUDGET_REG
