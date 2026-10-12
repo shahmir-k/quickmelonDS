@@ -38,6 +38,9 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsy
 #include "GPU.h"
 #include "GPU_Soft.h"
 #include "Platform.h"
+#ifdef LITEV_A7_NATIVE_WM
+#include "WMNative.h"
+#endif
 #include "xxhash/xxhash.h"
 
 #include "PlatformHeadless.h"
@@ -1138,6 +1141,11 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             lockstepMP->SetWake(k, *nd);
         }
         b[k].udata->instanceID = k;
+#ifdef LITEV_A7_NATIVE_WM
+        // LITEV_A7WM_INST=<mask>: console k runs the native ARM7 WM driver iff bit k (unset: debug.litev.a7wm decides)
+        if (const char* wm = getenv("LITEV_A7WM_INST")) WMNative::SetInstance(*b[k].nds, k, (strtoul(wm, nullptr, 0) >> k) & 1);
+        else WMNative::SetInstance(*b[k].nds, k, -1);
+#endif
         // Distinct MAC per instance so they associate as different wireless players.
         if (k && !getenv("LITEV_APP_FW"))
         {

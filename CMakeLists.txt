@@ -718,6 +718,14 @@ if (LITEV_A7HLE)
     add_compile_definitions(LITEV_A7HLE=1)
 endif()
 
+# A7_NATIVE_WM: the NitroSDK ARM7 wireless driver (WM: WMSP + the MAC layer under it) natively, per WM build found by
+# signature (unrecognised builds keep the emulated driver). Runtime: debug.litev.a7wm (prop on Android, env elsewhere).
+# See src/WMNative.h.
+option(LITEV_A7_NATIVE_WM "Native ARM7 WM wireless driver per WM build (category B)" OFF)
+if (LITEV_A7_NATIVE_WM)
+    add_compile_definitions(LITEV_A7_NATIVE_WM=1)
+endif()
+
 # A9HLE: Pokemon Black/White's NitroSDK ARM9 OS: spurious OS_WaitIrq wake-ups (the IRQ handler
 # switching to the VBlank-waiting main thread and back on every HBlank, 25-50% of ARM9 guest
 # instructions) are skipped with the exact memory/register result, and OS_SetIrqFunction /

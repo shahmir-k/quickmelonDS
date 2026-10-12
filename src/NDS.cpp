@@ -34,6 +34,9 @@
 #include "SPI.h"
 #include "RTC.h"
 #include "Wifi.h"
+#ifdef LITEV_A7_NATIVE_WM
+#include "WMNative.h"
+#endif
 #include "AREngine.h"
 #include "Platform.h"
 #include "FreeBIOS.h"
@@ -3230,6 +3233,9 @@ void NDS::ARM7Write8(u32 addr, u8 val)
     {
     case 0x02000000:
     case 0x02800000:
+#if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
+        WMNative::TraceA7Write(*this, addr, val, 1);
+#endif
         JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr, (u8*)&MainRAM[addr & MainRAMMask], (u8)val);
         *(u8*)&MainRAM[addr & MainRAMMask] = val;
         return;
@@ -3289,6 +3295,9 @@ void NDS::ARM7Write16(u32 addr, u16 val)
     {
     case 0x02000000:
     case 0x02800000:
+#if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
+        WMNative::TraceA7Write(*this, addr, val, 2);
+#endif
         JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr, (u16*)&MainRAM[addr & MainRAMMask], (u16)val);
         *(u16*)&MainRAM[addr & MainRAMMask] = val;
         return;
@@ -3359,6 +3368,9 @@ void NDS::ARM7Write32(u32 addr, u32 val)
     {
     case 0x02000000:
     case 0x02800000:
+#if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
+        WMNative::TraceA7Write(*this, addr, val, 4);
+#endif
         JIT.CheckAndInvalidate<1, ARMJIT_Memory::memregion_MainRAM>(addr, (u32*)&MainRAM[addr & MainRAMMask], (u32)val);
         *(u32*)&MainRAM[addr & MainRAMMask] = val;
         return;
@@ -4328,12 +4340,18 @@ LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite32(u32 addr, u32 val)
         case (0x04000188 & 0x1FFF) >> 2:
             if (IPCFIFOCnt9 & 0x8000)
             {
+#ifdef LITEV_A7_NATIVE_WM
+                if ((val & 31) == 10 && WMNative::Fifo9(*this, val)) return;   // (the native WM driver consumed it)
+#endif
                 if (IPCFIFO9.IsFull())
                     IPCFIFOCnt9 |= 0x4000;
                 else
                 {
                     bool wasempty = IPCFIFO9.IsEmpty();
                     IPCFIFO9.Write(val);
+#if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
+                    WMNative::TraceFifo(*this, 0, val);
+#endif
                     if ((IPCFIFOCnt7 & 0x0400) && wasempty)
                         SetIRQ(1, IRQ_IPCRecv);
                 }
@@ -4490,12 +4508,18 @@ LITEV_MEM_SPLIT_NOINLINE void NDS::ARM9IOWrite32(u32 addr, u32 val)
     case 0x04000188:
         if (IPCFIFOCnt9 & 0x8000)
         {
+#ifdef LITEV_A7_NATIVE_WM
+            if ((val & 31) == 10 && WMNative::Fifo9(*this, val)) return;   // (the native WM driver consumed it)
+#endif
             if (IPCFIFO9.IsFull())
                 IPCFIFOCnt9 |= 0x4000;
             else
             {
                 bool wasempty = IPCFIFO9.IsEmpty();
                 IPCFIFO9.Write(val);
+#if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
+                    WMNative::TraceFifo(*this, 0, val);
+#endif
                 if ((IPCFIFOCnt7 & 0x0400) && wasempty)
                     SetIRQ(1, IRQ_IPCRecv);
             }
@@ -5156,6 +5180,9 @@ void NDS::ARM7IOWrite32(u32 addr, u32 val)
             {
                 bool wasempty = IPCFIFO7.IsEmpty();
                 IPCFIFO7.Write(val);
+#if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
+                WMNative::TraceFifo(*this, 1, val);
+#endif
                 if ((IPCFIFOCnt9 & 0x0400) && wasempty)
                     SetIRQ(0, IRQ_IPCRecv);
             }

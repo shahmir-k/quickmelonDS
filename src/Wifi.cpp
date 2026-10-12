@@ -22,6 +22,9 @@
 #include "NDS.h"
 #include "SPI.h"
 #include "Wifi.h"
+#ifdef LITEV_A7_NATIVE_WM
+#include "WMNative.h"
+#endif
 #include "MPLinkFlags.h"
 #include "WifiAP.h"
 #include "Platform.h"
@@ -131,6 +134,9 @@ Wifi::~Wifi()
 
 void Wifi::Reset()
 {
+#ifdef LITEV_A7_NATIVE_WM
+    WMNative::Reset(NDS);
+#endif
     memset(RAM, 0, 0x2000);
     memset(IO, 0, 0x1000);
 
@@ -706,6 +712,9 @@ void Wifi::SetPowerCnt(u32 val)
 void Wifi::CheckIRQ(u16 oldflags)
 {
     u16 newflags = IOPORT(W_IF) & IOPORT(W_IE);
+#ifdef LITEV_A7_NATIVE_WM
+    if (WMNOwns) { if (newflags) WMNative::ChipIRQ(NDS); return; }
+#endif
 
     if ((oldflags == 0) && (newflags != 0))
         NDS.SetIRQ(1, IRQ_Wifi);
@@ -991,6 +1000,9 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
 
     if (CurChannel == 0) return;
     TXBuffer[9] = CurChannel;
+#if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
+    WMNative::TraceFrame(NDS, 1 + num, TXBuffer, 12 + len, USTimestamp);
+#endif
 
     switch (num)
     {
@@ -1790,6 +1802,9 @@ void Wifi::FinishRX()
 
     // TODO: RX stats
 
+#if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
+    WMNative::TraceFrame(NDS, 0, RXBuffer, 12 + (*(u16*)&RXBuffer[8]), USTimestamp);
+#endif
     u16 framectl = *(u16*)&RXBuffer[12];
     u16 seqno = *(u16*)&RXBuffer[12 + 22];
 
@@ -2749,6 +2764,9 @@ void Wifi::Write(u32 addr, u16 val)
 {
     if (addr >= 0x04810000) return;
     if (PowerOn) EvtCatchUp(NDS.ARM7Timestamp);
+#if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
+    WMNative::TraceChip(NDS, 1, addr, val, USTimestamp);
+#endif
     WriteReg(addr, val);
     // (Wi-Fi RAM is not what EvtSchedule judges by)
     if (PowerOn && !((addr & 0x7FFE) >= 0x2000 && (addr & 0x7FFE) < 0x6000)) EvtSchedule(false);
