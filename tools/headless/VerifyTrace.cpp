@@ -1101,6 +1101,9 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_NP_ADAPTIVE_DELAY
     if (net && np) net->Adaptive = adaptive != 0;   // plain Netplay, on unless adaptive=0
 #endif
+#ifdef LITEV_NP_QUIET_HB
+    if (net && np) net->QuietHeartbeat = !getenv("LITEV_NP_QUIET_HB") || atoi(getenv("LITEV_NP_QUIET_HB")) != 0;   // plain Netplay; =0 off
+#endif
     for (int k = 0; k < n; k++)
     {
         if (lockstepMP)

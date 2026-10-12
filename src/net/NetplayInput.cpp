@@ -23,6 +23,7 @@
 #include <sys/resource.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <cmath>
@@ -240,13 +241,32 @@ void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
     Send();
 }
 
-void NetplayInput::Send()
+#ifdef LITEV_NP_QUIET_HB
+bool NetplayInput::HeartbeatDue(int peer, u64 now) const
+{
+    const u64 since = now - LastSentTo[peer];
+    if (since >= kKeepaliveMs * 1000) return true;
+    if (OweAckSince[peer] && now - OweAckSince[peer] >= kAckDelayMs * 1000) return true;
+    // our inputs it has not acknowledged: its acknowledgement can take kAckDelayMs (+ a tick) and a
+    // round trip; a frame's send re-sends them anyway, so this only matters while we are blocked
+    const bool data = !Unacked.empty() && Unacked.back().first > PeerAck[peer];
+    return data && since >= 2 * kAckDelayMs * 1000 + RttP90[peer];
+}
+#endif
+
+void NetplayInput::Send(bool all)
 {
     std::vector<u8> packet;
     for (int peer : Peers)
     {
         {
             std::lock_guard<std::mutex> lk(Lock);
+#ifdef LITEV_NP_QUIET_HB
+            const u64 t = NowUs();
+            if (!all && QuietHeartbeat && !HeartbeatDue(peer, t)) continue;
+            LastSentTo[peer] = t;
+            OweAckSince[peer] = 0;  // this packet acknowledges everything we have
+#endif
             // what this peer has not acknowledged yet (Unacked also holds what only others lack)
             size_t first = 0;
             while (first < Unacked.size() && Unacked[first].first <= PeerAck[peer]) first++;
@@ -397,6 +417,9 @@ NetplayFrameInput NetplayInput::Get(int player, int frame)
 
 void NetplayInput::ReceiveLoop()
 {
+#if defined(LITEV_NP_QUIET_HB) && defined(__linux__)
+    pthread_setname_np(pthread_self(), "np-recv");
+#endif
 #if defined(LITEV_NP_RX_PRIO) && defined(__linux__)
     // the emulator threads run at nice -10..-16: at the default nice this thread waited for a core
     // tens of ms under load (in-race round trips 50-100 ms on a 3-10 ms Wi-Fi link)
@@ -426,7 +449,7 @@ void NetplayInput::ReceiveLoop()
         // heartbeat: re-sends what each peer has not acknowledged, and our acknowledgements, after
         // kResendMs with nothing sent
         now = NowUs();
-        if (send || now - LastSendUs.load() >= kResendMs * 1000) Send();
+        if (send || now - LastSendUs.load() >= kResendMs * 1000) Send(send);
         for (ssize_t len; (len = recv(Socket, buf, sizeof(buf), MSG_DONTWAIT)) > 0;)
         {
             now = NowUs();
@@ -547,6 +570,9 @@ void NetplayInput::Receive(const u8* data, size_t size, u64 now)
         while (inputs.count(RemoteUpTo[from] + 1)) { RemoteUpTo[from]++; NoteSpeed(from, RemoteUpTo[from], inputs[RemoteUpTo[from]]); }
 #else
         while (inputs.count(RemoteUpTo[from] + 1)) RemoteUpTo[from]++;
+#endif
+#ifdef LITEV_NP_QUIET_HB
+        if (header.Count && !OweAckSince[from]) OweAckSince[from] = now;   // even a re-send: our acknowledgement was lost
 #endif
         PeerAck[from] = std::max(PeerAck[from], header.Ack);
         int allAcked = INT32_MAX;

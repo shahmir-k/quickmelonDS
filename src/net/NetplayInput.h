@@ -36,6 +36,10 @@
 #include "types.h"
 #include "LockstepMP.h"
 
+#if defined(LITEV_NP_QUIET_HB) && !(defined(LITEV_NP_LEAN_IO) && defined(LITEV_NP_WIRE_RUNS))
+#error "LITEV_NP_QUIET_HB needs LITEV_NP_LEAN_IO and LITEV_NP_WIRE_RUNS"
+#endif
+
 namespace melonDS
 {
 
@@ -149,6 +153,12 @@ public:
     // stream), so this is deterministic. 0 = wait forever (Netplay: every device applies every
     // input itself, so all of them must wait).
     int DropAfterMs = 0;
+#ifdef LITEV_NP_QUIET_HB
+    // Plain Netplay: between frames, a heartbeat only to a peer that needs one (an acknowledgement
+    // owed, inputs of ours it has not acknowledged for a while, or silence). Off for Hosted Netplay
+    // (a replica applies its own input only once the server acknowledged it: it needs the 10 ms one).
+    bool QuietHeartbeat = false;
+#endif
     bool Dropped(int player) const { return (DroppedMask.load() >> player) & 1; }
     // `peer` has acknowledged all of our inputs up to this applied frame. Hosted Netplay: the server
     // applies a player's input exactly when it acknowledged it (it ignores a dropped player's
@@ -224,9 +234,16 @@ private:
     std::atomic<u64> LastSendUs {0};    // the last Send(): the heartbeat waits kResendMs after it
     u32 RttP90[kMaxPlayers] {};         // each peer's 90th percentile (0 = none yet)
 #endif
+#ifdef LITEV_NP_QUIET_HB
+    static constexpr int kAckDelayMs = 20;      // an acknowledgement waits this long for a frame's send to carry it
+    static constexpr int kKeepaliveMs = 100;    // the longest a peer goes without a packet (it shows "waiting" after 500)
+    u64 LastSentTo[kMaxPlayers] {};     // our last packet to that peer
+    u64 OweAckSince[kMaxPlayers] {};    // it sent us inputs since then and wants an acknowledgement (0 = none)
+    bool HeartbeatDue(int peer, u64 now) const;     // under Lock
+#endif
     void Receive(const u8* data, size_t len, u64 now);   // one packet (receive thread)
     void ReceiveLoop();
-    void Send();
+    void Send(bool all = true);    // all = a frame's send (else the heartbeat)
 };
 
 // A ROM's identity. Every player may run a different game (Pokemon White with Pokemon Black):
