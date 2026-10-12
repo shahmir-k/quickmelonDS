@@ -103,6 +103,8 @@ TileRenderer3D::TileRenderer3D(melonDS::GPU3D& gpu3D, SoftRenderer& parent) noex
     NB = LitevTopo::TileWorkers(NumBlocks, NBMax);   // fixed for this renderer's lifetime
     BlocksPerWorker = NumBlocks / NB;
 #endif
+    for (int b = 0; b < NCOL; b++)
+        for (int y = 0; y < OutHeight; y++) RowReady[b][y].store(1, std::memory_order_relaxed);
 }
 
 TileRenderer3D::~TileRenderer3D()
@@ -140,10 +142,9 @@ void TileRenderer3D::Reset()
         Band[b].Tex.Used = 0;
         Band[b].Tex.Count = 0;
     }
-    ConsumeIdx.store(0, std::memory_order_relaxed);
     DisplayIdx.store(0, std::memory_order_relaxed);
     for (int b = 0; b < NCOL; b++)
-        for (int y = 0; y < OutHeight; y++) RowReady[b][y].store(0, std::memory_order_relaxed);
+        for (int y = 0; y < OutHeight; y++) RowReady[b][y].store(1, std::memory_order_relaxed);   // blank = complete
     ConsumerPassIdx = 0;
     RenderIdx = 0;
     FrameIdentical = false;
@@ -500,7 +501,7 @@ u32 TileRenderer3D::AlphaBlend(u32 srccolor, u32 dstcolor, u32 alpha) const
     u32 srcG = (srccolor >> 8) & 0x3F;
     u32 srcB = (srccolor >> 16) & 0x3F;
 
-    if (GPU3D.RenderDispCnt & (1<<3))
+    if (Cfg[GeomRead].DispCnt & (1<<3))
     {
         u32 dstR = dstcolor & 0x3F;
         u32 dstG = (dstcolor >> 8) & 0x3F;
@@ -717,24 +718,25 @@ void TileRenderer3D::PlotTranslucentTile(BandScratch& bs, u32 idx, u32 color, s3
 
 u32 TileRenderer3D::CalculateFogDensity(u32 z) const
 {
+    const FrameCfg& cfg = Cfg[GeomRead];
     u32 densityid, densityfrac;
-    if (z < GPU3D.RenderFogOffset)
+    if (z < cfg.FogOffset)
     {
         densityid = 0;
         densityfrac = 0;
     }
     else
     {
-        z -= GPU3D.RenderFogOffset;
-        z = (z >> 2) << GPU3D.RenderFogShift;
+        z -= cfg.FogOffset;
+        z = (z >> 2) << cfg.FogShift;
         densityid = z >> 17;
         if (densityid >= 32) { densityid = 32; densityfrac = 0; }
         else                   densityfrac = z & 0x1FFFF;
     }
 
     u32 density =
-        ((GPU3D.RenderFogDensityTable[densityid] * (0x20000-densityfrac)) +
-         (GPU3D.RenderFogDensityTable[densityid+1] * densityfrac)) >> 17;
+        ((cfg.FogDensityTable[densityid] * (0x20000-densityfrac)) +
+         (cfg.FogDensityTable[densityid+1] * densityfrac)) >> 17;
     if (density >= 127) density = 128;
     return density;
 }
@@ -753,7 +755,8 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
                                  const u32* downColor, const u32* downDepthId)
 {
     (void)y;
-    const u32 dispcnt = GPU3D.RenderDispCnt;
+    const FrameCfg& cfg = Cfg[GeomRead];
+    const u32 dispcnt = cfg.DispCnt;
     const bool edgemark = (dispcnt & (1<<5)) != 0;
     const bool aa       = (dispcnt & (1<<4)) != 0;
     const bool fog      = (dispcnt & (1<<7)) != 0;
@@ -761,10 +764,10 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
 
     // fog constants (hoisted)
     const bool fogcolor = !(dispcnt & (1<<6));
-    u32 fogR = (GPU3D.RenderFogColor << 1) & 0x3E; if (fogR) fogR++;
-    u32 fogG = (GPU3D.RenderFogColor >> 4) & 0x3E; if (fogG) fogG++;
-    u32 fogB = (GPU3D.RenderFogColor >> 9) & 0x3E; if (fogB) fogB++;
-    u32 fogA = (GPU3D.RenderFogColor >> 16) & 0x1F;
+    u32 fogR = (cfg.FogColor << 1) & 0x3E; if (fogR) fogR++;
+    u32 fogG = (cfg.FogColor >> 4) & 0x3E; if (fogG) fogG++;
+    u32 fogB = (cfg.FogColor >> 9) & 0x3E; if (fogB) fogB++;
+    u32 fogA = (cfg.FogColor >> 16) & 0x1F;
 
     const u32 borderDI = Cfg[GeomRead].ClearDepthIdVal;
     const u32 borderC  = Cfg[GeomRead].ClearColorVal;
@@ -806,7 +809,7 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
             {
                 if (edgemark)
                 {
-                    u16 ec = GPU3D.RenderEdgeTable[cid >> 3];
+                    u16 ec = cfg.EdgeTable[cid >> 3];
                     u32 er = (ec << 1) & 0x3E; if (er) er++;
                     u32 eg = (ec >> 4) & 0x3E; if (eg) eg++;
                     u32 eb = (ec >> 9) & 0x3E; if (eb) eb++;
@@ -967,7 +970,8 @@ void TileRenderer3D::RasterPolyInTile(BandScratch& bs, const TilePoly& poly, s32
     {
         const u32 attr      = poly.attr;
         const u32 blendmode = (attr >> 4) & 0x3;
-        const u32 dispcnt   = GPU3D.RenderDispCnt;
+        const FrameCfg& cfg = Cfg[GeomRead];
+        const u32 dispcnt   = cfg.DispCnt;
         ps.toon      = (blendmode == 2);
         ps.highlight = ps.toon && (dispcnt & (1<<1));
         ps.decal     = (blendmode & 0x1) != 0;
@@ -975,10 +979,10 @@ void TileRenderer3D::RasterPolyInTile(BandScratch& bs, const TilePoly& poly, s32
         const u32 texfmt = (ps.texparam >> 26) & 0x7;
         ps.texEnable = (dispcnt & 0x1) && (texfmt != 0);
         ps.texpal    = poly.texpal;
-        ps.toontbl   = GPU3D.RenderToonTable;
+        ps.toontbl   = cfg.ToonTable;
         ps.polyalpha = (attr >> 16) & 0x1F;
         ps.wireframe = (ps.polyalpha == 0);
-        ps.alpharef  = GPU3D.RenderAlphaRef;
+        ps.alpharef  = cfg.AlphaRef;
         // DraStic id byte pre-shifted into bits 24-31: poly-id (opaque, 6 bits) | fog-enable (bit 6).
         const u32 polyid = (attr >> 24) & ID_POLY_MASK;
         const u32 fogbit = (attr & (1u<<15)) ? ID_FOG : 0;
@@ -1047,6 +1051,15 @@ void TileRenderer3D::ComputeClearConfig()
     }
     Cfg[GeomWrite].DoPost   = (GPU3D.RenderDispCnt & ((1<<4) | (1<<5) | (1<<7))) != 0;
     Cfg[GeomWrite].NeedHalo = (GPU3D.RenderDispCnt & ((1<<4) | (1<<5))) != 0;   // edge/AA read up/down; fog doesn't
+    FrameCfg& c = Cfg[GeomWrite];
+    c.DispCnt  = GPU3D.RenderDispCnt;
+    c.AlphaRef = GPU3D.RenderAlphaRef;
+    memcpy(c.ToonTable, GPU3D.RenderToonTable, sizeof(c.ToonTable));
+    memcpy(c.EdgeTable, GPU3D.RenderEdgeTable, sizeof(c.EdgeTable));
+    c.FogColor  = GPU3D.RenderFogColor;
+    c.FogOffset = GPU3D.RenderFogOffset;
+    c.FogShift  = GPU3D.RenderFogShift;
+    memcpy(c.FogDensityTable, GPU3D.RenderFogDensityTable, sizeof(c.FogDensityTable));
     for (int x = 0; x < OutWidth; x++) { Cfg[GeomWrite].BorderColor[x] = Cfg[GeomWrite].ClearColorVal; Cfg[GeomWrite].BorderDepthId[x] = Cfg[GeomWrite].ClearDepthIdVal; }
 }
 
@@ -1113,6 +1126,7 @@ void TileRenderer3D::WorkerRender(int idx)
             FlushTile(bs, out, ty0);
             for (int r = 0; r < TileH; r++)                    // per-row readiness (see GetLine)
                 PublishRow(rdy, ty0 + r);
+            WakeConsumer();
             continue;
         }
 
@@ -1127,6 +1141,7 @@ void TileRenderer3D::WorkerRender(int idx)
                             Cfg[GeomRead].BorderColor, Cfg[GeomRead].BorderDepthId, Cfg[GeomRead].BorderColor, Cfg[GeomRead].BorderDepthId);
                 PublishRow(rdy, y);
             }
+            WakeConsumer();
             continue;
         }
 
@@ -1152,6 +1167,7 @@ void TileRenderer3D::WorkerRender(int idx)
                         uc, ud, &bs.Color[o+OutWidth], &bs.DepthId[o+OutWidth]);
             PublishRow(rdy, y);
         }
+        WakeConsumer();
 
         // (3) defer this block's last row (+ its up-neighbour) to the next block in this range.
         const int last = TileH - 1;
@@ -1173,6 +1189,7 @@ void TileRenderer3D::WorkerRender(int idx)
             PostPassRow(carryY, &out[carryY * OutWidth], carryColor, carryDepthId,
                         carryUpColor, carryUpDepthId, Cfg[GeomRead].BorderColor, Cfg[GeomRead].BorderDepthId);
             PublishRow(rdy, carryY);
+            WakeConsumer();
         }
         else
         {
@@ -1192,6 +1209,7 @@ void TileRenderer3D::WorkerRender(int idx)
             PostPassRow(rowB, &out[rowB * OutWidth], SeamColor[idx+1][0], SeamDepthId[idx+1][0],
                         carryColor, carryDepthId, SeamColor[idx+1][1], SeamDepthId[idx+1][1]);
             PublishRow(rdy, rowB);
+            WakeConsumer();
         }
     }
 }
@@ -1286,14 +1304,6 @@ void TileRenderer3D::BandWorkerFunc(int idx)
         // other worker's writes (all rows composited before their fetch_subs).
         if (BandsRemaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
         {
-#ifdef LITEV_TILE_COORD
-            // The COORD workers write WorkerColIdx (set at dispatch); RenderIdx is the emu's newest,
-            // possibly-still-queued buffer. Publish the buffer THESE workers just completed so the
-            // consumer latches a fully-rasterized frame.
-            ConsumeIdx.store(WorkerColIdx, std::memory_order_release);
-#else
-            ConsumeIdx.store(RenderIdx, std::memory_order_release);
-#endif
             FrameComplete.store(true, std::memory_order_release);
             Platform::Semaphore_Post(Sema_FrameDone);
             // Row-wait flush: a consumer that checked FrameComplete==false and is about to block on
@@ -1368,6 +1378,11 @@ void TileRenderer3D::RenderFrame()
         Platform::Semaphore_Wait(Sema_RingFree);
     const u32 slot = FrameProduced.load(std::memory_order_relaxed);
     PendRing[slot % NCOL] = { GeomWrite, col };
+    // Not-ready from the moment it is PRODUCED (not when the coordinator later dispatches it):
+    // a 2D pass latched to this frame must wait for its rows even before the dispatch, never
+    // read the buffer's previous (3-frames-old) contents. Its previous frame's consumer is done
+    // (the 2D barrier drains kick N-2 before VCount 215 of N reuses the buffer).
+    for (int y = 0; y < OutHeight; y++) RowReady[col][y].store(0, std::memory_order_relaxed);
     RenderIdx = col;
     FrameProduced.fetch_add(1, std::memory_order_release);
     Platform::Semaphore_Post(Sema_CoordWork);        // wake the coordinator to raster this frame
@@ -1406,7 +1421,6 @@ void TileRenderer3D::CoordDispatch(int geomIdx, int colIdx)
 {
     GeomRead = geomIdx;
     WorkerColIdx = colIdx;
-    for (int y = 0; y < OutHeight; y++) RowReady[colIdx][y].store(0, std::memory_order_relaxed);
     for (int b = 0; b < NB; b++) SeamFirstReady[b].store(0, std::memory_order_relaxed);
     Platform::Semaphore_Reset(Sema_RowPub);
     // Reset frame-completion state BEFORE publishing DisplayIdx. The 2D consumer (GetLine) latches
@@ -1456,34 +1470,37 @@ void TileRenderer3D::RestartFrame()
 
 u32* TileRenderer3D::GetLine(int line)
 {
-    if (GPU3D.AbortFrame || line < 0 || line >= OutHeight)
+    return GetLineAt(line, GPU3D.RenderXPos, GPU3D.AbortFrame);
+}
+
+u32* TileRenderer3D::GetLineAt(int line, u16 xpos, bool abort)
+{
+    if (abort || line < 0 || line >= OutHeight)
     {
         memset(ScrolledLine, 0, sizeof(ScrolledLine));
         return ScrolledLine;
     }
 
-    // Per-row readiness (the reference's Sema_ScanlineCount pattern). The consumer LATCHES its
-    // buffer once per pass (line 0): the next RenderFrame (VCount 215) fires mid-pass and flips
-    // DisplayIdx / resets the OTHER bank's flags, but this pass's bank + flags stay intact -- that
-    // mid-pass clobber was the measured once-per-frame ~11ms stall. On an unready row the consumer
-    // blocks on Sema_RowPub (posted per published row) and re-checks: it sleeps only until THAT row
-    // lands (~0.1-1ms), not until frame end, then keeps pipelining behind the workers.
-    // No hang: (a) an in-flight frame always publishes all 192 rows (each post wakes the waiter);
-    // (b) the frame-end flush posts 192 extra so a waiter racing frame-completion still wakes;
-    // (c) DisplayIdx-changed / FrameComplete escapes cover a stale latch (boot: a consumer pass can
-    // start before the first 3D kick) -- both mean no more rows are coming for this bank.
+    // Per-row readiness (the reference's Sema_ScanlineCount pattern): on an unready row the
+    // consumer blocks on Sema_RowPub (posted per published row) and re-checks, so it sleeps only
+    // until THAT row lands, then keeps pipelining behind the workers.
+#if defined(LITEV_TILE_COORD) && defined(LITEV_SOFT2D_THREADED)
+    // The buffer was latched for this pass at its VBlank kick (LatchConsumer): the frame produced
+    // last before the kick, as on hardware. (It used to latch, at line 0 on the 2D thread, the last
+    // frame that happened to be COMPLETE -- one or two frames older depending on raster timing, so
+    // identical runs displayed/captured different 3D frames.) Its rows were marked not-ready when it
+    // was produced, so this waits however far behind the raster is. No hang: a produced frame is
+    // always dispatched and publishes all 192 rows; the coordinator never waits on the 2D.
+    const int idx = ConsumerPassIdx;
+#else
     if (line == 0)
 #ifdef LITEV_TILE_COORD
-        // Latch the last FULLY-COMPLETE 3D frame, not the in-progress buffer (DisplayIdx). The emu is
-        // already decoupled by the coordinator, so compositing a complete frame costs no emu fps and
-        // eliminates the read-ahead black-bar race: every row of ConsumeIdx is already published and
-        // its buffer is not reused for another NCOL-1 frames (~2 frames of margin vs one ~16ms pass).
-        // Boot: ConsumeIdx=0 is a black-cleared buffer until the first frame completes.
-        ConsumerPassIdx = ConsumeIdx.load(std::memory_order_acquire);
+        ConsumerPassIdx = RenderIdx;   // inline consumer = the emu thread: the newest produced frame
 #else
         ConsumerPassIdx = DisplayIdx.load(std::memory_order_acquire);
 #endif
     const int idx = ConsumerPassIdx;
+#endif
     std::atomic<u8>& rdy = RowReady[idx][line];
 
 #if LITEV_PROFILE
@@ -1494,9 +1511,12 @@ u32* TileRenderer3D::GetLine(int line)
 #endif
     while (rdy.load(std::memory_order_acquire) == 0)
     {
-        if (DisplayIdx.load(std::memory_order_acquire) != idx) break;  // latched frame superseded/stale
-        if (FrameComplete.load(std::memory_order_acquire)) break;      // frame done -> flags published
-        Platform::Semaphore_Wait(Sema_RowPub);                         // real block until the next row
+#ifndef LITEV_TILE_COORD
+        // stale latch (boot: a pass can start before the first 3D kick): no more rows are coming
+        if (DisplayIdx.load(std::memory_order_acquire) != idx) break;
+        if (FrameComplete.load(std::memory_order_acquire)) break;
+#endif
+        Platform::Semaphore_Wait(Sema_RowPub);
     }
 #if LITEV_PROFILE
     if (stalled)
@@ -1508,7 +1528,6 @@ u32* TileRenderer3D::GetLine(int line)
     u32* rawline = &plane[(u32)line * OutWidth];
 
     // 3D-layer X scroll (RenderXPos) -- byte-for-byte the SoftRenderer3D::GetLine logic.
-    u16 xpos = GPU3D.RenderXPos;
     if (xpos == 0)
         return rawline;
 

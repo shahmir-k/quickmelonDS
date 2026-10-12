@@ -65,6 +65,18 @@ public:
 
     u32* GetLine(int line) override;
 
+    // Async 2D consumer plumbing (LITEV_SOFT2D_THREADED). The display pass kicked at VBlank N
+    // must composite the 3D frame produced at VCount 215 of frame N-1 (what the hardware shows),
+    // i.e. the newest PRODUCED frame at the kick -- not whichever frame happens to be fully
+    // rastered when the 2D thread reaches line 0 (that was timing-dependent: run-to-run
+    // different output, and different display-capture VRAM). The emu thread reads
+    // ProducedColIdx() at the kick; the 2D thread latches it before its pass, and GetLineAt
+    // waits for that frame's rows. xpos/abort = BG0HOFS/GPU3D.AbortFrame as snapshotted for
+    // that line (the live values belong to a later frame by the time the async pass runs).
+    int  ProducedColIdx() const { return RenderIdx; }
+    void LatchConsumer(int col) { ConsumerPassIdx = col; }
+    u32* GetLineAt(int line, u16 xpos, bool abort);
+
     bool NeedsShaderCompile() override { return false; }
     void ShaderCompileStep(int& current, int& count) override {}
 
@@ -306,7 +318,6 @@ private:
     int GeomRead  = 0;   // set at worker dispatch; workers read this geometry buffer
     u32 ColorOut[NCOL][OutWidth * OutHeight] = {};
     int WorkerColIdx = 0;
-    std::atomic<int> ConsumeIdx { 0 };   // last FULLY-completed buffer (retained; frame-done gate)
     int RenderIdx = 0;                    // buffer the workers write this frame (emu-thread only)
 
     // Async consumer plumbing (reference-style per-row readiness):
@@ -384,6 +395,15 @@ private:
         bool DoPost   = false;     // any post-pass (edge/AA/fog) this frame
         bool NeedHalo = false;     // edge/AA -> needs up/down neighbour rows (fog is same-(x,y))
         u32  BorderColor[OutWidth], BorderDepthId[OutWidth];   // off-screen (clear) neighbour rows
+        // The frame's latched GPU3D Render* state (VCount 215). The workers raster this frame
+        // while the emu (TILE_COORD) already latches the next one into GPU3D.Render*, so the
+        // raster must read its own frame's copy, never the live registers.
+        u32  DispCnt = 0;
+        u8   AlphaRef = 0;
+        u16  ToonTable[32] = {};
+        u16  EdgeTable[8] = {};
+        u32  FogColor = 0, FogOffset = 0, FogShift = 0;
+        u8   FogDensityTable[34] = {};
     };
     FrameCfg Cfg[NGEOM];
 
@@ -427,13 +447,16 @@ private:
     std::atomic<int>     BandsRemaining     { 0 };      // workers still rendering this frame
     std::atomic_bool     FrameComplete      { true };   // true when no frame is in flight
 
-    // Publish one composited row: set its ready flag (release) then post the row semaphore so a
-    // blocked consumer wakes immediately.
+    // Publish one composited row: set its ready flag (release).
+    // The semaphore is posted once per published BLOCK (WakeConsumer), not per row (one lock +
+    // wake per block instead of 16). The count stays one per row: several 2D band threads can
+    // wait at once and a woken one that finds its row still unready takes a count back to sleep,
+    // so a count of 1 could leave the band whose row DID land asleep until a later block.
     inline void PublishRow(std::atomic<u8>* rdy, s32 y)
     {
         rdy[y].store(1, std::memory_order_release);
-        Platform::Semaphore_Post(Sema_RowPub);
     }
+    inline void WakeConsumer() { Platform::Semaphore_Post(Sema_RowPub, TileH); }
 
 #ifdef LITEV_TILE_COORD
     // The 3D coordinator thread (DraStic FUN_0015f2c8): owns the raster DISPATCH + the

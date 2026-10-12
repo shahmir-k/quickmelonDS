@@ -189,6 +189,17 @@ void SoftRenderer::Reset()
     FlushAsyncRender();
     AsyncEverProduced = false;
     AsyncPresentBuf = 1;
+#ifdef LITEV_SOFT2D_DEPTH2
+    // Depth-2 kicks target framebuffers round-robin and present the one 2 kicks back; until the
+    // first drain the present buffer is this one, so it must be the one the round-robin reaches
+    // LAST. A fixed 1 let the 2nd kick after a reset render into the buffer being presented
+    // (headless/app showed a half-rendered frame, a different one every run).
+#ifdef LITEV_HYB_SLOTS4
+    { const int n = Hybrid ? NFB : 3; P2FrameBufRR %= n; AsyncPresentBuf = (P2FrameBufRR + n - 1) % n; }
+#else
+    AsyncPresentBuf = (P2FrameBufRR + 2) % 3;
+#endif
+#endif
 #endif
     const size_t len = 256 * 192 * sizeof(u32);
     memset(Framebuffer[0][0], 0, len);
@@ -426,6 +437,7 @@ void SoftRenderer::SnapshotCompositeLine(u32 line)
     f.VRAMMapLCDC = GPU.VRAMMap_LCDC;
     f.Valid = 1;
     f.XPos3D = GPU.GPU3D.GetRenderXPos();
+    f.Abort3D = GPU.GPU3D.AbortFrame;
 }
 
 // The whole frame's 2D raster + final composite, run once at VBlank off the
@@ -545,7 +557,13 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
 #endif
         // the hybrid's 3D lives on the GPU: never GetLine here (no GL on this thread)
         u32* l3d = Hybrid ? (Hyb3DValid[_s3] ? &Hyb3D[_s3][line * 256] : nullptr)
-                 : AccurateBackend ? Snap3D[_s3][line] : Rend3D->GetLine(line);
+                 : AccurateBackend ? Snap3D[_s3][line]
+#ifdef LITEV_SOFT3D_DRASTIC
+                 // this line's BG0HOFS/abort as the emu had them (the live ones are a later frame's)
+                 : static_cast<TileRenderer3D*>(Rend3D.get())->GetLineAt(line, fsR[line].XPos3D, fsR[line].Abort3D);
+#else
+                 : Rend3D->GetLine(line);
+#endif
         LSP_ADD(S2DBlock[bi], LSP_NOW() - _lspG0);
 #ifdef LITEV_SOFT2D_DEPTH2
         if (pipeTraceOn)
@@ -927,6 +945,9 @@ void SoftRenderer::AsyncRenderThreadFunc()
             P2PopIdx = (P2PopIdx + 1) % 3;
             AsyncTargetBuf = fr.targetBuf;
             AsyncSnapSlot = fr.snapSlot;
+#ifdef LITEV_SOFT3D_DRASTIC
+            if (auto* tile = dynamic_cast<TileRenderer3D*>(Rend3D.get())) tile->LatchConsumer(fr.consume3DParity);
+#endif
         }
         // Part 1b: point the 2D flat BG/OBJ/ext-pal readers (GetBGVRAM/GetOBJVRAM/Get*ExtPal)
         // at THIS frame's snapshot bank before the raster reads them (AsyncSnapSlot: emu-set
@@ -1247,7 +1268,11 @@ void SoftRenderer::VBlank()
         // P2KickParity mod-3); the next toggle is N+1's VCount 215, so at THIS VBlank(N)
         // P2KickParity still equals 3D-N's parity -- exactly the value Pipeline2LatchConsume
         // uses at depth-1. Fetched cross-class via the public getter.
-        int consume3DParity = 0;   // tile renderer: 3D comes from GetLine, no plane parity
+        int consume3DParity = 0;
+#ifdef LITEV_SOFT3D_DRASTIC
+        // tile renderer: the colour buffer of the newest produced 3D frame (VCount 215 of N-1)
+        if (auto* tile = dynamic_cast<TileRenderer3D*>(Rend3D.get())) consume3DParity = tile->ProducedColIdx();
+#endif
         P2Ring[P2PushIdx] = { freshBuf, SnapParity, consume3DParity };
         P2PushIdx = (P2PushIdx + 1) % 3;
         P2InFlight++;
@@ -1270,6 +1295,9 @@ void SoftRenderer::VBlank()
 #ifdef LITEV_SOFT2D_DEPTH2
     // Depth-1: the render reads the slot we just wrote (== SnapParity).
     AsyncSnapSlot = SnapParity;
+#endif
+#ifdef LITEV_SOFT3D_DRASTIC
+    if (auto* tile = dynamic_cast<TileRenderer3D*>(Rend3D.get())) tile->LatchConsumer(tile->ProducedColIdx());
 #endif
     LSP_ADD(EmuSnap, LSP_NOW() - _lspSnap0);
     Platform::Semaphore_Post(AsyncStart);
