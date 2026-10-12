@@ -240,6 +240,7 @@ private:
     u64 LastSentTo[kMaxPlayers] {};     // our last packet to that peer
     u64 OweAckSince[kMaxPlayers] {};    // it sent us inputs since then and wants an acknowledgement (0 = none)
     bool HeartbeatDue(int peer, u64 now) const;     // under Lock
+    u64 NextHeartbeatUs();                          // takes Lock
 #endif
     void Receive(const u8* data, size_t len, u64 now);   // one packet (receive thread)
     void ReceiveLoop();

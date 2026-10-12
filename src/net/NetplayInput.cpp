@@ -252,6 +252,21 @@ bool NetplayInput::HeartbeatDue(int peer, u64 now) const
     const bool data = !Unacked.empty() && Unacked.back().first > PeerAck[peer];
     return data && since >= 2 * kAckDelayMs * 1000 + RttP90[peer];
 }
+
+u64 NetplayInput::NextHeartbeatUs()
+{
+    // the earliest time HeartbeatDue turns true for some peer (the receive thread sleeps until
+    // then instead of waking every kResendMs)
+    std::lock_guard<std::mutex> lk(Lock);
+    u64 next = UINT64_MAX;
+    for (int peer : Peers)
+    {
+        next = std::min(next, LastSentTo[peer] + kKeepaliveMs * 1000);
+        if (OweAckSince[peer]) next = std::min(next, OweAckSince[peer] + kAckDelayMs * 1000);
+        if (!Unacked.empty() && Unacked.back().first > PeerAck[peer]) next = std::min(next, LastSentTo[peer] + 2 * kAckDelayMs * 1000 + RttP90[peer]);
+    }
+    return next;
+}
 #endif
 
 void NetplayInput::Send(bool all)
@@ -436,6 +451,13 @@ void NetplayInput::ReceiveLoop()
         u64 now = NowUs();
         const u64 since = now - LastSendUs.load();
         int waitMs = since >= kResendMs * 1000 ? 0 : (int)((kResendMs * 1000 - since + 999) / 1000);
+#ifdef LITEV_NP_QUIET_HB
+        if (QuietHeartbeat)
+        {
+            const u64 next = NextHeartbeatUs();
+            waitMs = next <= now ? 0 : (int)std::min<u64>((next - now + 999) / 1000, kKeepaliveMs);
+        }
+#endif
         if (faults && !pending.empty()) waitMs = std::min(waitMs, 1);
         pollfd fds[2] = {{Socket, POLLIN, 0}, {WakePipe[0], POLLIN, 0}};
         poll(fds, WakePipe[0] >= 0 ? 2 : 1, waitMs);
@@ -449,6 +471,9 @@ void NetplayInput::ReceiveLoop()
         // heartbeat: re-sends what each peer has not acknowledged, and our acknowledgements, after
         // kResendMs with nothing sent
         now = NowUs();
+#ifdef LITEV_NP_QUIET_HB
+        if (QuietHeartbeat) { if (send || NextHeartbeatUs() <= now) Send(send); } else
+#endif
         if (send || now - LastSendUs.load() >= kResendMs * 1000) Send(send);
         for (ssize_t len; (len = recv(Socket, buf, sizeof(buf), MSG_DONTWAIT)) > 0;)
         {
