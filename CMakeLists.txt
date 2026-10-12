@@ -257,6 +257,17 @@ option(LITEV_SOFT2D_SPRLIST "liteV: 2D sprite candidate lists per OAM generation
 if (LITEV_SOFT2D_SPRLIST)
     add_compile_definitions(LITEV_SOFT2D_SPRLIST=1)
 endif()
+# LITEV_SOFT2D_PLANES: the threaded 2D draws each BG into its own plane (u16 table indices, text
+# rows expanded with NEON), then one priority select per line keeps the top (and, only when a colour
+# effect can read it, the second) layer per pixel and resolves those through the converted palettes.
+# Extended palettes converted once per change; affine BGs drawn a map cell at a time; identity-matrix
+# bitmap rows copied; lines no colour effect can touch skip the composite, brightness-only lines take
+# a NEON fade pass. Render-only, exact. Needs THREADED + PALCONV + NEON (AArch64). Inspired by
+# DSperate's layer planes (src/core/gpu/engine2d.cpp).
+option(LITEV_SOFT2D_PLANES "liteV: plane-based 2D (layer planes + one select/composite pass per line)" OFF)
+if (LITEV_SOFT2D_PLANES)
+    add_compile_definitions(LITEV_SOFT2D_PLANES=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

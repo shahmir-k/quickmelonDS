@@ -496,6 +496,9 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
     auto& fsR = FrameSnapR[_ss];
     const u8* palSnap = PaletteSnap[_ss];
     const u8* oamSnap = OAMSnap[_ss];
+#ifdef S2D_PLANES
+    rA->PlanesBeginFrame(); rB->PlanesBeginFrame();
+#endif
     // mid-frame write journal (GPU::S2DJ): the band seeks private palette/OAM copies (and, on
     // frames with VRAM entries, which AsyncRenderFrame keeps on one band, the shared flat shadow)
     // from the VBlank state back to each line's BG / sprite snapshot position

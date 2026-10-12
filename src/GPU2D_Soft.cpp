@@ -27,6 +27,10 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef S2D_PLANES
+#include "GPU2D_Planes.h"
+#endif
+
 namespace melonDS
 {
 
@@ -504,6 +508,14 @@ void SoftRenderer2D::DrawScanlineBGMode7(u32 line)
 
 void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
 {
+#ifdef S2D_PLANES
+    // the hybrid's 3D descriptor lines keep the layer-push path (Under3D bookkeeping)
+    if (CurPalConv && !(HybridDesc && !GPU2D.Num && (GPU2D.DispCnt & 0x8)))
+    {
+        DrawScanlinePlanes(line, dst);
+        return;
+    }
+#endif
     u64 backdrop;
     if (GPU2D.Num)
         backdrop = *(u16*)&CurPalette[0x400];
@@ -567,6 +579,854 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
     }
 #endif
 }
+
+
+#ifdef S2D_PLANES
+// ---- LITEV_SOFT2D_PLANES: layer planes + one select/resolve/composite pass per line ----
+// Inspired by DSperate's 2D line pipeline (https://github.com/beebono/DSperate, GPL-3.0-or-later,
+// commit f5fa35e, src/core/gpu/engine2d.cpp render_line / draw_bg_text / select_layers /
+// ext_pal18, docs/techniques/03-2d-engines-and-scanline-pipeline.md). Same pixels as the
+// layer-push path: each layer in the push order (priority 3..0, BG3..BG0 then OBJ) replaces the
+// top where it is opaque and its window bit is set, pushing the old top to the second slot; the
+// colours are then resolved for the top/second only, and ColorCompositeLine applies the effects.
+
+// Pixels until p (+= d per pixel) leaves its 8-texel (0x800) cell, at least 1. Within a cell an
+// affine map's entry, its overflow test and the tile row source stay the same.
+[[gnu::always_inline]] static inline u32 S2DCellSteps(s32 p, s32 d)
+{
+    if (d == 0) return 256;
+    const u32 dist = d > 0 ? (u32)((p | 0x7FF) - p) : (u32)(p - (p & ~0x7FF));
+    const u32 ad = d > 0 ? (u32)d : (u32)-d;
+    // a power-of-two step (unscaled or 90-degree maps) divides by a shift
+    return ((ad & (ad - 1)) ? dist / ad : dist >> __builtin_ctz(ad)) + 1;
+}
+
+// A bitmap BG line on the identity matrix (rotA = 0x100, rotC = 0, no mosaic): the row is fixed and
+// the texel column is (rotX >> 8) + i, wrapping at the bitmap width or transparent outside it. The
+// line's texels (es bytes each, 0 outside) are copied in runs, split where the VRAM mask wraps.
+// Inspired by DSperate's bitmap_row_degenerate (src/core/gpu/engine2d.cpp).
+static void S2DBitmapRow(const u8* vram, u32 vmask, u32 base, u32 rowoff, u32 width, bool wrap, s32 rx, u32 es, u8* out)
+{
+    auto emit = [&](u32 texel, u32 i, u32 n)
+    {
+        u32 addr = base + (rowoff + texel) * es;
+        while (n)
+        {
+            const u32 a = addr & vmask;
+            const u32 m = std::min(n, (vmask + 1 - a) / es);
+            memcpy(out + i * es, vram + a, m * es);
+            addr += m * es; i += m; n -= m;
+        }
+    };
+    const s32 x0 = rx >> 8;
+    if (wrap)
+    {
+        u32 i = 0, x = (u32)x0 & (width - 1);
+        while (i < 256) { const u32 n = std::min(256 - i, width - x); emit(x, i, n); i += n; x = 0; }
+        return;
+    }
+    memset(out, 0, 256 * es);
+    const s32 i0 = std::max(0, -x0), i1 = std::min<s32>(256, (s32)width - x0);
+    if (i0 < i1) emit((u32)(x0 + i0), (u32)i0, (u32)(i1 - i0));
+}
+
+// 8-bit indices -> plane values (0x8000 | idx, 0 for index 0); returns whether any is opaque
+static bool S2DPlaneFrom8(const u8* idx, u16* v)
+{
+    uint8x16_t acc = vdupq_n_u8(0);
+    for (u32 i = 0; i < 256; i += 16)
+    {
+        const uint8x16_t x = vld1q_u8(idx + i);
+        acc = vorrq_u8(acc, x);
+        const uint16x8_t lo = vmovl_u8(vget_low_u8(x)), hi = vmovl_u8(vget_high_u8(x));
+        vst1q_u16(v + i, vorrq_u16(lo, vandq_u16(vtstq_u16(lo, lo), vdupq_n_u16(0x8000))));
+        vst1q_u16(v + i + 8, vorrq_u16(hi, vandq_u16(vtstq_u16(hi, hi), vdupq_n_u16(0x8000))));
+    }
+    return vmaxvq_u8(acc) != 0;
+}
+
+// direct colours -> colour records by position (dc) + plane values (0x8000 | position where bit 15
+// is set); returns whether any is opaque
+static bool S2DPlaneFromDirect(const u16* col, u32* dc, u16* v)
+{
+    const uint16x8_t lane = {0, 1, 2, 3, 4, 5, 6, 7}, op = vdupq_n_u16(0x8000), m3e = vdupq_n_u16(0x3E);
+    uint16x8_t acc = vdupq_n_u16(0);
+    for (u32 i = 0; i < 256; i += 8)
+    {
+        const uint16x8_t c = vld1q_u16(col + i);
+        const uint16x8_t o = vtstq_u16(c, op);
+        acc = vorrq_u16(acc, o);
+        vst1q_u16(v + i, vandq_u16(o, vorrq_u16(op, vaddq_u16(lane, vdupq_n_u16((u16)i)))));
+        // S2DConvColor(c & 0x7FFF): r = (c & 0x1F) << 1, g = (c & 0x3E0) >> 4, b = (c & 0x7C00) >> 9
+        uint8x8x4_t px;
+        px.val[0] = vmovn_u16(vandq_u16(vshlq_n_u16(c, 1), m3e));
+        px.val[1] = vmovn_u16(vandq_u16(vshrq_n_u16(c, 4), m3e));
+        px.val[2] = vmovn_u16(vandq_u16(vshrq_n_u16(c, 9), m3e));
+        px.val[3] = vdup_n_u8(0);
+        vst4_u8((u8*)(dc + i), px);
+    }
+    return vmaxvq_u16(acc) != 0;
+}
+
+// the extended palettes in palmask (bit = palette) converted, if they changed since the copy
+void SoftRenderer2D::ValidateBGExt(u32 slot, u32 palmask)
+{
+    for (u32 m = palmask & ~(u32)(BGExtChecked >> (slot * 16)) & 0xFFFF; m; m &= m - 1)
+    {
+        const u32 p = __builtin_ctz(m);
+        const u64 bit = 1ull << (slot * 16 + p);
+        BGExtChecked |= bit;
+        const u16* src = GPU2D.GetBGExtPal(slot, p);
+        u16* copy = &BGExtCopy[slot][p * 256];
+        if ((BGExtHave & bit) && !memcmp(src, copy, 512)) continue;
+        memcpy(copy, src, 512);
+        u32* d = &BGExtConv[slot][p * 256];
+        for (int i = 0; i < 256; i++) d[i] = S2DConvColor(copy[i]);
+        BGExtHave |= bit;
+    }
+}
+
+void SoftRenderer2D::ValidateOBJExt(u32 p)
+{
+    OBJExtChecked |= 1u << p;
+    const u16* src = GPU2D.GetOBJExtPal() + p * 256;
+    u16* copy = &OBJExtCopy[p * 256];
+    if ((OBJExtHave & (1u << p)) && !memcmp(src, copy, 512)) return;
+    memcpy(copy, src, 512);
+    u32* d = &OBJExtConv[p * 256];
+    for (int i = 0; i < 256; i++) d[i] = S2DConvColor(copy[i]);
+    OBJExtHave |= 1u << p;
+}
+
+namespace
+{
+// the winning values through their tables, with the BGOBJLine layer flags: out = tab[t][v & 0x7FFF]
+// | flag[t]. Pixel-indexed layers (OBJ, 3D, direct-colour BGs) carry the pixel position as value.
+void S2DResolve(const u16* v, const u8* tid, const u32* const* tab, const u32* flag, u32 posmask, u32* out)
+{
+    for (u32 i = 0; i < 256; i += 16)
+    {
+        if (!S2DPlanes::UniformU8(tid + i))
+        {
+            for (u32 k = i; k < i + 16; k++) { const u32 t = tid[k]; out[k] = tab[t][v[k] & 0x7FFF] | flag[t]; }
+            continue;
+        }
+        const u32 t = tid[i];
+        const u32* tb = tab[t]; const u32 f = flag[t];
+        if (t >= 5 && t != 6)
+        {
+            // backdrop / nothing: one record (TID_BACKDROP, TID_NONE; the value is always 0)
+            const uint32x4_t c = vdupq_n_u32(tb[0] | f);
+            for (u32 k = i; k < i + 16; k += 4) vst1q_u32(out + k, c);
+            continue;
+        }
+        if ((posmask >> t) & 1)
+        {
+            // a position-indexed layer (3D, OBJ, direct colour): its records in place
+            const uint32x4_t f3 = vdupq_n_u32(f);
+            for (u32 k = i; k < i + 16; k += 4) vst1q_u32(out + k, vorrq_u32(vld1q_u32(tb + k), f3));
+            continue;
+        }
+        for (u32 k = i; k < i + 16; k += 4)
+        {
+            u64 a; memcpy(&a, v + k, 8);
+            out[k]   = tb[a & 0x7FFF] | f;         out[k+1] = tb[(a >> 16) & 0x7FFF] | f;
+            out[k+2] = tb[(a >> 32) & 0x7FFF] | f; out[k+3] = tb[(a >> 48) & 0x7FFF] | f;
+        }
+    }
+}
+}
+
+#define S2D_SEL(fn, ...) (second ? (win ? fn<true, true>(__VA_ARGS__) : fn<true, false>(__VA_ARGS__)) \
+                                 : (win ? fn<false, true>(__VA_ARGS__) : fn<false, false>(__VA_ARGS__)))
+
+void SoftRenderer2D::DrawScanlinePlanes(u32 line, u32* dst)
+{
+    using namespace S2DPlanes;
+    const u32 dispCnt = GPU2D.DispCnt;
+    const u16* bgCnt = GPU2D.BGCnt;
+    const u32 layers = GPU2D.LayerEnable;
+
+    const bool win = dispCnt & 0xE000;
+    if (win) GPU2D.CalculateWindowMask(WindowMask, OBJWindow);
+    else memset(WindowMask, 0xFF, 256);
+    ApplySpriteMosaicX();
+    CurBGXMosaicTable = MosaicTable[GPU2D.BGMosaicSize[0]].data();
+
+    // 1. the BG planes. Layer kind per mode as in DrawScanlineBGMode<>/6/7: 1 text, 2 affine,
+    // 3 extended, 4 large. BG0 is the 3D layer on engine A when DISPCNT bit 3 is set.
+    static constexpr u8 kinds[8][4] = {{1,1,1,1}, {1,1,1,2}, {1,1,2,2}, {1,1,1,3}, {1,1,2,3}, {1,1,3,3}, {0,0,4,0}, {1,1,0,0}};
+    const u32 mode = dispCnt & 7;
+    const bool l3d = !GPU2D.Num && (dispCnt & 0x8) && (layers & 1);
+    const bool mosaicOn = GPU2D.BGMosaicSize[0] > 0;
+    u32 present = 0;
+    for (u32 n = 0; n < 4; n++)
+    {
+        PlaneAny[n] = false;
+        if (!(layers & (1u << n)) || (n == 0 && !GPU2D.Num && (dispCnt & 0x8))) continue;
+        const bool mos = (bgCnt[n] & (1<<6)) && mosaicOn;
+        switch (kinds[mode][n])
+        {
+        case 1: if (mos) PlaneBG_Text<true>(line, n); else PlaneBG_Text<false>(line, n); break;
+        case 2: if (mos) PlaneBG_Affine<true>(n); else PlaneBG_Affine<false>(n); break;
+        case 3: if (mos) PlaneBG_Extended<true>(n); else PlaneBG_Extended<false>(n); break;
+        case 4: if (mos) PlaneBG_Large<true>(); else PlaneBG_Large<false>(); break;
+        default: break;
+        }
+        if (PlaneAny[n]) present |= 1u << n;
+    }
+
+    // 2. what the colour effects can read on this line (a "no" must hold for every pixel)
+#ifdef LITEV_SOFT2D_SPRLIST
+    const bool objOn = (layers & 0x10) && NumSprites && OBJPrioMask;
+#else
+    const bool objOn = (layers & 0x10) && NumSprites;
+#endif
+    bool objBlend = false;   // a semi-transparent or bitmap sprite pixel (flag 0x80)
+    if (objOn)
+    {
+        uint32x4_t acc = vdupq_n_u32(0);
+        for (u32 i = 0; i < 256; i += 4) acc = vorrq_u32(acc, vld1q_u32(OBJLine + i));
+        objBlend = vmaxvq_u32(acc) >> 31;
+        // the opaque sprite pixels' colours (InterleaveSprites' palette choice), by position
+        const u32* cvo = CurPalConv + (GPU2D.Num ? 0x300 : 0x100);
+        const uint32x4_t vop = vdupq_n_u32(OBJ_IsOpaque);
+        for (u32 i = 0; i < 256; i += 16)
+        {
+            const uint32x4_t o = vorrq_u32(vorrq_u32(vld1q_u32(OBJLine + i), vld1q_u32(OBJLine + i + 4)),
+                                           vorrq_u32(vld1q_u32(OBJLine + i + 8), vld1q_u32(OBJLine + i + 12)));
+            if (!vmaxvq_u32(vandq_u32(o, vop))) continue;
+            for (u32 k = i; k < i + 16; k++)
+            {
+                const u32 px = OBJLine[k];
+                if (!(px & OBJ_IsOpaque)) continue;
+                const u32 fl = px & 0xFF000000;
+                if (px & OBJ_DirectColor)      ObjCol[k] = S2DConvColor(px & 0x7FFF) | fl;
+                else if (px & OBJ_StandardPal) ObjCol[k] = cvo[px & 0xFF] | fl;
+                else
+                {
+                    if (!((OBJExtChecked >> ((px >> 8) & 0xF)) & 1)) ValidateOBJExt((px >> 8) & 0xF);
+                    ObjCol[k] = OBJExtConv[px & 0xFFF] | fl;
+                }
+            }
+        }
+    }
+    const u32 bc = GPU2D.BlendCnt;
+    // identity coefficients make the BLDCNT effect a no-op on the colours (EVA 16/EVB 0, EVY 0); it
+    // then only sets the alpha byte to 0xFF, which no consumer reads beyond "non-zero" (capture)
+    // and the line records' alpha is non-zero anyway. Inspired by DSperate's effect_possible.
+    const u32 ceRaw = (bc >> 6) & 3;
+    const u32 ce = ((ceRaw == 1 && GPU2D.EVA == 16 && GPU2D.EVB == 0) || (ceRaw >= 2 && GPU2D.EVY == 0)) ? 0 : ceRaw;
+    // first targets that can be on top: backdrop, the BG planes, OBJ, 3D (as BG0)
+    const bool fxPossible = ce && (bc & (0x20 | present | (objOn ? 0x10 : 0) | (l3d ? 0x01 : 0)));
+    // The second layer matters only through a second-target hit (BLDCNT bits 8-13): a sprite blend
+    // (flag 0x80), the 3D layer's alpha blend, or a BLDCNT alpha blend (effect 1). A 3D pixel over a
+    // second target blends with alpha+1 of 32 (alpha 31 keeps it) and is exempt from the BLDCNT
+    // effect, so with no translucent 3D pixel the hit only matters if a brightness effect could
+    // apply to the 3D layer (first target bit 0).
+    bool l3dHit = false;
+    if (l3d && (bc & 0x3F00))
+    {
+        if ((ce == 2 || ce == 3) && (bc & 0x01)) l3dHit = true;
+        else
+        {
+            // any 3D pixel drawn (alpha byte non-zero) with alpha (bits 24-28) below 31
+            const uint32x4_t m1f = vdupq_n_u32(0x1F), z = vdupq_n_u32(0);
+            uint32x4_t acc = z;
+            for (u32 i = 0; i < 256; i += 4)
+            {
+                const uint32x4_t a = vshrq_n_u32(vld1q_u32(Cur3DLine + i), 24);
+                acc = vorrq_u32(acc, vbicq_u32(vmvnq_u32(vceqq_u32(a, z)), vceqq_u32(vandq_u32(a, m1f), m1f)));
+            }
+            l3dHit = vmaxvq_u32(acc) != 0;
+        }
+    }
+    const bool second = ((bc & 0x3F00) && objBlend) || l3dHit || (fxPossible && ce == 1);
+    const bool flat = !second && !fxPossible;
+
+    if (flat && !present && !objOn && !l3d)
+    {
+        // nothing but the backdrop on the line
+        const uint32x4_t c = vdupq_n_u32(CurPalConv[GPU2D.Num ? 0x200 : 0] | 0x20000000);
+        for (u32 i = 0; i < 256; i += 4) vst1q_u32(dst + i, c);
+        return;
+    }
+
+    // the topmost layer in push order (priority 0 first; within one, OBJ, then BG0..BG3): when it is
+    // a BG plane opaque everywhere with no window, it alone decides the top (DSperate resolve16_one)
+    if (!second && !win)
+    {
+        int top = -1;
+        for (int prio = 0; prio < 4 && top < 0; prio++)
+        {
+#ifdef LITEV_SOFT2D_SPRLIST
+            if (objOn && ((OBJPrioMask >> prio) & 1)) break;
+#else
+            if (objOn) break;
+#endif
+            for (int n = 0; n < 4; n++)
+            {
+                if ((bgCnt[n] & 3) != (u32)prio) continue;
+                if (n == 0 && l3d) { prio = 4; break; }
+                if (present & (1u << n)) { top = n; break; }
+            }
+        }
+        if (top >= 0)
+        {
+            const u16* pv = PlaneV(top);
+            uint16x8_t acc = vdupq_n_u16(0xFFFF);
+            for (u32 i = 0; i < 256; i += 8) acc = vandq_u16(acc, vld1q_u16(pv + i));
+            if (vminvq_u16(acc) & 0x8000)
+            {
+                const u32* tb = PlaneTab[top]; const u32 f = 0x01000000u << top;
+                u32* const out = flat ? dst : BGOBJLine;
+                if (tb == DirCol[top])
+                    for (u32 i = 0; i < 256; i += 4) vst1q_u32(out + i, vorrq_u32(vld1q_u32(tb + i), vdupq_n_u32(f)));
+                else
+                    for (u32 i = 0; i < 256; i += 4)
+                    {
+                        u64 a; memcpy(&a, pv + i, 8);
+                        out[i]   = tb[a & 0x7FFF] | f;         out[i+1] = tb[(a >> 16) & 0x7FFF] | f;
+                        out[i+2] = tb[(a >> 32) & 0x7FFF] | f; out[i+3] = tb[(a >> 48) & 0x7FFF] | f;
+                    }
+                if (!flat) FadeLine(BGOBJLine, WindowMask, bc, GPU2D.EVY, dst);
+                return;
+            }
+        }
+    }
+
+    // 3. priority select, in the layer-push order
+    memset(Top16, 0, sizeof(Top16)); memset(TopTid, TID_BACKDROP, sizeof(TopTid));
+    if (second) { memset(Sec16, 0, sizeof(Sec16)); memset(SecTid, TID_NONE, sizeof(SecTid)); }
+    for (int prio = 3; prio >= 0; prio--)
+    {
+        for (int n = 3; n >= 0; n--)
+        {
+            if ((bgCnt[n] & 3) != (u32)prio) continue;
+            if (n == 0 && l3d)
+                S2D_SEL(Select3D, Cur3DLine, WindowMask, TID_3D, Top16, TopTid, Sec16, SecTid);
+            else if (present & (1u << n))
+                S2D_SEL(SelectBG, PlaneV(n), WindowMask, (u8)(1u << n), (u8)n, Top16, TopTid, Sec16, SecTid);
+        }
+#ifdef LITEV_SOFT2D_SPRLIST
+        if (objOn && ((OBJPrioMask >> prio) & 1))
+#else
+        if (objOn)
+#endif
+            S2D_SEL(SelectOBJ, OBJLine, (u32)OBJ_OpaPrioMask, ((u32)prio << 16) | OBJ_IsOpaque, WindowMask, (u8)TID_OBJ, Top16, TopTid, Sec16, SecTid);
+    }
+
+    // 4. resolve the top (and second) colours, then the colour effects
+    const u32* pal = CurPalConv + (GPU2D.Num ? 0x200 : 0);
+    const u32 backdrop = pal[0] | 0x20000000;   // DrawScanline_BGOBJ's backdrop record
+    static const u32 zero = 0;
+    const u32* tab[8];
+    u32 flag[8];
+    for (u32 n = 0; n < 4; n++) { tab[n] = PlaneTab[n]; flag[n] = 0x01000000u << n; }
+    tab[TID_OBJ] = ObjCol; flag[TID_OBJ] = 0;
+    tab[TID_BACKDROP] = &backdrop; flag[TID_BACKDROP] = 0;
+    tab[TID_3D] = Cur3DLine; flag[TID_3D] = 0x40000000;
+    tab[TID_NONE] = &zero; flag[TID_NONE] = 0;
+    u32 posmask = (1u << TID_3D) | (1u << TID_OBJ);
+    for (u32 n = 0; n < 4; n++) if (PlaneTab[n] == DirCol[n]) posmask |= 1u << n;
+    if (flat)
+    {
+        S2DResolve(Top16, TopTid, tab, flag, posmask, dst);
+        return;
+    }
+    S2DResolve(Top16, TopTid, tab, flag, posmask, BGOBJLine);
+    if (!second)
+    {
+        FadeLine(BGOBJLine, WindowMask, bc, GPU2D.EVY, dst);   // the second layer can't matter
+        return;
+    }
+    S2DResolve(Sec16, SecTid, tab, flag, posmask, BGOBJLine + 256);
+    GPU2DNeon::ColorCompositeLine(dst, BGOBJLine, WindowMask, bc, GPU2D.EVA, GPU2D.EVB, GPU2D.EVY);
+}
+#undef S2D_SEL
+
+template<bool mosaic>
+void SoftRenderer2D::PlaneBG_Text(u32 line, u32 bgnum)
+{
+    using namespace S2DPlanes;
+    const u16 bgcnt = GPU2D.BGCnt[bgnum];
+    u16 xoff = GPU2D.BGXPos[bgnum];
+    u16 yoff = GPU2D.BGYPos[bgnum];
+    if (bgcnt & (1<<6)) yoff += GPU2D.BGMosaicLine;
+    else                yoff += line;
+
+    const u32 widexmask = (bgcnt & (1<<14)) ? 0x100 : 0;
+    const bool c256 = bgcnt & (1<<7);
+    const bool extpal = GPU2D.DispCnt & (1<<30);
+    const u32 extpalslot = ((bgnum<2) && (bgcnt&0x2000)) ? (2+bgnum) : bgnum;
+
+    u8* bgvram;
+    u32 bgvrammask;
+    GPU2D.GetBGVRAM(bgvram, bgvrammask);
+    u32 tilesetaddr, tilemapaddr;
+    if (GPU2D.Num)
+    {
+        tilesetaddr = ((bgcnt & 0x003C) << 12);
+        tilemapaddr = ((bgcnt & 0x1F00) << 3);
+    }
+    else
+    {
+        tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
+        tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
+    }
+    if (bgcnt & (1<<15))
+    {
+        tilemapaddr += ((yoff & 0x1F8) << 3);
+        if (bgcnt & (1<<14))
+            tilemapaddr += ((yoff & 0x100) << 3);
+    }
+    else
+        tilemapaddr += ((yoff & 0xF8) << 3);
+
+    const bool ext = c256 && extpal;
+    if (ext) PlaneTab[bgnum] = BGExtConv[extpalslot];
+    else PlaneTab[bgnum] = CurPalConv + (GPU2D.Num ? 0x200 : 0);
+    u16* const v = PlaneV(bgnum);
+    const u32 yrow = yoff & 7;
+
+    if constexpr (!mosaic)
+    {
+        // the 33 map entries and tile rows under the line, then the rows expanded at -scroll
+        // (DSperate draw_bg_text). The rows are 4/8-byte aligned and the VRAM mask is a power of
+        // two minus one, so a masked row address covers the whole row.
+        alignas(16) u8 rows[33 * 8 + 8];
+        u8 ctl[40];
+        // map entries: a screen block's row is 32 contiguous entries (64-byte aligned, so a masked
+        // run never wraps), the next block (wide maps) or the same row again after it
+        // (the line starts in the first of the two copied rows, at tx; tx + 32 <= 63)
+        alignas(16) u16 maprow[64];
+        {
+            const u32 blk = (xoff & widexmask) ? 1 : 0;
+            memcpy(maprow, &bgvram[(tilemapaddr + (blk << 11)) & bgvrammask], 64);
+            memcpy(maprow + 32, &bgvram[(tilemapaddr + ((widexmask ? blk ^ 1 : blk) << 11)) & bgvrammask], 64);
+        }
+        const u16* const tiles = maprow + ((xoff >> 3) & 31);
+        u64 acc = 0;
+        if (c256)
+        {
+            for (u32 t = 0; t < 33; t++)
+            {
+                const u16 tile = tiles[t];
+                const u32 row = (tile & (1<<11)) ? (7 - yrow) : yrow;
+                u64 px; memcpy(&px, &bgvram[(tilesetaddr + ((tile & 0x03FF) << 6) + (row << 3)) & bgvrammask], 8);
+                memcpy(rows + t * 8, &px, 8);
+                acc |= px;
+            }
+            if (ext && acc) ValidateBGExt(extpalslot, 0xFFFF);   // the slot once a frame
+        }
+        else
+        {
+            for (u32 t = 0; t < 33; t++)
+            {
+                const u16 tile = tiles[t];
+                const u32 row = (tile & (1<<11)) ? (7 - yrow) : yrow;
+                u32 px; memcpy(&px, &bgvram[(tilesetaddr + ((tile & 0x03FF) << 5) + (row << 2)) & bgvrammask], 4);
+                memcpy(rows + t * 4, &px, 4);
+                acc |= px;
+            }
+        }
+        if (!acc) { PlaneAny[bgnum] = false; return; }
+        TextCtl(tiles, ctl);
+        u16* const dv = v - (xoff & 7);
+        PlaneAny[bgnum] = c256 ? TextRow256(rows, ctl, 33, ext, dv) : TextRow16(rows, ctl, 33, dv);
+    }
+    else
+    {
+        // the layer-push path's mosaic loop, writing plane values
+        if (ext) ValidateBGExt(extpalslot, 0xFFFF);
+        u16 curtile = *(u16*)&bgvram[(tilemapaddr + ((xoff & 0xF8) >> 2) + ((xoff & widexmask) << 3)) & bgvrammask];
+        u32 pixelsaddr = 0, palbase = 0;
+        auto setup = [&]()
+        {
+            const u32 row = (curtile & (1<<11)) ? (7 - yrow) : yrow;
+            if (c256)
+            {
+                palbase = ext ? ((u32)(curtile >> 12) << 8) : 0;
+                pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 6) + (row << 3);
+            }
+            else
+            {
+                palbase = (curtile & 0xF000) >> 8;
+                pixelsaddr = tilesetaddr + ((curtile & 0x03FF) << 5) + (row << 2);
+            }
+        };
+        setup();
+        u32 lastxpos = xoff;
+        u32 any = 0;
+        for (int i = 0; i < 256; i++)
+        {
+            u32 xpos = xoff - CurBGXMosaicTable[i];
+            if ((xpos >> 3) != (lastxpos >> 3))
+            {
+                curtile = *(u16*)&bgvram[(tilemapaddr + ((xpos & 0xF8) >> 2) + ((xpos & widexmask) << 3)) & bgvrammask];
+                setup();
+                lastxpos = xpos;
+            }
+            const u32 tilexoff = (curtile & (1<<10)) ? (7-(xpos&0x7)) : (xpos&0x7);
+            u32 color;
+            if (c256) color = bgvram[(pixelsaddr + tilexoff) & bgvrammask];
+            else if (tilexoff & 0x1) color = bgvram[(pixelsaddr + (tilexoff >> 1)) & bgvrammask] >> 4;
+            else color = bgvram[(pixelsaddr + (tilexoff >> 1)) & bgvrammask] & 0x0F;
+            const u16 val = color ? (u16)(LV_OPAQUE | palbase | color) : 0;
+            v[i] = val;
+            any |= val;
+            xoff++;
+        }
+        PlaneAny[bgnum] = any != 0;
+    }
+}
+
+template<bool mosaic>
+void SoftRenderer2D::PlaneBG_Affine(u32 bgnum)
+{
+    const u16 bgcnt = GPU2D.BGCnt[bgnum];
+    u32 coordmask, yshift;
+    switch ((bgcnt >> 14) & 0x3)
+    {
+        case 0: coordmask = 0x07800; yshift = 7; break;
+        case 1: coordmask = 0x0F800; yshift = 8; break;
+        case 2: coordmask = 0x1F800; yshift = 9; break;
+        default: coordmask = 0x3F800; yshift = 10; break;
+    }
+    const u32 overflowmask = (bgcnt & (1<<13)) ? 0 : ~(coordmask | 0x7FF);
+    const s16 rotA = GPU2D.BGRotA[bgnum-2];
+    const s16 rotC = GPU2D.BGRotC[bgnum-2];
+    s32 rotX = GPU2D.BGXRefInternal[bgnum-2];
+    s32 rotY = GPU2D.BGYRefInternal[bgnum-2];
+
+    u8* bgvram;
+    u32 bgvrammask;
+    GPU2D.GetBGVRAM(bgvram, bgvrammask);
+    u32 tilesetaddr, tilemapaddr;
+    if (GPU2D.Num)
+    {
+        tilesetaddr = ((bgcnt & 0x003C) << 12);
+        tilemapaddr = ((bgcnt & 0x1F00) << 3);
+    }
+    else
+    {
+        tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
+        tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
+    }
+    PlaneTab[bgnum] = CurPalConv + (GPU2D.Num ? 0x200 : 0);
+    u16* const v = PlaneV(bgnum);
+    yshift -= 3;
+    u32 any = 0;
+    if constexpr (!mosaic)
+    {
+        // a map cell at a time: one map entry per span of pixels inside the same 8x8 tile
+        for (u32 i = 0; i < 256; )
+        {
+            s32 x = rotX, y = rotY;
+            const u32 n = std::min<u32>(std::min(S2DCellSteps(x, rotA), S2DCellSteps(y, rotC)), 256 - i);
+            if ((x | y) & overflowmask)
+                memset(&v[i], 0, n * 2);
+            else
+            {
+                const u32 curtile = bgvram[(tilemapaddr + ((((y & coordmask) >> 11) << yshift) + ((x & coordmask) >> 11))) & bgvrammask];
+                const u32 tilebase = tilesetaddr + (curtile << 6);
+                for (u32 k = i; k < i + n; k++)
+                {
+                    const u32 color = bgvram[(tilebase + ((((u32)y >> 8) & 0x7) << 3) + (((u32)x >> 8) & 0x7)) & bgvrammask];
+                    const u16 val = color ? (u16)(0x8000 | color) : 0;
+                    v[k] = val;
+                    any |= val;
+                    x += rotA;
+                    y += rotC;
+                }
+            }
+            rotX += (s32)n * rotA;
+            rotY += (s32)n * rotC;
+            i += n;
+        }
+        PlaneAny[bgnum] = any != 0;
+        return;
+    }
+    for (int i = 0; i < 256; i++)
+    {
+        s32 finalX, finalY;
+        if (mosaic)
+        {
+            int im = CurBGXMosaicTable[i];
+            finalX = rotX - (im * rotA);
+            finalY = rotY - (im * rotC);
+        }
+        else
+        {
+            finalX = rotX;
+            finalY = rotY;
+        }
+        u16 val = 0;
+        if (!((finalX|finalY) & overflowmask))
+        {
+            const u32 curtile = bgvram[(tilemapaddr + ((((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11))) & bgvrammask];
+            const u32 color = bgvram[(tilesetaddr + (curtile << 6) + (((finalY >> 8) & 0x7) << 3) + ((finalX >> 8) & 0x7)) & bgvrammask];
+            if (color) val = 0x8000 | color;
+        }
+        v[i] = val;
+        any |= val;
+        rotX += rotA;
+        rotY += rotC;
+    }
+    PlaneAny[bgnum] = any != 0;
+}
+
+template<bool mosaic>
+void SoftRenderer2D::PlaneBG_Extended(u32 bgnum)
+{
+    const u16 bgcnt = GPU2D.BGCnt[bgnum];
+    u8* bgvram;
+    u32 bgvrammask;
+    GPU2D.GetBGVRAM(bgvram, bgvrammask);
+    const bool extpal = GPU2D.DispCnt & (1<<30);
+    const s16 rotA = GPU2D.BGRotA[bgnum-2];
+    const s16 rotC = GPU2D.BGRotC[bgnum-2];
+    s32 rotX = GPU2D.BGXRefInternal[bgnum-2];
+    s32 rotY = GPU2D.BGYRefInternal[bgnum-2];
+    u16* const v = PlaneV(bgnum);
+    PlaneTab[bgnum] = CurPalConv + (GPU2D.Num ? 0x200 : 0);
+    u32 any = 0;
+
+#define S2D_FINAL() \
+        s32 finalX, finalY; \
+        if (mosaic) { int im = CurBGXMosaicTable[i]; finalX = rotX - (im * rotA); finalY = rotY - (im * rotC); } \
+        else { finalX = rotX; finalY = rotY; }
+
+    if (bgcnt & (1<<7))
+    {
+        // bitmap modes
+        u32 xmask, ymask, yshift;
+        switch ((bgcnt >> 14) & 0x3)
+        {
+            case 0: xmask = 0x07FFF; ymask = 0x07FFF; yshift = 7; break;
+            case 1: xmask = 0x0FFFF; ymask = 0x0FFFF; yshift = 8; break;
+            case 2: xmask = 0x1FFFF; ymask = 0x0FFFF; yshift = 9; break;
+            default: xmask = 0x1FFFF; ymask = 0x1FFFF; yshift = 9; break;
+        }
+        const u32 ofxmask = (bgcnt & (1<<13)) ? 0 : ~xmask;
+        const u32 ofymask = (bgcnt & (1<<13)) ? 0 : ~ymask;
+        const u32 tilemapaddr = ((bgcnt & 0x1F00) << 6);
+        if (bgcnt & (1<<2))
+        {
+            // direct colour bitmap: the colours by position, the plane holds the position
+            u32* const dc = DirCol[bgnum];
+            PlaneTab[bgnum] = dc;
+            if (!mosaic && rotA == 0x100 && rotC == 0)
+            {
+                if (!ofymask || !((u32)rotY & ofymask))
+                {
+                    alignas(16) u16 col[256];
+                    S2DBitmapRow(bgvram, bgvrammask, tilemapaddr, (((u32)rotY & ymask) >> 8) << yshift, (xmask >> 8) + 1, !ofxmask, rotX, 2, (u8*)col);
+                    PlaneAny[bgnum] = S2DPlaneFromDirect(col, dc, v);
+                }
+                return;
+            }
+            for (int i = 0; i < 256; i++)
+            {
+                S2D_FINAL()
+                u16 val = 0;
+                if (!(finalX & ofxmask) && !(finalY & ofymask))
+                {
+                    const u16 color = *(u16*)&bgvram[(tilemapaddr + (((((finalY & ymask) >> 8) << yshift) + ((finalX & xmask) >> 8)) << 1)) & bgvrammask];
+                    if (color & 0x8000) { dc[i] = S2DConvColor(color & 0x7FFF); val = 0x8000 | i; }
+                }
+                v[i] = val;
+                any |= val;
+                rotX += rotA;
+                rotY += rotC;
+            }
+        }
+        else
+        {
+            if (!mosaic && rotA == 0x100 && rotC == 0)
+            {
+                if (!ofymask || !((u32)rotY & ofymask))
+                {
+                    alignas(16) u8 idx[256];
+                    S2DBitmapRow(bgvram, bgvrammask, tilemapaddr, (((u32)rotY & ymask) >> 8) << yshift, (xmask >> 8) + 1, !ofxmask, rotX, 1, idx);
+                    PlaneAny[bgnum] = S2DPlaneFrom8(idx, v);
+                }
+                return;
+            }
+            for (int i = 0; i < 256; i++)
+            {
+                S2D_FINAL()
+                u16 val = 0;
+                if (!(finalX & ofxmask) && !(finalY & ofymask))
+                {
+                    const u32 color = bgvram[(tilemapaddr + (((finalY & ymask) >> 8) << yshift) + ((finalX & xmask) >> 8)) & bgvrammask];
+                    if (color) val = 0x8000 | color;
+                }
+                v[i] = val;
+                any |= val;
+                rotX += rotA;
+                rotY += rotC;
+            }
+        }
+    }
+    else
+    {
+        // mixed affine/text mode: 16-bit map entries, 256-colour tiles, extended palettes
+        u32 coordmask, yshift;
+        switch ((bgcnt >> 14) & 0x3)
+        {
+            case 0: coordmask = 0x07800; yshift = 7; break;
+            case 1: coordmask = 0x0F800; yshift = 8; break;
+            case 2: coordmask = 0x1F800; yshift = 9; break;
+            default: coordmask = 0x3F800; yshift = 10; break;
+        }
+        const u32 overflowmask = (bgcnt & (1<<13)) ? 0 : ~(coordmask | 0x7FF);
+        u32 tilesetaddr, tilemapaddr;
+        if (GPU2D.Num)
+        {
+            tilesetaddr = ((bgcnt & 0x003C) << 12);
+            tilemapaddr = ((bgcnt & 0x1F00) << 3);
+        }
+        else
+        {
+            tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
+            tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
+        }
+        if (extpal) PlaneTab[bgnum] = BGExtConv[bgnum];
+        yshift -= 3;
+        if constexpr (!mosaic)
+        {
+            u32 palmask = 0;
+            // a map cell at a time (see PlaneBG_Affine)
+            for (u32 i = 0; i < 256; )
+            {
+                s32 x = rotX, y = rotY;
+                const u32 n = std::min<u32>(std::min(S2DCellSteps(x, rotA), S2DCellSteps(y, rotC)), 256 - i);
+                if ((x | y) & overflowmask)
+                    memset(&v[i], 0, n * 2);
+                else
+                {
+                    const u16 curtile = *(u16*)&bgvram[(tilemapaddr + (((((y & coordmask) >> 11) << yshift) + ((x & coordmask) >> 11)) << 1)) & bgvrammask];
+                    const u32 tilebase = tilesetaddr + ((curtile & 0x03FF) << 6);
+                    const u32 palbase = 0x8000 | (extpal ? ((u32)(curtile >> 12) << 8) : 0);
+                    palmask |= 1u << (curtile >> 12);
+                    // (tileyoff << 3) + tilexoff, each flipped as 7 - off = off ^ 7
+                    const u32 flip = ((curtile & (1<<10)) ? 0x07 : 0) | ((curtile & (1<<11)) ? 0x38 : 0);
+                    for (u32 k = i; k < i + n; k++)
+                    {
+                        const u32 off = (((((u32)y >> 8) & 0x7) << 3) | (((u32)x >> 8) & 0x7)) ^ flip;
+                        const u32 color = bgvram[(tilebase + off) & bgvrammask];
+                        const u16 val = color ? (u16)(palbase | color) : 0;
+                        v[k] = val;
+                        any |= val;
+                        x += rotA;
+                        y += rotC;
+                    }
+                }
+                rotX += (s32)n * rotA;
+                rotY += (s32)n * rotC;
+                i += n;
+            }
+            if (extpal && any) ValidateBGExt(bgnum, palmask);
+            PlaneAny[bgnum] = any != 0;
+            return;
+        }
+        if (extpal) ValidateBGExt(bgnum, 0xFFFF);
+        u32 lastmapoff = ~0u, tilebase = 0, palbase = 0, flip = 0;
+        for (int i = 0; i < 256; i++)
+        {
+            S2D_FINAL()
+            u16 val = 0;
+            if (!((finalX|finalY) & overflowmask))
+            {
+                // consecutive pixels on the same map entry (scaled/rotated maps) reuse it
+                const u32 mapoff = (((((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11)) << 1);
+                if (mapoff != lastmapoff)
+                {
+                    lastmapoff = mapoff;
+                    const u16 curtile = *(u16*)&bgvram[(tilemapaddr + mapoff) & bgvrammask];
+                    tilebase = tilesetaddr + ((curtile & 0x03FF) << 6);
+                    palbase = extpal ? ((u32)(curtile >> 12) << 8) : 0;
+                    flip = ((curtile & (1<<10)) ? 0x07 : 0) | ((curtile & (1<<11)) ? 0x38 : 0);
+                }
+                // (tileyoff << 3) + tilexoff, each flipped as 7 - off = off ^ 7
+                const u32 off = (((((u32)finalY >> 8) & 0x7) << 3) | (((u32)finalX >> 8) & 0x7)) ^ flip;
+                const u32 color = bgvram[(tilebase + off) & bgvrammask];
+                if (color) val = (u16)(0x8000 | palbase | color);
+            }
+            v[i] = val;
+            any |= val;
+            rotX += rotA;
+            rotY += rotC;
+        }
+    }
+#undef S2D_FINAL
+    PlaneAny[bgnum] = any != 0;
+}
+
+template<bool mosaic>
+void SoftRenderer2D::PlaneBG_Large()
+{
+    const u16 bgcnt = GPU2D.BGCnt[2];
+    u32 xmask, ymask, yshift;
+    switch ((bgcnt >> 14) & 0x3)
+    {
+        case 0: xmask = 0x1FFFF; ymask = 0x3FFFF; yshift = 9; break;
+        case 1: xmask = 0x3FFFF; ymask = 0x1FFFF; yshift = 10; break;
+        case 2: xmask = 0x1FFFF; ymask = 0x0FFFF; yshift = 9; break;
+        default: xmask = 0x1FFFF; ymask = 0x1FFFF; yshift = 9; break;
+    }
+    const u32 ofxmask = (bgcnt & (1<<13)) ? 0 : ~xmask;
+    const u32 ofymask = (bgcnt & (1<<13)) ? 0 : ~ymask;
+    const s16 rotA = GPU2D.BGRotA[0];
+    const s16 rotC = GPU2D.BGRotC[0];
+    s32 rotX = GPU2D.BGXRefInternal[0];
+    s32 rotY = GPU2D.BGYRefInternal[0];
+    u8* bgvram;
+    u32 bgvrammask;
+    GPU2D.GetBGVRAM(bgvram, bgvrammask);
+    PlaneTab[2] = CurPalConv + (GPU2D.Num ? 0x200 : 0);
+    u16* const v = PlaneV(2);
+    u32 any = 0;
+    if (!mosaic && rotA == 0x100 && rotC == 0)
+    {
+        PlaneAny[2] = false;
+        if (!ofymask || !((u32)rotY & ofymask))
+        {
+            alignas(16) u8 idx[256];
+            S2DBitmapRow(bgvram, bgvrammask, 0, (((u32)rotY & ymask) >> 8) << yshift, (xmask >> 8) + 1, !ofxmask, rotX, 1, idx);
+            PlaneAny[2] = S2DPlaneFrom8(idx, v);
+        }
+        return;
+    }
+    for (int i = 0; i < 256; i++)
+    {
+        s32 finalX, finalY;
+        if (mosaic)
+        {
+            int im = CurBGXMosaicTable[i];
+            finalX = rotX - (im * rotA);
+            finalY = rotY - (im * rotC);
+        }
+        else
+        {
+            finalX = rotX;
+            finalY = rotY;
+        }
+        u16 val = 0;
+        if (!(finalX & ofxmask) && !(finalY & ofymask))
+        {
+            const u32 color = bgvram[((((finalY & ymask) >> 8) << yshift) + ((finalX & xmask) >> 8)) & bgvrammask];
+            if (color) val = 0x8000 | color;
+        }
+        v[i] = val;
+        any |= val;
+        rotX += rotA;
+        rotY += rotC;
+    }
+    PlaneAny[2] = any != 0;
+}
+#endif // S2D_PLANES
 
 
 void SoftRenderer2D::DrawPixel(u32* dst, u16 color, u32 flag)
@@ -1925,6 +2785,7 @@ void SoftRenderer2D::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheigh
         }
     }
 }
+
 
 template<bool window>
 void SoftRenderer2D::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos)

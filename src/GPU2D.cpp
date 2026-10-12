@@ -22,6 +22,9 @@
 #include "NDS.h"
 #include "GPU.h"
 #include "GPU3D.h"
+#if defined(LITEV_SOFT2D_PLANES) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace melonDS
 {
@@ -755,8 +758,20 @@ void GPU2D::CalculateWindowMask(u8* windowMask, const u8* objWindow)
     if (check) CalculateWindowMaskRef(ref, objWindow, DispCnt, WinCnt, Win0Coords, Win1Coords, a0, a1);
     memset(windowMask, WinCnt[2], 256);   // window outside
     if (DispCnt & (1<<15))
+    {
+#if defined(LITEV_SOFT2D_PLANES) && defined(__aarch64__)
+        // 16 at a time (LITEV_SOFT2D_PLANES)
+        const uint8x16_t in = vdupq_n_u8(WinCnt[3]), out = vdupq_n_u8(WinCnt[2]);
+        for (int i = 0; i < 256; i += 16)
+        {
+            const uint8x16_t o = vld1q_u8(objWindow + i);
+            vst1q_u8(windowMask + i, vbslq_u8(vtstq_u8(o, o), in, out));
+        }
+#else
         for (int i = 0; i < 256; i++)
             if (objWindow[i]) windowMask[i] = WinCnt[3];
+#endif
+    }
     if (DispCnt & (1<<14)) litevWindowSpans(windowMask, Win1Active, Win1Coords[0], Win1Coords[1], WinCnt[1]);
     if (DispCnt & (1<<13)) litevWindowSpans(windowMask, Win0Active, Win0Coords[0], Win0Coords[1], WinCnt[0]);
     if (check && (memcmp(ref, windowMask, 256) || a0 != Win0Active || a1 != Win1Active))
