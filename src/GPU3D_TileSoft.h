@@ -19,6 +19,10 @@
 #pragma once
 
 #include <atomic>
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+#include <unordered_map>
+#include <vector>
+#endif
 
 #include "GPU3D.h"     // Renderer3D, GPU3D, Vertex, Polygon, s32/s64/u32/u16
 #include "Platform.h"  // Thread / Semaphore (band-worker pool, DraStic-style)
@@ -404,6 +408,9 @@ private:
         u16  EdgeTable[8] = {};
         u32  FogColor = 0, FogOffset = 0, FogShift = 0;
         u8   FogDensityTable[34] = {};
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+        u32  TexGen = 0;          // texture VRAM generation (bumped when texture / palette VRAM is rewritten)
+#endif
 #ifdef LITEV_TILE_SAMEFRAME
         bool TexDirty = false;    // texture / texture-palette VRAM was rewritten at this frame's render
 #endif
@@ -543,6 +550,35 @@ private:
     bool SameAsLast(int gi, u32 nvtx) const;
     void SaveLast(int gi, u32 nvtx, int col);
 #endif
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+    // ONE shared texture cache (was: a private 4MB arena per worker, each decoding every texture
+    // it met, wiped on any texture VRAM write, and A3I5/A5I3 decoded per pixel). The coordinator
+    // resolves every textured polygon before it dispatches the workers (they only read). An entry
+    // holds the texels pre-expanded for ShadeTexel (6-bit r|g|b, 5-bit alpha) and a copy of the
+    // VRAM bytes it was decoded from: valid while the texture VRAM generation is unchanged, else
+    // compared byte for byte and decoded again only if they differ. The key leaves out the
+    // wrap/flip bits (decode doesn't depend on them).
+    // Based on DSperate (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
+    // src/core/gpu/texcache.{h,cpp}).
+    struct TexRange { u32 addr, len; bool pal; };
+    struct TexShEntry
+    {
+        std::vector<u32> texels;
+        std::vector<u8> src;
+        std::vector<TexRange> ranges;
+        u32 gen = 0;
+        u64 used = 0;
+    };
+    static constexpr size_t TexShBudget = 16u << 20;
+    std::unordered_map<u64, TexShEntry> TexSh;
+    size_t TexShBytes = 0;
+    u64 TexShFrame = 0;
+    u32 TexGen = 1;          // emu thread
+    u32 TexShDecodes = 0;    // decodes in the frame being resolved
+    const u32* PolyTex[MaxPolys] = {};   // per FramePolys[GeomRead] index, set by the coordinator
+    void ResolveTexShared(int gi);
+    void DecodeTexShared(TexShEntry& e, u32 texparam, u32 texpal) const;
+#endif
     void BuildFrameGeom(int gi);   // build compact verts + per-block buckets into buffer gi
 
     // ---- texture (P3) -- reused melonDS decode-once cache (per-worker; see BandScratch::Tex) ----
@@ -551,6 +587,9 @@ private:
     struct PolyShade
     {
         const u16* texcache;
+#if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+        const u32* tex32;       // shared cache texels (r6 | g6<<8 | b6<<16 | a5<<24)
+#endif
         s32  texW, texH;
         u32  texparam, texpal;
         const u16* toontbl;
