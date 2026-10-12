@@ -1172,6 +1172,98 @@ void NDS::RunSystemSleep(u64 timestamp)
     }
 }
 
+// The ARM9 side of a scheduler iteration (RunFrame).
+template <CPUExecuteMode cpuMode>
+__attribute__((always_inline)) inline void NDS::RunArm9Step()
+{
+    if (CPUStop & CPUStop_GXStall)
+    {
+        // GXFIFO stall (ARM9 halted waiting on geometry; the
+        // CyclesToRunFor() call is trivial -> falls to residual)
+        s32 cycles = GPU.GPU3D.CyclesToRunFor();
+
+        ARM9Timestamp = std::min(ARM9Target, ARM9Timestamp+(cycles<<ARM9ClockShift));
+    }
+    else if (CPUStop & CPUStop_DMA9)
+    {
+        // M6.11: DMA9 timed separately (was nested in ARM9ExecNs)
+        LITE_PROFILE_SCOPE(_dma9timer, LiteProfile::g_Frame.DMA9Ns);
+        DMAs[0].Run();
+        if (!(CPUStop & CPUStop_GXStall)) DMAs[1].Run();
+        if (!(CPUStop & CPUStop_GXStall)) DMAs[2].Run();
+        if (!(CPUStop & CPUStop_GXStall)) DMAs[3].Run();
+        if (ConsoleType == 1)
+        {
+            auto& dsi = dynamic_cast<melonDS::DSi&>(*this);
+            dsi.RunNDMAs(0);
+        }
+    }
+    else
+    {
+        // M6.11: ARM9 JIT execution only (excludes GPU3D/GXFIFO,
+        // which drain later in GPU.GPU3D.Run(), and DMA above)
+        LITE_PROFILE_SCOPE(_arm9timer, LiteProfile::g_Frame.ARM9ExecNs);
+        ARM9.Execute<cpuMode>();
+    }
+}
+
+// The rest of a scheduler iteration after its ARM9 side: ARM7 catch-up and the events.
+// false: sleep mode was entered (RunFrame leaves its slice loop).
+template <CPUExecuteMode cpuMode>
+__attribute__((always_inline)) inline bool NDS::RunSliceTail()
+{
+    u64 target = ARM9Timestamp >> ARM9ClockShift;
+    CurCPU = 1;
+
+    {
+        while (ARM7Timestamp < target)
+        {
+            ARM7Target = target; // might be changed by a reschedule
+
+            if (CPUStop & CPUStop_DMA7)
+            {
+                // M6.11: DMA7 timed separately (was nested in ARM7ExecNs)
+                LITE_PROFILE_SCOPE(_dma7timer, LiteProfile::g_Frame.DMA7Ns);
+                DMAs[4].Run();
+                DMAs[5].Run();
+                DMAs[6].Run();
+                DMAs[7].Run();
+                if (ConsoleType == 1)
+                {
+                    auto& dsi = dynamic_cast<melonDS::DSi&>(*this);
+                    dsi.RunNDMAs(1);
+                }
+            }
+            else
+            {
+                // M6.11: ARM7 execution only (excludes DMA7 above)
+                LITE_PROFILE_SCOPE(_arm7timer, LiteProfile::g_Frame.ARM7ExecNs);
+                ARM7.Execute<cpuMode>();
+            }
+
+#ifdef LITEV_SCHED_LEAN
+            RunTimersDue(1);
+#else
+            RunTimers(1);
+#endif
+        }
+    }
+
+    {
+        LITE_PROFILE_SCOPE(_systimer, LiteProfile::g_Frame.RunSystemNs);
+        RunSystem(target);
+    }
+
+    if (CPUStop & CPUStop_Sleep)
+    {
+#ifdef LITEV_SCHED_LEAN
+        RunTimers(0); RunTimers(1);   // the sleep loop moves TimerTimestamp without counting
+#endif
+        return false;
+    }
+    return true;
+}
+
 template <CPUExecuteMode cpuMode>
 u32 NDS::RunFrame()
 {
@@ -1258,35 +1350,10 @@ u32 NDS::RunFrame()
                 for (;;)
 #endif
                 {
-                    if (CPUStop & CPUStop_GXStall)
-                    {
-                        // GXFIFO stall (ARM9 halted waiting on geometry; the
-                        // CyclesToRunFor() call is trivial -> falls to residual)
-                        s32 cycles = GPU.GPU3D.CyclesToRunFor();
-
-                        ARM9Timestamp = std::min(ARM9Target, ARM9Timestamp+(cycles<<ARM9ClockShift));
-                    }
-                    else if (CPUStop & CPUStop_DMA9)
-                    {
-                        // M6.11: DMA9 timed separately (was nested in ARM9ExecNs)
-                        LITE_PROFILE_SCOPE(_dma9timer, LiteProfile::g_Frame.DMA9Ns);
-                        DMAs[0].Run();
-                        if (!(CPUStop & CPUStop_GXStall)) DMAs[1].Run();
-                        if (!(CPUStop & CPUStop_GXStall)) DMAs[2].Run();
-                        if (!(CPUStop & CPUStop_GXStall)) DMAs[3].Run();
-                        if (ConsoleType == 1)
-                        {
-                            auto& dsi = dynamic_cast<melonDS::DSi&>(*this);
-                            dsi.RunNDMAs(0);
-                        }
-                    }
-                    else
-                    {
-                        // M6.11: ARM9 JIT execution only (excludes GPU3D/GXFIFO,
-                        // which drain later in GPU.GPU3D.Run(), and DMA above)
-                        LITE_PROFILE_SCOPE(_arm9timer, LiteProfile::g_Frame.ARM9ExecNs);
-                        ARM9.Execute<cpuMode>();
-                    }
+                    RunArm9Step<cpuMode>();
+#ifdef LITEV_JIT_NATIVE_LOOP
+                    if (NativeTailDone) break;
+#endif
 
 #ifdef LITEV_SCHED_LEAN
                     RunTimersDue(0);
@@ -1310,55 +1377,18 @@ u32 NDS::RunFrame()
                 }
 #endif
 
-                target = ARM9Timestamp >> ARM9ClockShift;
-                CurCPU = 1;
-
+#ifdef LITEV_JIT_NATIVE_LOOP
+                if (NativeTailDone)
                 {
-                    while (ARM7Timestamp < target)
-                    {
-                        ARM7Target = target; // might be changed by a reschedule
-
-                        if (CPUStop & CPUStop_DMA7)
-                        {
-                            // M6.11: DMA7 timed separately (was nested in ARM7ExecNs)
-                            LITE_PROFILE_SCOPE(_dma7timer, LiteProfile::g_Frame.DMA7Ns);
-                            DMAs[4].Run();
-                            DMAs[5].Run();
-                            DMAs[6].Run();
-                            DMAs[7].Run();
-                            if (ConsoleType == 1)
-                            {
-                                auto& dsi = dynamic_cast<melonDS::DSi&>(*this);
-                                dsi.RunNDMAs(1);
-                            }
-                        }
-                        else
-                        {
-                            // M6.11: ARM7 execution only (excludes DMA7 above)
-                            LITE_PROFILE_SCOPE(_arm7timer, LiteProfile::g_Frame.ARM7ExecNs);
-                            ARM7.Execute<cpuMode>();
-                        }
-
-#ifdef LITEV_SCHED_LEAN
-                        RunTimersDue(1);
-#else
-                        RunTimers(1);
-#endif
-                    }
+                    // the native slice loop ran this iteration's tail (and maybe more iterations)
+                    const bool sleep = NativeTailDone == 2;
+                    NativeTailDone = 0;
+                    if (sleep) break;
+                    continue;
                 }
-
-                {
-                    LITE_PROFILE_SCOPE(_systimer, LiteProfile::g_Frame.RunSystemNs);
-                    RunSystem(target);
-                }
-
-                if (CPUStop & CPUStop_Sleep)
-                {
-#ifdef LITEV_SCHED_LEAN
-                    RunTimers(0); RunTimers(1);   // the sleep loop moves TimerTimestamp without counting
 #endif
+                if (!RunSliceTail<cpuMode>())
                     break;
-                }
             }
         }
 
@@ -1406,6 +1436,125 @@ u32 NDS::RunFrame()
     else
         return 263;
 }
+
+#if defined(LITEV_JIT_NATIVE_LOOP) && defined(JIT_ENABLED)
+// LITEV_JIT_NATIVE_LOOP: the ARM9 stays in JIT code across slice ends. Inspired by DSperate's
+// native slice loop (the scheduler's slice sequence runs from a loop in the JIT arena;
+// src/core/cpu/jit/runtime.cpp, src/core/cpu/jit/a64/stubs.cpp, src/core/sched/scheduler.cpp
+// slice_next; https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e).
+//
+// Called by the ARM9 dispatcher when the budget ran out (block K committed, ARM9Timestamp >=
+// ARM9Target and spilled, Cycles 0). Without the loop the dispatcher returns through ARM_Ret to
+// ARMv5::Execute, whose loop ends, RunFrame runs the iteration's tail and the next iteration's
+// head, then ARMv5::Execute sets up the next slice and ARM_Dispatch enters the next block. This
+// runs the same steps in the same order through the same code (RunSliceTail, NextTarget) while
+// the guest registers stay in the JIT's host registers: nothing these steps run reads the
+// ARM9's registers (the ARM7 runs in its own nested ARM_Dispatch, which preserves them), and
+// whatever acts on the ARM9 (an IRQ, a halt, a DMA9 or GXFIFO stop) makes it hand back to C++
+// before the next block. Exact: guest state and timing are those of the C++ loop. Host side:
+// the dispatcher's region / block lookup replaces JitSetupRegion / LookUpBlock (same tables),
+// and the hop skips the per-site caches, as a C++ entry does.
+s32 NDS::NativeSliceNext()
+{
+    ARMv5& a = ARM9;
+    // A stop C++ handles (an unmasked IRQ, a halt, an idle loop): back to ARMv5::Execute as
+    // before. An IRQ the guest has masked is no stop there (TriggerIRQ returns at once).
+    auto stopFree = [&a] { return !a.StopExecution || (a.StopExecution == 0x100 && (a.CPSR & 0x80)); };
+#ifdef LITEV_NPSCHED_STATS
+    SchedStats.Native[0]++;   // budget exits
+#endif
+    if (!stopFree())
+        return 0;
+    // ARMv5::Execute after ARM_Dispatch: merge the NZCV slot, Timestamp += Cycles (0)
+#ifdef LITEV_JIT_LAZYFLAGS
+    a.CPSR = (a.CPSR & 0x0FFFFFFF) | (a.JitNZCV & 0xF0000000);
+#endif
+    a.Cycles = 0;
+    // A budget zeroed by Reschedule (an event due before the slice end): the target moved
+    // earlier but may still be ahead, and then Execute's loop dispatches again.
+    if (ARM9Timestamp < ARM9Target)
+    {
+#ifdef LITEV_NPSCHED_STATS
+        SchedStats.Native[1]++;   // continued in the same slice
+#endif
+        return NativeDispatch();
+    }
+    // Execute's loop ends (Halted == 0). RunFrame: the rest of the iteration (SchedDrainContinue
+    // needs a GXFIFO stall or a DMA9, so RunArm9Step does not call Execute here)
+#ifdef LITEV_SCHED_LEAN
+    RunTimersDue(0);
+#else
+    RunTimers(0);
+#endif
+    {
+        LITE_PROFILE_SCOPE(_gpu3dtimer, LiteProfile::g_Frame.GPU3DNs);
+        GPU.GPU3D.Run();
+    }
+    while (SchedDrainContinue())
+    {
+        LITE_PROFILE_ADD(LiteProfile::g_Frame.SchedulerIterations);
+        RunArm9Step<CPUExecuteMode::JIT>();
+#ifdef LITEV_SCHED_LEAN
+        RunTimersDue(0);
+#else
+        RunTimers(0);
+#endif
+        LITE_PROFILE_SCOPE(_gpu3dtimer, LiteProfile::g_Frame.GPU3DNs);
+        GPU.GPU3D.Run();
+    }
+    NativeTailDone = 1;   // a hand-back from here on skips RunFrame's tail
+    if (!RunSliceTail<CPUExecuteMode::JIT>())
+    {
+        NativeTailDone = 2;
+        return 0;
+    }
+    if (!(Running && GPU.TotalScanlines == 0))
+        return 0;
+
+    // the next iteration's head (RunFrame), as far as its ARM9 dispatch: RunArm9Step must take
+    // its Execute branch, Execute must find the ARM9 running with no stop to handle (NextTarget
+    // does not change these; a hand-back leaves RunFrame to compute it)
+    if ((CPUStop & (CPUStop_GXStall|CPUStop_DMA9)) || a.Halted || !stopFree())
+        return 0;
+    LITE_PROFILE_ADD(LiteProfile::g_Frame.SchedulerIterations);
+#ifdef LITEV_NPSCHED_STATS
+    SchedStats.Iter++;
+    if (ARM7.Halted == 1 && !HaltInterrupted(1) && !CPUStop)
+        SchedStats.A9Only++;
+#endif
+    u64 target = NextTarget();
+    ARM9Target = target << ARM9ClockShift;
+    CurCPU = 0;
+    // Execute's loop runs (otherwise: a hand-back, RunFrame computes the same NextTarget again)
+    if (!(ARM9Timestamp < ARM9Target))
+        return 0;
+#ifdef LITEV_NPSCHED_STATS
+    SchedStats.Exec[0]++;
+    SchedStats.Native[2]++;   // continued into the next slice
+#endif
+    NativeTailDone = 0;
+    return NativeDispatch();
+}
+
+// ARMv5::Execute's per-dispatch setup (the dispatcher does the region check and the lookup)
+s32 NDS::NativeDispatch()
+{
+    ARMv5& a = ARM9;
+#ifdef LITEV_NPSCHED_STATS
+    SchedStats.Disp[0]++;
+#endif
+    a.CyclesBudget = (s32)std::min<s64>((s64)(ARM9Target - ARM9Timestamp), INT32_MAX);
+    a.JitTsPtr = &ARM9Timestamp;
+    a.JitTsBase = ARM9Timestamp + a.CyclesBudget;
+#ifdef LITEV_EXIT_PROTO_STOP
+    a.JitStopToBudget();   // (no-op: no stop the dispatcher would take)
+#endif
+#ifdef LITEV_JIT_LAZYFLAGS
+    a.JitNZCV = a.CPSR & 0xF0000000;
+#endif
+    return a.CyclesBudget;
+}
+#endif
 
 u32 NDS::RunFrame()
 {
