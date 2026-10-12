@@ -796,6 +796,60 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
     else
         tilemapaddr += ((yoff & 0xF8) << 3);
 
+#ifdef LITEV_SOFT2D_BGSPAN
+    if constexpr (!mosaic)
+    {
+        // A tile at a time: one tilemap entry + one tile-row load per 8 pixels, and a blank tile
+        // row (all colour 0) skipped without touching its pixels. Same pixels as the loop below:
+        // the row is 4/8-byte aligned and the VRAM mask is a power of two minus one, so the
+        // per-pixel masked address is the masked row address + the byte offset.
+        // Inspired by DSperate's text BG row gather with blank-tile skip (https://github.com/
+        // beebono/DSperate, GPL-3.0-or-later, commit f5fa35e, src/core/gpu/engine2d.cpp).
+        const u32 bgbit = 1u << bgnum, flag = 0x01000000u << bgnum, yrow = yoff & 7;
+        const bool c256 = bgcnt & (1<<7);
+        const bool nowin = !(GPU2D.DispCnt & 0xE000);   // WindowMask is all 0xFF (DrawScanline_BGOBJ)
+        for (u32 i = 0; i < 256; )
+        {
+            const u32 xpos = (u16)(xoff + i);
+            const u32 tx = xpos & 7;
+            const u32 n = std::min<u32>(8 - tx, 256 - i);
+            const u16 tile = *(u16*)&bgvram[(tilemapaddr + ((xpos & 0xF8) >> 2) + ((xpos & widexmask) << 3)) & bgvrammask];
+            const u32 row = (tile & (1<<11)) ? (7 - yrow) : yrow;
+            const u32 hx = (tile & (1<<10)) ? 7 : 0;   // tilexoff = x ^ 7 when flipped
+            if (c256)
+            {
+                u64 px; memcpy(&px, &bgvram[(tilesetaddr + ((tile & 0x03FF) << 6) + (row << 3)) & bgvrammask], 8);
+                if (px)
+                {
+                    const u16* cp = extpal ? S2D_EXTPAL(extpalslot, tile>>12) : pal;
+                    for (u32 k = 0; k < n; k++)
+                    {
+                        const u32 color = (px >> (((tx + k) ^ hx) * 8)) & 0xFF;
+                        if (color && (nowin || (WindowMask[i+k] & bgbit)))
+                            DrawPixel(&BGOBJLine[i+k], cp[color], flag);
+                    }
+                }
+            }
+            else
+            {
+                u32 px; memcpy(&px, &bgvram[(tilesetaddr + ((tile & 0x03FF) << 5) + (row << 2)) & bgvrammask], 4);
+                if (px)
+                {
+                    const u16* cp = pal + ((tile & 0xF000) >> 8);
+                    for (u32 k = 0; k < n; k++)
+                    {
+                        const u32 color = (px >> (((tx + k) ^ hx) * 4)) & 0xF;
+                        if (color && (nowin || (WindowMask[i+k] & bgbit)))
+                            DrawPixel(&BGOBJLine[i+k], cp[color], flag);
+                    }
+                }
+            }
+            i += n;
+        }
+        return;
+    }
+
+#endif
     u16 curtile;
     u16* curpal;
     u32 pixelsaddr;
@@ -1164,6 +1218,9 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
         u8 color;
 
         yshift -= 3;
+#ifdef LITEV_SOFT2D_BGSPAN
+        u32 lastmapoff = ~0u;
+#endif
 
         for (int i = 0; i < 256; i++)
         {
@@ -1184,10 +1241,22 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
 
                 if ((!((finalX|finalY) & overflowmask)))
                 {
+#ifdef LITEV_SOFT2D_BGSPAN
+                    // consecutive pixels on the same map entry (scaled/rotated maps) reuse it
+                    const u32 mapoff = (((((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11)) << 1);
+                    if (mapoff != lastmapoff)
+                    {
+                        lastmapoff = mapoff;
+                        curtile = *(u16*)&bgvram[(tilemapaddr + mapoff) & bgvrammask];
+                        if (extpal) curpal = S2D_EXTPAL(bgnum, curtile>>12);
+                        else        curpal = pal;
+                    }
+#else
                     curtile = *(u16*)&bgvram[(tilemapaddr + (((((finalY & coordmask) >> 11) << yshift) + ((finalX & coordmask) >> 11)) << 1)) & bgvrammask];
 
                     if (extpal) curpal = S2D_EXTPAL(bgnum, curtile>>12);
                     else        curpal = pal;
+#endif
 
                     // draw pixel
                     u32 tilexoff = (finalX >> 8) & 0x7;

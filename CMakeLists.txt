@@ -237,6 +237,13 @@ option(LITEV_SOFT2D_BITMASK "liteV: DSperate byte-plane masked 2D colour-effect 
 if (LITEV_SOFT2D_BITMASK)
     add_compile_definitions(LITEV_SOFT2D_BITMASK=1)
 endif()
+# LITEV_SOFT2D_BGSPAN: text BG layers drawn a tile at a time (one tilemap + tile-row fetch per 8 px,
+# blank tile rows skipped, no per-pixel window test without windows); extended rotscale BGs reuse
+# the map entry while consecutive pixels stay on it. Same pixels. Inspired by DSperate (f5fa35e).
+option(LITEV_SOFT2D_BGSPAN "liteV: tile-at-a-time text BG with blank tile-row skip" OFF)
+if (LITEV_SOFT2D_BGSPAN)
+    add_compile_definitions(LITEV_SOFT2D_BGSPAN=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)
