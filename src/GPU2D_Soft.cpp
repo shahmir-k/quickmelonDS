@@ -1046,13 +1046,6 @@ void SoftRenderer2D::PlaneBG_Text(u32 line, u32 bgnum)
             const u32 blk = (xoff & widexmask) ? 1 : 0;
             memcpy(maprow, &bgvram[(tilemapaddr + (blk << 11)) & bgvrammask], 64);
             memcpy(maprow + 32, &bgvram[(tilemapaddr + ((widexmask ? blk ^ 1 : blk) << 11)) & bgvrammask], 64);
-#ifdef LITEV_SOFT2D_PREFETCH
-            if (yrow == 7)   // the next line starts the next map row (hint only)
-            {
-                __builtin_prefetch(&bgvram[(tilemapaddr + 64 + (blk << 11)) & bgvrammask]);
-                __builtin_prefetch(&bgvram[(tilemapaddr + 64 + ((widexmask ? blk ^ 1 : blk) << 11)) & bgvrammask]);
-            }
-#endif
         }
         const u16* const tiles = maprow + ((xoff >> 3) & 31);
         u64 acc = 0;

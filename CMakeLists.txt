@@ -284,10 +284,9 @@ option(LITEV_SOFT2D_OBJROW "liteV: NEON sprite row plot for the software 2D" OFF
 if (LITEV_SOFT2D_OBJROW)
     add_compile_definitions(LITEV_SOFT2D_OBJROW=1)
 endif()
-# LITEV_SOFT2D_PREFETCH: the threaded 2D's band loop prefetches what the next steps read from memory
-# other cores wrote (in-order A55: every miss stalls the pipe): the next line's register snapshots,
-# this line's 3D line right after it is handed over (read by the select after the sprite and BG
-# passes), and the next line's framebuffer rows for store. Render-only, exact (hints only).
+# LITEV_SOFT2D_PREFETCH: the threaded 2D's band loop prefetches the next line's register snapshots
+# (written by the emu at VBlank; their first touch was the 2D thread's hottest stall on the in-order
+# A55). Render-only, exact (hints only).
 option(LITEV_SOFT2D_PREFETCH "liteV: software prefetch in the threaded 2D band loop" OFF)
 if (LITEV_SOFT2D_PREFETCH)
     add_compile_definitions(LITEV_SOFT2D_PREFETCH=1)
