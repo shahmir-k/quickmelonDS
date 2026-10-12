@@ -120,6 +120,8 @@ public:
     // SprSnap for the next frame. Avoids a per-scanline read/write race.
 #if defined(LITEV_SOFT2D_DEPTH2)
     void CopyLineSnaps(int slot);
+    bool LineSnapsEqual(int slot) const   // skip-repeat: this frame's snapshots == slot's
+    { return !memcmp(LineSnap, LineSnapR[slot], sizeof(LineSnap)) && !memcmp(SprSnap, SprSnapR[slot], sizeof(SprSnap)); }
 #else
     void CopyLineSnaps();
 #endif

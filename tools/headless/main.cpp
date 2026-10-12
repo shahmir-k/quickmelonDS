@@ -729,6 +729,9 @@ int main(int argc, char** argv)
     if (getenv("LITEV_LCDEVT")) nds->GPU.LcdEvt = atoi(getenv("LITEV_LCDEVT")) != 0;   // A/B (default on)
 #endif
 #endif
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+    if (getenv("LITEV_SKIPREPEAT")) nds->GPU.SkipRepeatEnabled = atoi(getenv("LITEV_SKIPREPEAT")) != 0;   // the app's "Skip repeated frames"
+#endif
     // LITEV_LOOP=<n>: run the --frames window n more times from --savestate (profile a short burst)
     int loopsLeft = getenv("LITEV_LOOP") ? atoi(getenv("LITEV_LOOP")) : 0;
     for (int frame = 0; frame < opt.frames; frame++)
@@ -992,6 +995,22 @@ int main(int argc, char** argv)
 
             if (opt.fbHashEvery > 0 && ((frame + 1) % opt.fbHashEvery) == 0)
             {
+                static const bool fbRetire = getenv("LITEV_FB_RETIRE") != nullptr;   // + frames finished, drawn / skip-repeat
+                auto* sr = fbRetire ? dynamic_cast<melonDS::SoftRenderer*>(&nds->GPU.GetRenderer()) : nullptr;
+                if (sr)
+                    printf("frame %d  top=%016llx  bottom=%016llx r=%u d=%d sr=%d\n",
+                           frame + 1, (unsigned long long)topHash, (unsigned long long)botHash, sr->RetiredFrames(),
+#ifdef LITEV_AGGRESSIVE_SKIP
+                           !nds->GPU.SkipThisFrame,
+#else
+                           1,
+#endif
+#ifdef LITEV_SKIP_REPEAT_FRAMES
+                           (int)nds->GPU.SkipRepeat);
+#else
+                           0);
+#endif
+                else
                 printf("frame %d  top=%016llx  bottom=%016llx\n",
                        frame + 1, (unsigned long long)topHash, (unsigned long long)botHash);
                 fflush(stdout);

@@ -20,6 +20,8 @@
 #define GPU_H
 
 #include <memory>
+#include <algorithm>
+#include <cstring>
 #if defined(LITEV_SOFT2D_DEPTH2)   // mid-frame 2D write journal hooks (see GPU::S2DJ)
 #define LITEV_S2DJ_PRE(T, rd)  T _j0 = 0; if (S2DJOn) _j0 = rd<T>(addr);
 // (every bank mapped at addr, if any, was just written with val: val is the new read value)
@@ -43,6 +45,32 @@ class ARMJIT;
 
 static constexpr u32 VRAMDirtyGranularity = 512;
 class GPU;
+
+// skip-repeat: which 512-byte chunks of a flat VRAM copy changed, and the changed byte span in each
+struct VRAMDiffMap
+{
+    u64 Bits[1024 / 64] {};
+    u16 Lo[1024] {}, Hi[1024] {};
+    bool Any() const noexcept { for (u64 w : Bits) if (w) return true; return false; }
+    void Clear() noexcept { memset(Bits, 0, sizeof(Bits)); }
+    void Mark(u32 c, u32 lo, u32 hi) noexcept
+    {
+        if ((Bits[c >> 6] >> (c & 63)) & 1) { Lo[c] = std::min<u32>(Lo[c], lo); Hi[c] = std::max<u32>(Hi[c], hi); }
+        else { Bits[c >> 6] |= 1ull << (c & 63); Lo[c] = lo; Hi[c] = hi; }
+    }
+    // a changed byte in [start, start+len) of a flat copy of nchunks chunks (wrapping)
+    bool Hit(u32 nchunks, u32 start, u32 len) const noexcept
+    {
+        if (!len) return false;
+        const u32 end = start + std::min(len, nchunks * 512) - 1;
+        for (u32 c = start / 512; c <= end / 512; c++)
+        {
+            const u32 cc = c % nchunks;
+            if (((Bits[cc >> 6] >> (cc & 63)) & 1) && c * 512 + Hi[cc] >= start && c * 512 + Lo[cc] <= end) return true;
+        }
+        return false;
+    }
+};
 
 template <u32 Size, u32 MappingGranularity>
 struct VRAMTrackingSet
@@ -686,6 +714,14 @@ public:
     bool CaptureDraw() const noexcept
     { return (CaptureCnt & (1u << 31)) && !LITEV_HEADLESS(Headless) && (!CaptureLast || FrameskipCounter <= 1); }
     bool Tail3DDone = true, TailSprDone = true, CaptureLast = false;
+    // the next frame is drawn by the schedule (its 3D renders at this frame's VCount 215 and its
+    // line-0 sprites at line 262). A target change (SetFrameskipTarget) after that draws the next
+    // frame anyway: StartFrame then renders both late.
+    bool NextFrameDrawn() const noexcept
+    {
+        if (LITEV_HEADLESS(Headless)) return CaptureSeen;
+        return FrameskipTarget <= 0 || FrameskipCounter <= 0 || KeepCapturesSeen;
+    }
 
     // Netplay: a console nobody looks at (another player's) draws nothing. Rendering does not
     // feed back into emulation, except through display capture, so once the game has used
@@ -721,14 +757,23 @@ public:
     int DiagNoDraw = 0;         // TEMP diagnostic: bit0 skip 2D drawing, bit1 skip 3D rendering   // the game has used display capture (Netplay then renders identically everywhere)
 
 #ifdef LITEV_SKIP_REPEAT_FRAMES
-    // Display-only: while a game draws 3D at 30 Hz (new 3D every other frame), skip the 2D
-    // drawing and the present of each frame whose 3D repeats the previous frame's; the screen
-    // keeps the previous frame (only 2D changes on that frame show one frame late). Never on a
-    // headless console or once the game has used display capture (drawn pixels then reach VRAM).
+    // Display-only: skip the 2D render and the present of a frame on which nothing visible
+    // changed since the last drawn frame; the screen keeps that frame (pixel-identical). Decided
+    // at VBlank by the renderer (SoftRenderer::RepeatUnchanged: the frame's per-line 2D register
+    // snapshots, palette, OAM, the mid-frame write journal, BG/OBJ VRAM contents) plus the 3D
+    // (every 3D frame since the last drawn one repeated its inputs and texture VRAM contents).
+    // Renderers without that check never skip. Never on a headless console or once the game has
+    // used display capture (drawn pixels then reach VRAM).
     bool SkipRepeatEnabled = false;
-    bool SkipRepeat = false;         // this frame (valid until the next frame starts)
-    bool NextSkipRepeat = false;     // decided at line 262, before the next frame's line-0 sprites
-    bool LastRepeat3D = false;
+    bool SkipRepeat = false;         // this frame was not drawn (set at its VBlank)
+    bool SkipRepeatCand = false;     // this frame may be skipped (no capture, ...)
+    bool NextSkipRepeat = false;     // the next frame's SkipRepeatCand, decided at line 262
+    bool RepeatChanged3D = true;     // a 3D frame since the last drawn frame differs from its 3D
+    bool RepeatTexDiff = true;       // texture/palette VRAM contents changed (3D renders)
+    VRAMDiffMap RepeatTexMap, RepeatPalMap;   // where (texture / texture palette VRAM)
+    bool RepeatTexUsedChanged() const noexcept;
+    bool RepeatFlat2DDiff = true;    // BG/OBJ VRAM contents changed since the last drawn frame
+    bool* RepeatDiff(bool& f) noexcept { if (SkipRepeatEnabled) return &f; f = true; return nullptr; }
 #endif
 
     void SetFrameskipTarget(int target) noexcept
@@ -1021,7 +1066,9 @@ private:
     }
 
     template <u32 MappingGranularity, u32 Size>
-    constexpr bool CopyLinearVRAM(u8* flat, const u32* mappings, NonStupidBitField<Size>& dirty, u64 (GPU::* const slowAccess)(u32) const noexcept) noexcept
+    // diff (skip-repeat): set when a copied chunk's bytes differ from what the flat copy held;
+    // dm: and record the changed span (8-byte words) of each chunk
+    constexpr bool CopyLinearVRAM(u8* flat, const u32* mappings, NonStupidBitField<Size>& dirty, u64 (GPU::* const slowAccess)(u32) const noexcept, bool* diff = nullptr, VRAMDiffMap* dm = nullptr) noexcept
     {
         const u32 VRAMBitsPerMapping = MappingGranularity / VRAMDirtyGranularity;
 
@@ -1035,12 +1082,31 @@ private:
             u8* fastAccess = GetUniqueBankPtr(mappings[*it / VRAMBitsPerMapping], offset);
             if (fastAccess)
             {
+                if (diff && dm)
+                {
+                    u32 lo = ~0u, hi = 0;
+                    for (u32 i = 0; i < VRAMDirtyGranularity; i += 8)
+                        if (*(const u64*)&dst[i] != *(const u64*)&fastAccess[i]) { lo = std::min(lo, i); hi = i + 7; }
+                    if (lo != ~0u) { *diff = true; dm->Mark(*it, lo, hi); }
+                }
+                else if (diff && !*diff && memcmp(dst, fastAccess, VRAMDirtyGranularity))
+                    *diff = true;
                 memcpy(dst, fastAccess, VRAMDirtyGranularity);
             }
             else
             {
+                u32 lo = ~0u, hi = 0;
                 for (u32 i = 0; i < VRAMDirtyGranularity; i += 8)
-                    *(u64*)&dst[i] = (this->*slowAccess)(offset + i);
+                {
+                    const u64 v = (this->*slowAccess)(offset + i);
+                    if (*(u64*)&dst[i] != v) { lo = std::min(lo, i); hi = i + 7; }
+                    *(u64*)&dst[i] = v;
+                }
+                if (diff && lo != ~0u)
+                {
+                    *diff = true;
+                    if (dm) dm->Mark(*it, lo, hi);
+                }
             }
             change = true;
             it++;
