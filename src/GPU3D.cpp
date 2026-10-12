@@ -4352,6 +4352,149 @@ bool GPU3D::BulkReady() const noexcept
 // ahead of the guest clock: their cycles pile up in CycleCount, so the engine stays busy
 // (GXSTAT bit 27) for the same total time, which Run() then counts down. The game sees the
 // FIFO empty throughout instead of filling and draining.
+#ifdef LITEV_REMOTE_GX_FASTSINK
+#if !defined(LITEV_REMOTE_GX_SINK) || !defined(LITEV_GX_UNTIMED) || !defined(LITEV_GX_CMD_SLIM) || !defined(LITEV_GX_BULK_LEAN) || defined(LITEV_REMOTE_GX_MODEL)
+#error "LITEV_REMOTE_GX_FASTSINK needs LITEV_REMOTE_GX_SINK, LITEV_GX_UNTIMED, LITEV_GX_CMD_SLIM, LITEV_GX_BULK_LEAN, not LITEV_REMOTE_GX_MODEL"
+#endif
+// off: env LITEV_GXFASTSINK=0 (headless A/B) or, on Android, debug.litev.gxfastsink=0
+static const bool GXFastSinkOn = [] {
+    if (const char* e = getenv("LITEV_GXFASTSINK")) return atoi(e) != 0;
+#if defined(__ANDROID__)
+    return litevGxPropDefault("debug.litev.gxfastsink", 1) != 0;
+#else
+    return true;
+#endif
+}();
+
+// What a sink copy keeps of the geometry commands (untimed engine): only what the game can observe.
+// With no matrix, vertex, lighting or polygon results computed, the observable state of the engine is
+// the command timing (CycleCount: the busy bit after a batch), the matrix stack pointers and their
+// overflow bit (GXSTAT), the vertex/polygon counting (RAM_COUNT) and swap / test commands (handled by
+// the executor). So the pass keeps MatrixMode, the stack pointers + overflow, PolygonAttr ->
+// CurPolygonAttr, the BEGIN state and the counting, and CycleCount's adds (3 per vertex, the lights per
+// normal); the render-only registers (colours, normals, texture state, materials, lights, viewport,
+// current vertex, matrices, ExecParams) and the pipeline counters (read only by the timed engine) are
+// left as they are. Reading a result vetoes the sink anyway (SinkUse).
+__attribute__((noinline)) void GPU3D::SinkCmd(u32 cmd, u32 val) noexcept
+{
+    switch (cmd)
+    {
+    case 0x10: MatrixMode = val & 0x3; break;
+    case 0x11: // push
+        if (MatrixMode == 0) { if (ProjMatrixStackPointer > 0) GXStat |= (1<<15); ProjMatrixStackPointer = (ProjMatrixStackPointer + 1) & 0x1; }
+        else if (MatrixMode == 3) { if (TexMatrixStackPointer > 0) GXStat |= (1<<15); TexMatrixStackPointer = (TexMatrixStackPointer + 1) & 0x1; }
+        else { if (PosMatrixStackPointer > 30) GXStat |= (1<<15); PosMatrixStackPointer = (PosMatrixStackPointer + 1) & 0x3F; }
+        break;
+    case 0x12: // pop
+        if (MatrixMode == 0) { if (ProjMatrixStackPointer == 0) GXStat |= (1<<15); ProjMatrixStackPointer = (ProjMatrixStackPointer - 1) & 0x1; }
+        else if (MatrixMode == 3) { if (TexMatrixStackPointer == 0) GXStat |= (1<<15); TexMatrixStackPointer = (TexMatrixStackPointer - 1) & 0x1; }
+        else
+        {
+            s32 offset = (s32)(val << 26) >> 26;
+            PosMatrixStackPointer = (PosMatrixStackPointer - offset) & 0x3F;
+            if (PosMatrixStackPointer > 30) GXStat |= (1<<15);
+        }
+        break;
+    case 0x13: case 0x14: // store / restore
+        if (MatrixMode != 0 && MatrixMode != 3 && (val & 0x1F) > 30) GXStat |= (1<<15);
+        break;
+    case 0x29: PolygonAttr = val; break;
+    case 0x40:
+        PolygonMode = val & 0x3;
+        VertexNum = 0; VertexNumInPoly = 0; NumConsecutivePolygons = 0; LastStripPolygon = NULL;
+        CurPolygonAttr = PolygonAttr;
+        break;
+    }
+}
+
+// Sink copy, untimed engine: the bulk executor's observable effects (SinkCmd) run from the decoder,
+// a command on its last parameter word, without the entry queue and the executor. Swap and test
+// commands stop the pass: the caller hands them to the executor. Returns the words taken.
+u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
+{
+    // 1 = vertex, 2 = normal, 3 = SinkCmd, 4 = stop (swap, tests); 0 = nothing observable
+    static const u8 kKind[256] =
+    {
+        [0x10] = 3, [0x11] = 3, [0x12] = 3, [0x13] = 3, [0x14] = 3, [0x21] = 2,
+        [0x23] = 1, [0x24] = 1, [0x25] = 1, [0x26] = 1, [0x27] = 1, [0x28] = 1,
+        [0x29] = 3, [0x40] = 3, [0x50] = 4, [0x70] = 4, [0x71] = 4, [0x72] = 4,
+    };
+#ifdef LITEV_FF_HEADLESS3D
+    const bool lightCycles = LITEV_HEADLESS(Headless) && !FFHeadlessNow;
+#else
+    const bool lightCycles = LITEV_HEADLESS(Headless);
+#endif
+    u32 numCmds = NumCommands, cur = CurCommand, pc = ParamCount, tp = TotalParams;
+    // the current command (mid-way from an earlier call) must be one this pass runs, and
+    // ExecParamCount must be where the executor left it (it ran every entry: the FIFO is empty)
+    if (numCmds && kKind[cur & 0xFF] == 4) return 0;
+    if (ExecParamCount != ((numCmds && tp > 1) ? pc : 0)) return 0;
+    s32 cyc = 0;
+    u32 i = 0;
+    for (; i < n; i++)
+    {
+        const u32 val = words[i];
+        if (numCmds == 0)
+        {
+            numCmds = 4;
+            cur = val;
+            pc = 0;
+            tp = CmdNumParams[cur & 0xFF];
+            if (tp > 0) { if (kKind[cur & 0xFF] == 4) { i++; break; } continue; }
+        }
+        else
+            pc++;
+
+        bool halt = false;
+        for (;;)
+        {
+            if ((cur & 0xFF) || (numCmds == 4 && cur == 0))
+            {
+                ran = true;   // an entry {cur & 0xFF, val}; the command runs on its last one
+                if (pc >= tp) switch (kKind[cur & 0xFF])
+                {
+                case 1: // vertex: SubmitVertex's sink counting; AddCycles(3) (the pipeline counters aside)
+                    VertexNum++;
+                    VertexNumInPoly++;
+                    switch (PolygonMode)
+                    {
+                    case 0: if (VertexNumInPoly == 3) { VertexNumInPoly = 0; NumConsecutivePolygons++; } break;
+                    case 1: if (VertexNumInPoly == 4) { VertexNumInPoly = 0; NumConsecutivePolygons++; } break;
+                    case 2: if ((NumConsecutivePolygons & 1) || VertexNumInPoly == 3) { VertexNumInPoly = 2; NumConsecutivePolygons++; } break;
+                    case 3: if (VertexNumInPoly == 4) { VertexNumInPoly = 2; NumConsecutivePolygons++; } break;
+                    }
+                    cyc += 3;
+                    break;
+                case 2: // normal: CalculateLighting's headless cycles
+                    if (lightCycles) { const s32 c = __builtin_popcount(CurPolygonAttr & 0xF); cyc += c < 1 ? 1 : c; }
+                    else { CycleCount += cyc; cyc = 0; CalculateLighting(); }
+                    break;
+                case 3: SinkCmd(cur & 0xFF, val); break;
+                }
+            }
+
+            if (pc >= tp)
+            {
+                cur >>= 8;
+                numCmds--;
+                if (numCmds == 0) break;
+
+                pc = 0;
+                tp = CmdNumParams[cur & 0xFF];
+                if (tp > 0 && kKind[cur & 0xFF] == 4) { halt = true; break; }
+            }
+            if (pc < tp)
+                break;
+        }
+        if (halt) { i++; break; }
+    }
+    CycleCount += cyc;
+    NumCommands = numCmds; CurCommand = cur; ParamCount = pc; TotalParams = tp;
+    ExecParamCount = (numCmds && tp > 1) ? pc : 0;   // where the executor would be in a command
+    return i;
+}
+#endif
+
 void GPU3D::BulkWords(const u32* words, u32 n) noexcept
 {
     // contract: n <= 64 (the decode buffer below; after a SWAP_BUFFERS the rest goes to the 260-entry FIFO). A larger
@@ -4362,6 +4505,25 @@ void GPU3D::BulkWords(const u32* words, u32 n) noexcept
     if (A9HLE::GxTap) A9HLE::GxTap->insert(A9HLE::GxTap->end(), words, words + n);
 #endif
 
+#ifdef LITEV_REMOTE_GX_FASTSINK
+    if (Sink && GXUntimedOn && GXFastSinkOn)
+    {
+        bool ran = false;
+        const u32 k = SinkWords(words, n, ran);
+        if (k == n)
+        {
+            // as the queue path's tail for a batch of entries (the executor ran them)
+            if (!ran) return;
+            GXStat |= (1<<27);
+            if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
+            if (NumTestCommands == 0)    GXStat &= ~(1<<0);
+            RunUntimed();
+            return;
+        }
+        // a swap or test command: from it on the queue path (its tail covers the entries run here)
+        words += k; n -= k;
+    }
+#endif
     CmdFIFOEntry q[4*64]; // a word holds at most 4 commands; Run9 passes <= 64 words
     u32 m = 0;
     u32 numCmds = NumCommands, cur = CurCommand, pc = ParamCount, tp = TotalParams;
