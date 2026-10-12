@@ -404,6 +404,9 @@ private:
         u16  EdgeTable[8] = {};
         u32  FogColor = 0, FogOffset = 0, FogShift = 0;
         u8   FogDensityTable[34] = {};
+#ifdef LITEV_TILE_SAMEFRAME
+        bool TexDirty = false;    // texture / texture-palette VRAM was rewritten at this frame's render
+#endif
     };
     FrameCfg Cfg[NGEOM];
 
@@ -516,6 +519,7 @@ private:
         u32 attr;             // poly->Attr
         u32 texparam, texpal;
     };
+    static_assert(sizeof(TilePoly) == 28, "TilePoly has no padding (compared with memcmp)");
     TilePoly FramePolys[NGEOM][MaxPolys];
     u32 FrameNumPolys[NGEOM] = {};
 
@@ -523,6 +527,22 @@ private:
     u16 Bucket[NGEOM][NumBlocks][MaxPolys];
     u16 BucketCount[NGEOM][NumBlocks];
 
+#if defined(LITEV_TILE_SAMEFRAME) && defined(LITEV_TILE_COORD)
+    // Coordinator-only: the inputs of the last frame whose output is in ColorOut[LastCol]. A frame
+    // with the same polygons, vertices, render state and texture inputs gets a copy of that output
+    // instead of a raster (games resubmit identical lists while the camera stands still).
+    // Inspired by DSperate (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
+    // src/core/gpu/gpu3d.cpp list_same_, render3d.cpp kept frames).
+    bool     LastValid = false;
+    bool     TexDirtySinceLast = false;
+    int      LastCol = 0;
+    u32      LastNumPolys = 0, LastNumVtx = 0;
+    FrameCfg* LastCfg = nullptr;
+    TilePoly* LastPolys = nullptr;
+    TileVtx*  LastVtx = nullptr;
+    bool SameAsLast(int gi, u32 nvtx) const;
+    void SaveLast(int gi, u32 nvtx, int col);
+#endif
     void BuildFrameGeom(int gi);   // build compact verts + per-block buckets into buffer gi
 
     // ---- texture (P3) -- reused melonDS decode-once cache (per-worker; see BandScratch::Tex) ----
