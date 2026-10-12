@@ -27,6 +27,7 @@
 #include "ARM7HLE.h"
 #include "ARM9HLE.h"
 #include "HLELeaf.h"
+#include "ARM7Native.h"
 #include "ARMJIT_Memory.h"
 #include <string.h>
 #include <assert.h>
@@ -688,6 +689,28 @@ void NOP(ARM* cpu) {}
     F(name##_POST_REG_LSL), F(name##_POST_REG_LSR), F(name##_POST_REG_ASR), F(name##_POST_REG_ROR), F(name##_POST_IMM)
 #define F_MEM_HD(name) \
     F(name##_REG), F(name##_IMM), F(name##_POST_REG), F(name##_POST_IMM)
+#if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
+// ak_HLECALL / tk_HLECALL: a call compiled as a native call (ARM9: HLELeaf, ARM7: A7Native)
+static void HleCallA(ARM* cpu)
+{
+#ifdef LITEV_A7HLE
+    if (cpu->Num) { A7Native::CallA(cpu); return; }
+#endif
+#ifdef LITEV_A9HLE
+    HLELeaf::CallA(cpu);
+#endif
+}
+static void HleCallT(ARM* cpu)
+{
+#ifdef LITEV_A7HLE
+    if (cpu->Num) { A7Native::CallT(cpu); return; }
+#endif
+#ifdef LITEV_A9HLE
+    HLELeaf::CallT(cpu);
+#endif
+}
+#endif
+
 InterpreterFunc InterpretARM[ARMInstrInfo::ak_Count] =
 {
     F_ALU(AND,), F_ALU(AND,_S),
@@ -728,8 +751,8 @@ InterpreterFunc InterpretARM[ARMInstrInfo::ak_Count] =
     F(B), F(BL), F(BLX_IMM), F(BX), F(BLX_REG),
     F(UNK), F(MSR_IMM), F(MSR_REG), F(MRS), F(MCR), F(MRC), F(SVC),
     NOP,
-#ifdef LITEV_A9HLE
-    HLELeaf::CallA,
+#if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
+    HleCallA,
 #else
     NULL,
 #endif
@@ -764,8 +787,8 @@ InterpreterFunc InterpretTHUMB[ARMInstrInfo::tk_Count] =
     F(BCOND), F(BX), F(BLX_REG), F(B), F(BL_LONG_1), F(BL_LONG_2),
     F(UNK), F(SVC),
     T_BL_LONG, // BL_LONG psudo opcode
-#ifdef LITEV_A9HLE
-    HLELeaf::CallT,
+#if defined(LITEV_A9HLE) || defined(LITEV_A7HLE)
+    HleCallT,
 #else
     NULL,
 #endif
@@ -1600,6 +1623,23 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
         }
 #endif
 #ifdef LITEV_A7HLE
+        // a call to a native ARM7 OS function (A7Native, per SDK build): a non-branching fallback that runs it natively at
+        // the call; the block depends on the callee's code (and its callees') and goes on after the call
+        if (cpu->Num == 1 && !thumb && instrs[i].Info.Kind == ARMInstrInfo::ak_BL)
+        {
+            const u32 w = instrs[i].Instr;
+            u32 la[32], lb[32];
+            const int nl = A7Native::At(NDS, instrs[i].Addr + 8 + (u32)((s32)(w << 8) >> 6), la, lb, 32);
+            if (nl > 0)
+            {
+                for (int d = 0; d < nl; d++) addDeps(1, la[d], lb[d]);
+                a7Hook = true;      // (another restore key than the same bytes compiled with an ordinary call)
+                ARMInstrInfo::Info& in = instrs[i].Info;
+                in.Kind = ARMInstrInfo::ak_HLECALL;
+                in.SrcRegs = 0x7FFF; in.DstRegs = 0x500F; in.NotStrictlyNeeded = 0;
+                in.SpecialKind = 0; in.ReadFlags = 0; in.WriteFlags = 0xF; in.EndBlock = false;
+            }
+        }
         // HLE'd ARM7 function entry: compile it as an interpreter fallback that ends the block
         // (decoded as an undefined instruction); A_UNK runs the native function or the original
         // instruction. Keeps Instr, so the code hash / invalidation still see the real bytes.
