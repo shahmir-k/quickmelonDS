@@ -614,3 +614,51 @@ constexpr SigField kSigMkShp_F[] = {
     {offsetof(Found, mk.shpCode[8]), 2, 8, 9}};
 constexpr SigGroup kSigMkShp = {{0x01FF85D0, 0xE92D4030, 0xE24DD004, 18, kSigMkShp_C, 40, kSigMkShp_L}, 5, kSigMkShp_O, 22, kSigMkShp_F, 3, 0, "kSigMkShp"};
 
+// kSigOsN6: hook 1 (wake) of the NTR 2005-2006 OS build (reference cv.mem, entry 01ffe150; 13 chunks, 28 links)
+constexpr HLESig::Chunk kSigOsN6_C[] = {
+    {0x01FFE0E0, 0x01FFE150, 0x2eb9d695d3d1c74eull, 4, 1, 0, -112, 0},
+    {0x01FFE150, 0x01FFE294, 0xd27ea3636d844decull, 0, 0, 0, 0, 0},
+    {0x0209A348, 0x0209A3C8, 0xb520fe6fdc34fe19ull, 5, 0, 0, -382910352, 0},
+    {0x0209B91C, 0x0209BA08, 0xbb057be6824a1a83ull, 1, 5, 15, 0, 0},
+    {0x0209BA08, 0x0209BA34, 0x2cde9456fbee0e1dull, 1, 3, 20, 0, 0},
+    {0x0209BAE8, 0x0209BB3C, 0x4ffad5ba2da10237ull, 1, 2, 23, 0, 0},
+    {0x0209C14C, 0x0209C1C4, 0x7d83b74a7c7fe3f3ull, 1, 5, 12, 0, 0},
+    {0x0209C248, 0x0209C294, 0xd7e836f3193052d3ull, 1, 3, 32, 0, 0},
+    {0x0209C294, 0x0209C2D8, 0x96b3d42cba68d4dfull, 1, 3, 52, 0, 0},
+    {0x0209D85C, 0x0209D870, 0x08bf6b6fa8b89a42ull, 1, 2, 3, 0, 0},
+    {0x0209D870, 0x0209D888, 0xfd3c9de99740f980ull, 1, 2, 12, 0, 0},
+    {0x0209D8B4, 0x0209D8C0, 0x0a09cf7925475aefull, 1, 3, 10, 0, 0},
+    {0x020A38B4, 0x020A3994, 0x71b94e2cfe107d9bull, 1, 1, 79, 108, 0}};
+constexpr HLESig::Link kSigOsN6_L[] = {
+    {0, 20, 2, 0, 0x027C1580}, {0, 21, 1, 0, 0x01FFE138}, {0, 27, 0, 1, 0x01FFE188}, {1, 77, 2, 0, 0x027C15E0},
+    {1, 78, 2, 0, 0x021C9E6C}, {1, 79, 1, 12, 0x020A3920}, {1, 80, 1, 12, 0x020A38B4}, {2, 3, 0, 9, 0x0209D85C},
+    {2, 12, 0, 10, 0x0209D870}, {2, 23, 0, 5, 0x0209BAE8}, {2, 29, 2, 0, 0x027C0000}, {2, 31, 2, 0, 0x027C15E0},
+    {3, 10, 0, 11, 0x0209D8B4}, {3, 20, 0, 4, 0x0209BA08}, {3, 32, 0, 7, 0x0209C248}, {3, 52, 0, 8, 0x0209C294},
+    {3, 55, 2, 0, 0x021C9E58}, {3, 56, 2, 0, 0x021C9E6C}, {3, 57, 2, 0, 0x021C9E64}, {3, 58, 2, 0, 0x021C9E60},
+    {4, 10, 2, 0, 0x021C9E6C}, {5, 2, 0, 9, 0x0209D85C}, {5, 12, 0, 6, 0x0209C14C}, {5, 15, 0, 3, 0x0209B91C},
+    {5, 17, 0, 10, 0x0209D870}, {5, 20, 2, 0, 0x021C9E64}, {7, 18, 1, 12, 0x020A3920}, {8, 16, 1, 12, 0x020A38B4}};
+constexpr SigObj kSigOsN6_O[] = {{0x027C0000, 0x4}, {0x027C1580, 0x4}, {0x027C15E0, 0x8}, {0x021C9E58, 0x24}};
+constexpr SigField kSigOsN6_F[] = {
+    {offsetof(Found, var.wake), 0, 1, 0},
+    {offsetof(Found, var.code[0]), 2, 0, 1},
+    {offsetof(Found, var.code[1]), 2, 12, 12},
+    {offsetof(Found, var.code[2]), 2, 2, 2},
+    {offsetof(Found, var.code[4]), 2, 6, 6},
+    {offsetof(Found, var.code[5]), 2, 3, 3},
+    {offsetof(Found, var.code[6]), 2, 5, 5},
+    {offsetof(Found, var.code[7]), 2, 4, 4},
+    {offsetof(Found, var.code[8]), 2, 7, 8},
+    {offsetof(Found, var.code[10]), 2, 9, 10},
+    {offsetof(Found, var.code[11]), 2, 11, 11},
+    {offsetof(Found, var.info), 1, 3, 20},
+    {offsetof(Found, var.osi), 1, 3, 0},
+    {offsetof(Found, var.irqQueue), 1, 2, 0},
+    {offsetof(Found, var.irqCheck), 1, 0, 16376},
+    {offsetof(Found, var.irqTable), 1, 1, 0},
+    {offsetof(Found, var.ctxPc), 0, 7, 72},
+    {offsetof(Found, var.ctxLr), 0, 3, 132},
+    {offsetof(Found, var.retSleep), 0, 5, 64},
+    {offsetof(Found, var.retWait), 0, 2, 96},
+    {offsetof(Found, var.retLoad), 0, 3, 212}};
+constexpr SigGroup kSigOsN6 = {{0x01FFE150, 0xE58C2064, 0xE58C3078, 13, kSigOsN6_C, 28, kSigOsN6_L}, 4, kSigOsN6_O, 21, kSigOsN6_F, 4, 0, "kSigOsN6"};
+

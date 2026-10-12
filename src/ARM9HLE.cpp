@@ -71,7 +71,7 @@ struct NodeVar { u32 blend, anm, sclB, sclM, sndB, sndM, rsLit, rotTab, pivTab, 
 
 // OSThread: +0 context {cpsr, r0-r14, pc, sp_svc, CP context (+0x48, 0x1C bytes)}, +0x64 state,
 // +0x68 list link, +0x70 priority, +0x78 queue, +0x7C/+0x80 queue link prev/next
-// The OS build of a game: the addresses its hooks use, found by signature (the groups below) or by OsScan (2005-06 build).
+// The OS build of a game: the addresses its hooks use, found by signature (the groups below).
 struct Variant
 {
     const char* name;
@@ -115,13 +115,13 @@ inline u32 IrqQueueOf(const Variant& v) { return v.irqQueue; }
 inline u32 IrqCheckOf(const Variant& v) { return v.irqCheck; }
 inline u32 IrqTableOf(const Variant& v) { return v.irqTable; }
 // a build's constants (everything but the addresses, which its signature groups fill in): 1 the TWL ARM build (Pokemon
-// Black / White), 2 the TWL Thumb build (Pokemon White 2), 3 NTR 2005-2006 (OsScan)
+// Black / White), 2 the TWL Thumb build (Pokemon White 2), 4 the NTR 2005-2006 OS (3: MKDS's NNS G3D, no OS)
 Variant BuildTemplate(int b)
 {
     Variant v{};
     if (b == 1) { v.name = "TWL ARM"; v.setCyc = 500; v.getCyc = 27; v.getCycPerBit = 17; }
     if (b == 2) { v.name = "TWL Thumb"; v.twl = 1; v.setCyc = 417; v.getCyc = 25; v.getCycPerBit = 13; }   // check mode: set 417, get 302 at bit 21 (~13/bit, Thumb loop)
-    if (b == 3) { v.name = "NTR2006"; v.n6 = 1; v.oLock = 0x00; v.oCb = 0x08; v.oCur = 0x0C; v.oDepth = 0x16; v.wakeCyc = 1467; }   // (1467: check-mode guest average, CV 144k round trips; MKDS 1.7k: 5008)
+    if (b == 4) { v.name = "NTR2006"; v.n6 = 1; v.oLock = 0x00; v.oCb = 0x08; v.oCur = 0x0C; v.oDepth = 0x16; v.wakeCyc = 1467; }   // (1467: check-mode guest average, CV 144k round trips; MKDS 1.7k: 5008)
     return v;
 }
 // 21. / 23. / 25.: Mario Kart DS's NNS G3D (2005 build, in ITCM): the functions and the globals the natives use
@@ -149,18 +149,10 @@ struct SigObj { u32 base, size; };
 struct SigField { u16 off; u8 kind, a; u32 b; };    // kind 0 code (chunk a + b), 1 data (object a + b), 2 range (chunks a..b), 3 zero
 struct SigGroup { HLESig::Recipe r; u8 nObj; const SigObj* o; u8 nF; const SigField* f; u8 build, thumb; const char* name; };
 #include "A9HLERecipes.inc"
-enum { gOsA, gGxA, gShpA, gOsT, gGxT, gShpT, gMatT, gNodeT, gSbcT, gMkMat, gMkSbc, gMkShp, kNumGroups };
+enum { gOsA, gGxA, gShpA, gOsT, gGxT, gShpT, gMatT, gNodeT, gSbcT, gMkMat, gMkSbc, gMkShp, gOsN6, kNumGroups };
 constexpr const SigGroup* kGroups[kNumGroups] = {&kSigOsA, &kSigGxA, &kSigShpA, &kSigOsT, &kSigGxT, &kSigShpT, &kSigMatT,
-                                                 &kSigNodeT, &kSigSbcT, &kSigMkMat, &kSigMkSbc, &kSigMkShp};
+                                                 &kSigNodeT, &kSigSbcT, &kSigMkMat, &kSigMkSbc, &kSigMkShp, &kSigOsN6};
 
-// ---- signature scan of an OS build (FLIRT-style): the wake hook's variant in any game --------------------------------
-// A recipe row per code range (tools/hle/osscan.py from the reference: Castlevania PoR): its length, its masked FNV-1a 64
-// (branches out of the range: offset zeroed; the pointer literals it loads: zeroed) and how to find it: the hook's range
-// (hook - off), a literal (range r, word w), a BL target (range r, word w), or a scan of main RAM (its first three masked
-// words, then the masked FNV; exactly one match). Run once, when the JIT first compiles a candidate wake-loop instruction.
-struct OsRange { u32 len; u64 mfnv; u8 how, r; u16 w; s32 off; u32 w0, w1, w2; };
-#include "A9HLEOsScan.inc"
-constexpr int kOsN6Code[10] = {0, 1, 2, 4, 5, 6, 7, 8, 10, 11};    // Variant::code index of each row
 // hook kind of (addr, instr) in variant v: 0 wake, 1 set, 2 get, 5 GX send, -1 none (thumb: a Thumb entry, instr the halfword)
 inline int Kind(const Variant& v, u32 addr, u32 instr, bool thumb = false)
 {
@@ -201,7 +193,7 @@ struct EntryTrace
 struct State
 {
     int status = 0;                 // 0 no OS build matched (yet), 1 active (v), -1 off
-    const Variant* v = nullptr;     // the game's OS build (status 1): &f.var (signature groups) or &scanned (OsScan)
+    const Variant* v = nullptr;     // the game's OS build (status 1): &f.var
     bool init = false, on = true;   // prop read; prop on
     u32 mask = kAllHooks;           // 1 wake, 2 set, 4 get, 8 HBlank IRQ, 16 GX send, 32 card read, 64 LZ, 128 G3D material, 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ, 2048 G3D shape, 4096 VEC_Normalize, 8192 G3D node, 16384 MKDS sample effect, 32768 G3D material animation, 65536 G3D SBC loop, 131072 G2D cell to OAMs, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase, 8388608 MKDS G3D shape
     // signature groups: per group 0 not found (yet), 1 found at gEntry, -1 off (its recipe matched in two places); the
@@ -209,7 +201,7 @@ struct State
     // reference -> candidate places of every matched chunk / object (a group must agree with the ones found before it)
     s8 gs[kNumGroups] = {};
     u32 gEntry[kNumGroups] = {};
-    u8 build = 0;                   // the OS group's build (1, 2), 3 OsScan
+    u8 build = 0;                   // the OS group's build (1, 2, 4)
     Found f = {};
     std::vector<Range> gr[kNumGroups];
     std::vector<u8> gsnap[kNumGroups];
@@ -226,7 +218,6 @@ struct State
     u32 mkSbcLive = 0;              // 23.: verified with the loop's hook block: 1 the loop and 21., 2 also 25.
     EntryTrace traces[8]; u32 nTrace = 0;   // 3c.: recorded IRQ entries
     u64 trRec = 0, trHit = 0, trChk = 0, trDiff = 0, trChkFail = 0;    // (stats; replay check)
-    Variant scanned = {};           // the wake hook's variant found by OsScan (v == &scanned)
     std::vector<u32> tried;         // wake-loop candidates probed (no OS build found there)
     bool hbLive = false, dmaLive = false;   // 3. / 11. verified when the wake hook block (A9HLEGuard) was compiled
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
@@ -439,92 +430,6 @@ int GroupAt(melonDS::ARMv5* c, int g, u32 a)
 }
 
 u32 RdCode(melonDS::ARMv5* c, u32 a, bool& ok) { const u8* p = CodePtr(c, a); ok = ok && p; return p ? R32(p) : 0; }
-// masked FNV of [a, a + len) (as tools/hle/osscan.py); ok cleared if unreadable
-u64 MaskedFnv(melonDS::ARMv5* c, u32 a, u32 len, bool& ok)
-{
-    u32 w[0x200 / 4];
-    const u32 n = len / 4;
-    if (n > 0x80) { ok = false; return 0; }
-    for (u32 i = 0; i < n; i++) w[i] = RdCode(c, a + 4 * i, ok);
-    bool lit[0x80] = {};
-    for (u32 i = 0; i < n; i++)
-        if ((w[i] & 0x0F7F0000) == 0x051F0000 && (w[i] >> 28) != 0xF)
-        {
-            const u32 imm = w[i] & 0xFFF, la = a + 4 * i + 8 + ((w[i] >> 23 & 1) ? imm : -imm);
-            if (la >= a && la < a + len) lit[(la - a) / 4] = true;
-        }
-    u64 h = 0xcbf29ce484222325ull;
-    for (u32 i = 0; i < n; i++)
-    {
-        u32 x = w[i];
-        if ((x >> 25 & 7) == 5)
-        {
-            const u32 t = a + 4 * i + 8 + (u32)((s32)(x << 8) >> 6) + ((x >> 28) == 0xF ? (x >> 23 & 2) : 0);
-            if (t < a || t >= a + len) x &= 0xFF000000;
-        }
-        else if (lit[i] && x >= 0x01FF8000 && x < 0x04000000) x = 0;
-        for (int k = 0; k < 4; k++) h = (h ^ ((x >> (8 * k)) & 0xFF)) * 0x100000001b3ull;
-    }
-    return h;
-}
-// the NTR 2005-2006 OS build around a wake-loop candidate at hook: v filled (addresses, data from the literals) if every
-// range is found and matches
-__attribute__((noinline, cold)) bool OsScan(melonDS::ARMv5* c, u32 hook, Variant& v)
-{
-    constexpr int N = sizeof(kOsN6) / sizeof(kOsN6[0]);
-    u32 loc[N] = {};
-    bool got[N] = {}, ok = true;
-    for (bool more = true; more;)
-    {
-        more = false;
-        for (int k = 0; k < N; k++)
-        {
-            if (got[k]) continue;
-            const OsRange& r = kOsN6[k];
-            u32 at = 0;
-            if (r.how == 0) at = hook - r.off;
-            else if (r.how == 3)
-            {
-                // main RAM (4 MB): the three first words, then the masked code; one match only
-                int hits = 0;
-                for (u32 a = 0x02000000; a < 0x02400000 - r.len; a += 4)
-                {
-                    const u32 x = R32(&c->NDS.MainRAM[a & c->NDS.MainRAMMask]);
-                    if (x != r.w0 || R32(&c->NDS.MainRAM[(a + 4) & c->NDS.MainRAMMask]) != r.w1
-                        || R32(&c->NDS.MainRAM[(a + 8) & c->NDS.MainRAMMask]) != r.w2) continue;
-                    bool o = true;
-                    if (MaskedFnv(c, a, r.len, o) == r.mfnv && o) { at = a; hits++; }
-                }
-                if (hits != 1) return false;
-            }
-            else
-            {
-                if (!got[r.r]) continue;
-                const u32 wa = loc[r.r] + 4 * r.w, w = RdCode(c, wa, ok);
-                if (r.how == 1) at = w;
-                else if ((w >> 24) == 0xEB) at = wa + 8 + (u32)((s32)(w << 8) >> 6);
-                else return false;
-            }
-            loc[k] = at; got[k] = true; more = true;
-            if (MaskedFnv(c, at, r.len, ok) != r.mfnv || !ok) return false;
-        }
-    }
-    for (int k = 0; k < N; k++) if (!got[k]) return false;
-    // data from the literals (the reference's slots): queue, table, OSThreadInfo (IRQ handler), the DTCM base (OS_WaitIrq), the
-    // scheduler's globals (OS_RescheduleThread), checked against each other
-    auto lit = [&](int k, int w) { return RdCode(c, loc[k] + 4 * w, ok); };
-    v = BuildTemplate(3);
-    v.wake = hook;
-    for (int k = 0; k < N; k++) v.code[kOsN6Code[k]] = {loc[k], loc[k] + kOsN6[k].len};
-    v.irqTable = lit(0, 20); v.irqQueue = lit(0, 105); v.info = lit(0, 106); v.irqCheck = lit(2, 29) + 0x3FF8;
-    v.osi = lit(4, 55);
-    if (!ok || lit(4, 56) != v.info || lit(4, 57) != v.osi + v.oCur || lit(4, 58) != v.osi + v.oCb || lit(5, 20) != v.osi + v.oCur
-        || lit(6, 10) != v.info || lit(2, 31) != v.irqQueue || v.info - v.osi > 0x40) return false;
-    v.ctxPc = loc[7] + 0x48; v.ctxLr = loc[4] + 0x84; v.retSleep = loc[5] + 0x40; v.retWait = loc[2] + 0x60; v.retLoad = loc[4] + 0xD4;
-    if (g_Stats) fprintf(stderr, "A9HLE: OS scan: %s at %08x (OS_WaitIrq %08x, OSThreadInfo %08x, IRQ queue %08x)\n", v.name, hook, loc[2], v.info, v.irqQueue);
-    return true;
-}
-
 // how much of main RAM the OS groups' scan searches: the static module's code and data (the OS is there), up to NitroSDK's
 // module params' autoload start (found by their two magic words in the first 32 KB); else all 4 MB
 u32 StaticEnd(melonDS::ARMv5* c)
@@ -591,7 +496,7 @@ __attribute__((noinline, cold)) bool MatchGroup(melonDS::ARMv5* c, State& s, int
 // switched off
 __attribute__((noinline, cold)) void UpdateOk(melonDS::ARMv5* c, State& s)
 {
-    if (s.v != &s.f.var) return;
+    if (s.build != 1 && s.build != 2) return;
     Variant& v = s.f.var;
     const int b = s.build, gx = b == 1 ? gGxA : gGxT, shp = b == 1 ? gShpA : gShpT;
     v.matT = b == 2 && s.gs[gMatT] == 1 ? &s.f.matT : nullptr;
@@ -644,7 +549,7 @@ __attribute__((noinline, cold)) void AtEntry(melonDS::ARMv5* c, State& s, u32 a,
         const SigGroup& g = *kGroups[gi];
         if (g.thumb != thumb || s.gs[gi] < 0 || (s.gs[gi] == 1 && s.gEntry[gi] == a)) continue;
         if (g.build != 3 && (s.status != 1 || g.build != s.build)) continue;    // (the OS group comes first: its build's)
-        if (gi == gOsA || gi == gOsT || !GroupPre(c, g, a)) continue;
+        if (gi == gOsA || gi == gOsT || gi == gOsN6 || !GroupPre(c, g, a)) continue;
         if (s.gs[gi] == 0) { if (MatchGroup(c, s, gi, a, true)) { any = true; Chain(c, s); } }
         else if (MatchGroup(c, s, gi, a, false)) { s.gs[gi] = -1; any = true; if (g_Stats) fprintf(stderr, "A9HLE: %s matches twice: off\n", g.name); }
     }
@@ -667,32 +572,24 @@ __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 in
     if (instr != kWakeInstr) return s;
     for (u32 a : s.tried) if (a == addr) return s;
     if (s.tried.size() < 16) s.tried.push_back(addr);
-    for (int gi : {gOsA, gOsT})
+    for (int gi : {gOsA, gOsT, gOsN6})
     {
         if (!MatchGroup(c, s, gi, addr, true)) continue;
         s.build = kGroups[gi]->build;
         const Variant t = BuildTemplate(s.build);
         Variant& v = s.f.var;
         v.name = t.name; v.twl = t.twl; v.setCyc = t.setCyc; v.getCyc = t.getCyc; v.getCycPerBit = t.getCycPerBit;
+        v.n6 = t.n6; v.oLock = t.oLock; v.oCb = t.oCb; v.oCur = t.oCur; v.oDepth = t.oDepth; v.wakeCyc = t.wakeCyc;
         s.v = &v;
         s.status = 1;
         s.biosRet = BiosIrqRet(c->NDS);
         CodeBytes(c, s.code, v.code, 0, kNumWake);
-        s.irqOk = s.biosRet != 0;
+        s.irqOk = s.biosRet != 0 && !v.n6;      // (3.: the TWL builds)
         Chain(c, s);
         UpdateOk(c, s);
         if (g_Stats) fprintf(stderr, "A9HLE: OS build %s at %08x: GX %d shape %d material %d node %d SBC %d\n", v.name, addr,
                              s.gs[s.build == 1 ? gGxA : gGxT], s.gs[s.build == 1 ? gShpA : gShpT], s.gs[gMatT], s.gs[gNodeT], s.gs[gSbcT]);
         return s;
-    }
-    if (OsScan(c, addr, s.scanned))
-    {
-        s.build = 3;
-        s.v = &s.scanned;
-        s.status = 1;
-        s.biosRet = BiosIrqRet(c->NDS);
-        CodeBytes(c, s.code, s.scanned.code, 0, kNumWake);
-        if (g_Stats) fprintf(stderr, "A9HLE: OS scan at %08x: found\n", addr);
     }
     return s;
 }
@@ -1027,9 +924,12 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     if (!v.n6) m.W(ts, 0, v.twl ? t : v.info);
     m.W(ts, 4, cur);
     m.W(ts, 8, v.retLoad);
-    // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack (PW/PB/W2: its TWL divider check)
+    // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack (PW/PB/W2: its TWL divider check); the 2005-2006
+    // build only has the handler's own switch to t there: its stmdb sp!, {r1 = t} in SVC mode (found by compare mode on
+    // cold boots of Castlevania PoR / Metroid Prime Hunters, where another thread's switch had left another value)
     if (!v.n6)
         for (int i = 0; i < 6; i++) m.W(sv, i * 4, f[i]);
+    else m.W(sv, 20, t);
     m.Flush();
 
     // registers after the guest's return into cur
@@ -4986,20 +4886,18 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
     if (!has) return;
     if (!f->Saving) c->A9HLEState = &Own(nds);
     State& s = *(State*)c->A9HLEState;
-    // the OS build (0 none, 1 the signature groups' f.var, 2 OsScan's), what the groups found (f: plain data but for the
-    // name / matT pointers, set again), the scan's variant
-    u32 vi = !s.v ? 0 : s.v == &s.f.var ? 1 : 2;
+    // the OS build (0 none, 1 the signature groups' f.var), what the groups found (f: plain data but for the name / matT
+    // pointers, set again)
+    u32 vi = s.v ? 1 : 0;
     f->Var32(&vi);
     f->VarArray(&s.f, sizeof(Found));
-    f->VarArray(&s.scanned, sizeof(Variant));
     if (!f->Saving)
     {
-        s.v = vi == 1 ? &s.f.var : vi == 2 ? &s.scanned : nullptr;
+        s.v = vi ? &s.f.var : nullptr;
         s.f.var.matT = s.f.var.matT ? &s.f.matT : nullptr;
-        s.scanned.matT = nullptr;
     }
     f->Var8(&s.build);
-    if (!f->Saving) { s.f.var.name = BuildTemplate(s.build).name; s.scanned.name = BuildTemplate(3).name; }
+    if (!f->Saving) s.f.var.name = BuildTemplate(s.build).name;
     for (int g = 0; g < kNumGroups; g++)
     {
         f->Var8((u8*)&s.gs[g]);
