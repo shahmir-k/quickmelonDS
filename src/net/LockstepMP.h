@@ -98,6 +98,15 @@ public:
 #ifdef LITEV_MP_FASTPOLL
     static bool HostFrameMaybe(void* self, int inst);
 #endif
+#ifdef LITEV_WIFI_EVT
+    // LITEV_WIFI_EVT: a client's host polls at visible times <= `until`: 0 = none of them returns a
+    // frame; 1 = the earliest unconsumed host frame (*time, *sender) shows by `until`; -1 = unknown
+    // (no host taken from yet: poll every tick). Waits until that is settled (the host past `until`),
+    // so the answer depends on emulated times only. The host is the console's own last host
+    // (ClientHost), as RecvPacket's on-time rule.
+    static int HostQuiet(void* self, int inst, u64 until, u64* time, int* sender);
+    bool NoQuiet = false;   // (RecordMP) Hosted replays poll every tick: keep the recorded calls the same
+#endif
     // Ends every wait (the session is shutting down).
     void Stop();
 

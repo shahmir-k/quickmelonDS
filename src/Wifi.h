@@ -255,6 +255,18 @@ private:
 
     class WifiAP* WifiAP;
 
+#ifdef LITEV_WIFI_EVT
+    // Event-driven ticks: Event_Wifi fires only on a tick that does something; the idle ticks before
+    // it (counters only, EvtIdleTick) run lazily, before any register access (EvtCatchUp).
+    u64 NextTickTs = 0;     // system time of the next tick not run yet (TimerError: its delay's error)
+    u64 QuietUntil = 0;     // MP client: no host frame shows to a poll at a time <= this (HostQuiet)
+    void EvtIdleTick();
+    void EvtCatchUp(u64 now);
+    void EvtSchedule(bool ask);
+    void EvtScheduleAt(u64 ts);
+    void WriteReg(u32 addr, u16 val);
+#endif
+
     void ScheduleTimer(bool first, int ticks = 1);
     void UpdatePowerOn();
 
