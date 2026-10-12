@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <chrono>
+#include <time.h>
 #include <algorithm>
 #ifdef __linux__
 #include <sys/prctl.h>
@@ -609,6 +610,8 @@ int main(int argc, char** argv)
     if (wav) fseek(wav, 44, SEEK_SET);
 
     auto wallStart = std::chrono::steady_clock::now();
+    timespec emuCpu0{};   // emu (this) thread CPU time: the device A/B metric (blocked time excluded)
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &emuCpu0);
 #ifdef __APPLE__
     // emu-thread instructions/cycles (this thread only; render workers excluded): deterministic
     // A/B metric on a loaded Mac, where wall time is noise.
@@ -1069,6 +1072,11 @@ int main(int argc, char** argv)
     printf("mode:        %s\n", opt.jit ? "jit" : "interp");
     printf("frames:      %d\n", opt.frames);
     printf("wall_time_s: %.4f\n", wallSec);
+    {
+        timespec t1{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t1);
+        printf("emu_thread_cpu_s: %.4f\n", (t1.tv_sec - emuCpu0.tv_sec) + (t1.tv_nsec - emuCpu0.tv_nsec) * 1e-9);
+    }
 #ifdef __APPLE__
     {
         uint64_t thsc1[2] = {0, 0};
