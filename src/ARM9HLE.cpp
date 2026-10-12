@@ -177,18 +177,26 @@ struct EntryTrace
     u32 fn = 0, cool = 0, miss = 0;
     u32 R0[15] = {}, cpsr0 = 0, R1[15] = {}, cpsr1 = 0;     // registers at the entry (the key) / at the return
     s32 cyc = 0;
-    u8 nl = 0, ns = 0, nc = 0, ok = 0, nr = 0, npg = 0;
+    u8 nl = 0, ns = 0, nc = 0, ok = 0, nr = 0, npg = 0, frameHit = 0;
     u16 key = 0;                                            // the entry registers its run depends on (the others it only saves /
     s8 id[15] = {};                                         // restores: id[r] = the entry register r holds at the return, or -1)
     struct A { u32 a, v; u8 sz; s8 src; } ld[24], st[24];   // loads from outside its own stores (inputs), stores (in order; src:
                                                             // the entry register stored, or -1: v)
-    struct C { u32 a, w; u8 t; } code[40];                  // the instructions it ran (recording)
+    struct C { u32 a, w; u8 t; } code[40];                  // the instructions it ran, t 1 Thumb; 2: a literal it loaded
+                                                            // (pc-relative: code, not an input) (recording)
     struct Rg { u32 a; u16 off, len; } rg[8]; u8 cb[192];   // ... as contiguous code ranges with their bytes
     struct Pg { u32 page; u8 perm; } pg[6];                 // the protection-unit pages it touched (1 read, 2 write)
     u32 map[3] = {};                                        // the memory map it was resolved under (DTCM base / mask, ITCM size)
-    // host pointers of the ranges / loads / stores (resolved for key; not in savestates: hp cleared on load)
-    bool hp = false;
-    const u8* rp[8]; const u8* lp[24]; u8* sp[24]; u8 inv[24];
+    // host pointers of the ranges / loads / stores (resolved for key; not in savestates: hp cleared on load); guarded: its code
+    // ranges are dependencies of the live guard block (A9HLEGuard): a write there invalidates it (no per-IRQ code compare)
+    bool hp = false, guarded = false;
+    const u8* rp[8]; const u8* lp[24]; u8 inv[24];
+    struct LOp { const u8* w; u32 m, v; } lo[24];               // the loads as (aligned word, mask, value)
+    struct SOp { u8* p; u32 a, v; s8 src; u8 sk, sz; } so[24];  // the stores; sk 0 word, no JIT check (DTCM), 1 word in main
+                                                                // RAM, 2 other
+    u8 nidr = 0, idr[15];                       // the registers whose return value is an entry register
+    u8 nup = 0, up[8];                          // r4-r11 that do not return their entry value
+    bool usesIf = false;                        // it reads or stores r2 (OS_IrqHandler's IF read)
 };
 struct State
 {
@@ -216,10 +224,11 @@ struct State
     u32 anmDef = 0; bool anmOk = false;     // 17. (ARM build): the code of MAT_InternalDefault at anmDef verified at the last compile
     u32 sbcLive = 0;                // 18.: what was verified with the loop's hook block (SbcVerify)
     u32 mkSbcLive = 0;              // 23.: verified with the loop's hook block: 1 the loop and 21., 2 also 25.
-    EntryTrace traces[8]; u32 nTrace = 0;   // 3c.: recorded IRQ entries
+    EntryTrace traces[8]; u32 nTrace = 0, lastTrace = 0;    // 3c.: recorded IRQ entries (the last one replayed)
     u64 trRec = 0, trHit = 0, trChk = 0, trDiff = 0, trChkFail = 0;    // (stats; replay check)
     std::vector<u32> tried;         // wake-loop candidates probed (no OS build found there)
     bool hbLive = false, dmaLive = false;   // 3. / 11. verified when the wake hook block (A9HLEGuard) was compiled
+    const void* listBlk[4] = {};            // 11.: the live blocks that start display lists (host; A9HLEGuardDma = any of them)
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
     u64 calls[kKinds] = {}, native[kKinds] = {}, fallback[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, irqDuring[kKinds] = {};
     u64 guestCyc[kKinds] = {}, guestN[kKinds] = {}, getBits = 0, gxWords = 0, lzBytes = 0, lzEst = 0, cardWords = 0;
@@ -249,10 +258,13 @@ bool g_Dry = getenv("LITEV_A9HLE_DRY") && atoi(getenv("LITEV_A9HLE_DRY"));
 bool g_DryIrq = g_Dry || (getenv("LITEV_A9HLE_DRYIRQ") && atoi(getenv("LITEV_A9HLE_DRYIRQ")));
 // 3c. check: every matching IRQ-entry trace is compared with a fresh interpreted run instead of replayed (JIT mode)
 bool g_TraceCheck = getenv("LITEV_A9HLE_TRACECHECK") && atoi(getenv("LITEV_A9HLE_TRACECHECK"));
+// 3. fused check: the separate path (3a. IrqEnter + IrqFast) instead of the fused one, under the same conditions; its
+// per-frame states must equal the fused run's (--record-trace files byte-identical)
+bool g_NoFused = getenv("LITEV_A9HLE_NOFUSED") && atoi(getenv("LITEV_A9HLE_NOFUSED"));
 const bool g_Time = g_Stats;    // host ns per native call
 #else
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
-constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false, g_TraceCheck = false;
+constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false, g_TraceCheck = false, g_NoFused = false;
 #endif
 const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "irqenter", "irqtail", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc", "mkbp", "mkshp", "copy8"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
@@ -560,8 +572,7 @@ __attribute__((noinline, cold)) void AtEntry(melonDS::ARMv5* c, State& s, u32 a,
 __attribute__((noinline, cold)) State& Probe(melonDS::ARMv5* c, u32 addr, u32 instr, bool thumb)
 {
     State& s = St(c);
-    static const bool noprobe = getenv("DBGNOPROBE");
-    if (s.status != 0 || thumb || noprobe) return s;
+    if (s.status != 0 || thumb) return s;
     if (instr == kTailInstr)
     {
         // 3b.'s hook (compiled first: it is the wake loop's block's first instruction): the wake loop 0x18 bytes on
@@ -610,6 +621,16 @@ inline State* Active(melonDS::ARMv5* c)
 // Reads are host loads from main RAM / DTCM. Writes (only after every address was validated)
 // go straight to memory and only when the word changes; in check mode they are logged instead.
 struct Wr { u32 a, v; u8 sz; };
+// the JIT invalidation check of a main RAM store at a (CheckAndInvalidate's main RAM case, without the out-of-line
+// LocaliseAddress: the same code index bit, the same InvalidateByAddr)
+__attribute__((always_inline)) inline void InvMain(melonDS::ARMv5* c, u32 a)
+{
+#ifdef JIT_ENABLED
+    const u32 l = a & c->NDS.MainRAMMask;
+    if (c->NDS.JIT.CodeIndexMainRAM[l / 512].Code & (1u << ((l & 0x1FF) / 16)))
+        c->NDS.JIT.InvalidateByAddr(l | (melonDS::ARMJIT_Memory::memregion_MainRAM << 27));
+#endif
+}
 // a validated, contiguous guest object in host memory
 struct Obj
 {
@@ -642,10 +663,22 @@ struct Mem
     // [a, a+len) in one host block (main RAM or DTCM, no mirror wrap), else empty
     __attribute__((always_inline)) Obj O(u32 a, u32 len)
     {
+        // (P(a) and P(a + len - 1) == P(a) + len - 1, in one pass)
         Obj x;
-        u8* p = P(a);
-        if (!p || (a & 3) || P(a + len - 1) != p + len - 1) return x;
-        x.p = p; x.a = a; x.dtcm = (a & c->DTCMMask) == c->DTCMBase;
+        const u32 e = a + len - 1;
+        if ((a & 3) || a < c->ITCMSize) return x;
+        if ((a & c->DTCMMask) == c->DTCMBase)
+        {
+            if ((e & c->DTCMMask) != c->DTCMBase || (a & (DTCMPhysicalSize - 1)) + len > DTCMPhysicalSize) return x;
+            x.p = &c->DTCM[a & (DTCMPhysicalSize - 1)]; x.dtcm = true;
+        }
+        else
+        {
+            const u32 rm = c->NDS.MainRAMMask;
+            if ((a >> 24) != 0x02 || (e >> 24) != 0x02 || (e & c->DTCMMask) == c->DTCMBase || (a & rm) + len > rm + 1) return x;
+            x.p = &c->NDS.MainRAM[a & rm];
+        }
+        x.a = a;
         return x;
     }
     // queue a word write (applied by Flush, after every check passed); a: guest address (word
@@ -653,6 +686,14 @@ struct Mem
     struct Pw { u8* p; u32 a, v; } pw[96];   // (the W2 shape fold queues ~71)
     u32 np = 0;
     __attribute__((always_inline)) void W(const Obj& x, u32 o, u32 v) { pw[np++] = {x.p + o, (x.a + o) | (u32)x.dtcm, v}; }
+    // a word write at once (what Flush does for one queued write: only with nothing queued before it)
+    __attribute__((always_inline)) void Put(const Obj& x, u32 o, u32 v)
+    {
+        u8* p = x.p + o;
+        if (R32(p) == v) return;
+        if (!x.dtcm) InvMain(c, x.a + o);
+        memcpy(p, &v, 4);
+    }
     // only changed words are written, main RAM with the JIT invalidation check of ARM9Write32
     // (same effect, no bus dispatch); in check mode they are logged instead
     void Flush()
@@ -668,7 +709,7 @@ struct Mem
             }
 #endif
             if (R32(w.p) == w.v) continue;
-            if (!(w.a & 1)) c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(w.a);
+            if (!(w.a & 1)) InvMain(c, w.a);
             memcpy(w.p, &w.v, 4);
         }
         np = 0;
@@ -897,47 +938,56 @@ bool Wake(melonDS::ARMv5* c, State& s, Mem& m, Expect& e, const IrqIn& in, u32& 
     // (2005-2006 build: its ldmib r1!, {r0-r14}^ writes the base back, so the BIOS returns into t with r1 = t + 0x3C)
     const u32 tf[6] = {tp.r(4), v.n6 ? t + 0x3C : tp.r(8), tp.r(0xC), tp.r(0x10), tp.r(0x34), v.ctxPc};
 
-    // interrupted thread's context, as the IRQ path saves it
-    m.W(cp, 0x00, spsr);
-    for (int i = 0; i < 4; i++) m.W(cp, 4 + i * 4, f[i]);
-    for (int i = 4; i < 12; i++) m.W(cp, 4 + i * 4, c->R[i]);
-    m.W(cp, 0x34, f[4]);
-    m.W(cp, 0x38, in.sysSp);                                     // user/sys r13, r14 (banked out in IRQ mode)
-    m.W(cp, 0x3C, in.sysLr);
-    m.W(cp, 0x40, f[5]);
-    m.W(cp, 0x44, svcsp);
-    // CP_SaveContext: divider numerator/denominator, sqrt param, DIVCNT&3, SQRTCNT&1
-    // (the register values themselves: no lazy-divider materialisation needed for these bits)
-    u32 cpx[7];
-    nds.A9HLECpContext(cpx);
-    for (int i = 0; i < 7; i++) m.W(cp, 0x48 + i * 4, cpx[i]);
-    // IRQ stack below the frame: CP_SaveContext's push {r4} (not in the 2005-2006 build), push {r0 = C, r1 = t}
-    if (!v.n6) m.W(fr, 0, c->R[4]);
-    m.W(fr, 4, cur);
-    m.W(fr, 8, t);
-    // the IRQ frame rewritten with t's registers (the BIOS returned into t with them)
-    for (int i = 0; i < 6; i++) m.W(fr, 16 + i * 4, tf[i]);
-    // t slept again: its context holds r5 = the thread it switched to; its stack holds
-    // OS_LoadContext's push {r0 = cur, lr} and CP_RestoreContext's push {r4 = OS_RescheduleThread's
-    // r4: OSThreadInfo, TWL build: the current thread t}
-    m.W(tp, 0x18, cur);
-    if (!v.n6) m.W(ts, 0, v.twl ? t : v.info);
-    m.W(ts, 4, cur);
-    m.W(ts, 8, v.retLoad);
-    // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack (PW/PB/W2: its TWL divider check); the 2005-2006
-    // build only has the handler's own switch to t there: its stmdb sp!, {r1 = t} in SVC mode (found by compare mode on
-    // cold boots of Castlevania PoR / Metroid Prime Hunters, where another thread's switch had left another value)
-    if (!v.n6)
-        for (int i = 0; i < 6; i++) m.W(sv, i * 4, f[i]);
-    else m.W(sv, 20, t);
+    // the writes (every check passed): with nothing queued before, straight to memory in the same order, else queued
+    auto writes = [&](auto&& W)
+    {
+        // interrupted thread's context, as the IRQ path saves it
+        W(cp, 0x00, spsr);
+        for (int i = 0; i < 4; i++) W(cp, 4 + i * 4, f[i]);
+        for (int i = 4; i < 12; i++) W(cp, 4 + i * 4, c->R[i]);
+        W(cp, 0x34, f[4]);
+        W(cp, 0x38, in.sysSp);                                     // user/sys r13, r14 (banked out in IRQ mode)
+        W(cp, 0x3C, in.sysLr);
+        W(cp, 0x40, f[5]);
+        W(cp, 0x44, svcsp);
+        // CP_SaveContext: divider numerator/denominator, sqrt param, DIVCNT&3, SQRTCNT&1
+        // (the register values themselves: no lazy-divider materialisation needed for these bits)
+        u32 cpx[7];
+        nds.A9HLECpContext(cpx);
+        for (int i = 0; i < 7; i++) W(cp, 0x48 + i * 4, cpx[i]);
+        // IRQ stack below the frame: CP_SaveContext's push {r4} (not in the 2005-2006 build), push {r0 = C, r1 = t}
+        if (!v.n6) W(fr, 0, c->R[4]);
+        W(fr, 4, cur);
+        W(fr, 8, t);
+        // the IRQ frame rewritten with t's registers (the BIOS returned into t with them)
+        for (int i = 0; i < 6; i++) W(fr, 16 + i * 4, tf[i]);
+        // t slept again: its context holds r5 = the thread it switched to; its stack holds
+        // OS_LoadContext's push {r0 = cur, lr} and CP_RestoreContext's push {r4 = OS_RescheduleThread's
+        // r4: OSThreadInfo, TWL build: the current thread t}
+        W(tp, 0x18, cur);
+        if (!v.n6) W(ts, 0, v.twl ? t : v.info);
+        W(ts, 4, cur);
+        W(ts, 8, v.retLoad);
+        // OS_LoadContext(cur) pushed {r0-r3, r12, lr = pc} on cur's SVC stack (PW/PB/W2: its TWL divider check); the 2005-2006
+        // build only has the handler's own switch to t there: its stmdb sp!, {r1 = t} in SVC mode (found by compare mode on
+        // cold boots of Castlevania PoR / Metroid Prime Hunters, where another thread's switch had left another value)
+        if (!v.n6)
+            for (int i = 0; i < 6; i++) W(sv, i * 4, f[i]);
+        else W(sv, 20, t);
+    };
+    if (!m.np && !m.logOnly) writes([&](const Obj& x, u32 o, u32 val) { m.Put(x, o, val); });
+    else writes([&](const Obj& x, u32 o, u32 val) { m.W(x, o, val); });
     m.Flush();
 
-    // registers after the guest's return into cur
-    for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
-    for (int i = 0; i < 4; i++) e.R[i] = f[i];
-    e.R[12] = f[4];
-    e.R[13] = in.sysSp;
-    e.R[14] = in.sysLr;
+    // registers after the guest's return into cur (3. fused: the CPU's stay, only the banks)
+    if (!in.queued)
+    {
+        for (int i = 0; i < 16; i++) e.R[i] = c->R[i];
+        for (int i = 0; i < 4; i++) e.R[i] = f[i];
+        e.R[12] = f[4];
+        e.R[13] = in.sysSp;
+        e.R[14] = in.sysLr;
+    }
     e.CPSR = spsr;
     e.IRQ[0] = F + 28; e.IRQ[1] = tpc; e.IRQ[2] = tcpsr;
     e.SVC[0] = svcsp; e.SVC[1] = f[5]; e.SVC[2] = spsr;
@@ -1244,6 +1294,8 @@ __attribute__((noinline)) bool Record(melonDS::ARMv5* c, u32 tail, u32 fn, Entry
         case II::tk_LDR_SPREL: cls = 4; base = 13; rd = iw >> 8 & 7; break;
         default: break;
         }
+        // a literal load (ldr rd, [pc, #imm]): its word belongs to the code (the guard covers it like an instruction)
+        const bool lit = pass && (th ? inf.Kind == II::tk_LDR_PCREL : (iw & 0x0F5F0000) == 0x051F0000);
         if (rd == 15 || base == 15) cls = 0;
         log.clear();
         c->Idle2Log = &log;
@@ -1284,6 +1336,13 @@ __attribute__((noinline)) bool Record(melonDS::ARMv5* c, u32 tail, u32 fn, Entry
             if (!good) break;
             if (inner) continue;        // a load of its own store: not an input
             for (const auto& y : log) if (y.Write && !(x.Addr + x.Size <= y.Addr || y.Addr + y.Size <= x.Addr)) good = false;
+            if (lit && x.Size == 4 && !(x.Addr & 3))
+            {
+                int k = 0;
+                while (k < t.nc && !(t.code[k].a == x.Addr && t.code[k].t == 2)) k++;
+                if (k == t.nc) { if (t.nc == 40) { good = false; break; } t.code[t.nc++] = {x.Addr, Peek(p, 4), 2}; }
+                continue;
+            }
             bool dup = false;
             for (u32 i = 0; i < t.nl; i++) dup |= t.ld[i].a == x.Addr && t.ld[i].sz == x.Size;
             if (dup) continue;
@@ -1307,6 +1366,7 @@ __attribute__((noinline)) bool Record(melonDS::ARMv5* c, u32 tail, u32 fn, Entry
     }
     if (!good) return false;
     for (int i = 0; i < 15; i++) { t.R1[i] = c->R[i]; t.id[i] = id[i]; }
+    for (u32 i = 0; i < t.ns; i++) if (t.st[i].a + t.st[i].sz > t.R0[13] && t.st[i].a < t.R0[13] + 28) t.frameHit = 1;     // (the BIOS frame)
     t.key = used | (1u << 13);
     t.cpsr1 = c->CPSR;
     t.cyc = c->Cycles - cyc0;
@@ -1315,8 +1375,8 @@ __attribute__((noinline)) bool Record(melonDS::ARMv5* c, u32 tail, u32 fn, Entry
     u32 cbUsed = 0;
     for (u32 i = 0; i < t.nc;)
     {
-        u32 j = i, end = t.code[i].a + (t.code[i].t ? 2 : 4);
-        while (j + 1 < t.nc && t.code[j + 1].a <= end) { j++; end = std::max(end, t.code[j].a + (t.code[j].t ? 2u : 4u)); }
+        u32 j = i, end = t.code[i].a + (t.code[i].t == 1 ? 2 : 4);
+        while (j + 1 < t.nc && t.code[j + 1].a <= end) { j++; end = std::max(end, t.code[j].a + (t.code[j].t == 1 ? 2u : 4u)); }
         const u32 len = end - t.code[i].a;
         const u8* p = CodePtr(c, t.code[i].a);
         if (t.nr == 8 || cbUsed + len > sizeof(t.cb) || !p || CodePtr(c, end - 1) != p + len - 1) return false;
@@ -1332,6 +1392,7 @@ __attribute__((noinline)) bool Record(melonDS::ARMv5* c, u32 tail, u32 fn, Entry
         return true;
     };
     for (u32 i = 0; i < t.nl; i++) if (!page(t.ld[i].a, 1)) return false;
+    for (u32 i = 0; i < t.nc; i++) if (t.code[i].t == 2 && !page(t.code[i].a, 1)) return false;
     for (u32 i = 0; i < t.ns; i++) if (!page(t.st[i].a, 2)) return false;
     t.ok = 1;
     return true;
@@ -1348,14 +1409,36 @@ __attribute__((noinline)) bool TracePtrs(melonDS::ARMv5* c, EntryTrace& t)
         t.rp[i] = CodePtr(c, t.rg[i].a);
         if (!t.rp[i] || CodePtr(c, t.rg[i].a + t.rg[i].len - 1) != t.rp[i] + t.rg[i].len - 1) return false;
     }
-    for (u32 i = 0; i < t.nl; i++) if (!(t.lp[i] = DataPtr(c, t.ld[i].a, t.ld[i].sz))) return false;
+    for (u32 i = 0; i < t.nl; i++)
+    {
+        if (!(t.lp[i] = DataPtr(c, t.ld[i].a, t.ld[i].sz)) || !(t.lo[i].w = DataPtr(c, t.ld[i].a & ~3u, 4))) return false;
+        const u32 sh = 8 * (t.ld[i].a & 3);
+        t.lo[i].m = (t.ld[i].sz == 4 ? ~0u : (1u << (8 * t.ld[i].sz)) - 1) << sh;
+        t.lo[i].v = t.ld[i].v << sh;
+    }
+    t.nidr = 0;
+    for (u8 r = 0; r < 15; r++) if (t.id[r] >= 0) t.idr[t.nidr++] = r;
+    t.nup = 0;
+    for (u8 r = 4; r < 12; r++) if (t.id[r] != r) t.up[t.nup++] = r;
+    t.usesIf = t.key & 4;
+    for (u32 i = 0; i < t.ns; i++) t.usesIf |= t.st[i].src == 2;
     for (u32 i = 0; i < t.ns; i++)
     {
-        if (!(t.sp[i] = DataPtr(c, t.st[i].a, t.st[i].sz))) return false;
+        auto& o = t.so[i];
+        if (!(o.p = DataPtr(c, t.st[i].a, t.st[i].sz))) return false;
         t.inv[i] = t.st[i].a >= c->ITCMSize && (t.st[i].a & c->DTCMMask) != c->DTCMBase;    // main RAM: JIT code check
+        o.a = t.st[i].a; o.v = t.st[i].v; o.src = t.st[i].src; o.sz = t.st[i].sz;
+        o.sk = o.sz != 4 || (o.a & 3) ? 2 : t.inv[i];
     }
     t.map[0] = c->DTCMBase; t.map[1] = c->DTCMMask; t.map[2] = c->ITCMSize;
     t.hp = true;
+    return true;
+}
+// t's code as recorded (checked once when the guard block compiles with it)
+bool TraceCodeOk(melonDS::ARMv5* c, EntryTrace& t)
+{
+    if ((!t.hp || t.map[0] != c->DTCMBase || t.map[1] != c->DTCMMask || t.map[2] != c->ITCMSize) && !TracePtrs(c, t)) return false;
+    for (u32 i = 0; i < t.nr; i++) if (memcmp(t.rp[i], t.cb + t.rg[i].off, t.rg[i].len)) return false;
     return true;
 }
 // t matches the entry state R / cpsr (registers r0-r14, CPSR) and the code and data it read
@@ -1364,25 +1447,44 @@ inline bool TraceMatch(melonDS::ARMv5* c, EntryTrace& t, const u32* R, u32 cpsr)
     if (cpsr != t.cpsr0) return false;
     for (u32 k = t.key; k; k &= k - 1) if (R[__builtin_ctz(k)] != t.R0[__builtin_ctz(k)]) return false;
     if ((!t.hp || t.map[0] != c->DTCMBase || t.map[1] != c->DTCMMask || t.map[2] != c->ITCMSize) && !TracePtrs(c, t)) return false;
-    for (u32 i = 0; i < t.nr; i++) if (memcmp(t.rp[i], t.cb + t.rg[i].off, t.rg[i].len)) return false;
-    for (u32 i = 0; i < t.nl; i++) if (Peek(t.lp[i], t.ld[i].sz) != t.ld[i].v) return false;
-    for (u32 i = 0; i < t.npg; i++) if ((c->PU_Map[t.pg[i].page] & t.pg[i].perm) != t.pg[i].perm) return false;
+    if (!(t.guarded && c->A9HLEGuard))
+        for (u32 i = 0; i < t.nr; i++)
+        {
+            const u8* p = t.rp[i]; const u8* q = t.cb + t.rg[i].off;
+            for (u32 j = 0, n = t.rg[i].len; j < n; j += 2) if (R16(p + j) != R16(q + j)) return false;
+        }
+    for (const auto* o = t.lo, *e = t.lo + t.nl; o != e; o++) if ((R32(o->w) & o->m) != o->v) return false;
+    // (the run is in IRQ mode: the privileged map, also when the fused path checks it from user mode)
+    for (u32 i = 0; i < t.npg; i++) if ((c->PU_PrivMap[t.pg[i].page] & t.pg[i].perm) != t.pg[i].perm) return false;
     return true;
 }
 // its stores at the entry registers R (a saved register: its value now), the registers at the return into F
-void TraceStores(melonDS::ARMv5* c, const EntryTrace& t, const u32* R, u32* F)
+void TraceStores(melonDS::ARMv5* c, const EntryTrace& t, const u32* R)
 {
-    for (u32 i = 0; i < t.ns; i++)
+    for (const auto* o = t.so, *e = t.so + t.ns; o != e; o++)
     {
-        const auto& w = t.st[i];
-        const u32 v = w.src >= 0 ? R[w.src] : w.v;
-        if (Peek(t.sp[i], w.sz) == (w.sz == 4 ? v : w.sz == 2 ? (v & 0xFFFF) : (v & 0xFF))) continue;     // (unchanged)
-        if (t.inv[i]) c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(w.a & ~3u);
-        if (w.sz == 4) memcpy(t.sp[i], &v, 4);
-        else if (w.sz == 2) { const u16 h = (u16)v; memcpy(t.sp[i], &h, 2); }
-        else *t.sp[i] = (u8)v;
+        const u32 v = o->src >= 0 ? R[o->src] : o->v;
+        if (o->sk == 0) { memcpy(o->p, &v, 4); continue; }
+        if (o->sk == 1)
+        {
+            if (R32(o->p) != v) { InvMain(c, o->a); memcpy(o->p, &v, 4); }
+            continue;
+        }
+        if (o->a >= c->ITCMSize && (o->a & c->DTCMMask) != c->DTCMBase)
+        {
+            if (Peek(o->p, o->sz) == (o->sz == 4 ? v : o->sz == 2 ? (v & 0xFFFF) : (v & 0xFF))) continue;     // (unchanged)
+            InvMain(c, o->a & ~3u);
+        }
+        if (o->sz == 4) memcpy(o->p, &v, 4);
+        else if (o->sz == 2) { const u16 h = (u16)v; memcpy(o->p, &h, 2); }
+        else *o->p = (u8)v;
     }
-    for (int r = 0; r < 15; r++) F[r] = t.id[r] >= 0 ? R[t.id[r]] : t.R1[r];
+}
+// the registers at the return (r0-r14) for the entry registers R
+void TraceRegs(const EntryTrace& t, const u32* R, u32* F)
+{
+    memcpy(F, t.R1, sizeof(t.R1));
+    for (u32 i = 0; i < t.nidr; i++) F[t.idr[i]] = R[t.id[t.idr[i]]];
 }
 // t at the CPU's entry state: true = replayed (the CPU is at OS_IrqHandler's tail, its registers and memory as the guest
 // leaves them)
@@ -1390,7 +1492,8 @@ bool Replay(melonDS::ARMv5* c, EntryTrace& t)
 {
     if (!TraceMatch(c, t, c->R, c->CPSR)) return false;
     u32 F[15];
-    TraceStores(c, t, c->R, F);
+    TraceStores(c, t, c->R);
+    TraceRegs(t, c->R, F);
     memcpy(c->R, F, sizeof(F));
     c->CPSR = t.cpsr1;
     c->Cycles += t.cyc;
@@ -1414,13 +1517,15 @@ __attribute__((noinline)) int IrqFast(melonDS::ARMv5* c, State& s, Mem& m, const
     if (!t) return 0;
     if ((t->id[13] >= 0 ? e.R[t->id[13]] : t->R1[13]) != e.R[13]) return 0;     // (sp back where it was)
     for (u32 i = 0; i < t->ns; i++) if (t->st[i].a + t->st[i].sz > e.R[13] && t->st[i].a < e.R[13] + 28) return 0;   // (the BIOS frame)
+    if (c->Halted == 2 && t->usesIf) return 0;     // (the guest reads IF after the DMA: its end bits)
     s.trHit++;
     // the guest's order: the entry's frame and IF acknowledge, the run's stores, the tail
     u32 F[15];
     melonDS::NDS& nds = c->NDS;
     m.Flush();
     nds.IF[0] &= ~ifAck; nds.GPU.GPU3D.CheckFIFOIRQ(); nds.UpdateIRQ(0);
-    TraceStores(c, *t, e.R, F);
+    TraceStores(c, *t, e.R);
+    TraceRegs(*t, e.R, F);
     for (int i = 4; i < 12; i++) c->R[i] = F[i];     // (r4-r11 as the entry leaves them: what the wake skip saves)
     Mem m2(c, false);
     Expect e2;
@@ -1475,6 +1580,10 @@ __attribute__((noinline)) int RunEntry(melonDS::ARMv5* c, State& s, u32 fn, bool
             {
                 const u32 v = p->st[i].src >= 0 ? R[p->st[i].src] : p->st[i].v, m = p->st[i].sz == 4 ? ~0u : p->st[i].sz == 2 ? 0xFFFFu : 0xFFu;
                 d = q.st[i].a != p->st[i].a || q.st[i].sz != p->st[i].sz || (q.st[i].v & m) != (v & m);
+                // (the replay's store ops: the same stores, host pointer at the address, the JIT check where it applies)
+                const auto& o = p->so[i];
+                d |= o.a != p->st[i].a || o.v != p->st[i].v || o.src != p->st[i].src || o.sz != p->st[i].sz
+                     || o.p != DataPtr(c, o.a, o.sz) || (o.sk == 2) != (o.sz != 4 || (o.a & 3) != 0) || (o.sk == 1 && !p->inv[i]);
             }
             s.trChk++;
             if (d && s.trDiff++ < 10)
@@ -1493,23 +1602,34 @@ __attribute__((noinline)) int RunEntry(melonDS::ARMv5* c, State& s, u32 fn, bool
         // recorded only from the OS idle thread's halt (the state that repeats: 216 of 265 HBlank IRQs a frame in PW's
         // overworld); one slot per entry state, the oldest replaced; an entry whose recordings are not replayed backs off
         if (!idle) return 2;
+        // the slot: this entry's unrecordable one (backing off), else an empty one, else one that only holds another
+        // entry's back-off, else the oldest (a recorded run is only replaced when nothing else is left: an unrecordable
+        // entry, e.g. a VBlank handler, retrying every 2^k IRQs must not evict the runs that replay)
         EntryTrace* t = nullptr;
-        for (auto& x : s.traces) if (x.fn == fn && !x.ok && x.cool) t = &x;
-        if (t) { t->cool--; return 2; }
+        for (auto& x : s.traces) if (x.fn == fn && !x.ok) { t = &x; break; }
+        if (t && t->cool) { t->cool--; return 2; }
         u32 miss = 0;
         for (auto& x : s.traces) if (x.fn == fn) miss = std::max(miss, x.miss);
-        t = &s.traces[s.nTrace++ % 8];
+        if (!t) for (auto& x : s.traces) if (!x.fn) { t = &x; break; }
+        if (!t) for (auto& x : s.traces) if (!x.ok && (!t || x.miss < t->miss)) t = &x;
+        if (!t) t = &s.traces[s.nTrace++ % 8];
         c->SetupCodeMem(fn & ~1u);
         c->JumpTo(fn);
         if (!Record(c, tail, fn, *t))
         {
-            t->fn = fn; t->ok = 0; t->miss = miss + 1; t->cool = 1u << std::min<u32>(t->miss, 6);
+            t->fn = fn; t->ok = 0; t->miss = miss + 1; t->cool = 1u << std::min<u32>(t->miss, 10);
             const bool th = c->CPSR & 0x20;
             c->JumpTo((c->R[15] - (th ? 2 : 4)) | th);
             return 2;
         }
         t->miss = miss + 1;
         s.trRec++;
+        // (the guard block recompiles with this entry's code in its dependencies: then no per-IRQ code compare)
+        for (u32 a : {s.v->wake, tail})
+        {
+            if (a < c->ITCMSize) c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_ITCM>(a);
+            else c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(a);
+        }
     }
     }
 #ifdef LITEV_HLE_DIAG
@@ -3432,7 +3552,8 @@ __attribute__((noinline)) bool RunNode(melonDS::ARMv5* c, State& s, bool jit)
     const bool t = c->CPSR & 0x20;
     const u32 pc = c->R[15] - (t ? 4 : 8);
     u32 fn[4];
-    if (t) { if (jit ? !NodeTAt(c, pc) : NodeTAt(c, pc) != 1) return false; fn[0] = 1; }
+    // (JIT: the block's dependencies hold the code check; only the group's entry)
+    if (t) { if (jit ? s.gs[gNodeT] != 1 || pc != s.gEntry[gNodeT] : NodeTAt(c, pc) != 1) return false; fn[0] = 1; }
     else if (jit) fn[0] = BlTarget(c, pc + 0x70);
     else if (NodeAt(c, pc, fn) != 1) return false;
     s.calls[15]++;
@@ -4827,12 +4948,21 @@ void DumpStats(const State& s)
 
 namespace
 {
-// a hook block that starts display lists natively (10., 13., 18.)
-bool StartsLists(const State& s, u32 addr)
+// a hook block that starts display lists natively (10., 13., 18.): its slot in listBlk, or -1
+int ListSlot(const State& s, u32 addr)
 {
     const Variant& v = *s.v;
-    return (v.async && addr == v.async) || (v.shp && (addr == v.shp || (!v.twl && addr == v.shp + kSbcHead)))
-           || (v.twl && s.gs[gSbcT] == 1 && addr == s.gEntry[gSbcT]);
+    if (v.async && addr == v.async) return 0;
+    if (v.shp && addr == v.shp) return 1;
+    if (v.shp && !v.twl && addr == v.shp + kSbcHead) return 2;
+    if (v.twl && s.gs[gSbcT] == 1 && addr == s.gEntry[gSbcT]) return 3;
+    return -1;
+}
+// A9HLEGuardDma: any live one (each depends on the DMA-end IRQ's code)
+void ListGuard(melonDS::ARMv5* c, const State& s)
+{
+    c->A9HLEGuardDma = nullptr;
+    if (s.dmaLive) for (const void* b : s.listBlk) if (b) { c->A9HLEGuardDma = b; break; }
 }
 }
 void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block)
@@ -4840,24 +4970,43 @@ void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block)
     melonDS::ARMv5* c = &nds.ARM9;
     State* s = Active(c);
     if (!s) return;
-    if (StartsLists(*s, addr))
+    if (const int k = ListSlot(*s, addr); k >= 0)
     {
         // 11.: the blocks that start display lists (MI_SendGXCommandAsync, SBC SHP, the SBC loop) depend on the DMA-end IRQ's
-        // code too (Deps); the IRQ only follows a list one of them started
+        // code too (Deps); the IRQ only follows a list one of them started. Any live one guards it (one going away, e.g.
+        // its overlay page rewritten, leaves the others)
         s->dmaLive = s->dmaOk && (s->mask & 1024) && DmaIntact(c, *s) && CodeIntact(c, *s, 0);
-        c->A9HLEGuardDma = s->dmaLive ? block : nullptr;
+        s->listBlk[k] = block;
+        ListGuard(c, *s);
         return;
     }
     if (addr != s->v->wake && (s->v->n6 || addr != s->v->code[0].a + kTailOff)) return;
     // the wake / IRQ tail hook block depends on all of the OS build's code (Deps): while it lives, the IRQ path is intact
     s->hbLive = s->irqOk && (s->mask & 8) && s->v == &s->f.var && GroupIntact(c, *s, s->build == 1 ? gOsA : gOsT);
     c->A9HLEGuard = s->hbLive ? block : nullptr;
+    for (auto& t : s->traces) t.guarded = t.ok && s->hbLive && TraceCodeOk(c, t);    // (their code was in Deps)
 }
 
 void BlockGone(melonDS::NDS& nds, const void* block)
 {
-    if (nds.ARM9.A9HLEGuard == block) nds.ARM9.A9HLEGuard = nullptr;
-    if (nds.ARM9.A9HLEGuardDma == block) nds.ARM9.A9HLEGuardDma = nullptr;
+    if (!block)
+    {
+        nds.ARM9.A9HLEGuard = nds.ARM9.A9HLEGuardDma = nullptr;
+        if (State* s = Active(&nds.ARM9)) { for (auto& t : s->traces) t.guarded = false; for (const void*& b : s->listBlk) b = nullptr; }
+        return;
+    }
+    if (nds.ARM9.A9HLEGuard == block)
+    {
+        nds.ARM9.A9HLEGuard = nullptr;
+        if (State* s = Active(&nds.ARM9)) for (auto& t : s->traces) t.guarded = false;
+    }
+    if (State* s = Active(&nds.ARM9))
+    {
+        bool had = false;
+        for (const void*& b : s->listBlk) if (b == block) { b = nullptr; had = true; }
+        if (had) ListGuard(&nds.ARM9, *s);
+    }
+    else if (nds.ARM9.A9HLEGuardDma == block) nds.ARM9.A9HLEGuardDma = nullptr;
 }
 
 void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
@@ -4934,7 +5083,7 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
     f->Var32(&s.sbcLive);
     f->Var32(&s.mkSbcLive);
     f->VarArray(s.traces, sizeof(s.traces));
-    if (!f->Saving) for (auto& t : s.traces) t.hp = false;     // (host pointers of the saving process)
+    if (!f->Saving) for (auto& t : s.traces) t.hp = t.guarded = false;     // (host pointers of the saving process)
     f->Var32(&s.nTrace);
     f->Var32(&s.biosRet);
     f->Var32(&s.biosOk);
@@ -4947,18 +5096,114 @@ void HookRestored(melonDS::NDS& nds, u32 addr, const void* block)
     State* s = Active(c);
     if (!s) return;
     if ((addr == s->v->wake || (!s->v->n6 && addr == s->v->code[0].a + kTailOff)) && s->hbLive) c->A9HLEGuard = block;
-    if (StartsLists(*s, addr) && s->dmaLive) c->A9HLEGuardDma = block;
+    if (const int k = ListSlot(*s, addr); k >= 0) { s->listBlk[k] = block; ListGuard(c, *s); }
 }
 
 namespace
 {
 // one IRQ natively (3. HBlank, 11. a display list's DMA end): 1 done, 0 guest path, -1 check / dry (guest path, stop)
+// 3. fused (the common case: the IRQ's entry replays): 3a., the replayed entry and 3b. in one pass with one write queue and
+// no entry into the IRQ mode at all; the same writes and banked-register results as IrqEnter + IrqFast. 0: not taken
+// (nothing written: the separate path decides), 1: done (registers unchanged but r4-r11 as the entry leaves them), 2: the
+// tail needs the guest (the CPU is at the tail, entered as the guest would be).
+__attribute__((noinline)) int IrqFused(melonDS::ARMv5* c, State& s, bool idleOk, u32 bit)
+{
+    melonDS::NDS& nds = c->NDS;
+    const u32 cpsr = c->CPSR, mode = cpsr & 0x1F;
+    if ((cpsr & 0x80) || (mode != 0x1F && mode != 0x10 && mode != 0x13) || !(nds.IME[0] & 1)) return 0;
+    Mem m(c, false);
+    if (!Fixed(c, s, m) || !s.fhp || !s.ftab || R32(s.fhp) != s.v->code[0].a) return 0;
+    const u32 sp = c->R_IRQ[0], fn = R32(s.ftab + bit * 4);
+    // the entry state (registers r0-r14, CPSR) as IrqEnter computes it
+    u32 E[15];
+    memcpy(E, c->R, sizeof(E));
+    E[0] = fn; E[1] = IrqTableOf(*s.v); E[2] = nds.IF[0]; E[3] = 0x80000000u; E[12] = 0x04000210; E[13] = sp - 28;
+    E[14] = s.v->code[0].a + kTailOff;
+    const u32 ecpsr = (cpsr & 0x0FFFFF00u) | 0xD2 | (bit ? 0 : 0x40000000u) | 0x20000000u | ((fn & 1) << 5);
+    EntryTrace* t = &s.traces[s.lastTrace & 7];
+    if (!(t->fn == fn && t->ok && (t->cpsr1 & 0xBF) == 0x92 && TraceMatch(c, *t, E, ecpsr)))
+    {
+        t = nullptr;
+        for (u32 i = 0; i < 8; i++)
+        {
+            EntryTrace& x = s.traces[i];
+            if (x.fn == fn && x.ok && (x.cpsr1 & 0xBF) == 0x92 && TraceMatch(c, x, E, ecpsr)) { t = &x; s.lastTrace = i; break; }
+        }
+    }
+    if (!t || !idleOk) return 0;
+    if ((t->id[13] >= 0 ? E[t->id[13]] : t->R1[13]) != sp - 28) return 0;     // (sp back where it was)
+    if (t->frameHit) return 0;          // (it stores over the BIOS frame: the separate path)
+    if (c->Halted == 2 && t->usesIf) return 0;     // (the guest reads IF after the DMA: its end bits)
+    Obj fs = m.O(sp - 28, 28);
+    if (!fs) return 0;
+    s.trHit++;
+    // the guest's order: the BIOS frame and OS_IrqHandler's push, the IF acknowledge, the entry's stores, the tail
+    const u32 lrIrq = c->R[15] + ((cpsr & 0x20) ? 2 : 0);
+    const u32 w[7] = {s.biosRet, c->R[0], c->R[1], c->R[2], c->R[3], c->R[12], lrIrq};
+    const u32 head = R32(s.fq);
+    // (with a queue the wake skip rewrites the BIOS frame: only OS_IrqHandler's push stays; nothing queued: straight to memory)
+    if (fs.dtcm) { if (head) memcpy(fs.p, w, 4); else memcpy(fs.p, w, 28); }    // (DTCM: no JIT code)
+    else for (int i = 0; i < (head ? 1 : 7); i++) m.Put(fs, i * 4, w[i]);
+    nds.IF[0] &= ~(1u << bit); nds.GPU.GPU3D.CheckFIFOIRQ(); nds.UpdateIRQ(0);
+    TraceStores(c, *t, E);
+    // r4-r11 as the entry leaves them (E[4..11] are the CPU's: only the ones it changes)
+    for (u32 i = 0; i < t->nup; i++) { const u32 r = t->up[i]; c->R[r] = t->id[r] >= 0 ? E[t->id[r]] : t->R1[r]; }
+    const bool svc = mode == 0x13;
+    const u32 usrSp = svc ? c->R_SVC[0] : c->R[13], usrLr = svc ? c->R_SVC[1] : c->R[14];
+    const u32 svcSp = svc ? c->R[13] : c->R_SVC[0];
+    Expect e;
+    u32 tpc, tcpsr;
+    bool ok;
+    if (head)
+    {
+        // 1.: the wake skip (the frame values as queued writes: they are what memory has now)
+        IrqIn in{cpsr, sp - 28, svcSp, usrSp, usrLr, head, true, s.biosRet, {w[1], w[2], w[3], w[4], w[5], w[6]}};
+        ok = Wake(c, s, m, e, in, tpc, tcpsr);
+    }
+    else ok = !R16(s.fosi + (s.v->info - s.v->osi));    // (a reschedule pending: the thread switch, guest)
+    if (!ok)
+    {
+        // the CPU at the tail, as the guest would be there (the BIOS frame as the entry left it)
+        m.np = 0;
+        for (int i = 1; i < 7; i++) m.W(fs, i * 4, w[i]);
+        m.Flush();
+        const u32 old = c->CPSR;
+        c->CPSR = (old & ~0xFFu) | 0xD2;
+        c->UpdateMode(old, c->CPSR);
+        c->R_IRQ[2] = old;
+        u32 F[15];
+        TraceRegs(*t, E, F);
+        memcpy(c->R, F, sizeof(F));
+        c->CPSR = t->cpsr1;
+        c->Cycles += kIrqEnterCyc + t->cyc;
+        c->JumpTo(s.v->code[0].a + kTailOff);
+        s.native[3]++;
+        return 2;
+    }
+    m.Flush();
+    if (head) { c->R_SVC[1] = e.SVC[1]; c->R_SVC[2] = e.SVC[2]; c->R_IRQ[1] = e.IRQ[1]; c->R_IRQ[2] = e.IRQ[2]; }
+    else { c->R_IRQ[1] = lrIrq; c->R_IRQ[2] = cpsr; }
+    c->Cycles += kIrqEnterCyc + t->cyc + (head ? e.cyc : kIrqTailCyc);
+    s.native[3]++; s.native[4]++;
+    return 1;
+}
 // one IRQ natively: 11. (a display list's DMA end, taken whole: 1) or 3a. (any other: the CPU enters its OS_IRQTable entry:
 // 2); 0 guest path, -1 check / dry (guest path, stop)
 int IrqOne(melonDS::ARMv5* c, State& s, bool halted, u32 low)
 {
     const bool jm = c->NDS.IsJITEnabled();     // JIT: the guard blocks hold the code checks
     melonDS::NDS& nds = c->NDS;
+    // the common case first: a replayed entry, nothing entered. Also while a DMA stops the CPU (the guest's handler would
+    // run after it): when every running DMA writes IO (GXFIFO, display registers: nothing the entry or the tail reads) and
+    // it is not the GXFIFO IRQ (Defer moves that one past the DMA)
+    const bool haltOk = c->Halted != 2 || (low != 0x200000 && nds.A9HLEDmaWritesIo());
+    if (!(low & 0xE00) && jm && c->A9HLEGuard && s.hbLive && haltOk && !g_Check && !g_DryIrq && !g_TraceCheck && !g_NoFused)
+    {
+        const bool idleOk = !halted || ((c->CPSR & 0x3F) == 0x1F && c->R[15] - 4 == s.v->idlePc && c->R[0] == 0 && c->R[14] == s.v->idleLr);
+        if (const int r = IrqFused(c, s, idleOk, __builtin_ctz(low))) { s.calls[3]++; return r; }
+    }
+    // (not entered while a DMA is about to stop the CPU: the guest's handler runs after it and sees the IF bits it raises)
+    if (!(low & 0xE00) && c->Halted == 2 && !(g_NoFused && haltOk)) return 0;
     const u64 t0 = g_Time ? Now() : 0;
     Mem m(c, g_Check || g_DryIrq);
     Expect e;
@@ -4971,7 +5216,7 @@ int IrqOne(melonDS::ARMv5* c, State& s, bool halted, u32 low)
     {
         m.np = 0;
         // (not while a DMA is about to stop the CPU: the guest's handler runs after it and sees the IF bits it raises)
-        if (c->Halted == 2 || (jm ? !c->A9HLEGuard || !s.hbLive : (!s.irqOk || !(s.mask & 8) || !CodeIntact(c, s, 0)))) return 0;
+        if ((c->Halted == 2 && !(g_NoFused && haltOk)) || (jm ? !c->A9HLEGuard || !s.hbLive : (!s.irqOk || !(s.mask & 8) || !CodeIntact(c, s, 0)))) return 0;
         kind = 3;
         if (!IrqEnter(c, s, m, e, __builtin_ctz(low), ifAck)) return 0;
     }
@@ -5194,11 +5439,15 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
     const Variant& v = *Active(&nds.ARM9)->v;     // after IsHook != 0
     if (addr == v.wake || (instr == kTailInstr && addr == v.code[0].a + kTailOff))
     {
-        static thread_local Range wk[kNumCode + 3];
+        // (+ the code of the recorded IRQ entries, 3c.: guarded by this block)
+        static thread_local Range wk[kNumCode + 3 + 8 * 8];
         for (int i = 0; i < kNumCode; i++) wk[i] = v.code[i];
         for (int i = 0; i < 3; i++) wk[kNumCode + i] = v.dmaCode[i];
+        int n = kNumCode + 3;
+        for (const auto& t : Active(&nds.ARM9)->traces)
+            if (t.ok) for (u32 i = 0; i < t.nr; i++) wk[n++] = {t.rg[i].a, t.rg[i].a + t.rg[i].len};
         r = wk;
-        return kNumCode + 3;
+        return n;
     }
     if (addr == v.gx) { r = &v.gxCode; return 1; }
     if (v.matT && addr == v.matT->sbc) { r = v.matT->code; return 11; }

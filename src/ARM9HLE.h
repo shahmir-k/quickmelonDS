@@ -143,7 +143,7 @@ int Irq(melonDS::ARMv5* c, bool halted);
 bool Defer(melonDS::ARMv5* c);
 // ARMJIT: a block compiled with the wake hook (code verified, IsHook == 1) at addr
 void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
-// ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted)
+// ARMJIT: a block is leaving the JIT (invalidated, replaced or deleted); nullptr: all of them (block cache reset)
 void BlockGone(melonDS::NDS& nds, const void* block);
 // Savestate section "A9HL" (loaded before the JIT's blocks are rebuilt): the per-console state the JIT
 // paths trust (variant, code snapshots, the checks made when hook blocks were compiled) and a
