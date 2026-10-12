@@ -141,6 +141,24 @@ private:
             }
         }
 
+#ifdef LITEV_TILE_SPANFAST
+        bool Linear() const { return linear; }
+        u32  Factor() const { return yfactor; }
+        // SetX split in two: the position (all InterpolateZ needs without a w-buffer), then the
+        // perspective factor (exactly SetX's), so a z-buffered span divides only for visible pixels
+        void SetXPos(s32 x) { this->x = x - x0; }
+        void SetXFactor()
+        {
+            if ((xdiff != 0) && ((!linear) || wbuffer))
+            {
+                u32 num = (x * w0n) << shift;
+                u32 den = (x * w0d) + ((xdiff-x) * w1d);
+                if (den == 0) yfactor = 0;
+                else          yfactor = num / den;
+            }
+        }
+#endif
+
         constexpr s32 Interpolate(s32 y0, s32 y1) const
         {
             if (xdiff == 0 || y0 == y1) return y0;
@@ -617,6 +635,11 @@ private:
                           Slope<0>& sl, Slope<1>& sr,
                           u32 cvl, u32 nvl, u32 cvr, u32 nvr, s32 xl, s32 xr, s32 y);
     void FlushTile(BandScratch& bs, u32* out, s32 ty0);
+#if defined(LITEV_TILE_SPANFAST) && defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
+    template<bool TEX, int MODE>
+    void SpanFill(BandScratch& bs, const PolyShade& ps, Interpolator<0>& ix, s32 rowbase, s32 x, s32 xlim,
+                  s32 zl, s32 zr, bool wbuf, const s32* base, const u32* d, u32 rev);
+#endif
 };
 
 }
