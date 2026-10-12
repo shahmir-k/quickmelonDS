@@ -2384,7 +2384,13 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
 
     e.stubOff = stubOff;
     e.promoted = 1;
-#ifdef LITEV_JIT_DP_REVERTLIST
+#ifdef LITEV_JIT_DP_TARGETED
+    if (!((e._dp0 & 2) && (u32)e._dp1 == (guestTarget & ~1u)))
+    {
+        e._dp0 |= 2; e._dp1 = guestTarget & ~1u;
+        DPByTarget[num].emplace(guestTarget & ~1u, site);
+    }
+#elif defined(LITEV_JIT_DP_REVERTLIST)
     if (!e._dp0) { e._dp0 = 1; DirectPatchListed[num].push_back(site); }
 #endif
 #if LITEV_PROFILE
@@ -2467,6 +2473,40 @@ void Compiler::DirectPatchRevertAll()
     (void)any;
 #endif
 }
+
+#ifdef LITEV_JIT_DP_TARGETED
+// Revert the promoted sites that jump to a block at one of `addrs` (dead blocks of CPU num): the
+// sound part of DirectPatchRevertAll (a direct edge must not outlive its target block). Every other
+// promotion stays: its target is alive, and a promoted site behaves as the dispatcher resolve it
+// replaced (the guard compares the guest target).
+void Compiler::DirectPatchRevertTargets(u32 num, const u32* addrs, int n)
+{
+    if (!ICacheTable[num] || DPByTarget[num].empty()) return;
+#ifdef LITEV_JIT_BGEMIT
+    std::lock_guard<std::recursive_mutex> lk(EmitLock);
+#endif
+    bool write = false;
+    const u32 dispOff = (u32)((u8*)DispatcherEntry[num] - GetRXBase());
+    for (int k = 0; k < n; k++)
+    {
+        const u32 a = addrs[k] & ~1u;
+        auto r = DPByTarget[num].equal_range(a);
+        for (auto it = r.first; it != r.second; ++it)
+        {
+            ICacheEntry& e = ICacheTable[num][it->second];
+            if (!(e._dp0 & 2) || (u32)e._dp1 != a) continue;   // indexed under another target since
+            e._dp0 &= ~2ull;
+            if (!e.promoted) continue;
+            if (!write) { NDS.JIT.JitEnableWrite(); write = true; }
+            DirectPatchWriteBranch(e.patchOff, dispOff);
+            e.promoted = 0;
+            e.hitCount = 0;
+        }
+        DPByTarget[num].erase(r.first, r.second);
+    }
+    if (write) NDS.JIT.JitEnableExecute();
+}
+#endif
 
 static void LiteV_DirectPatchPromote(Compiler* c, u32 num, u32 site, u32 guestTarget, u64 hostEntry)
 {
@@ -3445,6 +3485,9 @@ void Compiler::ICacheReset()
         if (ICacheTable[c]) memset(ICacheTable[c], 0, (size_t)ICacheSites * sizeof(ICacheEntry));
 #if defined(LITEV_JIT_DIRECTPATCH) && defined(LITEV_JIT_DP_REVERTLIST)
         DirectPatchListed[c].clear();
+#endif
+#if defined(LITEV_JIT_DIRECTPATCH) && defined(LITEV_JIT_DP_TARGETED)
+        DPByTarget[c].clear();
 #endif
     }
     ICacheNextSite = 1;

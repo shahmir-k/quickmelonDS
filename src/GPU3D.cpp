@@ -311,6 +311,9 @@ void GPU3D::ResetRenderingState() noexcept
 
 void GPU3D::Reset() noexcept
 {
+#ifdef LITEV_GX_LAZY
+    LazyN = 0;
+#endif
 #ifdef LITEV_GXFIFO_UNIFIED
     CmdQHead = PipeN = FifoN = 0;
 #else
@@ -436,6 +439,9 @@ void GPU3D::Reset() noexcept
 
 void GPU3D::DoSavestate(Savestate* file) noexcept
 {
+#ifdef LITEV_GX_LAZY
+    if (file->Saving) LazySync(); else LazyN = 0;
+#endif
     file->Section("GP3D");
 
 #ifdef LITEV_GXFIFO_UNIFIED
@@ -704,6 +710,9 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 
 void GPU3D::SetEnabled(bool geometry, bool rendering) noexcept
 {
+#ifdef LITEV_GX_LAZY
+    LazySync();
+#endif
     GeometryEnabled = geometry;
     RenderingEnabled = rendering;
 
@@ -2518,7 +2527,32 @@ GPU3D::CmdFIFOEntry GPU3D::CmdFIFORead() noexcept
 #if !defined(LITEV_GXFIFO_THREADED) || !defined(LITEV_GXFIFO_UNIFIED) || !defined(LITEV_DMA_GXFIFO_FAST)
 #error "LITEV_GX_BULK needs LITEV_GXFIFO_THREADED, LITEV_GXFIFO_UNIFIED and LITEV_DMA_GXFIFO_FAST"
 #endif
+#ifdef LITEV_GX_LAZY
+void GPU3D::ExecuteCommand() noexcept { LazySync(); ExecuteCommandT<false>(); }
+
+const bool GXLazyOn = [] {
+#if defined(__ANDROID__)
+    return litevGxPropDefault("debug.litev.gxlazy", 1) != 0;
+#else
+    const char* e = getenv("debug.litev.gxlazy");
+    return e ? atoi(e) != 0 : true;
+#endif
+}();
+
+void GPU3D::LazyDrain() noexcept
+{
+    // the logged entries in order, as BulkWords would have run them (no swap or test command among them)
+    const u32 n = LazyN;
+    LazyN = 0;
+    BulkPtr = LazyLog.get(); BulkEnd = BulkPtr + n;
+    const s32 cc = CycleCount;   // charged when logged
+    ExecuteCommandT<true>();
+    CycleCount = cc;
+    BulkPtr = BulkEnd = nullptr;
+}
+#else
 void GPU3D::ExecuteCommand() noexcept { ExecuteCommandT<false>(); }
+#endif
 
 #ifdef LITEV_REMOTE_GX_MODEL
 // GX timing model (Netplay, every console of an allowlisted game; GPU3D::TimingModel): a command
@@ -4673,11 +4707,53 @@ void GPU3D::BulkWords(const u32* words, u32 n) noexcept
     if (m == 0) return;
 
     GXStat |= (1<<27);
+#ifdef LITEV_GX_LAZY
+    if (GXLazyOn && GXUntimedOn
+#ifdef LITEV_REMOTE_GX_SINK
+        && !Sink
+#endif
+        )
+    {
+        bool plain = true;   // no swap (waits in the FIFO) and no test command (counted per entry)
+        for (u32 j = 0; j < m; j++)
+            if (q[j].Command == 0x50 || (q[j].Command >= 0x70 && q[j].Command <= 0x72)) { plain = false; break; }
+        if (plain)
+        {
+            if (LazyN + m > LazyCap) LazyDrain();
+            if (LazyN == 0) { LazyEPC = ExecParamCount; LazyPA = PolygonAttr; LazyCPA = CurPolygonAttr; }
+            // the CycleCount the batch's commands add when they run (see LazyEPC)
+            s32 cyc = 0;
+            u32 epc = LazyEPC, pa = LazyPA, cpa = LazyCPA;
+            for (u32 j = 0; j < m; j++)
+            {
+                const u32 cmd = q[j].Command, np = CmdNumParams[cmd];
+                if (np > 1 && ++epc < np) continue;
+                if (np > 1) epc = 0;
+                switch (cmd)
+                {
+                case 0x21: { const s32 c = __builtin_popcount(cpa & 0xF); cyc += c < 1 ? 1 : c; break; }
+                case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x28: cyc += 3; break;
+                case 0x29: pa = q[j].Param; break;
+                case 0x40: cpa = pa; break;
+                }
+            }
+            LazyEPC = epc; LazyPA = pa; LazyCPA = cpa;
+            CycleCount += cyc;
+            memcpy(&LazyLog[LazyN], q, m * sizeof(CmdFIFOEntry));
+            LazyN += m;
+            goto bulk_tail;
+        }
+    }
+    LazySync();
+#endif
     BulkPtr = q; BulkEnd = q + m;
     ExecuteCommandT<true>();
     // from a SWAP_BUFFERS on: the FIFO, as usual (fits: the FIFO+PIPE hold 260)
     for (; BulkPtr < BulkEnd; BulkPtr++) CmdFIFOWrite_Inline(*BulkPtr);
     BulkPtr = BulkEnd = nullptr;
+#ifdef LITEV_GX_LAZY
+bulk_tail:
+#endif
 
     if (NumPushPopCommands == 0) GXStat &= ~(1<<14);
     if (NumTestCommands == 0)    GXStat &= ~(1<<0);
@@ -4950,6 +5026,9 @@ bool YSort(Polygon* a, Polygon* b)
 
 void GPU3D::VBlank() noexcept
 {
+#ifdef LITEV_GX_LAZY
+    LazySync();
+#endif
 #ifdef LITEV_REMOTE_GX_SINK
     if (Sink && SinkVeto.load(std::memory_order_relaxed)) SinkOff("another console used geometry results");
 #endif
@@ -5106,6 +5185,12 @@ void GPU3D::WriteToGXFIFO(u32 val) noexcept
 
 u8 GPU3D::Read8(u32 addr) noexcept
 {
+#ifdef LITEV_GX_LAZY
+    LazySync();
+#endif
+#ifdef LITEV_IDLE_CENSUS
+    if ((addr & ~3u) == 0x04000600) IdleCensus(1, NDS.ARM9.R[15], NDS.NumFrames);
+#endif
 #ifdef LITEV_GX_UNTIMED
     if (GXUntimedOn) RunUntimed();   // every observation sees all written commands done
 #endif
@@ -5151,6 +5236,12 @@ u8 GPU3D::Read8(u32 addr) noexcept
 
 u16 GPU3D::Read16(u32 addr) noexcept
 {
+#ifdef LITEV_GX_LAZY
+    LazySync();
+#endif
+#ifdef LITEV_IDLE_CENSUS
+    if ((addr & ~3u) == 0x04000600) IdleCensus(1, NDS.ARM9.R[15], NDS.NumFrames);
+#endif
 #ifdef LITEV_GX_UNTIMED
     if (GXUntimedOn) RunUntimed();   // every observation sees all written commands done
 #endif
@@ -5201,6 +5292,12 @@ u16 GPU3D::Read16(u32 addr) noexcept
 
 u32 GPU3D::Read32(u32 addr) noexcept
 {
+#ifdef LITEV_GX_LAZY
+    LazySync();
+#endif
+#ifdef LITEV_IDLE_CENSUS
+    if ((addr & ~3u) == 0x04000600) IdleCensus(1, NDS.ARM9.R[15], NDS.NumFrames);
+#endif
 #ifdef LITEV_GX_UNTIMED
     if (GXUntimedOn) RunUntimed();   // every observation sees all written commands done
 #endif
@@ -5260,6 +5357,9 @@ u32 GPU3D::Read32(u32 addr) noexcept
 
 void GPU3D::Write8(u32 addr, u8 val) noexcept
 {
+#ifdef LITEV_GX_LAZY
+    if (addr - 0x04000400 >= 0x200) LazySync();   // (the command ports queue behind the log)
+#endif
 #ifdef LITEV_A9HLE_GXCHECK
     if (A9HLE::GxTap && addr >= 0x04000400 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
 #endif
@@ -5313,6 +5413,9 @@ void GPU3D::Write8(u32 addr, u8 val) noexcept
 
 void GPU3D::Write16(u32 addr, u16 val) noexcept
 {
+#ifdef LITEV_GX_LAZY
+    if (addr - 0x04000400 >= 0x200) LazySync();   // (the command ports queue behind the log)
+#endif
 #ifdef LITEV_A9HLE_GXCHECK
     if (A9HLE::GxTap && addr >= 0x04000400 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
 #endif
@@ -5403,6 +5506,9 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
 
 void GPU3D::Write32(u32 addr, u32 val) noexcept
 {
+#ifdef LITEV_GX_LAZY
+    if (addr - 0x04000400 >= 0x200) LazySync();   // (the command ports queue behind the log)
+#endif
 #ifdef LITEV_A9HLE_GXCHECK
     if (A9HLE::GxTap && addr >= 0x04000440 && addr < 0x040005CC) A9HLE::GxOtherSeen = true;
 #endif

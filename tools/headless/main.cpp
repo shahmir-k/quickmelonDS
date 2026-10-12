@@ -54,7 +54,7 @@ static uint64_t EmuThreadInstr = 0, EmuThreadCycles = 0;
 #include "VerifyTrace.h"
 #include "ARM9HLE.h"
 #include "InputScript.h"
-namespace melonDS { extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults, JitStoreRepromotions; }
+namespace melonDS { extern u64 JitRestoreCount, JitRecompileSame[8]; extern u64 JitCompileCount, JitProtectCalls, JitProtectFaults, JitStoreRepromotions; }
 #ifdef LITEV_JIT_COMPILE_STATS
 #include "ARMJIT_Internal.h"
 #endif
@@ -1092,6 +1092,7 @@ int main(int argc, char** argv)
     printf("audio_samples: %llu\n", (unsigned long long)audioSampleCount);
 #ifdef __APPLE__
     // emulation thread only (RunFrame), so render/worker threads don't dilute A/B deltas
+    printf("jit_compiles: %llu restored: %llu same-bytes recompiles: restored %llu not %llu (nocand %llu addr %llu lit %llu ranges %llu) resets %llu\n", (unsigned long long)melonDS::JitCompileCount, (unsigned long long)melonDS::JitRestoreCount, (unsigned long long)melonDS::JitRecompileSame[0], (unsigned long long)melonDS::JitRecompileSame[1], (unsigned long long)melonDS::JitRecompileSame[2], (unsigned long long)melonDS::JitRecompileSame[3], (unsigned long long)melonDS::JitRecompileSame[4], (unsigned long long)melonDS::JitRecompileSame[5], (unsigned long long)melonDS::JitRecompileSame[6]);
     printf("emu_thread_instructions: %llu\nemu_thread_cycles: %llu\n",
            (unsigned long long)EmuThreadInstr, (unsigned long long)EmuThreadCycles);
 #endif

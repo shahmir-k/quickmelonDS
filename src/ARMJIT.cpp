@@ -1377,6 +1377,8 @@ void ARMJIT::SetFastMemory(bool enabled) noexcept
 }
 
 u64 JitCompileCount = 0;   // blocks compiled so far (headless LITEV_FRAME_MS)
+u64 JitRestoreCount = 0;   // of those, restored from RestoreCandidates (no emission)
+u64 JitRecompileSame[8] = {};   // LITEV_JIT_COMPILE_STATS: same (cpu, address, bytes) compiled before: restored / not
 #ifdef LITEV_JIT_COMPILE_STATS
 // time per compile phase in timer ticks (JitTicks(); JitTicksPerSec), see JitPhase
 u64 JitCompileTicks[JitPhase_Count] = {};
@@ -1974,6 +1976,17 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
     }
 
     JIT_PHASE(JitPhase_Hash);
+#ifdef LITEV_JIT_COMPILE_STATS
+    {   // revive potential: a block compiled again with the same bytes (address, instruction hash)
+        static std::unordered_set<u64> seen;
+        if (!seen.insert(((u64)cpu->Num << 63) | ((u64)blockAddr << 32) | instrHash).second)
+        {
+            (mayRestore ? JitRecompileSame[0] : JitRecompileSame[1])++;
+            if (!mayRestore)   // why not: 2 no candidate, 3 other address, 4 literals, 5 ranges
+                JitRecompileSame[!prevBlock ? 2 : prevBlock->StartAddr != blockAddr ? 3 : prevBlock->LiteralHash != literalHash ? 4 : 5]++;
+        }
+    }
+#endif
     JitBlock* block;
     if (!mayRestore)
     {
@@ -2118,6 +2131,7 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
     else
     {
         JIT_DEBUGPRINT("restored! %p\n", prevBlock);
+        JitRestoreCount++;
         block = prevBlock;
         if (!block->EntryPoint)
             CompileFromProfile(block);
@@ -2190,6 +2204,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
     range->Code = 0;
 #ifdef LITEV_JIT_DIRECTPATCH
     bool dpAnyInval = false;
+#ifdef LITEV_JIT_DP_TARGETED
+    u32 dpDead[2][32]; int dpN[2] = {0, 0};   // dead blocks' start addresses per CPU (overflow: revert all)
+#endif
 #endif
     for (int i = 0; i < range->Blocks.Length;)
     {
@@ -2280,6 +2297,10 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
         // but any promoted direct edge into it (or out of a co-invalidated source) must
         // be neutralised BEFORE it can execute. Revert-all once after the loop.
         dpAnyInval = true;
+#ifdef LITEV_JIT_DP_TARGETED
+        if (dpN[block->Num] < 32) dpDead[block->Num][dpN[block->Num]] = block->StartAddr;
+        dpN[block->Num]++;
+#endif
 #endif
         if (block->Num == 0)
             JitBlocks9.erase(block->StartAddr);
@@ -2304,8 +2325,16 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
 
 #ifdef LITEV_JIT_DIRECTPATCH
     // Neutralise every live promotion once, after all block removals for this address.
+#ifdef LITEV_JIT_DP_TARGETED
+    if (dpAnyInval && (dpN[0] > 32 || dpN[1] > 32))
+        JITCompiler.DirectPatchRevertAll();
+    else if (dpAnyInval)
+        for (u32 num = 0; num < 2; num++)
+            if (dpN[num]) JITCompiler.DirectPatchRevertTargets(num, dpDead[num], dpN[num]);
+#else
     if (dpAnyInval)
         JITCompiler.DirectPatchRevertAll();
+#endif
 #endif
 
 #if defined(LITEV_JIT_LINK) && defined(LITEV_SHADOW_ASSERT)
@@ -2430,6 +2459,10 @@ template void ARMJIT::CheckAndInvalidate<1, ARMJIT_Memory::memregion_NewSharedWR
 
 void ARMJIT::ResetBlockCache() noexcept
 {
+    JitRecompileSame[6]++;
+#ifdef LITEV_JIT_COMPILE_STATS
+    if (getenv("LITEV_JIT_RESETLOG")) fprintf(stderr, "JIT reset at frame %u (compiles so far %llu)\n", NDS.NumFrames, (unsigned long long)JitCompileCount);
+#endif
     Log(LogLevel::Debug, "Resetting JIT block cache...\n");
 #ifdef __aarch64__
     static const bool resetLog = getenv("LITEV_JITRESET_LOG") != nullptr;   // when / how full (diagnosis)

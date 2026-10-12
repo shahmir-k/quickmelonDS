@@ -645,6 +645,13 @@ public:
     // CPU x 64 B = 2 MB) a code overwrite of ~100 invalidations/frame scanned ~200 MB.
     std::vector<u32> DirectPatchListed[2];
 #endif
+#ifdef LITEV_JIT_DP_TARGETED
+    // LITEV_JIT_DP_TARGETED: a block invalidation reverts only the promoted sites whose guest target
+    // is one of the dead blocks (ICacheEntry::_dp1 = target, _dp0 bit 1 = indexed under it), not every
+    // promotion. Promoted sites by guest target (& ~1); stale entries are skipped (target changed).
+    std::unordered_multimap<u32, u32> DPByTarget[2];
+    void DirectPatchRevertTargets(u32 num, const u32* addrs, int n);
+#endif
 #endif
 #endif
 

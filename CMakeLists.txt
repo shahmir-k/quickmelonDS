@@ -848,6 +848,12 @@ endif()
 # GX_UNTIMED: geometry commands cost no guest time (category B). Inspired by DSperate's untimed
 # geometry engine (GPL-3.0-or-later, commit f5fa35e, src/core/gpu/gpu3d.cpp) and DraStic's GXFIFO
 # command timing x0 (as documented by DSperate). Runtime off: debug.litev.gxuntimed=0.
+# GX_LAZY: bulk geometry batches are logged and run at the next observation (inspired by DSperate's
+# geometry command log, src/core/gpu/gpu3d.cpp; exact relative to GX_UNTIMED; runtime debug.litev.gxlazy)
+option(LITEV_GX_LAZY "Log bulk geometry batches, run them when observed (exact vs LITEV_GX_UNTIMED; needs GX_UNTIMED + GX_BULK)" OFF)
+if (LITEV_GX_LAZY)
+    add_compile_definitions(LITEV_GX_LAZY=1)
+endif()
 option(LITEV_GX_UNTIMED "Untimed geometry engine (category B; runtime debug.litev.gxuntimed)" OFF)
 if (LITEV_GX_UNTIMED)
     add_compile_definitions(LITEV_GX_UNTIMED=1)
@@ -1305,6 +1311,13 @@ option(LITEV_JIT_COND_MEMGUESS "JIT: a conditional ARM load/store that ran while
 if (LITEV_JIT_COND_MEMGUESS)
     add_compile_definitions(LITEV_JIT_COND_MEMGUESS=1)
 endif()
+# DP_TARGETED: a block invalidation reverts only the direct patches into the dead blocks (exact).
+# Part of the park-and-revive item (DSperate https://github.com/beebono/DSperate, GPL-3.0-or-later,
+# commit f5fa35e, cpu/jit/runtime.cpp: a killed block leaves the rest of the translation cache as is).
+option(LITEV_JIT_DP_TARGETED "JIT: an invalidation reverts only the direct patches whose target block died (exact; needs LITEV_JIT_DIRECTPATCH)" OFF)
+if (LITEV_JIT_DP_TARGETED)
+    add_compile_definitions(LITEV_JIT_DP_TARGETED=1)
+endif()
 option(LITEV_JIT_DP_REVERTLIST "JIT: DIRECTPATCH revert-all walks a list of promoted sites, not all 2x16383 slots (exact)" OFF)
 if (LITEV_JIT_DP_REVERTLIST)
     add_compile_definitions(LITEV_JIT_DP_REVERTLIST=1)
@@ -1381,6 +1394,10 @@ if (LITEV_JIT_BGEMIT)
     add_compile_definitions(LITEV_JIT_BGEMIT=1)
 endif()
 
+option(LITEV_IDLE_CENSUS "Diagnosis: SPICNT (ARM7) / GXSTAT (ARM9) reads per guest PC, printed at exit" OFF)
+if (LITEV_IDLE_CENSUS)
+    add_compile_definitions(LITEV_IDLE_CENSUS=1)
+endif()
 option(LITEV_JIT_COMPILE_STATS "JIT diagnosis: per-phase compile time counters (JitCompileTicks), printed per frame by the app replay log / headless LITEV_FRAME_MS" OFF)
 if (LITEV_JIT_COMPILE_STATS)
     add_compile_definitions(LITEV_JIT_COMPILE_STATS=1)
@@ -1587,8 +1604,15 @@ if (LITEV_HYB_COMPOSITE_NEON)
 endif()
 option(LITEV_SPU_BATCH "DraStic #11: batch N audio samples per Event_SPU (coarsen SPU event flood)" OFF)
 set(LITEV_SPU_BATCH_N "8" CACHE STRING "SPU batch factor (samples generated per scheduled Event_SPU)")
+# LITEV_SPU_BATCH16: 16 samples per mix event, as DSperate (src/core/spu/spu.cpp, spu.h). Category B: Event_SPU
+# bounds the event slices (LITEV_EVENT_SLICES), so the batch size changes the ARM9/ARM7 interleave.
+option(LITEV_SPU_BATCH16 "SPU batch of 16 samples per Event_SPU instead of LITEV_SPU_BATCH_N (category B; needs LITEV_SPU_BATCH)" OFF)
 if (LITEV_SPU_BATCH)
-    add_compile_definitions(LITEV_SPU_BATCH=1 LITEV_SPU_BATCH_N=${LITEV_SPU_BATCH_N})
+    if (LITEV_SPU_BATCH16)
+        add_compile_definitions(LITEV_SPU_BATCH=1 LITEV_SPU_BATCH_N=16 LITEV_SPU_BATCH16=1)
+    else()
+        add_compile_definitions(LITEV_SPU_BATCH=1 LITEV_SPU_BATCH_N=${LITEV_SPU_BATCH_N})
+    endif()
 endif()
 
 # Integer-NEON vectorization of the SPU 16-channel pan-accumulate in SPU::Mix.

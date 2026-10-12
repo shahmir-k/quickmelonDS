@@ -177,6 +177,23 @@ private:
     const CmdFIFOEntry* BulkPtr = nullptr;
     const CmdFIFOEntry* BulkEnd = nullptr;
 #endif
+#ifdef LITEV_GX_LAZY
+    // LITEV_GX_LAZY (inspired by DSperate's geometry command log, https://github.com/beebono/DSperate,
+    // GPL-3.0-or-later, commit f5fa35e, src/core/gpu/gpu3d.h:24-26, gpu3d.cpp:339-397): with the untimed
+    // engine, a bulk batch (geometry DMA, GX_CPUSEND, A9HLE sends) with no swap or test command is
+    // logged instead of run; the log runs before anything that can observe the engine (a GPU3D
+    // register read or write, the FIFO executor, POWCNT1, VBlank, a savestate) or when it fills.
+    // Untimed, the batch costs no guest time and never touches the FIFO, so this is exact.
+    static constexpr u32 LazyCap = 1u << 14;
+    std::unique_ptr<CmdFIFOEntry[]> LazyLog { new CmdFIFOEntry[LazyCap] };
+    u32 LazyN = 0;
+    // the engine state the log's cycle charge reads, as of the log's end (ExecParamCount, PolygonAttr,
+    // CurPolygonAttr): untimed, SubmitVertex and CalculateLighting still add to CycleCount (a short
+    // busy window after the batch), which the log charges when it takes the batch
+    u32 LazyEPC = 0, LazyPA = 0, LazyCPA = 0;
+    __attribute__((noinline)) void LazyDrain() noexcept;
+    void LazySync() noexcept { if (__builtin_expect(LazyN != 0, 0)) LazyDrain(); }
+#endif
     void UpdateClipMatrix() noexcept;
     void ResetRenderingState() noexcept;
     void AddCycles(s32 num) noexcept;
