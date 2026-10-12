@@ -1600,6 +1600,7 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
     ReplayMP* replay = replayOwned.get();
     NDS* nd = b.nds.get();
     replay->SetClock([nd] { return nd->GetSysTimestamp(); });
+    replay->SetWake(*nd);
     MPInterface::Set(std::move(replayOwned), MPInterface_Netplay);
 
     std::unique_ptr<NetplayInput> net;
