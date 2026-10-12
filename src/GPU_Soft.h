@@ -230,6 +230,12 @@ protected:
     // first present (before any async frame finishes) returns the untouched buffer,
     // not buffer 0 which the first async frame is concurrently rendering into.
     int  AsyncPresentBuf = 1;
+    u32  RetireSeq = 0;      // emu: bumped whenever a finished frame becomes AsyncPresentBuf
+    u32  VBlankSeq = 0;      // emu: VBlanks seen (drawn or not), for the in-flight age rule
+public:
+    // a new finished frame is ready to present since the caller last saw this value
+    u32 RetiredFrames() const { return RetireSeq; }
+protected:
 
 #ifdef LITEV_SOFT2D_DEPTH2
     // Part 3: depth-2 in-flight ring. pipedepth==1 keeps the depth-1 barrier (byte-identical);
@@ -243,7 +249,7 @@ protected:
     // never collide). The emu writes ring[PushIdx] then posts AsyncStart (release); the 2D
     // thread pops ring[PopIdx] after Wait(AsyncStart) (acquire) -> the write is published. The
     // emu presents ring[PresentIdx] after Wait(AsyncDone) (the drained render is complete).
-    struct P2InFlightFrame { int targetBuf; int snapSlot; int consume3DParity; };
+    struct P2InFlightFrame { int targetBuf; int snapSlot; int consume3DParity; u32 kickVBlank; };
     P2InFlightFrame P2Ring[3] {};
     int P2PushIdx = 0;        // emu: next ring slot to fill (mod 3)
     int P2PresentIdx = 0;     // emu: next ring slot to present/drain (mod 3)
@@ -294,6 +300,9 @@ protected:
     void AsyncRenderThreadFunc();         // the persistent loop
     void AsyncRenderFrame();              // banded raster+composite+capture (off-thread)
     void FlushAsyncRender();              // barrier: wait in-flight done + publish present
+#ifdef LITEV_SOFT2D_DEPTH2
+    void P2RetireOld();                   // depth-2: retire passes kicked 2+ VBlanks ago
+#endif
 #endif
 
     void DrawScanlineA(u32 line, u32* dst, const u32* src2d, u32 dispcnt, u16 mbright);
