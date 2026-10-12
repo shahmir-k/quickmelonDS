@@ -49,6 +49,11 @@ public:
 
 #ifdef LITEV_SOFT2D_THREADED
     void VBlank() override;
+    void Start3DRendering() override { DrainCaptures(); Rend3D->RenderFrame(); }
+    // a 2D render still in flight writes display capture into a VRAM bank the emu side now
+    // reads (remapped off LCDC: BG/OBJ shadows, textures, CPU): finish it first, as on hardware
+    // (capture of frame N is complete at its line 191)
+    void DrainCaptures();
 #else
     void VBlank() override {};
 #endif
@@ -224,6 +229,7 @@ protected:
     Platform::Semaphore* AsyncDone  = nullptr;   // render -> emu: "frame complete"
     std::atomic<bool> AsyncThreadRunning { false };
     bool AsyncInFlight = false;           // a render was signaled and not yet barriered
+    u32  AsyncCapBanks = 0;               // VRAM banks A-D an in-flight render may capture into
     bool AsyncEverProduced = false;       // at least one async frame completed
     int  AsyncTargetBuf = 0;              // framebuffer index the render thread writes
     // last COMPLETED framebuffer (returned by GetFramebuffers). Inits to 1 so the
@@ -249,6 +255,7 @@ protected:
     int P2PresentIdx = 0;     // emu: next ring slot to present/drain (mod 3)
     int P2PopIdx = 0;         // 2D thread: next ring slot to consume (mod 3)
     int P2InFlight = 0;       // emu: pushed-but-not-presented count (0..2)
+    int P2Done = 0;           // emu: of those, the oldest P2Done already waited (AsyncDone taken)
     int P2FrameBufRR = 0;     // emu: round-robin framebuffer picker (mod 3)
     int PipeDepth = 0;        // debug.litev.pipedepth (1 or 2); 0=unread. Read ONCE at the
                               // first VBlank and cached for the session -- a mid-run 1<->2
