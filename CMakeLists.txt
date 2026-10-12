@@ -850,6 +850,8 @@ endif()
 # command timing x0 (as documented by DSperate). Runtime off: debug.litev.gxuntimed=0.
 # GX_LAZY: bulk geometry batches are logged and run at the next observation (inspired by DSperate's
 # geometry command log, src/core/gpu/gpu3d.cpp; exact relative to GX_UNTIMED; runtime debug.litev.gxlazy)
+# Measured 2026-10-12: exact (PW 8 segments states identical) but SLOWER (Mac emu instr PW town +5.4%, gift box +5.2%,
+# title +7.0%, overworld +1.2%, Golden Sun +2.5%): untimed, deferring the batch removes no work. Keep OFF.
 option(LITEV_GX_LAZY "Log bulk geometry batches, run them when observed (exact vs LITEV_GX_UNTIMED; needs GX_UNTIMED + GX_BULK)" OFF)
 if (LITEV_GX_LAZY)
     add_compile_definitions(LITEV_GX_LAZY=1)
