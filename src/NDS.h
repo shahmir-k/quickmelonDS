@@ -570,6 +570,24 @@ protected:
     u16 WifiWaitCnt;
     u8 TimerCheckMask[2];
     u64 TimerTimestamp[2];
+#ifdef LITEV_A7HLE
+public:
+    // A7Native (ARM7Native.cpp): ARM7 timer id's (4-7) counter at ARM7 time t without running the timers (no side
+    // effects); false if it overflows by then (or t is before its start)
+    bool PeekTimer7(u32 id, u64 t, u16& v) const
+    {
+        const Timer& tm = Timers[id];
+        if (!(TimerCheckMask[1] & (1u << (id & 3)))) { v = (u16)(tm.Counter >> 10); return true; }
+        const s64 c = (s64)tm.Counter + (s64)((s64)(t - TimerTimestamp[1]) * ((s64)1 << tm.CycleShift));
+        if (c < 0 || (c >> 26)) return false;
+        v = (u16)(c >> 10);
+        return true;
+    }
+    u64 TimerTimestamp7() const { return TimerTimestamp[1]; }
+    // (A7Native: the IO register effects of its stores without the bus dispatch)
+    void A7NTimerStart(u32 id, u16 cnt) { TimerStart(id, cnt); }
+protected:
+#endif
 #if defined(LITEV_TIMER_FAST)
     // LITEV_TIMER_FAST: cached NextTimerDeadline (DraStic "baked deadline").
     // The soonest-overflow SysTimestamp is INVARIANT as timers advance between

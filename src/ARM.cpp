@@ -27,6 +27,7 @@
 #include "ARM.h"
 #include "ARM7Prof.h"
 #include "ARM7HLE.h"
+#include "ARM7Native.h"
 #include "ARM9HLE.h"
 #include "ARMInterpreter.h"
 #include "AREngine.h"
@@ -1319,6 +1320,10 @@ void ARM::TriggerIRQ()
     {
         if ((NDS.IF[1] & NDS.IE[1]) & (1<<IRQ_VBlank))
             NDS.AREngine.RunCheats();
+#ifdef LITEV_A7HLE
+        // the OS IRQ path natively from the BIOS vector (A7Native: per SDK build)
+        A7Native::Irq(this);
+#endif
     }
 }
 
@@ -1824,6 +1829,9 @@ void ARMv4::Execute()
 
                 // actually execute
                 u32 icode = (CurInstr >> 6);
+#ifdef LITEV_A7HLE
+                if (A7Native::CheckPending) A7Native::CheckAt(this, R[15] - 4);
+#endif
 #ifdef LITEV_A7PROF
                 if (&NDS == A7Prof::Target) A7Prof::g.Pre(R[15] - 4, 2, CPSR, R[14]);
                 const u32 a7pc = R[15] - 4;
@@ -1851,7 +1859,11 @@ void ARMv4::Execute()
 #endif
 #ifdef LITEV_A7HLE
                 if (A7HLE::CheckPending) A7HLE::CheckAt(this, R[15] - 8);
-                if ((CurInstr == 0xE92D4FF8 || CurInstr == 0xE92D4FF0 || CurInstr == 0xE92D47F0 || CurInstr == 0xE081C002) && A7HLE::Run(this, false)) {}
+                if (A7Native::CheckPending) A7Native::CheckAt(this, R[15] - 8);
+                if (A7Native::MaybeExit(CurInstr) && A7Native::Hook(this, false)) {}
+                else if ((CurInstr == 0xE92D4FF8 || CurInstr == 0xE92D4FF0 || CurInstr == 0xE92D47F0 || CurInstr == 0xE081C002) && A7HLE::Run(this, false)) {}
+                else if ((CurInstr & 0x0F000000) == 0x0B000000 && (CurInstr >> 28) != 0xF && CheckCondition(CurInstr >> 28)
+                         && A7Native::Interp(this, false)) {}
                 else
 #endif
                 if (CheckCondition(CurInstr >> 28))
