@@ -130,6 +130,12 @@ public:
     // commands now; a SWAP_BUFFERS and everything after it is queued in the FIFO as usual.
     bool BulkReady() const noexcept;
     void BulkWords(const u32* words, u32 n) noexcept;
+#if defined(LITEV_REMOTE_GX_FASTSINK)
+    // sink copy, untimed engine: decode and run the words in one pass (no entry queue, no
+    // executor); returns the words taken, stopping before a swap or test command
+    u32 SinkWords(const u32* words, u32 n, bool& ran) noexcept;
+    void SinkCmd(u32 cmd, u32 val) noexcept;
+#endif
 #endif
 
     u8 Read8(u32 addr) noexcept;
