@@ -25,6 +25,9 @@
 #include "MPLinkFlags.h"
 #include "WifiAP.h"
 #include "Platform.h"
+#if defined(LITEV_WIFI_EVT_DIRECT) && defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 #ifdef LITEV_LAN_STATS
 #include <chrono>
 // Measurement only: real-time timeline of the MP sync, per exchange (us, steady clock).
@@ -419,10 +422,69 @@ void Wifi::EvtIdleTick()
     }
 }
 
+#ifdef LITEV_WIFI_EVT_DIRECT
+// LITEV_WIFI_EVT_DIRECT: the idle-tick walks (EvtSchedule's search, EvtCatchUp's counters) in closed
+// form while no transfer is in progress (ComStatus 0). Exact: the same ticks, events and counters.
+// off: env LITEV_WIFIDIRECT=0 (headless A/B) or, on Android, debug.litev.wifidirect=0
+static const bool WifiDirectOn = [] {
+    if (const char* e = getenv("LITEV_WIFIDIRECT")) return atoi(e) != 0;
+#if defined(__ANDROID__)
+    char b[PROP_VALUE_MAX] = {0};
+    return __system_property_get("debug.litev.wifidirect", b) > 0 ? atoi(b) != 0 : true;
+#else
+    return true;
+#endif
+}();
+static constexpr u64 kTickCycles = 33513982ull * 8;   // WifiTickDelay: delay_i = ceil((kTickCycles - err_i) / 1e6)
+// k ticks from a delay error err: their summed delay D = ceil((k kTickCycles - err) / 1e6) (the errors
+// telescope: D 1e6 = k kTickCycles - err + err_k, 0 <= err_k < 1e6); err becomes err_k
+static inline u64 TickSpan(u64 k, s32& err)
+{
+    if (k == 0) return 0;
+    const u64 x = k * kTickCycles - (u64)err;
+    const u64 d = (x + 999999) / 1000000;
+    err = (s32)(d * 1000000 - x);
+    return d;
+}
+// the first k with D(k) > x (k ticks from err)
+static inline u64 TicksPast(s64 x, s32 err)
+{
+    if (x < 0) return 0;
+    if (x > (s64)(4096 * 269)) return ~0ull >> 1;
+    return ((u64)x * 1000000 + (u64)err) / kTickCycles + 1;
+}
+// walk iteration k sees us0 + 8 (k + 1): the first k where that is >= target
+static inline u64 UsReach(u64 target, u64 us0)
+{
+    return target <= us0 + 8 ? 0 : (target - us0 + 7) / 8 - 1;
+}
+#endif
+
 // Runs the idle ticks due by `now` (all before the pending event's tick)
 void Wifi::EvtCatchUp(u64 now)
 {
     const u64 evt = NDS.SchedList[Event_Wifi].Timestamp;
+#ifdef LITEV_WIFI_EVT_DIRECT
+    if (ComStatus == 0 && WifiDirectOn)
+    {
+        // ticks at NextTickTs + D(j), j = 0..k-1, while <= lim
+        if (NextTickTs > now || NextTickTs >= evt) return;
+        const u64 lim = std::min(now, evt - 1);
+        const u64 k = ((lim - NextTickTs) * 1000000 + (u64)TimerError) / kTickCycles + 1;
+        NextTickTs += TickSpan(k, TimerError);
+        // EvtIdleTick k times (ComStatus 0)
+        const u64 u = USTimestamp >> 3;   // MSTimer on each tick that lands on a 1024 us boundary
+        for (u64 m = ((u + k) >> 7) - (u >> 7); m; m--) WifiAP->MSTimer();
+        USTimestamp += k * kTimerInterval;
+        if (IOPORT(W_USCountCnt)) USCounter += k * kTimerInterval;
+        if ((IOPORT(W_CmdCountCnt) & 0x0001) && CmdCounter > 0)
+            CmdCounter = CmdCounter <= k * kTimerInterval ? 0 : CmdCounter - (u32)(k * kTimerInterval);
+        if (IOPORT(W_ContentFree) != 0)
+            IOPORT(W_ContentFree) = IOPORT(W_ContentFree) <= k * kTimerInterval ? 0 : IOPORT(W_ContentFree) - (u16)(k * kTimerInterval);
+        RXCounter += (u32)(k * kTimerInterval);
+        return;
+    }
+#endif
     while (NextTickTs <= now && NextTickTs < evt)
     {
         EvtIdleTick();
@@ -461,6 +523,56 @@ void Wifi::EvtSchedule(bool ask)
         int pt = slot ? slot->CurPhaseTime : 0, mprt = MPReplyTimer, rt = RXTime;
         u16 rxaddr = IOPORT(W_RXTXAddr) << 1;
         const u16 rdcur = IOPORT(W_RXBufReadCursor) << 1;
+#ifdef LITEV_WIFI_EVT_DIRECT
+        if (ComStatus == 0 && WifiDirectOn)
+        {
+            // the walk below in closed form: each condition's first iteration k (us = us0 + 8 (k + 1),
+            // usc likewise, rxc = rxc0 + 8 k, t = NextTickTs + D(k)); the earliest one ends the walk
+            constexpr u64 kNever = ~0ull >> 1;
+            const u64 us0 = us;
+            u64 k1 = kNever, k3 = kNever, k4 = kNever, k5 = kNever;
+            if (client && RXTimestamp) k1 = UsReach(RXTimestamp, us0);                                   // why 1
+            if (cnt)
+            {
+                const u64 u = (usc >> 3) & 127;
+                k4 = (127 - u) & 127;                                                                    // MSTimer: why 5
+                if (cmp && (pre >> 10) == bc1) k3 = ((((~pre >> 3) & 127) - u - 1) & 127);              // IRQ15: why 4
+            }
+            if (!rxoff && (!client || !(LinkDelaysRegularFrames && (MPInExchange || RXTimestamp))))      // CheckRX(0): why 6
+            {
+                const u64 lo = client ? UsReach(NextSync + 1, us0) : 0;
+                const u64 r = (64 - ((rxc >> 3) & 63)) & 63;   // first k with (rxc0 >> 3) + k == 0 mod 64
+                k5 = lo <= r ? r : r + ((lo - r + 63) & ~(u64)63);
+            }
+            u64 kend = std::min(std::min(k1, k3), std::min(k4, k5));
+            // client host polls (why 2 / 3): at the first k >= every bound with t > QuietUntil; a
+            // HostQuiet answer that moves QuietUntil past t lets the walk go on
+            u64 kmin = 0;
+            const u64 kns = (client && !rxoff) ? UsReach(NextSync, us0) : kNever;
+            while (kns != kNever)
+            {
+                u64 k2 = std::max(std::max(kns, kmin), TicksPast((s64)(QuietUntil - t), err));
+                if (k2 >= (u64)kEvtMaxIdle || k2 > kend || (k2 == kend && k1 == kend)) break;
+                s32 e2 = err;
+                const u64 tk = t + TickSpan(k2, e2);
+                const u64 until = tk + kEvtQuietSpan;
+                if (!ask || !NDS.MPHostQuiet || until > NDS.GetSysTimestamp() + kEvtAskAhead) { kend = k2; why = 2; break; }
+                u64 ft; int fs;
+                int r = NDS.MPHostQuiet(NDS.MPHostQuietCtx, NDS.MPHostQuietInst, until, &ft, &fs);
+                if (r < 0) { kend = k2; why = 2; break; }
+                QuietUntil = r == 0 ? until : (fs < NDS.MPHostQuietInst ? ft - 1 : ft);
+                if (tk > QuietUntil) { kend = k2; why = 3; break; }
+                kmin = k2 + 1;
+            }
+            if (kend >= (u64)kEvtMaxIdle) kend = kEvtMaxIdle;
+            t += TickSpan(kend, err);
+#ifdef LITEV_NPSCHED_STATS
+            if (why == 7 && kend < (u64)kEvtMaxIdle)
+                why = kend == k1 ? 1 : kend == k3 ? 4 : kend == k4 ? 5 : 6;
+#endif
+        }
+        else
+#endif
         for (int k = 0; k < kEvtMaxIdle; k++)
         {
             us += kTimerInterval;

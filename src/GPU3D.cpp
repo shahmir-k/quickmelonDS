@@ -26,6 +26,9 @@
 #include "Platform.h"
 #include "GPU3D.h"
 #include "LiteProfile.h"
+#ifdef LITEV_REMOTE_GX_SINKMEMO
+#include "xxhash/xxhash.h"
+#endif
 // LITEV_GXFIFO_DMA_INLINE: single-source inline bodies for the GXFIFO producer path. Included here
 // so the public WriteToGXFIFO/CmdFIFOWrite delegate to the SAME code DMA.cpp inlines (no duplication).
 // The extern decl inside also gives CmdNumParams (defined below) external linkage for other TUs.
@@ -4366,6 +4369,18 @@ static const bool GXFastSinkOn = [] {
 #endif
 }();
 
+#ifdef LITEV_REMOTE_GX_SINKSKIP
+// off: env LITEV_GXSINKSKIP=0 (headless A/B) or, on Android, debug.litev.gxsinkskip=0
+static const bool GXSinkSkipOn = [] {
+    if (const char* e = getenv("LITEV_GXSINKSKIP")) return atoi(e) != 0;
+#if defined(__ANDROID__)
+    return litevGxPropDefault("debug.litev.gxsinkskip", 1) != 0;
+#else
+    return true;
+#endif
+}();
+#endif
+
 // What a sink copy keeps of the geometry commands (untimed engine): only what the game can observe.
 // With no matrix, vertex, lighting or polygon results computed, the observable state of the engine is
 // the command timing (CycleCount: the busy bit after a batch), the matrix stack pointers and their
@@ -4400,6 +4415,9 @@ __attribute__((noinline)) void GPU3D::SinkCmd(u32 cmd, u32 val) noexcept
         break;
     case 0x29: PolygonAttr = val; break;
     case 0x40:
+#ifdef LITEV_REMOTE_GX_SINKMEMO
+        SinkBegan = true;
+#endif
         PolygonMode = val & 0x3;
         VertexNum = 0; VertexNumInPoly = 0; NumConsecutivePolygons = 0; LastStripPolygon = NULL;
         CurPolygonAttr = PolygonAttr;
@@ -4433,6 +4451,18 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
     u32 i = 0;
     for (; i < n; i++)
     {
+#ifdef LITEV_REMOTE_GX_SINKSKIP
+        // LITEV_REMOTE_GX_SINKSKIP: a command's parameter words before its last one only count
+        // (pc++, an entry: ran); take them in one step. Exact: the same state as word by word.
+        if (pc + 1 < tp && numCmds && GXSinkSkipOn)
+        {
+            const u32 t = std::min(tp - 1 - pc, n - i);
+            ran = true;
+            pc += t;
+            i += t - 1;
+            continue;
+        }
+#endif
         const u32 val = words[i];
         if (numCmds == 0)
         {
@@ -4495,6 +4525,71 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
 }
 #endif
 
+#ifdef LITEV_REMOTE_GX_SINKMEMO
+// LITEV_REMOTE_GX_SINKMEMO: a remote's display lists repeat frame after frame (MKDS 8P race: 99.5%
+// of the DMA chunks a sink copy decodes were decoded before with the same engine state), so keep
+// SinkWords' effect per chunk. The key is everything SinkWords reads: the words and the state below,
+// as their XXH3-128 hash (one 64-byte entry per chunk: a first version that kept the words for a full
+// compare, 1.5 MB per console, was slower on the RG DS than decoding); the stored effect is everything
+// it writes. VertexNum and NumConsecutivePolygons are only counted up (their parity is all SinkWords
+// reads) unless a BEGIN resets them: stored as a delta, or as the final value after a BEGIN. Exact
+// (the same state as running SinkWords) barring a 128-bit hash collision.
+// Off: env LITEV_GXSINKMEMO=0, debug.litev.gxsinkmemo=0.
+static const bool GXSinkMemoOn = [] {
+    if (const char* e = getenv("LITEV_GXSINKMEMO")) return atoi(e) != 0;
+#if defined(__ANDROID__)
+    return litevGxPropDefault("debug.litev.gxsinkmemo", 1) != 0;
+#else
+    return true;
+#endif
+}();
+
+static constexpr u32 kSinkMemoSize = 4096;   // direct-mapped, 64 B entries: 256 KB (MKDS race: ~270 chunks per frame, misses 23% at 1024 entries, 6.5% at 4096)
+
+u32 GPU3D::SinkMemo(const u32* words, u32 n, bool& ran) noexcept
+{
+    if (!SinkMemoTab) SinkMemoTab.reset(new SinkMemoEntry[kSinkMemoSize]());
+    u32 key[64 + 15];
+    memcpy(key, words, n * 4);
+    const u32 st[15] = {n, NumCommands, CurCommand, ParamCount, TotalParams, ExecParamCount, MatrixMode, PolygonAttr,
+                        CurPolygonAttr, PolygonMode, VertexNumInPoly, NumConsecutivePolygons & 1,
+                        (u32)ProjMatrixStackPointer, (u32)TexMatrixStackPointer, (u32)PosMatrixStackPointer};
+    memcpy(key + n, st, sizeof st);
+    const XXH128_hash_t h = XXH3_128bits(key, n * 4 + sizeof st);
+    SinkMemoEntry& e = SinkMemoTab[h.low64 & (kSinkMemoSize - 1)];
+    if ((e.flags & 8) && e.h0 == h.low64 && e.h1 == h.high64)
+    {
+        NumCommands = e.numCmds; CurCommand = e.cur; ParamCount = e.pc; TotalParams = e.tp; ExecParamCount = e.epc;
+        MatrixMode = e.mm; PolygonAttr = e.pattr; CurPolygonAttr = e.cpattr; PolygonMode = e.pmode; VertexNumInPoly = e.vnip;
+        ProjMatrixStackPointer = e.projSP; TexMatrixStackPointer = e.texSP; PosMatrixStackPointer = e.posSP;
+        if (e.flags & 4) GXStat |= (1<<15);
+        CycleCount += e.cyc;
+        if (e.flags & 2) { VertexNum = e.vnum; NumConsecutivePolygons = e.ncp; LastStripPolygon = NULL; }
+        else { VertexNum += e.vnum; NumConsecutivePolygons += e.ncp; }
+        if (e.flags & 1) ran = true;
+        return e.k;
+    }
+    const u32 vnum0 = VertexNum, ncp0 = NumConsecutivePolygons, bit15 = GXStat & (1<<15);
+    const s32 cyc0 = CycleCount;
+    bool r = false;
+    SinkBegan = false;
+    GXStat &= ~(1<<15);   // the only GXStat bit SinkWords touches (ORs in): record what it sets
+    const u32 k = SinkWords(words, n, r);
+    const bool set15 = GXStat & (1<<15);
+    GXStat |= bit15;
+    e.h0 = h.low64; e.h1 = h.high64;
+    e.k = k; e.numCmds = NumCommands; e.cur = CurCommand; e.pc = ParamCount; e.tp = TotalParams; e.epc = ExecParamCount;
+    e.mm = MatrixMode; e.pattr = PolygonAttr; e.cpattr = CurPolygonAttr; e.pmode = PolygonMode; e.vnip = VertexNumInPoly;
+    e.projSP = ProjMatrixStackPointer; e.texSP = TexMatrixStackPointer; e.posSP = PosMatrixStackPointer;
+    e.cyc = CycleCount - cyc0;
+    e.vnum = SinkBegan ? VertexNum : VertexNum - vnum0;
+    e.ncp = SinkBegan ? NumConsecutivePolygons : NumConsecutivePolygons - ncp0;
+    e.flags = 8 | (r ? 1 : 0) | (SinkBegan ? 2 : 0) | (set15 ? 4 : 0);
+    if (r) ran = true;
+    return k;
+}
+#endif
+
 void GPU3D::BulkWords(const u32* words, u32 n) noexcept
 {
     // contract: n <= 64 (the decode buffer below; after a SWAP_BUFFERS the rest goes to the 260-entry FIFO). A larger
@@ -4509,7 +4604,16 @@ void GPU3D::BulkWords(const u32* words, u32 n) noexcept
     if (Sink && GXUntimedOn && GXFastSinkOn)
     {
         bool ran = false;
+#ifdef LITEV_REMOTE_GX_SINKMEMO
+#ifdef LITEV_FF_HEADLESS3D
+        const bool memo = GXSinkMemoOn && LITEV_HEADLESS(Headless) && !FFHeadlessNow;   // SinkWords' lightCycles
+#else
+        const bool memo = GXSinkMemoOn && LITEV_HEADLESS(Headless);
+#endif
+        const u32 k = memo ? SinkMemo(words, n, ran) : SinkWords(words, n, ran);
+#else
         const u32 k = SinkWords(words, n, ran);
+#endif
         if (k == n)
         {
             // as the queue path's tail for a batch of entries (the executor ran them)

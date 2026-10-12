@@ -135,6 +135,19 @@ public:
     // executor); returns the words taken, stopping before a swap or test command
     u32 SinkWords(const u32* words, u32 n, bool& ran) noexcept;
     void SinkCmd(u32 cmd, u32 val) noexcept;
+#ifdef LITEV_REMOTE_GX_SINKMEMO
+    // LITEV_REMOTE_GX_SINKMEMO: SinkWords' effect per (words, the engine state it reads), memoized
+    u32 SinkMemo(const u32* words, u32 n, bool& ran) noexcept;
+    struct alignas(64) SinkMemoEntry   // one cache line
+    {
+        u64 h0, h1;   // XXH3-128 of the words and the state read (the key)
+        u32 cur, pattr, cpattr, vnum, ncp;
+        s32 cyc;
+        u8 k, numCmds, pc, tp, epc, mm, pmode, vnip, projSP, texSP, posSP, flags;   // flags: 1 ran, 2 began, 4 GXSTAT bit 15, 8 valid
+    };
+    std::unique_ptr<SinkMemoEntry[]> SinkMemoTab;
+    bool SinkBegan = false;   // a BEGIN_VTXS ran (SinkCmd), for the memo
+#endif
 #endif
 #endif
 
