@@ -648,6 +648,20 @@ if (LITEV_JIT_REGION_CACHE)
     endif()
 endif()
 
+# REFILL_FAST: shorter indirect-branch refill stubs (Gen_JumpTo9/7), same arithmetic: the MemTimings
+# byte address in 3 instructions instead of 4, the doubled ARM9 refill folded into one shifted ADD,
+# the ARM9 Thumb x1/x2 select as a shift, the ARM7 timing table addressed from RCPU, the ARM7 ARM
+# byte pair summed with a shifted ADD. Exact (category A): every stub adds the same cycles and
+# stores the same fields as before.
+option(LITEV_JIT_REFILL_FAST "Shorter, equivalent indirect-branch refill stubs (exact)" OFF)
+if (LITEV_JIT_REFILL_FAST)
+    if (ENABLE_JIT AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_REFILL_FAST=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_REFILL_FAST requires ENABLE_JIT and an AArch64 target.")
+    endif()
+endif()
+
 option(LITEV_JIT_ICACHE "Per-site 2-way block inline cache in the dispatcher (guest-PC->host-ptr), epoch-guarded" OFF)
 if (LITEV_JIT_ICACHE)
     if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")

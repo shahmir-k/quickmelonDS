@@ -356,9 +356,22 @@ void* Compiler::Gen_JumpTo9(int kind)
     AlignCode16();
     void* res = GetRXPtr();
 
+#ifdef LITEV_JIT_REFILL_FAST
+    // The same byte (RCPU + MemTimings + (addr >> 12)) in 3 instructions instead of 4. X0 >> 12 ==
+    // W0 >> 12: the only caller (Comp_JumpTo) hands the target over in W0 from a 32-bit write,
+    // which zeroes bits 63:32.
+    {
+        constexpr u32 mt = offsetof(ARMv5, MemTimings);
+        static_assert(mt < 0x1000000, "MemTimings offset must fit ADD imm12 lsl 12 + LDRB imm12");
+        ADD(X1, RCPU, X0, ArithOption(X0, ST_LSR, 12));
+        ADD(X1, X1, mt >> 12, true);
+        LDRB(INDEX_UNSIGNED, W1, X1, mt & 0xFFF);
+    }
+#else
     LSR(W1, W0, 12);
     ADDI2R(W1, W1, offsetof(ARMv5, MemTimings), W2);
     LDRB(W1, RCPU, W1);
+#endif
 
     LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARMv5, ITCMSize));
 
@@ -403,8 +416,12 @@ void* Compiler::Gen_JumpTo9(int kind)
         else
 #endif
         {
+#ifdef LITEV_JIT_REFILL_FAST
+        ADD(RCycles, RCycles, W1, ArithOption(W1, ST_LSL, 1));   // += 2 * W1
+#else
         ADD(W1, W1, W1);
         ADD(RCycles, RCycles, W1);
+#endif
         }
         RET();
     }
@@ -433,9 +450,14 @@ void* Compiler::Gen_JumpTo9(int kind)
         else
 #endif
         {
+#ifdef LITEV_JIT_REFILL_FAST
+        UBFX(W2, W0, 1, 1);      // (W0 & 2) ? 2 * W1 : W1, as a shift
+        LSLV(W1, W1, W2);
+#else
         ADD(W2, W1, W1);
         TSTI2R(W0, 0x2);
         CSEL(W1, W1, W2, CC_EQ);
+#endif
         ADD(RCycles, RCycles, W1);
         }
         RET();
@@ -453,6 +475,14 @@ void* Compiler::Gen_JumpTo7(int kind)
     LSR(W1, W0, 15);
     STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CodeCycles));
 
+#ifdef LITEV_JIT_REFILL_FAST
+    // ARM7 blocks run with RCPU == &NDS.ARM7, and the table is a member of the same NDS object:
+    // address it from RCPU (ADD+ADD) instead of a 64-bit pointer constant (MOVZ+MOVK+MOVK).
+    const s64 a7mt = (s64)((u8*)NDS.ARM7MemTimings - (u8*)&NDS.ARM7);
+    if (a7mt > -0x1000000 && a7mt < 0x1000000)
+        ADDI2R(X2, RCPU, (u64)a7mt);
+    else
+#endif
     MOVP2R(X2, NDS.ARM7MemTimings);
     LDR(W3, X2, ArithOption(W1, true));
 
@@ -514,8 +544,12 @@ void* Compiler::Gen_JumpTo7(int kind)
 #endif
         {
         UBFX(W2, W3, 16, 8);
+#ifdef LITEV_JIT_REFILL_FAST
+        ADD(W2, W2, W3, ArithOption(W3, ST_LSR, 24));   // byte 2 + byte 3
+#else
         UBFX(W3, W3, 24, 8);
         ADD(W2, W3, W2);
+#endif
         ADD(RCycles, RCycles, W2);
         }
 
