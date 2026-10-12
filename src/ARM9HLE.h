@@ -28,7 +28,7 @@
 // 256 _ll_sdiv, 512 GX async start, 1024 GX DMA-end IRQ,
 // 2048 G3D shape (needs 512), 4096 VEC_Normalize, 8192 G3D node (NODEDESC),
 // 16384 MKDS stereo sample effect, 32768 G3D material animation (needs 128), 65536 G3D SBC loop,
-// 131072 NNS_G2dMakeCellToOams, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase, 8388608 MKDS G3D shape, 16777216 SDK leaf functions at their BL (HLELeaf.h); 8 needs 1)
+// 131072 NNS_G2dMakeCellToOams, 262144 MKDS streaming LZ, 524288 MKDS G3D material, 1048576 MKDS KCL prism loop, 2097152 MKDS SBC loop, 4194304 MKDS broad phase, 8388608 MKDS G3D shape, 16777216 SDK leaf functions at their BL (HLELeaf.h), 33554432 the byte memcpy loop; 8 needs 1)
 // for A/B of single hooks.
 // Hooks 1-5 are keyed to a per-game Variant (ARM9HLE.cpp: Pokemon White, Pokemon Black, Pokemon White 2),
 // probed when a hook entry of that variant is first reached; hook 6 is position independent (any game).
@@ -104,7 +104,7 @@ namespace melonDS { class ARM; class ARMv5; class NDS; class Savestate; }
 namespace melonDS::A9HLE
 {
 // first instruction words of the hooked entries (cheap pre-filter for the interpreter)
-inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001 || instr == 0xE5942000
+inline bool MaybeHook(u32 instr) { return instr == 0xE58C2064 || instr == 0xE4D13001 || instr == 0xE92D47F0 || instr == 0xE59F207C || instr == 0xE92D40F8 || instr == 0xE1530001 || instr == 0xE5942000
                                         || instr == 0xE92D4010 || instr == 0xE92D58F0 || instr == 0xE92D4FF8 || instr == 0xE92D4FF0
                                         || instr == 0xE5941008 || instr == 0xE3540000 || instr == 0xE92D4070 || instr == 0xE59D102C || instr == 0xE5941000 || instr == 0xE92D4030; }
 // Thumb entries (W2 OS_SetIrqFunction push {r4-r7} / OS_GetIrqFunction push {r3, r4} / MIi_FIFOCallback

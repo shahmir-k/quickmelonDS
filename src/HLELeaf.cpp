@@ -113,7 +113,7 @@ u8* Host(melonDS::ARMv5* c, u32 a, u32 len, bool& dtcm)
     if ((a & m) + len > m + 1 || ((a + len - 1) & c->DTCMMask) == c->DTCMBase) return nullptr;
     return &c->NDS.MainRAM[a & m];
 }
-void Commit(melonDS::ARMv5* c, const Out& o)
+void Commit(melonDS::ARMv5* c, Out& o)
 {
     for (u32 i = 0; i < o.nw; i++)
     {
@@ -293,6 +293,10 @@ int At(melonDS::NDS& nds, u32 target, u32* a, u32* b, int max)
     if (!melonDS::A9HLE::MaskOn(nds, 16777216)) return 0;
     u32 len = 0;
     const int k = KindAt(&nds.ARM9, target, len);
+#ifdef LITEV_HLE_DIAG
+    static const u32 kinds = getenv("LITEV_HLELEAF_KINDS") ? (u32)strtoul(getenv("LITEV_HLELEAF_KINDS"), nullptr, 0) : ~0u;   // (A/B)
+    if (k && !(kinds >> k & 1)) return 0;
+#endif
     if (k) { a[0] = target & ~1u; b[0] = a[0] + len; return 1; }
     // A/B: hooks through their block exits instead (Android: debug.litev.hlehooks=0, else env LITEV_HLELEAF_NOHOOKS=1)
     static const bool noHooks = []

@@ -318,8 +318,8 @@ constexpr s32 kWakeCycles = 900;
 // 3.: guest averages in check mode (PW f17000 / f6500): IRQ entry to return, empty queue / with the wake round trip
 constexpr s32 kIrqCycles = 158, kIrqWakeCycles = 1032;
 
-constexpr int kKinds = 26;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
-constexpr u32 kAllHooks = 33554431;    // (bit 16777216: HLELeaf)
+constexpr int kKinds = 27;    // 0 wake, 1 set, 2 get, 3 HBlank, 4 HBlank+wake, 5 GX send, 6 LZ, 7 card read, 8 G3D material, 9 _ll_sdiv, 10 GX async start, 11 GX DMA-end IRQ
+constexpr u32 kAllHooks = 67108863;    // (bit 16777216: HLELeaf, 33554432: the byte copy loop)
 struct State
 {
     int status = 0;                 // 0 no variant matched (yet), 1 active (v), -1 off
@@ -363,9 +363,9 @@ const bool g_Time = g_Stats;    // host ns per native call
 // shipping: no compare / dry / timing code in the hooks (the in-order A55 pays for every hot byte)
 constexpr bool g_Check = false, g_Dry = false, g_DryIrq = false, g_Time = false;
 #endif
-const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc", "mkbp", "mkshp"};
+const char* kName[kKinds] = {"irqwake", "setirqfn", "getirqfn", "hblank", "hblank+wake", "gxsend", "lz", "cardread", "g3dmat", "llsdiv", "gxasync", "dmairq", "irqdefer", "g3dshp", "vecnorm", "g3dnode", "mkfx", "g3dmatanm", "g3dsbc", "g2dcell", "mkcxlz", "mkmat", "mkkcl", "mksbc", "mkbp", "mkshp", "copy8"};
 // kind -> LITEV_A9HLE_ONLY / debug.litev.a9hle mask bit
-inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : k == 24 ? 4194304 : k == 25 ? 8388608 : 1u << k; }
+inline u32 Bit(int k) { return k == 5 ? 16 : k == 6 ? 64 : k == 7 ? 32 : k == 8 ? 128 : k == 9 ? 256 : k == 10 ? 512 : k == 11 ? 1024 : k == 13 ? 2048 : k == 14 ? 4096 : k == 15 ? 8192 : k == 16 ? 16384 : k == 17 ? 32768 : k == 18 ? 65536 : k == 19 ? 131072 : k == 20 ? 262144 : k == 21 ? 524288 : k == 22 ? 1048576 : k == 23 ? 2097152 : k == 24 ? 4194304 : k == 25 ? 8388608 : k == 26 ? 33554432 : 1u << k; }
 
 // stats only
 u64 Now() { return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -1538,6 +1538,66 @@ __attribute__((noinline)) bool RunLz(melonDS::ARMv5* c, State& s, bool jit)
     c->CPSR = z.cpsr;
     c->Cycles += z.cyc;
     c->JumpTo(z.pc);
+    return true;
+}
+
+// ---- 26. the C runtime's byte memcpy loop: 256 bytes per native step --------------------------------------------
+// mov ip, r0; cmp r2, #0; bxeq lr; loop: ldrb r3, [r1], #1; subs r2, r2, #1; strb r3, [ip], #1; bne loop; bx lr (8 exact
+// words, position independent; The Sims 3 moves ~14 KB heap blocks with it, ~3.9% of its ARM9 guest instructions). At the
+// loop head: up to 256 bytes forward, byte by byte (an overlap copies what the loop copies), then the registers / flags
+// the loop leaves there (r1, ip advanced, r2 counted down, r3 the last byte, NZCV of the subs) and back at the loop head,
+// or past the bne when r2 reached 0: IRQs and events are taken between steps, as with hook 6 (a call at the BL instead,
+// HLELeaf, copied 14 KB in one go and moved every event behind it: The Sims 3 then ran +7% more guest code).
+constexpr u32 kCopyInstr = 0xE4D13001;      // ldrb r3, [r1], #1 (the loop head)
+constexpr u32 kCopyCode[8] = {0xE1A0C000, 0xE3520000, 0x012FFF1E, 0xE4D13001, 0xE2522001, 0xE4CC3001, 0x1AFFFFFB, 0xE12FFF1E};
+constexpr u32 kCopyHead = 12, kCopyStep = 256;
+constexpr s32 kCopyCycByte = 11;            // (exact for every checked call: 8 + 11 per byte from the entry)
+bool CopyCodeAt(melonDS::ARMv5* c, u32 head)
+{
+    for (u32 i = 0; i < 8; i++)
+    {
+        const u8* p = CodePtr(c, head - kCopyHead + 4 * i);
+        if (!p || R32(p) != kCopyCode[i]) return false;
+    }
+    return true;
+}
+__attribute__((noinline)) bool RunCopy(melonDS::ARMv5* c, State& s, bool jit)
+{
+    const u32 head = c->R[15] - 8;
+    if (!jit && !CopyCodeAt(c, head)) return false;
+    s.calls[26]++;
+    const u32 src = c->R[1], dst = c->R[12], left = c->R[2];
+    const u32 n = left < kCopyStep ? left : kCopyStep;
+    Mem m(c, false);
+    u8 *d = nullptr, *q = nullptr;
+    if (n && !CheckPending)
+    {
+        const u32 dl = ((dst & 3) + n + 3) & ~3u, sl = ((src & 3) + n + 3) & ~3u;
+        Obj od = m.O(dst & ~3u, dl), os = m.O(src & ~3u, sl);
+        if (od && os) { d = od.p + (dst & 3); q = os.p + (src & 3); }
+        if (d && od.dtcm) d = nullptr;      // (main RAM only: the JIT check below)
+    }
+    if (!d)
+    {
+        s.fallback[26]++;
+        GuestFallback(c);
+        return true;
+    }
+    for (u32 i = 0; i < n; i++) d[i] = q[i];
+    for (u32 a = dst & ~15u; a < dst + n; a += 16)
+        c->NDS.JIT.CheckAndInvalidate<0, melonDS::ARMJIT_Memory::memregion_MainRAM>(a);
+    s.native[26]++;
+    c->R[1] = src + n; c->R[12] = dst + n; c->R[2] = left - n; c->R[3] = d[n - 1];
+    // NZCV of the last subs r2, r2, #1 (from a value >= 1: no borrow, no overflow below 0x80000001)
+    const u32 r = left - n;
+    c->CPSR = (c->CPSR & 0x0FFFFFFF) | (r & 0x80000000) | ((r == 0) << 30) | (1u << 29) | ((left - n + 1 == 0x80000000u) << 28);
+    s32 cpb = kCopyCycByte;
+#ifdef LITEV_HLE_DIAG
+    static const s32 ov = getenv("LITEV_A9HLE_COPYCYC") ? atoi(getenv("LITEV_A9HLE_COPYCYC")) : -1;
+    if (ov >= 0) cpb = ov;
+#endif
+    c->Cycles += cpb * (s32)n;
+    c->JumpTo(r ? head : head + 16);
     return true;
 }
 
@@ -4644,6 +4704,13 @@ int Deps(melonDS::NDS& nds, u32 addr, u32 instr, const Range*& r)
         r = &sd;
         return 1;
     }
+    if (instr == kCopyInstr)
+    {
+        static thread_local Range cp;
+        cp = {addr - kCopyHead, addr - kCopyHead + 8 * 4};
+        r = &cp;
+        return 1;
+    }
     if (instr == kLzInstr)
     {
         static thread_local Range lz;
@@ -4834,6 +4901,11 @@ int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, bool thumb)
         // position independent: the code bytes around addr
         State& s = St(&nds.ARM9);
         return s.on && (s.mask & 64) && LzCodeAt(&nds.ARM9, addr) ? 1 : 0;
+    }
+    if (instr == kCopyInstr)
+    {
+        State& s = St(&nds.ARM9);
+        return s.on && (s.mask & 33554432) && CopyCodeAt(&nds.ARM9, addr) ? 1 : 0;
     }
     State& s = Get(&nds.ARM9, addr, instr);
     if (s.status != 1) return 0;
@@ -5839,6 +5911,11 @@ bool Run(melonDS::ARM* cpu, bool jit)
     {
         State& s = St(c);
         return s.on && (s.mask & 64) && RunLz(c, s, jit);
+    }
+    if (in == kCopyInstr)
+    {
+        State& s = St(c);
+        return s.on && (s.mask & 33554432) && RunCopy(c, s, jit);
     }
 #ifdef LITEV_GX_BULK
     if (in == kSbcInstr)
