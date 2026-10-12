@@ -365,7 +365,13 @@ private:
     // 2 * 16 * 256 * 4 = 32KB -> fits ONE A55 core's 32KB L1D. There is ONE tile PER WORKER thread
     // (each pinned to its own core), so each core rasters into its own L1D-resident 32KB tile --
     // the DraStic per-band-worker private-tile model. 3 workers => 96KB total across 3 cores' L1D.
+#ifdef LITEV_TILE_H8
+    // 8-row tiles: colour + depth/id + translucent-id = 16.5 KB, inside the A55's 32 KB L1D with
+    // room for texels (16 rows = 33 KB missed the L1 on every tile pass)
+    static constexpr int TileH = 8;
+#else
     static constexpr int TileH = 16;
+#endif
     static constexpr int NumBlocks = OutHeight / TileH;   // 12
 #ifdef LITEV_TOPO_PIN
     // Band-worker count from the topology (the fastest non-emu cluster; RG DS 3, Thor 4),
