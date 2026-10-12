@@ -200,6 +200,8 @@ bool GLRenderer2D::InitShaders()
 
     }
     CompositorScaleULoc = glGetUniformLocation(CompositorShader, "uScaleFactor");
+    ObjMosULoc[0] = glGetUniformLocation(CompositorShader, "uObjMosaicAny");
+    ObjMosULoc[1] = CompositorRun ? glGetUniformLocation(CompositorRun, "uObjMosaicAny") : -1;
     if (CompositorRun)
         glUniformBlockBinding(CompositorRun, glGetUniformBlockIndex(CompositorRun, "ubLineConfig"), 25);
 
@@ -241,6 +243,7 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     LayerPreCurBGULoc = other.LayerPreCurBGULoc;
     SpriteRenderTransULoc = other.SpriteRenderTransULoc;
     CompositorScaleULoc = other.CompositorScaleULoc;
+    ObjMosULoc[0] = other.ObjMosULoc[0]; ObjMosULoc[1] = other.ObjMosULoc[1];
 
     MosaicTex = other.MosaicTex;
 
@@ -443,6 +446,7 @@ GLRenderer2D::~GLRenderer2D()
 
     glDeleteTextures(1, &OutputTex);
     glDeleteFramebuffers(1, &OutputFB);
+    if (LowFB) { glDeleteTextures(1, &LowTex); glDeleteFramebuffers(1, &LowFB); LowFB = LowTex = 0; }
 
     glDeleteBuffers(1, &ScanlineConfigUBO);
     glDeleteBuffers(1, &SpriteScanlineConfigUBO);
@@ -485,6 +489,9 @@ void GLRenderer2D::Reset()
     memset(OAM, 0, sizeof(OAM));
     NumSprites = 0;
     SpriteUseMosaic = false;
+    SpriteMosaicAttr = true;
+    SpriteAffine = true;
+    AffineUncomposited = true;
 
     SpriteDispCnt = 0;
     SpriteConfigDirty = true;
@@ -831,6 +838,9 @@ void GLRenderer2D::UpdateAndRender(int line)
         // TODO make this only do it over the required subsection?
         NumSprites = 0;
         SpriteUseMosaic = false;
+        SpriteMosaicAttr = false;
+        AffineUncomposited |= SpriteAffine;
+        SpriteAffine = false;
         UpdateOAM(0, 192);
 
         glActiveTexture(GL_TEXTURE0);
@@ -1445,6 +1455,7 @@ void GLRenderer2D::UpdateOAM(int ystart, int yend)
             sprcfg.Flip[0] = 0;
             sprcfg.Flip[1] = 0;
             sprcfg.Rotscale = (attrib[1] >> 9) & 0x1F;
+            SpriteAffine = true;
         }
         else
         {
@@ -1566,6 +1577,7 @@ void GLRenderer2D::UpdateOAM(int ystart, int yend)
 
         if (sprcfg.Mosaic && (GPU2D.OBJMosaicSize[0] > 0))
             SpriteUseMosaic = true;
+        if (sprcfg.Mosaic) SpriteMosaicAttr = true;
     }
 
     glBindBuffer(GL_UNIFORM_BUFFER, SpriteConfigUBO);
@@ -1845,6 +1857,44 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
         return;
     }
 
+    {
+        static const bool skipMos = GLProp("debug.litev.glhimos", 1) != 0;
+        const bool any = !skipMos || SpriteMosaicAttr;
+        if (ObjMosULoc[0] >= 0) { glUseProgram(CompositorShader); glUniform1i(ObjMosULoc[0], any); }
+        if (CompositorRun && ObjMosULoc[1] >= 0) { glUseProgram(CompositorRun); glUniform1i(ObjMosULoc[1], any); }
+    }
+    // debug.litev.glhi1x (default on): a screen with no hi-res content (no 3D layer, no
+    // rotscale/bitmap/capture BG, no rotscaled sprite) composites to the same value at every
+    // sub-pixel of a native pixel: text BGs are sampled nearest at the pixel's native texel,
+    // non-rotscaled sprites are drawn as whole native pixels into the OBJ layer, and windows,
+    // mosaic and blending use native coordinates. So composite it at 1x and blit it up
+    // (nearest): same pixels, 1/scale^2 of the shading.
+    // (=2: diagnostic, every screen at 1x: wrong pixels where it has hi-res content)
+    static const int comp1x = GLProp("debug.litev.glhi1x", 1);
+    bool low = comp1x && ScaleFactor > 1 && !SpriteAffine && !AffineUncomposited && !CompositorRef && !(OpenGL::GLSkip() & 260);
+    for (int l = 0; l < 4 && low; l++)
+        if ((LayerEnable & (1 << l)) && LayerConfig.uBGConfig[l].Type >= 2) low = false;
+    if (comp1x == 2 && ScaleFactor > 1 && !CompositorRef) low = true;
+    AffineUncomposited = false;
+    CompSF = low ? 1 : ScaleFactor;
+    if (low)
+    {
+        if (!LowFB)
+        {
+            glGenTextures(1, &LowTex);
+            glBindTexture(GL_TEXTURE_2D, LowTex);
+            glDefaultTexParams(GL_TEXTURE_2D);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glGenFramebuffers(1, &LowFB);
+            glBindFramebuffer(GL_FRAMEBUFFER, LowFB);
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, LowTex, 0);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        }
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, LowFB);
+        glViewport(0, 0, 256, 192);
+        glScissor(0, ystart, 256, yend - ystart);
+    }
+
     glUseProgram(CompositorShader);
     if (OpenGL::GLSkip() & 256)
     {
@@ -1898,15 +1948,68 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
     glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
     glBindVertexArray(Parent.RectVtxArray);
     OpenGL::GLStatAdd(OpenGL::GLStatComp);
-    if (!(OpenGL::GLSkip() & (4 | 256)) && CompositorRun && DrawRuns(ystart, yend))
+    if (!(OpenGL::GLSkip() & (4 | 256)) && CompositorRun && DrawRuns(ystart, yend)) {}
+    else
+    {
+        if (!(OpenGL::GLSkip() & 4)) glDrawArrays(GL_TRIANGLES, 0, 2*3);
+        if (CompositorRef && !(OpenGL::GLSkip() & 260)) CheckCompositor(ystart, yend);
+    }
+    if (low)
     {
         glDisable(GL_SCISSOR_TEST);
-        return;
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, LowFB);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+        glBlitFramebuffer(0, ystart, 256, yend, 0, ystart * ScaleFactor, ScreenW, yend * ScaleFactor,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glViewport(0, 0, ScreenW, ScreenH);
+        static const bool check = GLProp("debug.litev.glhi1xcheck", 0) != 0;
+        if (check) Check1x(ystart, yend);
     }
-    if (!(OpenGL::GLSkip() & 4)) glDrawArrays(GL_TRIANGLES, 0, 2*3);
-    if (CompositorRef && !(OpenGL::GLSkip() & 260)) CheckCompositor(ystart, yend);
 
     glDisable(GL_SCISSOR_TEST);
+}
+
+// debug.litev.glhi1xcheck=1: every 4th 1x composite, also composite the region at full scale
+// (CompositorShader) and count the pixels that differ from the blitted 1x result (LITEV_HI1XCHECK)
+void GLRenderer2D::Check1x(int ystart, int yend)
+{
+    static int calls = 0, checks = 0;
+    static long px = 0, bad = 0;
+    if (++calls % 4) return;
+    static GLuint fb = 0, tex = 0;
+    static int w = 0;
+    if (!fb || w != ScreenW)
+    {
+        if (!fb) { glGenFramebuffers(1, &fb); glGenTextures(1, &tex); }
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+        w = ScreenW;
+    }
+    const int y0 = ystart * ScaleFactor, h = (yend - ystart) * ScaleFactor;
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, y0, ScreenW, h);
+    glUseProgram(CompositorShader);
+    glDrawArrays(GL_TRIANGLES, 0, 2*3);
+    glDisable(GL_SCISSOR_TEST);
+    std::vector<u8> a((size_t)ScreenW * h * 4), r((size_t)ScreenW * h * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB);
+    glReadPixels(0, y0, ScreenW, h, GL_RGBA, GL_UNSIGNED_BYTE, a.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+    glReadPixels(0, y0, ScreenW, h, GL_RGBA, GL_UNSIGNED_BYTE, r.data());
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+    for (size_t i = 0; i < a.size(); i += 4)
+        if (memcmp(&a[i], &r[i], 3)) bad++;
+    px += a.size() / 4;
+    if (++checks % 20 == 0)
+    {
+        Platform::Log(Platform::Info, "LITEV_HI1XCHECK %d checks: %ld px, %ld differ\n", checks, px, bad);
+        px = bad = 0;
+    }
 }
 
 // Split [ystart, yend) into runs of lines whose scanline config is the first line's plus
@@ -1960,7 +2063,7 @@ bool GLRenderer2D::DrawRuns(int ystart, int yend)
     for (int i = 0; i < n; i++)
     {
         glBindBufferRange(GL_UNIFORM_BUFFER, 25, LineRunUBO, i * stride, sizeof(RunBlock));
-        glScissor(0, ry[i] * ScaleFactor, ScreenW, (ry[i + 1] - ry[i]) * ScaleFactor);
+        glScissor(0, ry[i] * CompSF, 256 * CompSF, (ry[i + 1] - ry[i]) * CompSF);
         glDrawArrays(GL_TRIANGLES, 0, 2*3);
     }
     if (CompositorRef) { glScissor(0, ystart * ScaleFactor, ScreenW, (yend - ystart) * ScaleFactor); CheckCompositor(ystart, yend); }

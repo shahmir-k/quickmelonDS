@@ -21,6 +21,7 @@
 #include "GPU_OpenGL.h"
 #include "GLThread3D.h"
 #include "GLWorker.h"
+#include "LitevSoftProf.h"
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
@@ -660,7 +661,7 @@ void GLRenderer::RenderScreen(int ystart, int yend)
 {
     int backbuf = BackBuffer;
     // the present thread may still be copying this buffer out (its previous frame)
-    if (Present && PresDone.load(std::memory_order_acquire) < BufPresSeq[backbuf]) Present->Wait();
+    if (Present && PresDone.load(std::memory_order_acquire) < BufPresSeq[backbuf]) LSP_WAIT("hi-present", GPU.NDS.NumFrames, Present->Wait());
     if (BufFence[backbuf])
     {
         glWaitSync(BufFence[backbuf], 0, GL_TIMEOUT_IGNORED);
@@ -763,6 +764,9 @@ void GLRenderer::VBlank()
     Rend2D_B->VBlank();
 
     RenderScreen(LastLine, 192);
+#ifdef LITEV_SOFTPROF
+    if (LitevSP::StallLogOn()) LitevSP::StallFrame(GPU.NDS.NumFrames);
+#endif
     if (++StatFrames == 120)
     {
         StatFrames = 0;
