@@ -68,6 +68,10 @@ layout(std140) uniform ubCompositorConfig
 };
 
 uniform int uScaleFactor;
+// false: no sprite in the OBJ layer has the mosaic attribute (debug.litev.glhimos), so the
+// OBJ mosaic loop's last iteration always wins: its result is the OBJ pixel at the line's
+// native point, fetched directly (same pixels, 2 fetches instead of 48)
+uniform bool uObjMosaicAny;
 
 smooth in vec4 fTexcoord;
 
@@ -308,13 +312,21 @@ vec4 CompositeLayers()
 #if COMPDIAG == 3
     if (false)
 #else
-    if (mosaicsize.z > 0)
+    if (mosaicsize.z > 0 && uObjMosaicAny)
 #endif
     {
         vec4 oc;
         CalcSpriteMosaic(ivec2(fTexcoord.xy), objflags, oc);
         lc4 = oc;
     }
+#if COMPDIAG != 3
+    else if (mosaicsize.z > 0)
+    {
+        ivec2 p1 = ivec2(fTexcoord.xy) * uScaleFactor;
+        lc4 = texelFetch(OBJLayerTex, ivec3(p1, 0), 0);
+        objflags = ivec4(texelFetch(OBJLayerTex, ivec3(p1, 1), 0) * 255.0);
+    }
+#endif
 #if COMPDIAG != 3
     else
 #else

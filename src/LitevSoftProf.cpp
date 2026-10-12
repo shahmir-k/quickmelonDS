@@ -101,8 +101,13 @@ bool StallLogOn()
 
 GLJobStat GLJ;
 
+// per-site emu-thread wait totals, logged every 120 frames by StallFrame (LITEV_WAITSUM)
+static struct { const char* Site; double Ms; int N; } WaitSum[16];
+
 void StallWait(const char* site, double ms, unsigned frame)
 {
+    for (auto& w : WaitSum)
+        if (w.Site == site || !w.Site) { w.Site = site; w.Ms += ms; w.N++; break; }
     if (ms >= 3.0) Platform::Log(Platform::LogLevel::Info, "LITEV_STALL wait %s %.1f ms frame %u t %.3f\n", site, ms, frame, NowMs());
 }
 
@@ -122,6 +127,16 @@ void StallFrame(unsigned frame)
     if (last > 0 && t - last > 20.0)
         Platform::Log(Platform::LogLevel::Info, "LITEV_STALL vbl frame %u gap %.1f t %.3f\n", frame, t - last, t);
     last = t;
+    static int n = 0;
+    if (++n == 120)
+    {
+        char buf[512]; int len = 0;
+        for (auto& w : WaitSum)
+            if (w.Site && len < 440) { len += snprintf(buf + len, sizeof(buf) - len, " %s=%.2f/%d", w.Site, w.Ms / n, w.N); w.Ms = 0; w.N = 0; }
+        buf[len] = 0;
+        Platform::Log(Platform::LogLevel::Info, "LITEV_WAITSUM 120f (ms/frame/count):%s\n", buf);
+        n = 0;
+    }
 }
 
 void Tick()

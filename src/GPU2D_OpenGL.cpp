@@ -200,6 +200,8 @@ bool GLRenderer2D::InitShaders()
 
     }
     CompositorScaleULoc = glGetUniformLocation(CompositorShader, "uScaleFactor");
+    ObjMosULoc[0] = glGetUniformLocation(CompositorShader, "uObjMosaicAny");
+    ObjMosULoc[1] = CompositorRun ? glGetUniformLocation(CompositorRun, "uObjMosaicAny") : -1;
     if (CompositorRun)
         glUniformBlockBinding(CompositorRun, glGetUniformBlockIndex(CompositorRun, "ubLineConfig"), 25);
 
@@ -241,6 +243,7 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     LayerPreCurBGULoc = other.LayerPreCurBGULoc;
     SpriteRenderTransULoc = other.SpriteRenderTransULoc;
     CompositorScaleULoc = other.CompositorScaleULoc;
+    ObjMosULoc[0] = other.ObjMosULoc[0]; ObjMosULoc[1] = other.ObjMosULoc[1];
 
     MosaicTex = other.MosaicTex;
 
@@ -485,6 +488,7 @@ void GLRenderer2D::Reset()
     memset(OAM, 0, sizeof(OAM));
     NumSprites = 0;
     SpriteUseMosaic = false;
+    SpriteMosaicAttr = true;
 
     SpriteDispCnt = 0;
     SpriteConfigDirty = true;
@@ -831,6 +835,7 @@ void GLRenderer2D::UpdateAndRender(int line)
         // TODO make this only do it over the required subsection?
         NumSprites = 0;
         SpriteUseMosaic = false;
+        SpriteMosaicAttr = false;
         UpdateOAM(0, 192);
 
         glActiveTexture(GL_TEXTURE0);
@@ -1566,6 +1571,7 @@ void GLRenderer2D::UpdateOAM(int ystart, int yend)
 
         if (sprcfg.Mosaic && (GPU2D.OBJMosaicSize[0] > 0))
             SpriteUseMosaic = true;
+        if (sprcfg.Mosaic) SpriteMosaicAttr = true;
     }
 
     glBindBuffer(GL_UNIFORM_BUFFER, SpriteConfigUBO);
@@ -1845,6 +1851,12 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
         return;
     }
 
+    {
+        static const bool skipMos = GLProp("debug.litev.glhimos", 1) != 0;
+        const bool any = !skipMos || SpriteMosaicAttr;
+        if (ObjMosULoc[0] >= 0) { glUseProgram(CompositorShader); glUniform1i(ObjMosULoc[0], any); }
+        if (CompositorRun && ObjMosULoc[1] >= 0) { glUseProgram(CompositorRun); glUniform1i(ObjMosULoc[1], any); }
+    }
     glUseProgram(CompositorShader);
     if (OpenGL::GLSkip() & 256)
     {

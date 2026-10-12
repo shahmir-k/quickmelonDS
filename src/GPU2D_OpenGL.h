@@ -158,6 +158,8 @@ private:
     } SpriteConfig;
     int NumSprites;
     bool SpriteUseMosaic;
+    bool SpriteMosaicAttr = true;   // some sprite has the mosaic attribute (debug.litev.glhimos)
+    GLint ObjMosULoc[2] = {-1, -1};
 
     struct sScanlineConfig
     {
