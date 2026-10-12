@@ -4366,6 +4366,18 @@ static const bool GXFastSinkOn = [] {
 #endif
 }();
 
+#ifdef LITEV_REMOTE_GX_SINKSKIP
+// off: env LITEV_GXSINKSKIP=0 (headless A/B) or, on Android, debug.litev.gxsinkskip=0
+static const bool GXSinkSkipOn = [] {
+    if (const char* e = getenv("LITEV_GXSINKSKIP")) return atoi(e) != 0;
+#if defined(__ANDROID__)
+    return litevGxPropDefault("debug.litev.gxsinkskip", 1) != 0;
+#else
+    return true;
+#endif
+}();
+#endif
+
 // What a sink copy keeps of the geometry commands (untimed engine): only what the game can observe.
 // With no matrix, vertex, lighting or polygon results computed, the observable state of the engine is
 // the command timing (CycleCount: the busy bit after a batch), the matrix stack pointers and their
@@ -4433,6 +4445,18 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
     u32 i = 0;
     for (; i < n; i++)
     {
+#ifdef LITEV_REMOTE_GX_SINKSKIP
+        // LITEV_REMOTE_GX_SINKSKIP: a command's parameter words before its last one only count
+        // (pc++, an entry: ran); take them in one step. Exact: the same state as word by word.
+        if (pc + 1 < tp && numCmds && GXSinkSkipOn)
+        {
+            const u32 t = std::min(tp - 1 - pc, n - i);
+            ran = true;
+            pc += t;
+            i += t - 1;
+            continue;
+        }
+#endif
         const u32 val = words[i];
         if (numCmds == 0)
         {
