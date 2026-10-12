@@ -320,6 +320,27 @@ option(LITEV_SOFT2D_OBJROW "liteV: NEON sprite row plot for the software 2D" OFF
 if (LITEV_SOFT2D_OBJROW)
     add_compile_definitions(LITEV_SOFT2D_OBJROW=1)
 endif()
+# LITEV_SOFT2D_PREFETCH: the threaded 2D's band loop prefetches the next line's register snapshots
+# (written by the emu at VBlank; their first touch was the 2D thread's hottest stall on the in-order
+# A55). Render-only, exact (hints only).
+option(LITEV_SOFT2D_PREFETCH "liteV: software prefetch in the threaded 2D band loop" OFF)
+if (LITEV_SOFT2D_PREFETCH)
+    add_compile_definitions(LITEV_SOFT2D_PREFETCH=1)
+endif()
+# LITEV_SOFT2D_AFFNEON: affine and extended (16-bit map) tiled BGs of the plane 2D: each map cell's
+# span of pixels is a TBL lookup into its 64-byte tile, 16 pixels at a time (NEON). Render-only, exact.
+# Needs PLANES (AArch64).
+option(LITEV_SOFT2D_AFFNEON "liteV: NEON tile gather for affine/extended BG cells" OFF)
+if (LITEV_SOFT2D_AFFNEON)
+    add_compile_definitions(LITEV_SOFT2D_AFFNEON=1)
+endif()
+# LITEV_SOFT2D_VRAMDISP: an engine A VRAM-display line (display mode 2, e.g. capture-fed screens) goes
+# to the framebuffer in one NEON pass like a regular line (BGR555 -> records, then OutputLine) instead
+# of the scalar convert + brightness + expand. Render-only, exact. Needs OUTNEON (AArch64).
+option(LITEV_SOFT2D_VRAMDISP "liteV: one-pass NEON VRAM-display output line" OFF)
+if (LITEV_SOFT2D_VRAMDISP)
+    add_compile_definitions(LITEV_SOFT2D_VRAMDISP=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)
