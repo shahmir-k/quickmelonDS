@@ -1221,9 +1221,13 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                     if (inst == net->LocalPlayer())
                     {
                         NetplayFrameInput local;
-                        local.Keys = bi.inputScript.Loaded() ? bi.inputScript.KeyMaskForFrame(f) : 0xFFF;
+                        // LITEV_NP_SCRIPT_APPLIED=1: the script is by APPLIED frame, as the app's
+                        // debug.litev.npscript (a live device + Mac peers then press on the same frames)
+                        static const bool byApplied = getenv("LITEV_NP_SCRIPT_APPLIED") != nullptr;
+                        const int sf = byApplied ? f + net->CurrentDelay() : f;
+                        local.Keys = bi.inputScript.Loaded() ? bi.inputScript.KeyMaskForFrame(sf) : 0xFFF;
                         int tx, ty;
-                        if (bi.inputScript.HasTouch() && bi.inputScript.TouchForFrame(f, tx, ty)) { local.TouchX = tx; local.TouchY = ty; }
+                        if (bi.inputScript.HasTouch() && bi.inputScript.TouchForFrame(sf, tx, ty)) { local.TouchX = tx; local.TouchY = ty; }
 #ifdef LITEV_NP_SPEED
                         auto plan = ffPlan.upper_bound(f);
                         if (plan != ffPlan.begin()) NetplaySpeed::Set(local, NetplaySpeed::Encode(std::prev(plan)->second));
