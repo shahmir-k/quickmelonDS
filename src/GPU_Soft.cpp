@@ -571,6 +571,26 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
                  : Rend3D->GetLine(line);
 #endif
         LSP_ADD(S2DBlock[bi], LSP_NOW() - _lspG0);
+#if defined(LITEV_SOFT2D_PREFETCH) && defined(LITEV_SOFT2D_DEPTH2)
+        // hints only (no effect on the pixels): the 3D line (written by the tile workers) is first
+        // read by the select, after both sprite passes and the BG planes; the next line's register
+        // snapshots (written by the emu at VBlank) and framebuffer rows (stored by OutputLine)
+        if (l3d) for (u32 o = 0; o < 256; o += 16) __builtin_prefetch(l3d + o, 0, 3);
+        if (line + 1 < y1)
+        {
+            const u32 n = line + 1;
+            __builtin_prefetch(&fsR[n], 0, 3);
+            __builtin_prefetch(&mainA->LineSnapR[_ss][n], 0, 3); __builtin_prefetch((const u8*)&mainA->LineSnapR[_ss][n] + 63, 0, 3);
+            __builtin_prefetch(&mainB->LineSnapR[_ss][n], 0, 3); __builtin_prefetch((const u8*)&mainB->LineSnapR[_ss][n] + 63, 0, 3);
+            __builtin_prefetch(&mainA->SprSnapR[_ss][n], 0, 3); __builtin_prefetch(&mainB->SprSnapR[_ss][n], 0, 3);
+            if (!Hybrid)
+                for (u32 o = 0; o < 256; o += 16)
+                {
+                    __builtin_prefetch(&Framebuffer[AsyncTargetBuf][0][256 * n + o], 1, 3);
+                    __builtin_prefetch(&Framebuffer[AsyncTargetBuf][1][256 * n + o], 1, 3);
+                }
+        }
+#endif
 #ifdef LITEV_SOFT2D_DEPTH2
         if (pipeTraceOn)
             pipe3dHash = litevPipeFnv1a(l3d, 256 * sizeof(u32), pipe3dHash);

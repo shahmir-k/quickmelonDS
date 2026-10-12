@@ -284,6 +284,21 @@ option(LITEV_SOFT2D_OBJROW "liteV: NEON sprite row plot for the software 2D" OFF
 if (LITEV_SOFT2D_OBJROW)
     add_compile_definitions(LITEV_SOFT2D_OBJROW=1)
 endif()
+# LITEV_SOFT2D_PREFETCH: the threaded 2D's band loop prefetches what the next steps read from memory
+# other cores wrote (in-order A55: every miss stalls the pipe): the next line's register snapshots,
+# this line's 3D line right after it is handed over (read by the select after the sprite and BG
+# passes), and the next line's framebuffer rows for store. Render-only, exact (hints only).
+option(LITEV_SOFT2D_PREFETCH "liteV: software prefetch in the threaded 2D band loop" OFF)
+if (LITEV_SOFT2D_PREFETCH)
+    add_compile_definitions(LITEV_SOFT2D_PREFETCH=1)
+endif()
+# LITEV_SOFT2D_AFFNEON: affine and extended (16-bit map) tiled BGs of the plane 2D: each map cell's
+# span of pixels is a TBL lookup into its 64-byte tile, 16 pixels at a time (NEON). Render-only, exact.
+# Needs PLANES (AArch64).
+option(LITEV_SOFT2D_AFFNEON "liteV: NEON tile gather for affine/extended BG cells" OFF)
+if (LITEV_SOFT2D_AFFNEON)
+    add_compile_definitions(LITEV_SOFT2D_AFFNEON=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

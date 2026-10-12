@@ -601,6 +601,48 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
     return ((ad & (ad - 1)) ? dist / ad : dist >> __builtin_ctz(ad)) + 1;
 }
 
+#ifdef LITEV_SOFT2D_AFFNEON
+// LITEV_SOFT2D_AFFNEON: one map cell's span of an affine / extended tiled BG, 16 pixels at a time.
+// Inside a cell every pixel reads the same 64-byte tile, so the texels are a table lookup (TBL) at
+// offset (((y >> 8) & 7) << 3 | ((x >> 8) & 7)) ^ flip; only the low 11 bits of x/y matter there,
+// so the coordinates step in u16 lanes (exact mod 2^16). Writes whole 16-lane chunks: lanes past n
+// land in the next cells' range (rewritten by them) or in the plane's tail padding. Returns the OR of
+// the n valid values.
+[[gnu::always_inline]] static inline u32 S2DCellGather(const u8* tile, s32 x, s32 y, s32 rotA, s32 rotC, u32 n, u32 flip, u16 palbase, u16* v)
+{
+    const uint8x16x4_t t = vld1q_u8_x4(tile);
+    const uint16x8_t lane0 = {0, 1, 2, 3, 4, 5, 6, 7};
+    const uint16x8_t lane1 = vaddq_u16(lane0, vdupq_n_u16(8));
+    const uint16x8_t ax = vdupq_n_u16((u16)rotA), ay = vdupq_n_u16((u16)rotC);
+    const uint16x8_t sx0 = vmulq_u16(lane0, ax), sx1 = vmulq_u16(lane1, ax);
+    const uint16x8_t sy0 = vmulq_u16(lane0, ay), sy1 = vmulq_u16(lane1, ay);
+    const uint16x8_t v7 = vdupq_n_u16(7);
+    const uint8x16_t vflip = vdupq_n_u8((u8)flip), vlane = vcombine_u8(vmovn_u16(lane0), vmovn_u16(lane1));
+    const uint16x8_t vpal = vdupq_n_u16(palbase);
+    uint16x8_t acc = vdupq_n_u16(0);
+    u16 bx = (u16)x, by = (u16)y;
+    const u16 stx = (u16)(rotA * 16), sty = (u16)(rotC * 16);
+    for (u32 j = 0; j < n; j += 16, bx += stx, by += sty, v += 16)
+    {
+        const uint16x8_t x0 = vaddq_u16(vdupq_n_u16(bx), sx0), x1 = vaddq_u16(vdupq_n_u16(bx), sx1);
+        const uint16x8_t y0 = vaddq_u16(vdupq_n_u16(by), sy0), y1 = vaddq_u16(vdupq_n_u16(by), sy1);
+        const uint16x8_t o0 = vorrq_u16(vshlq_n_u16(vandq_u16(vshrq_n_u16(y0, 8), v7), 3), vandq_u16(vshrq_n_u16(x0, 8), v7));
+        const uint16x8_t o1 = vorrq_u16(vshlq_n_u16(vandq_u16(vshrq_n_u16(y1, 8), v7), 3), vandq_u16(vshrq_n_u16(x1, 8), v7));
+        const uint8x16_t off = veorq_u8(vcombine_u8(vmovn_u16(o0), vmovn_u16(o1)), vflip);
+        uint8x16_t c = vqtbl4q_u8(t, off);
+        const uint16x8_t c0 = vmovl_u8(vget_low_u8(c)), c1 = vmovl_u8(vget_high_u8(c));
+        const uint16x8_t r0 = vandq_u16(vtstq_u16(c0, c0), vorrq_u16(c0, vpal));
+        const uint16x8_t r1 = vandq_u16(vtstq_u16(c1, c1), vorrq_u16(c1, vpal));
+        vst1q_u16(v, r0); vst1q_u16(v + 8, r1);
+        // only the valid lanes count towards "any"
+        c = vandq_u8(c, vcltq_u8(vlane, vdupq_n_u8((u8)std::min<u32>(n - j, 16))));
+        acc = vorrq_u16(acc, vmovl_u8(vget_low_u8(c)));
+        acc = vorrq_u16(acc, vmovl_u8(vget_high_u8(c)));
+    }
+    return vmaxvq_u16(acc) ? 0x8000u : 0u;
+}
+#endif
+
 // A bitmap BG line on the identity matrix (rotA = 0x100, rotC = 0, no mosaic): the row is fixed and
 // the texel column is (rotX >> 8) + i, wrapping at the bitmap width or transparent outside it. The
 // line's texels (es bytes each, 0 outside) are copied in runs, split where the VRAM mask wraps.
@@ -1130,6 +1172,9 @@ void SoftRenderer2D::PlaneBG_Affine(u32 bgnum)
             {
                 const u32 curtile = bgvram[(tilemapaddr + ((((y & coordmask) >> 11) << yshift) + ((x & coordmask) >> 11))) & bgvrammask];
                 const u32 tilebase = tilesetaddr + (curtile << 6);
+#ifdef LITEV_SOFT2D_AFFNEON
+                any |= S2DCellGather(&bgvram[tilebase & bgvrammask], x, y, rotA, rotC, n, 0, 0x8000, &v[i]);
+#else
                 for (u32 k = i; k < i + n; k++)
                 {
                     const u32 color = bgvram[(tilebase + ((((u32)y >> 8) & 0x7) << 3) + (((u32)x >> 8) & 0x7)) & bgvrammask];
@@ -1139,6 +1184,7 @@ void SoftRenderer2D::PlaneBG_Affine(u32 bgnum)
                     x += rotA;
                     y += rotC;
                 }
+#endif
             }
             rotX += (s32)n * rotA;
             rotY += (s32)n * rotC;
@@ -1312,6 +1358,9 @@ void SoftRenderer2D::PlaneBG_Extended(u32 bgnum)
                     palmask |= 1u << (curtile >> 12);
                     // (tileyoff << 3) + tilexoff, each flipped as 7 - off = off ^ 7
                     const u32 flip = ((curtile & (1<<10)) ? 0x07 : 0) | ((curtile & (1<<11)) ? 0x38 : 0);
+#ifdef LITEV_SOFT2D_AFFNEON
+                    any |= S2DCellGather(&bgvram[tilebase & bgvrammask], x, y, rotA, rotC, n, flip, (u16)palbase, &v[i]);
+#else
                     for (u32 k = i; k < i + n; k++)
                     {
                         const u32 off = (((((u32)y >> 8) & 0x7) << 3) | (((u32)x >> 8) & 0x7)) ^ flip;
@@ -1322,6 +1371,7 @@ void SoftRenderer2D::PlaneBG_Extended(u32 bgnum)
                         x += rotA;
                         y += rotC;
                     }
+#endif
                 }
                 rotX += (s32)n * rotA;
                 rotY += (s32)n * rotC;
