@@ -17,6 +17,7 @@
 */
 
 #include "ARMJIT_Compiler.h"
+#include <algorithm>
 
 #include "../ARMJIT_Internal.h"
 #include "../ARMInterpreter.h"
@@ -1663,6 +1664,26 @@ void* Compiler::Gen_Dispatcher(u32 num)
     ADD(X3, X3, 1);
     STR(INDEX_UNSIGNED, X3, X4, 0);
   #endif
+#ifdef LITEV_JIT_ICACHE_MRU
+    // Move the hit to slot 0 (most recent first), unless the site is promoted (its guard's
+    // target stays the slot-0 key, as before). Without this a site that went once elsewhere
+    // ([X, A] then A, A, A, ...) hit slot 1 for good: in the 8-player Mario Kart DS race ~45%
+    // of ARM9 dispatches, never promoted. The streak restarts at this hit.
+    {
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, promoted));
+        FixupBranch mruProm = CBNZ(W3);
+        LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key0));
+        LDR(INDEX_UNSIGNED, X4, X2, offsetof(ICacheEntry, ptr0));
+        STR(INDEX_UNSIGNED, W0, X2, offsetof(ICacheEntry, key0));
+        STR(INDEX_UNSIGNED, X5, X2, offsetof(ICacheEntry, ptr0));
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));
+        STR(INDEX_UNSIGNED, X4, X2, offsetof(ICacheEntry, ptr1));
+        MOVI2R(W3, 1);
+        STR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, hitCount));
+        BR(X5);
+        SetJumpTarget(mruProm);
+    }
+#endif
 #ifdef LITEV_JIT_DIRECTPATCH
     // A slot1 hit breaks the consecutive-slot0 streak (site is bimodal, not monomorphic).
     STR(INDEX_UNSIGNED, WZR, X2, offsetof(ICacheEntry, hitCount));
@@ -1679,16 +1700,40 @@ void* Compiler::Gen_Dispatcher(u32 num)
         // The guest registers pinned in callee-saved host registers stay live across the call.
         SetJumpTarget(exitBudget);
         EmitBudgetSpill(X1, X2, X3);
+  #ifdef LITEV_JIT_SLICE_SITE
+        // keep the exit's site (W9) and RAS slot (W10) over the slice when the guest PC is the
+        // same after it (no IRQ taken): the next block then comes from the per-site cache, not
+        // the full lookup (~240 times a frame per 8-player MKDS console)
+        LDR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, R[15]));
+        STP(INDEX_PRE, X9, X10, SP, -32);
+        STR(INDEX_UNSIGNED, X1, SP, 16);
+  #endif
         MOVP2R(X0, (void*)&NDS);
         ARM64XEmitter::QuickCallFunction(X16, (void*)&LiteV_NativeSlice9);
+  #ifdef LITEV_JIT_SLICE_SITE
+        LDR(INDEX_UNSIGNED, X1, SP, 16);
+        LDP(INDEX_POST, X9, X10, SP, 32);
+  #endif
         FixupBranch toCpp = CBZ(W0);
         MOV(RBudget, W0);
+  #ifdef LITEV_JIT_SLICE_SITE
+        LDR(INDEX_UNSIGNED, W2, RCPU, offsetof(ARM, R[15]));
+        CMP(W2, W1);
+    #ifdef LITEV_JIT_ICACHE
+        CSEL(W9, W9, WZR, CC_EQ);
+    #endif
+    #ifdef LITEV_JIT_RAS
+        if (RasOn)
+            CSEL(W10, W10, WZR, CC_EQ);
+    #endif
+  #else
   #ifdef LITEV_JIT_ICACHE
         MOVI2R(W9, 0);
   #endif
   #ifdef LITEV_JIT_RAS
         if (RasOn)
             MOVI2R(W10, 0);
+  #endif
   #endif
         B(lookupEntry);
         SetJumpTarget(toCpp);
@@ -3438,7 +3483,12 @@ void Compiler::ICacheReset()
     // is rejected. NextSite starts at 1 (0 reserved for "no cache").
     for (int c = 0; c < 2; c++)
     {
+#ifdef LITEV_JIT_ICACHE_SITES
+        // only [0, ICacheNextSite) were handed out since the last reset (the rest are still zero)
+        if (ICacheTable[c]) memset(ICacheTable[c], 0, (size_t)std::min(ICacheNextSite, ICacheSites) * sizeof(ICacheEntry));
+#else
         if (ICacheTable[c]) memset(ICacheTable[c], 0, (size_t)ICacheSites * sizeof(ICacheEntry));
+#endif
 #if defined(LITEV_JIT_DIRECTPATCH) && defined(LITEV_JIT_DP_REVERTLIST)
         DirectPatchListed[c].clear();
 #endif
@@ -3540,8 +3590,12 @@ void Compiler::Reset()
 
     const u32 brk_0 = 0xD4200000;
 
+#ifdef LITEV_JIT_RESET_FILL
+    std::fill_n((u32*)GetRWPtr(), (JitMemMainSize + JitMemSecondarySize) / 4, brk_0);
+#else
     for (int i = 0; i < (JitMemMainSize + JitMemSecondarySize) / 4; i++)
         *(((u32*)GetRWPtr()) + i) = brk_0;
+#endif
 
 #ifdef LITEV_JIT_DISPATCH
     // Generate the per-CPU dispatchers at the very start of the (now-brk-filled)

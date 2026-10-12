@@ -573,7 +573,14 @@ public:
     // dispatcher checks after computing instrAddr and before the region-bounds +
     // FastBlockLookup gather. Filled from a dispatcher region-hit resolve; epoch-
     // guarded (ARM::ICacheEpoch) for O(1) invalidation. See CMake LITEV_JIT_ICACHE.
+#ifdef LITEV_JIT_ICACHE_SITES
+    // 16384 ran out in long sessions (8-player Mario Kart DS: all handed out well before the block
+    // cache resets, ~2.3 per block incl. RAS call sites): later blocks' dynamic exits got no cache
+    // (always the full lookup, never promoted). Entries past the handed-out ones stay untouched.
+    static constexpr u32 ICacheSites = 65536;
+#else
     static constexpr u32 ICacheSites = 16384;   // per-CPU site slots (idx 0 reserved)
+#endif
     struct ICacheEntry {                        // 32 bytes (LSL #5); 64 bytes (LSL #6) under DIRECTPATCH
         u32 key0; u32 key1; u32 epoch; u32 _pad;
         u64 ptr0; u64 ptr1;
