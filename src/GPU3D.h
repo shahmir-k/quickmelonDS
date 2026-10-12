@@ -143,11 +143,11 @@ public:
         // key (state read): decoder + engine state; n == 0: empty slot
         u32 n, numCmds, cur, pc, tp, epc, mm, pattr, cpattr, pmode, vnip, ncpOdd;
         s32 projSP, texSP, posSP;
-        u32 words[64];
         // effect
         u32 k, oNumCmds, oCur, oPc, oTp, oEpc, oMm, oPattr, oCpattr, oPmode, oVnip, vnum, ncp, statOr;
         s32 oProjSP, oTexSP, oPosSP, cyc;
         bool ran, began;
+        u32 words[64];   // last: a lookup reads n of them, next to the fields above
     };
     std::unique_ptr<SinkMemoEntry[]> SinkMemoTab;
     bool SinkBegan = false;   // a BEGIN_VTXS ran (SinkCmd), for the memo

@@ -4542,7 +4542,7 @@ static const bool GXSinkMemoOn = [] {
 #endif
 }();
 
-static constexpr u32 kSinkMemoSize = 1024;   // direct-mapped (MKDS race: ~260 distinct chunks per frame)
+static constexpr u32 kSinkMemoSize = 4096;   // direct-mapped, ~1.5 MB (MKDS race: ~270 chunks per frame, misses 23% at 1024 entries, 6.5% at 4096)
 
 u32 GPU3D::SinkMemo(const u32* words, u32 n, bool& ran) noexcept
 {
