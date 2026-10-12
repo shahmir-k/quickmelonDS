@@ -1648,8 +1648,8 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
         // handler): a hook that steps the rest natively; the block depends on that function's code
         if (cpu->Num == 1 && !thumb && A7Native::MaybeExit(instrs[i].Instr))
         {
-            u32 la[48], lb[48];
-            const int nh = A7Native::IsHook(NDS, instrs[i].Addr, instrs[i].Instr, la, lb, 48);
+            u32 la[96], lb[96];
+            const int nh = A7Native::IsHook(NDS, instrs[i].Addr, instrs[i].Instr, la, lb, 96);
             if (nh > 0)
             {
                 for (int d = 0; d < nh; d++) addDeps(1, la[d], lb[d]);

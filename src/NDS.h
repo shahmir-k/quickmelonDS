@@ -584,6 +584,8 @@ public:
         return true;
     }
     u64 TimerTimestamp7() const { return TimerTimestamp[1]; }
+    // (A7Native: the IO register effects of its stores without the bus dispatch)
+    void A7NTimerStart(u32 id, u16 cnt) { TimerStart(id, cnt); }
 protected:
 #endif
 #if defined(LITEV_TIMER_FAST)
