@@ -138,6 +138,9 @@ static void s3dCpuFrame()
 
 #if defined(LITEV_TILE_TEXSHARED) && defined(LITEV_TILE_COORD)
 #define TILE_TEXSH 1
+#ifdef LITEV_TILE_SPANFAST
+#define TILE_SPANFAST 1
+#endif
 #include <algorithm>
 // flat texture / palette VRAM ranges (addresses wrap like ReadVRAMFlat_*)
 static void texFlatCopy(const melonDS::u8* base, melonDS::u32 mask, melonDS::u32 addr, melonDS::u32 len, melonDS::u8* dst)
@@ -919,6 +922,119 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
     }
 }
 
+#ifdef TILE_SPANFAST
+// The span pixel loop of RenderSpanInTile, specialised: TEX = texturing on (shared-cache texels),
+// MODE 0 modulate / 1 decal / 2 toon / 3 highlight. Every value is computed exactly as the generic
+// loop computes it (same expressions and types; ShadeTexel inlined with the texel passed in), with
+// the per-span / per-polygon constants in locals. Attribute k = base[k] + ((d[k] * f) >> 8),
+// f = the perspective factor, or 256 - it when bit k of rev is set: Interpolator<0>::Interpolate's
+// non-linear case (y0 < y1: y0 + (y1-y0)*f; else y1 + (y0-y1)*(256-f); y0 == y1: d = 0).
+template<bool TEX, int MODE>
+void TileRenderer3D::SpanFill(BandScratch& bs, const PolyShade& ps, Interpolator<0>& ix, s32 rowbase, s32 x, s32 xlim,
+                              s32 zl, s32 zr, bool wbuf, const s32* base, const u32* d, u32 rev)
+{
+    u32* const color = bs.Color;
+    u32* const depth = bs.DepthId;
+    const u16* const toontbl = ps.toontbl;
+    const u32 polyalpha = ps.polyalpha;
+    const u8  alpharef = ps.alpharef;
+    const bool wireframe = ps.wireframe;
+    const u32 idword = ps.idword;
+    const bool translDW = ps.translDepthWrite;
+    const u32* const tex = TEX ? ps.tex32 : nullptr;
+    const s32 tw = ps.texW, th = ps.texH;
+    const u32 tp = ps.texparam;
+    const s32 b0 = base[0], b1 = base[1], b2 = base[2], b3 = base[3], b4 = base[4];
+    const u32 d0 = d[0], d1 = d[1], d2 = d[2], d3 = d[3], d4 = d[4];
+
+    for (; x <= xlim; x++)
+    {
+        s32 z;
+        if (wbuf) { ix.SetXPos(x); ix.SetXFactor(); z = ix.InterpolateZ(zl, zr); }
+        else      { ix.SetXPos(x); z = ix.InterpolateZ(zl, zr); }
+        const u32 idx = (u32)(rowbase + x);
+        if (!((u32)z < (depth[idx] & 0x00FFFFFF))) continue;
+        if (!wbuf) ix.SetXFactor();
+
+        const u32 yf = ix.Factor(), yr = 256u - yf;
+        u32 vr = (u32)((s32)((u32)b0 + ((d0 * ((rev & 1)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+        u32 vg = (u32)((s32)((u32)b1 + ((d1 * ((rev & 2)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+        u32 vb = (u32)((s32)((u32)b2 + ((d2 * ((rev & 4)  ? yr : yf)) >> 8)) >> 3) & 0x3F;
+
+        u8 r, g, b, a;
+        if constexpr (MODE == 3) { vg = vr; vb = vr; }
+        else if constexpr (MODE == 2)
+        {
+            u16 tc = toontbl[vr >> 1];
+            vr = (tc << 1) & 0x3E; if (vr) vr++;
+            vg = (tc >> 4) & 0x3E; if (vg) vg++;
+            vb = (tc >> 9) & 0x3E; if (vb) vb++;
+        }
+        if constexpr (TEX)
+        {
+            const s16 s = (s16)(s32)((u32)b3 + ((d3 * ((rev & 8)  ? yr : yf)) >> 8));
+            const s16 t = (s16)(s32)((u32)b4 + ((d4 * ((rev & 16) ? yr : yf)) >> 8));
+            s32 si = s >> 4, ti = t >> 4;
+            if (tp & (1<<16))
+            {
+                if (tp & (1<<18)) { if (si & tw) si = (tw-1) - (si & (tw-1)); else si = (si & (tw-1)); }
+                else              si &= tw-1;
+            }
+            else { if (si < 0) si = 0; else if (si >= tw) si = tw-1; }
+            if (tp & (1<<17))
+            {
+                if (tp & (1<<19)) { if (ti & th) ti = (th-1) - (ti & (th-1)); else ti = (ti & (th-1)); }
+                else              ti &= th-1;
+            }
+            else { if (ti < 0) ti = 0; else if (ti >= th) ti = th-1; }
+            const u32 texel = tex[(u32)ti * (u32)tw + (u32)si];
+            const u8 tr = texel & 0x3F, tg = (texel >> 8) & 0x3F, tb = (texel >> 16) & 0x3F, talpha = texel >> 24;
+            if constexpr (MODE == 1)
+            {
+                if (talpha == 0)       { r = vr; g = vg; b = vb; }
+                else if (talpha == 31) { r = tr; g = tg; b = tb; }
+                else
+                {
+                    r = ((tr * talpha) + (vr * (31-talpha))) >> 5;
+                    g = ((tg * talpha) + (vg * (31-talpha))) >> 5;
+                    b = ((tb * talpha) + (vb * (31-talpha))) >> 5;
+                }
+                a = polyalpha;
+            }
+            else
+            {
+                r = ((tr+1) * (vr+1) - 1) >> 6;
+                g = ((tg+1) * (vg+1) - 1) >> 6;
+                b = ((tb+1) * (vb+1) - 1) >> 6;
+                a = ((talpha+1) * (polyalpha+1) - 1) >> 5;
+            }
+        }
+        else { r = vr; g = vg; b = vb; a = polyalpha; }
+        if constexpr (MODE == 3)
+        {
+            u16 tc = toontbl[vr >> 1];
+            u8 hr = (tc << 1) & 0x3E; if (hr) hr++;
+            u8 hg = (tc >> 4) & 0x3E; if (hg) hg++;
+            u8 hb = (tc >> 9) & 0x3E; if (hb) hb++;
+            int rr = r + hr; if (rr > 63) rr = 63; r = (u8)rr;
+            int gg = g + hg; if (gg > 63) gg = 63; g = (u8)gg;
+            int bb = b + hb; if (bb > 63) bb = 63; b = (u8)bb;
+        }
+        if (wireframe) a = 31;
+        const u32 col = r | (g << 8) | (b << 16) | ((u32)a << 24);
+
+        if (a <= alpharef) continue;   // alpha test
+        if (a == 31)
+        {
+            color[idx] = col;
+            depth[idx] = ((u32)z & 0x00FFFFFF) | idword;
+        }
+        else
+            PlotTranslucentTile(bs, idx, col, translDW ? z : -1, idword | (ID_TRANSL << 24));
+    }
+}
+#endif
+
 // Span fill for one scanline of one polygon into the 2-plane tile. Perspective-correct S/T and
 // colour interpolation, per-pixel alpha test, less-than depth test. Opaque -> write colour + (depth
 // | id). Translucent (shaded alpha < 31) -> DraStic 2-plane blend. NO per-pixel AA coverage.
@@ -975,6 +1091,31 @@ void TileRenderer3D::RenderSpanInTile(BandScratch& bs, const TilePoly& poly, s32
     s32 xlim = xend; if (xlim > OutWidth - 1) xlim = OutWidth - 1;
 
     const s32 rowbase = (y - ty0) * OutWidth;
+#ifdef TILE_SPANFAST
+    if (!ix.Linear())
+    {
+        s32 base[5]; u32 dd[5]; u32 rev = 0;
+        const s32 y0s[5] = { rl, gl, bl, sl_s, sl_t }, y1s[5] = { rr, gr, br, sr_s, sr_t };
+        for (int k = 0; k < 5; k++)
+        {
+            if (y0s[k] <= y1s[k]) { base[k] = y0s[k]; dd[k] = (u32)(y1s[k] - y0s[k]); }
+            else                  { base[k] = y1s[k]; dd[k] = (u32)(y0s[k] - y1s[k]); rev |= 1u << k; }
+        }
+        const int mode = ps.decal ? 1 : ps.toon ? (ps.highlight ? 3 : 2) : 0;
+        switch ((ps.texEnable ? 4 : 0) | mode)
+        {
+        case 0: SpanFill<false, 0>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 1: SpanFill<false, 1>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 2: SpanFill<false, 2>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 3: SpanFill<false, 3>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 4: SpanFill<true, 0>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 5: SpanFill<true, 1>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        case 6: SpanFill<true, 2>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        default: SpanFill<true, 3>(bs, ps, ix, rowbase, x, xlim, zl, zr, wbuf, base, dd, rev); break;
+        }
+        return;
+    }
+#endif
     for (; x <= xlim; x++)
     {
         ix.SetX(x);
