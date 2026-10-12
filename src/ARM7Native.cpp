@@ -146,9 +146,10 @@ struct State
     u64 calls[kKinds] = {}, native[kKinds] = {}, guest[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, timing[kKinds] = {};
     u64 irqs = 0, irqNative = 0, exits = 0, segs[kSegs] = {}, chainChecks = 0, chainDiffs = 0, chainTiming = 0, chainLost = 0;
     u64 stops[kSegs + 1] = {};
+    u64 verN = 0;
+    void Dump() const;
+    ~State() { Dump(); }
 };
-std::unordered_map<const melonDS::NDS*, State> g_State;
-u64 g_SameN = 0, g_VerN = 0;
 #if defined(__APPLE__) && defined(LITEV_HLE_DIAG)
 // LITEV_A7N_PMU=1: host instructions per native run (minus an empty measurement's)
 const bool g_Pmu = getenv("LITEV_A7N_PMU") != nullptr;
@@ -174,14 +175,12 @@ constexpr bool g_Check = false;
 
 State& Get(melonDS::NDS& nds)
 {
-    static thread_local const melonDS::NDS* last = nullptr;
-    static thread_local State* lastS = nullptr;
-    if (&nds == last) return *lastS;
-    State& s = g_State[&nds];       // (map nodes are stable)
-    last = &nds; lastS = &s;
-    return s;
+    auto& p = nds.ARM7.A7NState;        // (per console: --mp-test / Netplay run a console per thread)
+    if (!p) p = {new State, [](void* q) { delete (State*)q; }};
+    return *(State*)p.get();
 }
-// debug.litev.a7hle (unset or 1: all on): bit 32 the OS call natives, bit 64 the IRQ path
+// debug.litev.a7hle (unset or 1: the default set): bit 32 the OS call natives (default on), bit 64 the IRQ path (default OFF:
+// RG DS 1, non-PGO, emu-thread CPU vs bit 32 alone: Shrek +2.0%, PW overworld +1.6%, MKDS race -1.7%; Mac -0.3% average)
 u32 Mask()
 {
 #if defined(__ANDROID__)
@@ -191,17 +190,17 @@ u32 Mask()
     const char* v = getenv("debug.litev.a7hle");
 #endif
     const u32 m = v ? (u32)strtoul(v, nullptr, 0) : 1;
-    return m == 1 ? ~0u : m;
+    return m == 1 ? ~64u : m;
 }
 bool On(State& s) { if (s.on < 0) s.on = Mask() & 32 ? 1 : 0; return s.on == 1; }
 bool IrqOn(State& s) { if (s.irqOn < 0) s.irqOn = Mask() & 64 ? 1 : 0; return s.irqOn == 1; }
 
-struct StatsDump
+
+void State::Dump() const
 {
-    ~StatsDump()
+    if (!g_Stats) return;
     {
-        if (!g_Stats) return;
-        for (auto& [k, s] : g_State)
+        const State& s = *this;
         {
             for (u8 t : kTop)
                 if (s.calls[t] || s.checks[t])
@@ -215,14 +214,14 @@ struct StatsDump
                         (unsigned long long)s.chainChecks, (unsigned long long)s.chainDiffs, (unsigned long long)s.chainTiming,
                         (unsigned long long)s.chainLost);
                 for (int i = 0; i < kSegs; i++) fprintf(stderr, " %s=%llu", kSegName[i], (unsigned long long)s.segs[i]);
-                fprintf(stderr, " | same=%llu verify=%llu", (unsigned long long)g_SameN, (unsigned long long)g_VerN);
+                fprintf(stderr, " | verify=%llu", (unsigned long long)s.verN);
                 fprintf(stderr, " | stops:");
                 for (int i = 0; i <= kSegs; i++) if (s.stops[i]) fprintf(stderr, " %s=%llu", i < kSegs ? kSegName[i] : "guest", (unsigned long long)s.stops[i]);
                 fprintf(stderr, "\n");
             }
         }
     }
-} g_StatsDump;
+}
 
 // the entry of a native function at t: verified now if not seen (a block compiled before, e.g. restored)
 const Entry* Find(melonDS::NDS& nds, State& s, u32 t, bool verify)
@@ -248,7 +247,6 @@ const Entry* Find(melonDS::NDS& nds, State& s, u32 t, bool verify)
 // native run), else verified now; nullptr: not that function
 bool Same(melonDS::NDS& nds, const Fn& f)
 {
-    g_SameN++;
     size_t o = 0;
     for (const Rng& r : f.rs)
     {
@@ -284,7 +282,7 @@ const Fn* Chk(melonDS::NDS& nds, State& s, u32 a, u8 kind)
             break;
         }
     Fn f{a, kind, {}, {}, {}, s.run};
-    g_VerN++;
+    s.verN++;
     Rng d[kMaxDeps];
     int nd = 0;
     std::vector<Rng> read;
