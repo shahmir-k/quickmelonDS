@@ -381,6 +381,11 @@ u64 SoftRenderer2D::PipeTraceSpriteHash() const
         } \
     } while (false)
 
+#ifdef LITEV_SOFT2D_SPRLIST
+#define S2D_OBJPRIO(i) && ((OBJPrioMask >> (i)) & 1)   // some non-window sprite of priority i drawn
+#else
+#define S2D_OBJPRIO(i)
+#endif
 template<u32 bgmode>
 void SoftRenderer2D::DrawScanlineBGMode(u32 line)
 {
@@ -429,7 +434,7 @@ void SoftRenderer2D::DrawScanlineBGMode(u32 line)
                     DoDrawBG(Text, line, 0);
             }
         }
-        if ((GPU2D.LayerEnable & (1<<4)) && NumSprites)
+        if ((GPU2D.LayerEnable & (1<<4)) && NumSprites S2D_OBJPRIO(i))
         {
             InterleaveSprites(i);
         }
@@ -458,7 +463,7 @@ void SoftRenderer2D::DrawScanlineBGMode6(u32 line)
                     DrawBG_3D();
             }
         }
-        if ((GPU2D.LayerEnable & (1<<4)) && NumSprites)
+        if ((GPU2D.LayerEnable & (1<<4)) && NumSprites S2D_OBJPRIO(i))
         {
             InterleaveSprites(i);
         }
@@ -490,7 +495,7 @@ void SoftRenderer2D::DrawScanlineBGMode7(u32 line)
                     DoDrawBG(Text, line, 0);
             }
         }
-        if ((GPU2D.LayerEnable & (1<<4)) && NumSprites)
+        if ((GPU2D.LayerEnable & (1<<4)) && NumSprites S2D_OBJPRIO(i))
         {
             InterleaveSprites(i);
         }
@@ -1582,6 +1587,9 @@ void SoftRenderer2D::DrawSprites(u32 line)
     }
 
     NumSprites = 0;
+#ifdef LITEV_SOFT2D_SPRLIST
+    OBJPrioMask = 0;
+#endif
     memset(OBJLine, 0, sizeof(OBJLine));
     memset(OBJWindow, 0, sizeof(OBJWindow));
 
@@ -1609,8 +1617,22 @@ void SoftRenderer2D::DrawSprites(u32 line)
         64, 32, 64, 8
     };
 
+#ifdef LITEV_SOFT2D_SPRLIST
+    // only the sprites whose box covers this line (lists rebuilt per OAM generation), in OAM order
+    u64 cand[2] = {~0ull, ~0ull};
+    if (CurOAMGen && line < 192)
+    {
+        if (SprListGen != *CurOAMGen) BuildSprLists(oam);
+        cand[0] = SprLines[line][0]; cand[1] = SprLines[line][1];
+    }
+    for (int w = 0; w < 2; w++)
+    for (u64 m = cand[w]; m; m &= m - 1)
+    {
+        const int sprnum = w * 64 + __builtin_ctzll(m);
+#else
     for (int sprnum = 0; sprnum < 128; sprnum++)
     {
+#endif
         u16* attrib = &oam[sprnum*4];
 
         u16 sprtype = (attrib[0] >> 8) & 0x3;
@@ -1658,9 +1680,39 @@ void SoftRenderer2D::DrawSprites(u32 line)
             DoDrawSprite(Normal, sprnum, width, height, xpos, ypos);
 
         NumSprites++;
+#ifdef LITEV_SOFT2D_SPRLIST
+        if (!iswin) OBJPrioMask |= 1u << ((attrib[2] >> 10) & 3);
+#endif
     }
 }
 
+#ifdef LITEV_SOFT2D_SPRLIST
+// Per line, the sprites whose (bound) box covers it: the DrawSprites y test, done once per OAM
+// generation instead of for 128 sprites on every line. Inspired by DSperate's sprite candidate
+// lists (https://github.com/beebono/DSperate, GPL-3.0-or-later, commit f5fa35e,
+// src/core/gpu/engine2d.cpp rebuild_sprite_lists).
+void SoftRenderer2D::BuildSprLists(const u16* oam)
+{
+    static constexpr u8 sprheight[16] = { 8, 8, 16, 8, 16, 8, 32, 8, 32, 16, 32, 8, 64, 32, 64, 8 };
+    memset(SprLines, 0, sizeof(SprLines));
+    for (int sprnum = 0; sprnum < 128; sprnum++)
+    {
+        const u16* attrib = &oam[sprnum*4];
+        const u32 sprtype = (attrib[0] >> 8) & 0x3;
+        if (sprtype == 2) continue;
+        u32 bh = sprheight[(attrib[0] >> 14) | ((attrib[1] & 0xC000) >> 12)];
+        if (sprtype == 3) bh <<= 1;
+        const u32 ypos = attrib[0] & 0xFF;
+        for (u32 h = 0; h < bh; h++)
+        {
+            const u32 y = (ypos + h) & 0xFF;
+            if (y < 192) SprLines[y][sprnum >> 6] |= 1ull << (sprnum & 63);
+        }
+    }
+    SprListGen = *CurOAMGen;
+}
+
+#endif
 template<bool window>
 void SoftRenderer2D::DrawSpritePixel(int color, u32 pixelattr, s32 xpos)
 {

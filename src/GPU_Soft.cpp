@@ -502,6 +502,12 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
 #else
 #define S2D_PALCONV_SET(r)
 #endif
+#ifdef LITEV_SOFT2D_SPRLIST
+    if (!++S2DOAMGen[bi]) S2DOAMGen[bi] = 1;   // a new frame's OAM (0 = unknown)
+#define S2D_OAMGEN_SET(r) (r)->CurOAMGen = &S2DOAMGen[bi]
+#else
+#define S2D_OAMGEN_SET(r)
+#endif
 #define S2DJ_SPR()  if (jn > 0) S2DJSeek(_ss, bi, jpos, f.JMarkSpr)
 #define S2DJ_LINE() if (jn > 0) S2DJSeek(_ss, bi, jpos, f.JMarkLine)
 #else
@@ -557,7 +563,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             u32* fb = HybFB[AsyncTargetBuf];
             u32* descA = &fb[((f.ScreenSwap ? 0 : 1) * 192 + line) * HybStride];
             u32* descB = &fb[((f.ScreenSwap ? 1 : 0) * 192 + line) * HybStride];
-            rA->CurOAM = oamSnap; rA->CurPalette = palSnap; S2D_PALCONV_SET(rA);
+            rA->CurOAM = oamSnap; rA->CurPalette = palSnap; S2D_PALCONV_SET(rA); S2D_OAMGEN_SET(rA);
 #ifdef LITEV_SOFT2D_DEPTH2
             S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
             S2DJ_LINE(); rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, descA);
@@ -565,7 +571,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
             rA->DrawSpritesDeferred(mainA->SprSnapR[line], line);
             rA->DrawScanlineDeferred(mainA->LineSnapR[line], line, descA);
 #endif
-            rB->CurOAM = oamSnap; rB->CurPalette = palSnap; S2D_PALCONV_SET(rB);
+            rB->CurOAM = oamSnap; rB->CurPalette = palSnap; S2D_PALCONV_SET(rB); S2D_OAMGEN_SET(rB);
 #ifdef LITEV_SOFT2D_DEPTH2
             S2DJ_SPR(); rB->DrawSpritesDeferred(mainB->SprSnapR[_ss][line], line);
             S2DJ_LINE(); rB->DrawScanlineDeferred(mainB->LineSnapR[_ss][line], line, descB);
@@ -582,7 +588,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         {
             // self-test: descriptor + CPU resolve must equal the real composite below
             alignas(8) u32 desc[HybStride];
-            rA->Cur3DLine = l3d; rA->CurOAM = oamSnap; rA->CurPalette = palSnap; S2D_PALCONV_SET(rA);
+            rA->Cur3DLine = l3d; rA->CurOAM = oamSnap; rA->CurPalette = palSnap; S2D_PALCONV_SET(rA); S2D_OAMGEN_SET(rA);
             rA->HybridDesc = true;
 #ifdef LITEV_SOFT2D_DEPTH2
             S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
@@ -615,7 +621,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         // --- BG/OBJ raster into this band's per-engine line buffers ---
         rA->Cur3DLine = l3d;
         rA->CurOAM = oamSnap;
-        rA->CurPalette = palSnap; S2D_PALCONV_SET(rA);
+        rA->CurPalette = palSnap; S2D_PALCONV_SET(rA); S2D_OAMGEN_SET(rA);
 #ifdef LITEV_SOFT2D_DEPTH2
         S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
         if (pipeTraceOn)
@@ -635,7 +641,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
 
         rB->Cur3DLine = l3d;
         rB->CurOAM = oamSnap;
-        rB->CurPalette = palSnap; S2D_PALCONV_SET(rB);
+        rB->CurPalette = palSnap; S2D_PALCONV_SET(rB); S2D_OAMGEN_SET(rB);
 #ifdef LITEV_SOFT2D_DEPTH2
         S2DJ_SPR(); rB->DrawSpritesDeferred(mainB->SprSnapR[_ss][line], line);
         S2DJ_LINE(); rB->DrawScanlineDeferred(mainB->LineSnapR[_ss][line], line, BandOut2D[1][line]);
@@ -694,6 +700,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
 #undef S2DJ_SPR
 #undef S2DJ_LINE
 #undef S2D_PALCONV_SET
+#undef S2D_OAMGEN_SET
 #endif
     LSP_ADD(S2DBand[bi], LSP_NOW() - _lspB0);
 }
@@ -706,8 +713,11 @@ void SoftRenderer::S2DJSeek(int s, int bi, u32& pos, u32 to) noexcept
     const GPU::S2DJEntry* e = S2DJFrame[s].data();
     u8* const base[6] = {S2DJPal[bi], S2DJOAM[bi], GPU.VRAMFlat_ABGShadow[s], GPU.VRAMFlat_BBGShadow[s],
                          GPU.VRAMFlat_AOBJShadow[s], GPU.VRAMFlat_BOBJShadow[s]};
-#ifdef LITEV_SOFT2D_PALCONV
+#if defined(LITEV_SOFT2D_PALCONV) || defined(LITEV_SOFT2D_SPRLIST)
     auto conv = [&](const GPU::S2DJEntry& x) {
+#ifdef LITEV_SOFT2D_SPRLIST
+        if (x.kind == 1 && !++S2DOAMGen[bi]) S2DOAMGen[bi] = 1;   // new OAM generation
+#endif
 #ifdef LITEV_SOFT2D_PALCONV
         if (x.kind == 0)
             for (u32 i = x.off >> 1; i <= (x.off + x.size - 1) >> 1; i++)

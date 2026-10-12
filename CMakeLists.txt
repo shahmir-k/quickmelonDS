@@ -250,6 +250,13 @@ option(LITEV_SOFT2D_PALCONV "liteV: 2D palette converted once per frame (needs T
 if (LITEV_SOFT2D_PALCONV)
     add_compile_definitions(LITEV_SOFT2D_PALCONV=1)
 endif()
+# LITEV_SOFT2D_SPRLIST: the threaded 2D builds per-line sprite candidate lists once per OAM generation
+# (instead of testing 128 sprites per line) and skips sprite interleave passes for priorities no
+# sprite on the line has. Same pixels.
+option(LITEV_SOFT2D_SPRLIST "liteV: 2D sprite candidate lists per OAM generation (needs THREADED+DEPTH2)" OFF)
+if (LITEV_SOFT2D_SPRLIST)
+    add_compile_definitions(LITEV_SOFT2D_SPRLIST=1)
+endif()
 # Unit 2: shadow-mode equivalence assert for the CyclesBudget slot. Debug-only gate;
 # implies nothing else. Aborts if the budget and timestamp/target mechanisms disagree.
 option(LITEV_SHADOW_ASSERT "Assert CyclesBudget == timestamp/target equivalence" OFF)

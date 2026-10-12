@@ -203,6 +203,9 @@ protected:
     alignas(8) u8 S2DJOAM[S2D_NBANDS][2*1024];
     u64 S2DJStat[6] = {};   // frames, journaled frames, entries, max entries, unusable frames, VRAM frames (LITEV_S2DJ_STATS)
     void S2DJSeek(int slot, int band, u32& pos, u32 to) noexcept;
+#ifdef LITEV_SOFT2D_SPRLIST
+    u32 S2DOAMGen[S2D_NBANDS] {};   // per band: OAM copy generation (SoftRenderer2D::CurOAMGen)
+#endif
 #ifdef LITEV_SOFT2D_PALCONV
     // per band: the palette the band draws with, converted once per frame (and per journal entry)
     // to the BGOBJLine colour format (SoftRenderer2D::CurPalConv)

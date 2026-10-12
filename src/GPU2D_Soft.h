@@ -123,6 +123,9 @@ public:
 
     u32* Cur3DLine = nullptr;                  // per-line 3D output (replaces Parent.Output3D)
     const u8* CurOAM = nullptr;                // per-line OAM base (replaces GPU.OAM)
+#ifdef LITEV_SOFT2D_SPRLIST
+    const u32* CurOAMGen = nullptr;   // CurOAM content generation (null: unknown, scan all 128 sprites)
+#endif
 
     // Per-scanline snapshots, filled on the emu thread at each LCD scanline event,
     // consumed by the deferred (batched, later banded-threaded) render at VBlank.
@@ -188,6 +191,12 @@ private:
     alignas(8) u8 OBJWindow[256];
 
     u32 NumSprites;
+#ifdef LITEV_SOFT2D_SPRLIST
+    u32 OBJPrioMask = 0;        // priorities of this line's non-window sprites (InterleaveSprites skip)
+    u32 SprListGen = 0;         // generation SprLines was built for
+    u64 SprLines[192][2];       // per line: sprites whose box covers it
+    void BuildSprLists(const u16* oam);
+#endif
 
     u8* CurBGXMosaicTable;
     array2d<u8, 16, 256> MosaicTable = []() constexpr
