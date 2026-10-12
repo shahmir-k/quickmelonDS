@@ -77,6 +77,12 @@ struct State
 
 extern State S;
 
+// Phase timing (LSP_NOW / LSP_ADD and the 60-frame LITEV_SOFTPROF line) runs only while
+// debug.litev.softprof >= 1 (headless: env LITEV_SOFTPROF=1); Tick() polls it once a second.
+// Off: one relaxed load + a predictable branch per site instead of a clock read.
+extern std::atomic<bool> TimingOn;
+inline bool On() { return TimingOn.load(std::memory_order_relaxed); }
+
 // Called on the emu thread once per VBlank. Logs a decomposition every 60 frames.
 void Tick();
 
@@ -103,20 +109,20 @@ void StallFrame(unsigned frame);   // emu thread, each VBlank kick: logs gaps ov
 } // namespace LitevSP
 } // namespace melonDS
 
-#define LSP_NOW()          ::melonDS::LitevSP::NowMs()
-#define LSP_ADD(f, d)      ::melonDS::LitevSP::S.f.Add(d)
+#define LSP_NOW()          (::melonDS::LitevSP::On() ? ::melonDS::LitevSP::NowMs() : 0.0)
+#define LSP_ADD(f, d)      do { if (::melonDS::LitevSP::On()) ::melonDS::LitevSP::S.f.Add(d); } while (0)
 #define LSP_NAME(n)        ::melonDS::LitevSP::NameThread(n)
 #define LSP_EV(e)          ::melonDS::LitevSP::Ev(::melonDS::LitevSP::e)
 // time stmt into GLJ.<f> (+ count <f>N) when the stall log is on
-#define LSP_GLT(f, stmt)   do { if (::melonDS::LitevSP::StallLogOn()) { const double t_ = LSP_NOW(); stmt; \
-                               ::melonDS::LitevSP::GLJ.f += LSP_NOW() - t_; ::melonDS::LitevSP::GLJ.f##N++; } else { stmt; } } while (0)
+#define LSP_GLT(f, stmt)   do { if (::melonDS::LitevSP::StallLogOn()) { const double t_ = ::melonDS::LitevSP::NowMs(); stmt; \
+                               ::melonDS::LitevSP::GLJ.f += ::melonDS::LitevSP::NowMs() - t_; ::melonDS::LitevSP::GLJ.f##N++; } else { stmt; } } while (0)
 // a draw call: also keep the slowest one and its key
-#define LSP_GLDRAW(key, stmt) do { if (::melonDS::LitevSP::StallLogOn()) { const double t_ = LSP_NOW(); stmt; \
-                               const double d_ = LSP_NOW() - t_; auto& j_ = ::melonDS::LitevSP::GLJ; j_.Draw += d_; j_.DrawN++; \
+#define LSP_GLDRAW(key, stmt) do { if (::melonDS::LitevSP::StallLogOn()) { const double t_ = ::melonDS::LitevSP::NowMs(); stmt; \
+                               const double d_ = ::melonDS::LitevSP::NowMs() - t_; auto& j_ = ::melonDS::LitevSP::GLJ; j_.Draw += d_; j_.DrawN++; \
                                if (d_ > j_.DrawMax) { j_.DrawMax = d_; j_.DrawMaxKey = (int)(key); } } else { stmt; } } while (0)
 // an emu-thread wait
-#define LSP_WAIT(site, frame, stmt) do { if (::melonDS::LitevSP::StallLogOn()) { const double t_ = LSP_NOW(); stmt; \
-                               ::melonDS::LitevSP::StallWait(site, LSP_NOW() - t_, frame); } else { stmt; } } while (0)
+#define LSP_WAIT(site, frame, stmt) do { if (::melonDS::LitevSP::StallLogOn()) { const double t_ = ::melonDS::LitevSP::NowMs(); stmt; \
+                               ::melonDS::LitevSP::StallWait(site, ::melonDS::LitevSP::NowMs() - t_, frame); } else { stmt; } } while (0)
 
 #else   // !LITEV_SOFTPROF
 

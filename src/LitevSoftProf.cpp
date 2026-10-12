@@ -21,6 +21,18 @@ namespace LitevSP
 {
 
 State S;
+std::atomic<bool> TimingOn { false };
+
+static bool TimingWanted()
+{
+#ifdef __ANDROID__
+    char b[PROP_VALUE_MAX] = {};
+    return __system_property_get("debug.litev.softprof", b) > 0 && atoi(b) >= 1;
+#else
+    const char* e = getenv("LITEV_SOFTPROF");
+    return e && atoi(e) >= 1;
+#endif
+}
 
 void NameThread(const char* n)
 {
@@ -114,6 +126,20 @@ void StallFrame(unsigned frame)
 
 void Tick()
 {
+    static int poll = 59;
+    static bool discard = false;
+    if (++poll >= 60)
+    {
+        poll = 0;
+        const bool on = TimingWanted();
+        if (on != On())
+        {
+            TimingOn.store(on, std::memory_order_relaxed);
+            S.Frames.store(0, std::memory_order_relaxed);
+            discard = true;   // the first window mixes in samples taken across the switch
+        }
+    }
+    if (!On()) return;
     int f = S.Frames.fetch_add(1, std::memory_order_relaxed) + 1;
     if (f < 60) return;
     S.Frames.store(0, std::memory_order_relaxed);
@@ -167,6 +193,7 @@ void Tick()
     uint64_t ce[5];
     for (int i = 0; i < 5; i++) ce[i] = S.CompositeCE[i].exchange(0, std::memory_order_relaxed);
 
+    if (discard) { discard = false; return; }
     Platform::Log(Platform::LogLevel::Info,
         "LITEV_SOFTPROF 60f: N[post=%d rend=%d ident=%d fin=%d] EMU[bar3D=%.2f texbar=%.2f bar2D=%.2f snap=%.2f budget=%.2f] | "
         "3D[LATENCY=%.2f wake=%.2f clear=%.2f raster=%.2f final=%.2f bands=%s fin=%s] | "
