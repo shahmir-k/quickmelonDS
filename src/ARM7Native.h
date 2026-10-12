@@ -11,8 +11,9 @@
 // Category B: guest memory and the hardware register writes are the guest's; the call takes a fitted cycle estimate,
 // the IO accesses happen at the call (JIT) or at fitted offsets from it (interpreter), scratch registers r2, r3, r12 and
 // the flags are not written (dead after a call), the stack bytes below sp are not written.
-// Runtime: debug.litev.a7hle bit 32 (on by default: unset or 1), bit 64 the IRQ path (Irq / IsHook / Hook; default off: slower on
-// the RG DS for 2 of 3 games, see Mask()).
+// Runtime: debug.litev.a7hle (unset or 1: all on) bit 32 the OS call natives, bit 64 the IRQ path (Irq / IsHook / Hook), 128 the
+// SDK alarm handlers in it, 256 whole runs only (the TM1 alarm IRQ to the BIOS return or the guest), 512 that run as one function
+// (see Mask()).
 // Diagnostics (LITEV_HLE_DIAG): LITEV_A7N_CHECK=1 in --mode interp: native result computed, the guest runs, compared at its
 // return (memory, return registers, timer / IE state); LITEV_A7N_FIT=1 prints the guest cycles per call (cycle fits).
 // LITEV_A7HLE_STATS=1: per-kind call counts.
@@ -40,6 +41,8 @@ void Irq(melonDS::ARM* cpu);
 bool MaybeExit(u32 instr);
 int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, u32* a, u32* b, int max);
 bool Hook(melonDS::ARM* cpu, bool jit);
+// bit 256 (whole runs): the hook blocks compile the real instruction (they only guard the functions the native run uses)
+bool HookGuardOnly(melonDS::NDS& nds);
 // ARMJIT: an exit hook block was compiled (it guards the functions it depends on) / a block is gone / the cache reset
 void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
 void BlockGone(melonDS::NDS& nds, const void* block);
