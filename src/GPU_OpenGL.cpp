@@ -432,7 +432,12 @@ bool GLRenderer::InitGL()
     if (Thread3D)
         // a colour ring, so the frame shown keeps its 3D while the next one renders;
         // glFinish: the storage must be complete before this context uses it
-        Thread3D->Run([this] { Thread3D->GL->SetColorRing(4); glFinish(); }, true);
+    {
+        // LITEV_GLHI_DEFER: the worker samples a frame's 3D up to a frame later, while the 3D
+        // thread renders up to two ahead: more ring entries, so the one it reads is not reused
+        const int ring = Defer ? GLRenderer3D::MaxColorRing : 4;
+        Thread3D->Run([this, ring] { Thread3D->GL->SetColorRing(ring); glFinish(); }, true);
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return true;

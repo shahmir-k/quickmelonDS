@@ -195,7 +195,7 @@ bool HybridRenderer::Init()
             glBindBuffer(GL_TEXTURE_BUFFER, DescBuf[i]);
             glBufferData(GL_TEXTURE_BUFFER, 2 * 192 * HybStride * 4, HybFB[0], GL_STREAM_DRAW);
             glBindTexture(GL_TEXTURE_BUFFER, DescBufTex[i]);
-            glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA8UI, DescBuf[i]);
+            glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32UI, DescBuf[i]);
         }
         glBindBuffer(GL_TEXTURE_BUFFER, 0);
         glBindTexture(GL_TEXTURE_BUFFER, 0);
@@ -621,6 +621,54 @@ void HybridRenderer::Merge(GLuint fbo, int single, int bottomY)
     MergeSlot(fbo, single, bottomY, AsyncPresentBuf, HybTag[AsyncPresentBuf], EmptyVAO, true);
 }
 
+void HybridRenderer::TBOCheck(int fb)
+{
+    static long px = 0, bad = 0; static int checks = 0;
+    if (!TBOCheckProg)
+    {
+        OpenGL::CompileVertexFragmentProgram(TBOCheckProg,
+            "#version 140\nvoid main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n",
+            "#version 140\nuniform highp usamplerBuffer DescBuf;\nuniform highp usampler2DArray DescTex;\nout vec4 oColor;\n"
+            "void main() { highp ivec2 p = ivec2(gl_FragCoord.xy); highp int layer = p.y / 192, y = p.y - layer * 192;\n"
+            "  highp int i = (layer * 192 + y) * 513 + p.x; highp uint v = texelFetch(DescBuf, i >> 2)[i & 3];\n"
+            "  uvec4 a = uvec4(v, v >> 8, v >> 16, v >> 24) & 0xFFu; uvec4 b = texelFetch(DescTex, ivec3(p.x, y, layer), 0);\n"
+            "  oColor = vec4(any(notEqual(a, b)) ? 1.0 : 0.0, 0.0, 0.0, 1.0); }\n",
+            "HybTBOCheck", {}, {{"oColor", 0}});
+        glUseProgram(TBOCheckProg);
+        glUniform1i(glGetUniformLocation(TBOCheckProg, "DescBuf"), 0);
+        glUniform1i(glGetUniformLocation(TBOCheckProg, "DescTex"), 1);
+        glGenTextures(1, &TBOCheckTex);
+        glBindTexture(GL_TEXTURE_2D, TBOCheckTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, HybStride, 384, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glGenFramebuffers(1, &TBOCheckFB);
+        glBindFramebuffer(GL_FRAMEBUFFER, TBOCheckFB);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, TBOCheckTex, 0);
+    }
+    // the reference: the same descriptors as the texture upload of the direct path
+    glBindTexture(GL_TEXTURE_2D_ARRAY, DescTex[fb]);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, HybStride, 192, 2, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, HybFB[fb]);
+    glBindFramebuffer(GL_FRAMEBUFFER, TBOCheckFB);
+    glDisable(GL_SCISSOR_TEST); glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(0, 0, HybStride, 384);
+    glUseProgram(TBOCheckProg);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D_ARRAY, DescTex[fb]);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_BUFFER, DescBufTex[fb]);
+    glBindVertexArray(EmptyVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    std::vector<u8> r((size_t)HybStride * 384 * 4);
+    glReadPixels(0, 0, HybStride, 384, GL_RGBA, GL_UNSIGNED_BYTE, r.data());
+    for (size_t i = 0; i < r.size(); i += 4) if (r[i]) bad++;
+    px += HybStride * 384;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (++checks % 10 == 0)
+    {
+        Platform::Log(Platform::Info, "LITEV_HYBTBOCHECK %d checks: %ld descriptors, %ld differ\n", checks, px, bad);
+        px = bad = 0;
+    }
+}
+
 // ponytail: the Prof* counters are shared by the emu-thread and GL-thread merge paths
 // (diagnostic only; one path is active per session)
 void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int tag, GLuint vao, bool sync)
@@ -647,6 +695,9 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
         glBindBuffer(GL_TEXTURE_BUFFER, DescBuf[fb]);
         glBufferData(GL_TEXTURE_BUFFER, 2 * 192 * HybStride * 4, HybFB[fb], GL_STREAM_DRAW);
         glBindBuffer(GL_TEXTURE_BUFFER, 0);
+        static const bool check = OpenGL::Prop("hybtbocheck", 0) != 0;
+        static int n = 0;
+        if (check && ++n % 30 == 0) TBOCheck(fb);
     }
     else if (HybDirect())
     {

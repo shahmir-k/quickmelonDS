@@ -105,6 +105,10 @@ private:
     // texture upload (which the driver re-tiles on the CPU)
     bool DescTBO = false;
     GLuint DescBuf[NFB] {}, DescBufTex[NFB] {};
+    // debug.litev.hybtbocheck=1: every 30th merge also uploads the texture and compares every
+    // descriptor the merge can fetch from the buffer with the texture's (LITEV_HYBTBOCHECK)
+    GLuint TBOCheckProg = 0, TBOCheckFB = 0, TBOCheckTex = 0;
+    void TBOCheck(int fb);
     GLuint OutTex[2] {};           // Nx, 2 layers (top, bottom), like GLRenderer's FPOutputTex
     GLuint OutFB[2] {};
     int OutIdx = 0;
