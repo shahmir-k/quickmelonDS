@@ -14,6 +14,9 @@
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
+#if defined(__APPLE__) && defined(LITEV_HLE_DIAG)
+extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsystem_kernel: this thread's PMU counts
+#endif
 
 namespace melonDS::A7Native
 {
@@ -22,8 +25,10 @@ thread_local bool CheckPending = false;
 #endif
 namespace
 {
-struct A7NMask { s16 off; u8 type; u8 arg; };      // type 0 call (arg: callee kind), 1 field (arg: A7NField), 2 call never made
-struct A7NSig { const char* name; u8 kind; u8 fam; u32 w0; u64 h; u8 nr; const s16 (*r)[2]; u8 nm; const A7NMask* m; };
+// type 0 call (arg: callee kind), 1 field (arg: A7NField), 2 call never made, 3 code-pointer field (kPtrKind[arg] there)
+struct A7NMask { s16 off; u8 type; u8 arg; };
+// post: offset of the instruction after the function's first call through a register (mov lr, pc; bx rX), pw: that word
+struct A7NSig { const char* name; u8 kind; u8 fam; u32 w0; u64 h; u8 nr; const s16 (*r)[2]; u8 nm; const A7NMask* m; s16 post; u32 pw; };
 #include "A7NSigs.inc"
 
 using Mem = melonDS::ARMJIT_Memory;
@@ -41,15 +46,27 @@ u8* Host(melonDS::NDS& nds, u32 a, u8& reg)
 }
 bool Word(melonDS::NDS& nds, u32 a, u32& v) { u8 r; const u8* p = Host(nds, a, r); if (!p) return false; v = R32(p); return true; }
 
-// ---- matching (compile time) -------------------------------------------------------------------------------------
-struct Env { u8 fam = 0; u32 f[kFields] = {}; u32 has = 0; };
+// ---- matching ------------------------------------------------------------------------------------------------------
+struct Env
+{
+    u8 fam = 0;                     // the top function's SDK build
+    u8 kf[kKinds] = {};             // the build each kind matched (its callees, code pointers)
+    u32 ka[kKinds] = {};            // ... and where
+    u32 f[kFields] = {};
+    u32 has = 0;
+};
 struct Rng { u32 a, b; };
 constexpr int kMaxDeps = 48;
+struct Prog { u32 a; u8 k; };       // functions being verified (a cycle through one counts as a match)
 
-bool Verify(melonDS::NDS& nds, u32 a, u8 kind, Env& e, Rng* deps, int& nd, int depth)
+bool Verify(melonDS::NDS& nds, u32 a, u8 kind, Env& e, Rng* deps, int& nd, int depth, Prog* prog = nullptr, int np = 0)
 {
+    Prog local[16];
+    if (!prog) prog = local;
+    for (int i = 0; i < np; i++) if (prog[i].a == a && prog[i].k == kind) return true;
     u32 w0;
-    if (depth > 6 || !Word(nds, a, w0)) return false;
+    if (np >= 16 || !Word(nds, a, w0)) return false;
+    prog[np] = {a, kind};
     for (const A7NSig& s : kSigs)
     {
         if (s.kind != kind || s.w0 != w0) continue;
@@ -62,7 +79,7 @@ bool Verify(melonDS::NDS& nds, u32 a, u8 kind, Env& e, Rng* deps, int& nd, int d
                 u32 w;
                 if (!Word(nds, a + 4 * o, w)) { ok = false; break; }
                 while (mi < s.nm && s.m[mi].off < o) mi++;
-                if (mi < s.nm && s.m[mi].off == o) w = s.m[mi].type == 1 ? 0 : (w & 0xFF000000);
+                if (mi < s.nm && s.m[mi].off == o) w = s.m[mi].type & 1 ? 0 : (w & 0xFF000000);
                 for (int k = 0; k < 4; k++) h = (h ^ ((w >> (8 * k)) & 0xFF)) * 0x100000001b3ull;
             }
         if (!ok || h != s.h) continue;
@@ -74,11 +91,12 @@ bool Verify(melonDS::NDS& nds, u32 a, u8 kind, Env& e, Rng* deps, int& nd, int d
             u32 w;
             Word(nds, a + 4 * m.off, w);
             if (m.type == 0)
-                ok = Verify(nds, a + 4 * m.off + 8 + (u32)((s32)(w << 8) >> 6), m.arg, e2, deps, nd2, depth + 1);
-            else if (m.type == 1)
+                ok = Verify(nds, a + 4 * m.off + 8 + (u32)((s32)(w << 8) >> 6), m.arg, e2, deps, nd2, depth + 1, prog, np + 1);
+            else if (m.type == 1 || m.type == 3)
             {
                 if ((e2.has >> m.arg & 1) && e2.f[m.arg] != w) ok = false;
                 e2.f[m.arg] = w; e2.has |= 1u << m.arg;
+                if (ok && m.type == 3) ok = Verify(nds, w, kPtrKind[m.arg], e2, deps, nd2, depth + 1, prog, np + 1);
             }
         }
         for (int r = 0; r < s.nr && ok; r++)
@@ -90,23 +108,57 @@ bool Verify(melonDS::NDS& nds, u32 a, u8 kind, Env& e, Rng* deps, int& nd, int d
         }
         if (!ok) continue;
         if (depth == 0) e2.fam = s.fam;
+        e2.kf[kind] = s.fam; e2.ka[kind] = a;
         e = e2; nd = nd2;
         return true;
     }
     return false;
 }
+const A7NSig* SigOf(u8 kind, u8 fam) { for (const A7NSig& s : kSigs) if (s.kind == kind && s.fam == fam) return &s; return nullptr; }
 
 // ---- per console ---------------------------------------------------------------------------------------------------
 struct Entry { u32 addr; u8 kind; Env e; };
-constexpr u8 kTop[] = {kGetTick, kSetTimer, kInsertAlarm};     // what runs natively at a call
-const char* const kName[kKinds] = {"", "", "", "", "OS_GetTick", "", "", "", "", "", "", "OSi_SetTimer", "OSi_InsertAlarm"};
+// a function verified for the IRQ path, with a snapshot of all its code (checked at each use: a pure function of memory)
+struct Fn { u32 addr; u8 kind; Env e; std::vector<Rng> rs; std::vector<u8> snap; u64 run = 0; const void* guard = nullptr; };
+// what runs natively at a call (OS_DisableInterrupts / OS_RestoreInterrupts too measured slower: the JIT inlines them after
+// a followed BL)
+constexpr u8 kTop[] = {kGetTick, kSetTimer, kInsertAlarm};
+enum Seg : u8 { sBiosIn, sBiosRet, sIrqH, sStub, sIcbPre, sIcbPost, sAwPre, sAwPost, sArrPre, sArrPost, sTs, kSegs };
+const char* const kSegName[kSegs] = {"bios-in", "bios-ret", "irqh", "stub", "icb-pre", "icb-post", "aw-pre", "aw-post", "arr-pre", "arr-post", "ts"};
+const char* KindName(u8 k) { return k == kGetTick ? "OS_GetTick" : k == kSetTimer ? "OSi_SetTimer" : k == kInsertAlarm ? "OSi_InsertAlarm" : "?"; }
 struct State
 {
-    int on = -1;
+    int on = -1, irqOn = -1;
     std::vector<Entry> ents;
+    std::vector<Fn> fns;
+    const Fn* last[kKinds] = {};        // the last function found per kind (a guarded one needs no further check)
+    // A JIT hook block depends on the code of the functions its native run steps through: while it lives, they are
+    // unchanged (no snapshot compare). A pure optimization: Chk's answer is the same with or without a guard.
+    struct Cover { u32 hook; u32 a[2]; u8 k[2]; };
+    std::vector<Cover> cover;           // what the hooks being compiled guard
+    u64 run = 0;
+    int bios = 0; u32 biosRet = 0;  // ARM7 BIOS IRQ vector: 0 unchecked, 1 the standard one (return stub at biosRet), -1 other
     u64 calls[kKinds] = {}, native[kKinds] = {}, guest[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}, timing[kKinds] = {};
+    u64 irqs = 0, irqNative = 0, exits = 0, segs[kSegs] = {}, chainChecks = 0, chainDiffs = 0, chainTiming = 0, chainLost = 0;
+    u64 stops[kSegs + 1] = {};
 };
 std::unordered_map<const melonDS::NDS*, State> g_State;
+u64 g_SameN = 0, g_VerN = 0;
+#if defined(__APPLE__) && defined(LITEV_HLE_DIAG)
+// LITEV_A7N_PMU=1: host instructions per native run (minus an empty measurement's)
+const bool g_Pmu = getenv("LITEV_A7N_PMU") != nullptr;
+u64 g_PmuN[6 + kSegs] = {}, g_PmuI[6 + kSegs] = {}, g_PmuE = 0, g_PmuEN = 0;
+struct PmuDump { ~PmuDump() { if (g_Pmu) for (int i = 0; i < 6 + kSegs; i++) if (g_PmuN[i]) fprintf(stderr, "A7N pmu %s: %llu runs, %.0f host instr each (empty %.0f)\n", i >= 6 ? kSegName[i - 6] : (const char*[]){"irq", "exit", "call", "chain", "commit", "apply"}[i], (unsigned long long)g_PmuN[i], (double)g_PmuI[i] / g_PmuN[i] - (double)g_PmuE / (g_PmuEN ? g_PmuEN : 1), (double)g_PmuE / (g_PmuEN ? g_PmuEN : 1)); } } g_PmuDump;
+struct PmuScope
+{
+    int k; u64 c0[2];
+    PmuScope(int kind) : k(kind) { if (g_Pmu) { u64 e0[2], e1[2]; thread_selfcounts(1, e0, sizeof(e0)); thread_selfcounts(1, e1, sizeof(e1)); g_PmuE += e1[0] - e0[0]; g_PmuEN++; thread_selfcounts(1, c0, sizeof(c0)); } }
+    ~PmuScope() { if (g_Pmu) { u64 c1[2]; thread_selfcounts(1, c1, sizeof(c1)); g_PmuI[k] += c1[0] - c0[0]; g_PmuN[k]++; } }
+};
+#define A7N_PMU(k) PmuScope pmu_(k)
+#else
+#define A7N_PMU(k)
+#endif
 const bool g_Stats = getenv("LITEV_A7HLE_STATS") && atoi(getenv("LITEV_A7HLE_STATS"));
 #ifdef LITEV_HLE_DIAG
 const bool g_Check = getenv("LITEV_A7N_CHECK") && atoi(getenv("LITEV_A7N_CHECK"));
@@ -124,22 +176,20 @@ State& Get(melonDS::NDS& nds)
     last = &nds; lastS = &s;
     return s;
 }
-// debug.litev.a7hle bit 32 (unset or 1: all on)
-bool On(State& s)
+// debug.litev.a7hle (unset or 1: all on): bit 32 the OS call natives, bit 64 the IRQ path
+u32 Mask()
 {
-    if (s.on < 0)
-    {
 #if defined(__ANDROID__)
-        char b[16] = {0};
-        const char* v = __system_property_get("debug.litev.a7hle", b) > 0 ? b : nullptr;
+    char b[16] = {0};
+    const char* v = __system_property_get("debug.litev.a7hle", b) > 0 ? b : nullptr;
 #else
-        const char* v = getenv("debug.litev.a7hle");
+    const char* v = getenv("debug.litev.a7hle");
 #endif
-        const u32 m = v ? (u32)strtoul(v, nullptr, 0) : 1;
-        s.on = m == 1 || (m & 32) ? 1 : 0;
-    }
-    return s.on == 1;
+    const u32 m = v ? (u32)strtoul(v, nullptr, 0) : 1;
+    return m == 1 ? ~0u : m;
 }
+bool On(State& s) { if (s.on < 0) s.on = Mask() & 32 ? 1 : 0; return s.on == 1; }
+bool IrqOn(State& s) { if (s.irqOn < 0) s.irqOn = Mask() & 64 ? 1 : 0; return s.irqOn == 1; }
 
 struct StatsDump
 {
@@ -147,18 +197,37 @@ struct StatsDump
     {
         if (!g_Stats) return;
         for (auto& [k, s] : g_State)
+        {
             for (u8 t : kTop)
                 if (s.calls[t] || s.checks[t])
-                    fprintf(stderr, "A7N %s: calls=%llu native=%llu guest=%llu checks=%llu check_diffs=%llu timing=%llu\n", kName[t],
+                    fprintf(stderr, "A7N %s: calls=%llu native=%llu guest=%llu checks=%llu check_diffs=%llu timing=%llu\n", KindName(t),
                             (unsigned long long)s.calls[t], (unsigned long long)s.native[t], (unsigned long long)s.guest[t],
                             (unsigned long long)s.checks[t], (unsigned long long)s.diffs[t], (unsigned long long)s.timing[t]);
+            if (s.irqs || s.exits || s.chainChecks)
+            {
+                fprintf(stderr, "A7N irq: irqs=%llu native=%llu exits=%llu checks=%llu check_diffs=%llu timing=%llu lost=%llu segs:",
+                        (unsigned long long)s.irqs, (unsigned long long)s.irqNative, (unsigned long long)s.exits,
+                        (unsigned long long)s.chainChecks, (unsigned long long)s.chainDiffs, (unsigned long long)s.chainTiming,
+                        (unsigned long long)s.chainLost);
+                for (int i = 0; i < kSegs; i++) fprintf(stderr, " %s=%llu", kSegName[i], (unsigned long long)s.segs[i]);
+                fprintf(stderr, " | same=%llu verify=%llu", (unsigned long long)g_SameN, (unsigned long long)g_VerN);
+                fprintf(stderr, " | stops:");
+                for (int i = 0; i <= kSegs; i++) if (s.stops[i]) fprintf(stderr, " %s=%llu", i < kSegs ? kSegName[i] : "guest", (unsigned long long)s.stops[i]);
+                fprintf(stderr, "\n");
+            }
+        }
     }
 } g_StatsDump;
 
 // the entry of a native function at t: verified now if not seen (a block compiled before, e.g. restored)
 const Entry* Find(melonDS::NDS& nds, State& s, u32 t, bool verify)
 {
-    for (const Entry& e : s.ents) if (e.addr == t) return &e;
+    for (size_t i = 0; i < s.ents.size(); i++)
+        if (s.ents[i].addr == t)
+        {
+            if (i) std::swap(s.ents[i], s.ents[i - 1]);       // (hot targets move to the front)
+            return &s.ents[i ? i - 1 : 0];
+        }
     if (!verify) return nullptr;
     Rng d[kMaxDeps];
     for (u8 k : kTop)
@@ -170,18 +239,80 @@ const Entry* Find(melonDS::NDS& nds, State& s, u32 t, bool verify)
     return nullptr;
 }
 
+// the IRQ path's function of this kind at a, its code unchanged since it was verified (memcmp of the snapshot, once per
+// native run), else verified now; nullptr: not that function
+bool Same(melonDS::NDS& nds, const Fn& f)
+{
+    g_SameN++;
+    size_t o = 0;
+    for (const Rng& r : f.rs)
+    {
+        u8 reg;
+        const u8* p = Host(nds, r.a, reg);
+        if (!p || memcmp(p, &f.snap[o], r.b - r.a) != 0) return false;
+        o += r.b - r.a;
+    }
+    return true;
+}
+const Fn* Chk(melonDS::NDS& nds, State& s, u32 a, u8 kind)
+{
+    if (const Fn* f = s.last[kind]; f && f->addr == a && f->guard) return f;
+    for (size_t i = 0; i < s.fns.size(); i++)
+    {
+        Fn& f = s.fns[i];
+        if (f.addr != a || f.kind != kind) continue;
+        if (f.guard || f.run == s.run || Same(nds, f)) { f.run = s.run; s.last[kind] = &f; return &f; }
+        s.fns.erase(s.fns.begin() + i);
+        for (const Fn*& l : s.last) l = nullptr;
+        break;
+    }
+    u32 w0;
+    if (!Word(nds, a, w0)) return nullptr;
+    bool cand = false;
+    for (const A7NSig& g : kSigs) cand |= g.kind == kind && g.w0 == w0;
+    if (!cand) return nullptr;
+    Fn f{a, kind, {}, {}, {}, s.run};
+    g_VerN++;
+    Rng d[kMaxDeps];
+    int nd = 0;
+    if (!Verify(nds, a, kind, f.e, d, nd, 0)) return nullptr;
+    for (int i = 0; i < nd; i++)
+    {
+        u8 reg;
+        const u8* p = Host(nds, d[i].a, reg);
+        const u8* q = Host(nds, d[i].b - 4, reg);
+        if (!p || !q || q - p != (ptrdiff_t)(d[i].b - d[i].a - 4)) return nullptr;     // (one host block)
+        f.rs.push_back(d[i]);
+        f.snap.insert(f.snap.end(), p, p + (d[i].b - d[i].a));
+    }
+    s.fns.push_back(std::move(f));
+    for (const Fn*& l : s.last) l = nullptr;    // (the vector may have moved)
+    s.last[kind] = &s.fns.back();
+    return &s.fns.back();
+}
+
 // ---- the natives -------------------------------------------------------------------------------------------------
-// A transaction: everything a native call does, applied after it decided to run natively (or compared in check mode).
+// A transaction: everything a native run does, applied after it decided to run natively (or compared in check mode).
 struct Txn
 {
     struct W { u8* p; u32 a, v; u8 reg; };
-    struct Io { u32 a, v; s32 t; u8 op; };      // op 0: 16-bit store, 1: IE |= v
-    W w[40]; u32 nw = 0;
-    Io io[12]; u32 nio = 0;
+    // IO, in program order: op 0 16-bit store, 1 IE |= v, 2 IE &= ~v, 3 IF acknowledge (32-bit store of v to IF)
+    struct Io { u32 a, v; s32 t; u8 op; };
+    // compare mode (dry): the stores and IO are recorded here, reads see them; else they happen at once and the undo log
+    // takes back a segment's stores when it cannot finish (its IO comes after everything that can fail)
+    bool dry = false;
+    W w[96]; u32 nw = 0;
+    u64 bloom = 0;              // words written (bit (a >> 2) & 63): most reads skip the scan
+    struct U { u8* p; u32 a, old; u8 reg; };
+    U undo[128]; u32 nu = 0;
+    Io io[24]; u32 nio = 0;
     u32 r0 = 0, r1 = 0; bool ret = false;
-    s32 t = 0;                  // the virtual clock: cycles since the call
+    s32 t = 0;                  // the virtual clock: cycles since the start
     u16 ticks[4]; u32 nticks = 0;
     s32 walk = 0, ins = -1, steps = -1, set = 0, inc = 0, dpath = -1;   // the path taken (cycle fits)
+    s32 tsWake = 0, tsRes = 0, tsWalk = 0, tsSw = 0;
+    struct SegAt { u32 pc; s32 t; u8 seg; };
+    SegAt seg[24]; u32 nseg = 0;
 };
 struct Ctx
 {
@@ -191,24 +322,105 @@ struct Ctx
     u64 t0;                     // time of the call
     bool interp;                // IO at the fitted offsets (the interpreter's time advances per instruction)
 };
+// the JIT invalidation check of a store (ARMJIT::CheckAndInvalidate with the address localised inline for the ARM7's WRAM
+// and main RAM: most stores here hit pages without code)
+inline void Inval(melonDS::NDS& nds, u32 a, u8 reg)
+{
+    if (reg == Mem::memregion_WRAM7)
+    {
+        const u32 o = a & (melonDS::ARM7WRAMSize - 1);
+        if (nds.JIT.CodeIndexARM7WRAM[o / 512].Code & (1u << ((o & 0x1FF) / 16))) nds.JIT.InvalidateByAddr(o | (Mem::memregion_WRAM7 << 27));
+    }
+    else if (reg == Mem::memregion_MainRAM)
+    {
+        const u32 o = a & nds.MainRAMMask;
+        if (nds.JIT.CodeIndexMainRAM[o / 512].Code & (1u << ((o & 0x1FF) / 16))) nds.JIT.InvalidateByAddr(o | (Mem::memregion_MainRAM << 27));
+    }
+    else nds.JIT.CheckAndInvalidate<1, Mem::memregion_SharedWRAM>(a);
+}
 bool Rd(Ctx& c, u32 a, u32& v)
 {
-    for (u32 i = c.x.nw; i-- > 0;) if (c.x.w[i].a == a) { v = c.x.w[i].v; return true; }
+    if (!c.x.dry) return Word(c.nds, a, v);
+    if (c.x.bloom >> (a >> 2 & 63) & 1)
+    {
+        for (u32 i = c.x.nw; i-- > 0;) if (c.x.w[i].a == a) { v = c.x.w[i].v; return true; }
+    }
     return Word(c.nds, a, v);
 }
 bool Wr(Ctx& c, u32 a, u32 v)
 {
     u8 reg;
     u8* p = Host(c.nds, a, reg);
-    if (!p || c.x.nw >= 40) return false;
+    if (!p) return false;
+    if (!c.x.dry)
+    {
+        const u32 old = R32(p);
+        if (old == v) return true;
+        if (c.x.nu >= 128) return false;
+        c.x.undo[c.x.nu++] = {p, a, old, reg};
+        Inval(c.nds, a, reg);
+        memcpy(p, &v, 4);
+        return true;
+    }
+    if (c.x.nw >= 96) return false;
     c.x.w[c.x.nw++] = {p, a, v, reg};
+    c.x.bloom |= 1ull << (a >> 2 & 63);
     return true;
+}
+void Undo(melonDS::NDS& nds, Txn& x, u32 to)
+{
+    while (x.nu > to)
+    {
+        const Txn::U& u = x.undo[--x.nu];
+        Inval(nds, u.a, u.reg);
+        memcpy(u.p, &u.old, 4);
+    }
+}
+// an IO store now (or recorded in compare mode); interpreter: at the guest's time of the store (t0 + t: the run's cycles
+// are charged after it, >= t)
+void IoNow(melonDS::NDS& nds, u32 a, u32 v, u8 op, u64 at, bool interp)
+{
+    const u64 now = nds.ARM7Timestamp;
+    const u64 dt = interp && at > now ? at - now : 0;
+    nds.ARM7Timestamp += dt;
+    switch (op)
+    {
+    case 0: nds.ARM7Write16(a, (u16)v); break;
+    case 1: nds.ARM7Write32(0x04000210, nds.IE[1] | v); break;
+    case 2: nds.ARM7Write32(0x04000210, nds.IE[1] & ~v); break;
+    case 3: nds.ARM7Write32(0x04000214, v); break;
+    }
+    nds.ARM7Timestamp -= dt;
+}
+bool Rd16(Ctx& c, u32 a, u32& v) { u32 w; if (!Rd(c, a & ~3u, w)) return false; v = (w >> (8 * (a & 2))) & 0xFFFF; return true; }
+bool Wr16(Ctx& c, u32 a, u32 v)
+{
+    u32 w;
+    if (!Rd(c, a & ~3u, w)) return false;
+    const u32 sh = 8 * (a & 2);
+    return Wr(c, a & ~3u, (w & ~(0xFFFFu << sh)) | (v & 0xFFFF) << sh);
 }
 bool Io(Ctx& c, u32 a, u32 v, u8 op)
 {
-    if (c.x.nio >= 12) return false;
+    if (c.x.nio >= 24) return false;
     c.x.io[c.x.nio++] = {a, v, c.x.t, op};
+    if (!c.x.dry) IoNow(c.nds, a, v, op, c.t0 + (u64)c.x.t, c.interp);
     return true;
+}
+// IE / IF as the pending IO leaves them
+u32 IE(Ctx& c)
+{
+    u32 v = c.nds.IE[1];
+    if (!c.x.dry) return v;
+    for (u32 i = 0; i < c.x.nio; i++) { if (c.x.io[i].op == 1) v |= c.x.io[i].v; else if (c.x.io[i].op == 2) v &= ~c.x.io[i].v; }
+    return v;
+}
+u32 IF(Ctx& c)
+{
+    u32 v = c.nds.IF[1];
+    if (!c.x.dry) return v;
+    for (u32 i = 0; i < c.x.nio; i++) if (c.x.io[i].op == 3) v &= ~c.x.io[i].v;
+    return v;
 }
 
 // Cycle model per SDK build: the guest's cycles from the call, fitted in check mode (LITEV_A7N_FIT: the TM0 read times
@@ -224,15 +436,17 @@ constexpr Cyc kCyc[2] = {
     {21, 124, 16,  8, 113, 164, -2,  27, 40, 127, 123, 18, 130, 14},   // TWL
     {16,  77, 17,  8, 100, 139, -3,  22, 40, 133, 126, 18, 138, 12},   // NTR
 };
+inline const Cyc& CycOf(u8 fam) { return kCyc[fam == famTWL ? 0 : 1]; }
 // ARM7 multiply cycles by the multiplier's significant bytes (as the interpreter charges UMULL / MLA)
 inline s32 MulCyc(u32 x) { return x < 0x100 ? 2 : x < 0x10000 ? 3 : x < 0x1000000 ? 4 : 5; }
 
 bool GetTick(Ctx& c, u64& tick)
 {
     const Env& e = c.e;
-    const Cyc& k = kCyc[e.fam];
+    const u8 fam = e.kf[kGetTick];
+    const Cyc& k = CycOf(fam);
     u32 extra = 0;
-    if (e.fam == famTWL)
+    if (fam == famTWL)
     {
         // TwlSDK: on a DSi console the IRQ flags are read elsewhere (guest); the software IF of the TWL IRQ wrapper
         const u32 fl = e.f[f_flags];
@@ -255,12 +469,12 @@ bool GetTick(Ctx& c, u64& tick)
     u16 lo;
     if (!c.nds.PeekTimer7(4, c.interp ? c.t0 + c.x.t + k.gtRead : c.t0, lo)) return false;
     if (c.x.nticks < 4) c.x.ticks[c.x.nticks++] = lo;
-    const u32 tc = e.f[f_tc] + (e.fam == famTWL ? 8 : 0);
+    const u32 tc = e.f[f_tc] + (fam == famTWL ? 8 : 0);
     u32 cl, ch;
     if (!Rd(c, tc, cl) || !Rd(c, tc + 4, ch)) return false;
     u64 cnt = (u64)(ch & 0xFFFF) << 32 | cl;
     c.x.t += k.gtTot;
-    if (((c.nds.IF[1] | extra) & 8) && !(lo & 0x8000)) { cnt++; c.x.t += k.gtInc; c.x.inc++; }
+    if (((IF(c) | extra) & 8) && !(lo & 0x8000)) { cnt++; c.x.t += k.gtInc; c.x.inc++; }
     tick = cnt << 16 | lo;
     return true;
 }
@@ -268,14 +482,14 @@ bool GetTick(Ctx& c, u64& tick)
 bool SetTimer(Ctx& c, u32 alarm)
 {
     const Env& e = c.e;
-    const Cyc& k = kCyc[e.fam];
+    const Cyc& k = CycOf(e.kf[kSetTimer]);
     u64 tick;
     c.x.t += k.stGt;
     if (!GetTick(c, tick)) return false;
     const s32 tr = c.x.t;                       // (GetTick returned)
-    if (!Io(c, 0x04000106, 0, 0)) return false;
     u32 flo, fhi;
     if (!Rd(c, alarm + 0xC, flo) || !Rd(c, alarm + 0x10, fhi)) return false;
+    if (!Io(c, 0x04000106, 0, 0)) return false;
     const s64 delta = (s64)(((u64)fhi << 32 | flo) - tick);
     // OSi_EnterTimerCallback(OS_TIMER_1, OSi_AlarmHandler, NULL): callback table entry 1 (12-byte entries), IE |= TIMER1
     if (!Wr(c, e.f[f_cbf] + 12, e.f[f_ah]) || !Wr(c, e.f[f_cba] + 12, 0) || !Io(c, 0, 0x10, 1) || !Wr(c, e.f[f_cbe] + 12, 1))
@@ -294,7 +508,8 @@ bool SetTimer(Ctx& c, u32 alarm)
 bool InsertAlarm(Ctx& c, u32 alarm, u64 fire)
 {
     const Env& e = c.e;
-    const Cyc& k = kCyc[e.fam];
+    const u8 fam = e.kf[kInsertAlarm];
+    const Cyc& k = CycOf(fam);
     u32 plo, phi;
     if (!Rd(c, alarm + 0x1C, plo) || !Rd(c, alarm + 0x20, phi)) return false;
     const u64 period = (u64)phi << 32 | plo;
@@ -331,7 +546,7 @@ bool InsertAlarm(Ctx& c, u32 alarm, u64 fire)
     else c.x.t += k.iaNp;       // ponytail: one-shot alarm (no GetTick / division): estimate (not seen in the fits)
     const s32 tp = c.x.t;
     if (!Wr(c, alarm + 0xC, (u32)fire) || !Wr(c, alarm + 0x10, (u32)(fire >> 32))) return false;
-    const u32 head = e.f[f_q] + (e.fam == famTWL ? 4 : 0), tail = head + 4;
+    const u32 head = e.f[f_q] + (fam == famTWL ? 4 : 0), tail = head + 4;
     u32 next;
     if (!Rd(c, head, next)) return false;
     s32 w = 0;
@@ -392,29 +607,32 @@ bool Native(melonDS::ARM* cpu, const Entry& en, Txn& x, bool interp)
     return false;
 }
 
-void Commit(melonDS::ARM* cpu, const Txn& x, bool interp)
+// t0: the time the native run started (the IO of an interpreter run happens at t0 + its offset)
+void Commit(melonDS::ARM* cpu, const Txn& x, bool interp, u64 t0)
 {
     melonDS::NDS& nds = cpu->NDS;
+    if (!x.dry) return;         // (direct: done)
     for (u32 i = 0; i < x.nw; i++)
     {
         const Txn::W& w = x.w[i];
         if (R32(w.p) == w.v) continue;
-        switch (w.reg)
-        {
-        case Mem::memregion_MainRAM: nds.JIT.CheckAndInvalidate<1, Mem::memregion_MainRAM>(w.a); break;
-        case Mem::memregion_SharedWRAM: nds.JIT.CheckAndInvalidate<1, Mem::memregion_SharedWRAM>(w.a); break;
-        default: nds.JIT.CheckAndInvalidate<1, Mem::memregion_WRAM7>(w.a); break;
-        }
+        Inval(nds, w.a, w.reg);
         memcpy(w.p, &w.v, 4);
     }
     for (u32 i = 0; i < x.nio; i++)
     {
         const Txn::Io& o = x.io[i];
-        // interpreter: at the guest's time of the store (the instruction's cycles are charged after it, >= t)
-        const u64 dt = interp ? (u64)o.t : 0;
+        // interpreter: at the guest's time of the store (the run's cycles are charged after it, >= t)
+        const u64 at = t0 + (u64)o.t, now = nds.ARM7Timestamp;
+        const u64 dt = interp && at > now ? at - now : 0;
         nds.ARM7Timestamp += dt;
-        if (o.op == 0) nds.ARM7Write16(o.a, (u16)o.v);
-        else nds.ARM7Write32(0x04000210, nds.IE[1] | o.v);
+        switch (o.op)
+        {
+        case 0: nds.ARM7Write16(o.a, (u16)o.v); break;
+        case 1: nds.ARM7Write32(0x04000210, nds.IE[1] | o.v); break;
+        case 2: nds.ARM7Write32(0x04000210, nds.IE[1] & ~o.v); break;
+        case 3: nds.ARM7Write32(0x04000214, o.v); break;
+        }
         nds.ARM7Timestamp -= dt;
     }
 }
@@ -450,8 +668,580 @@ void Guest(melonDS::ARMv4* c, u32 target, u32 ret)
     fprintf(stderr, "A7Native: guest call to %08x never returned\n", target);
 }
 
-// ---- compare mode (interpreter) --------------------------------------------------------------------------------------
+// ---- the IRQ path ----------------------------------------------------------------------------------------------------
+// The guest IRQ path as a chain of segments (each the exact transcription of a stretch of guest code between calls),
+// stepped natively from the BIOS IRQ vector (TriggerIRQ) or from the instruction a guest function returns to (a JIT hook:
+// the thread switch, the IRQ callback dispatcher and OSi_ArrangeTimer after their calls). A segment runs only when every
+// function on it is verified and the state is the handled case; the chain stops at a guest function the OS calls (an IRQ
+// table function, a timer callback, an alarm handler) or when it returns to the interrupted code. The state at a stop
+// is the guest's: registers (incl. banked), the stack frames, memory and IO (scratch registers r1-r3 / r12 and the flags
+// at a call into guest code are the guest's too where the code sets them; category B: the cycles).
+struct St
+{
+    u32 r[16];                      // IRQ mode view; r[15] = the next instruction's address
+    u32 usr13, usr14, svc13, spsr;  // the user/system bank (R_IRQ[0..1] in IRQ mode), SVC sp, SPSR_irq
+    u32 cpsr;
+    bool ret = false;               // returned to the interrupted code (r[15] = its pc, CPSR = spsr)
+};
+struct Cyc2
+{
+    s32 biosIn, biosRet;
+    s32 irqh, irqhBit, irqhSave;    // OS_IrqHandler: to bx r0 (+ per lowest-bit loop step, + the TWL register save)
+    s32 irqhNone;                   // ... IME off or nothing pending: to its return
+    s32 stub, icbPre, icbNoCall, icbPost, icbDis;
+    s32 awPre, awPost;              // (the NTR 2005 build's OSi_AlarmHandler: one cycle less each)
+    s32 arrPre, arrEmpty, arrSet, arrSetEnd, arrDue, arrNoHandler, arrPost, arrIns, arrHead, arrEnd;
+    s32 tsNone, tsWake, tsWakeEach, tsResched, tsWalk, tsSwitch;
+};
+// fitted in check mode (LITEV_A7N_FIT: the guest's time at each segment, its TM0 reads and TM1's start; PW, PB, The Sims 3 /
+// Shrek, Castlevania, Mario Kart DS); ponytail: irqhNone, icbNoCall, icbDis, arrEmpty, arrNoHandler: instruction-count
+// estimates (paths not seen in the fits)
+constexpr Cyc2 kCyc2[2] = {
+    {16, 8,  40, 5, 9, 12,  6, 38, 32, 26, 30,  5, 6,  63, 12, 20, 8, 47, 40, 8, 6, 8, 8,  23, 12, 8, 28, 10, 78},   // TWL
+    {16, 8,  34, 5, 0, 12,  6, 38, 32, 26, 30,  5, 6,  50, 12, 18, 10, 50, 40, 8, 6, 8, 8,  23, 12, 8, 28, 10, 78},  // NTR
+};
+inline const Cyc2& Cyc2Of(u8 fam) { return kCyc2[fam == famTWL ? 0 : 1]; }
+constexpr u32 kMovLrPc = 0xE1A0E00F;
+
+enum Want : u8 { wBiosIn, wIrqH, wStub, wIcb, wIcbPost, wAw, wAwPost, wArr, wArrPost, wTs, wBiosRet, wNone };
+struct Run
+{
+    melonDS::NDS& nds;
+    State& s;
+    Txn& x;
+    u64 t0;
+    bool interp;
+    St& st;
+    u8 want;                        // the segment expected next (the path the guest code takes; anything else: stop)
+    const Env* env = nullptr;       // the IRQ handler's / ArrangeTimer's / ... (for Ctx)
+};
+bool Push(Run& R, const u32* v, int n)
+{
+    // stmdb sp!, {...}: lowest register at the lowest address
+    u32 sp = R.st.r[13] - 4 * n;
+    Ctx c{R.nds, *R.env, R.x, R.t0, R.interp};
+    for (int i = 0; i < n; i++) if (!Wr(c, sp + 4 * i, v[i])) return false;
+    R.st.r[13] = sp;
+    return true;
+}
+bool Pop(Run& R, u32* v, int n)
+{
+    Ctx c{R.nds, *R.env, R.x, R.t0, R.interp};
+    for (int i = 0; i < n; i++) if (!Rd(c, R.st.r[13] + 4 * i, v[i])) return false;
+    R.st.r[13] += 4 * n;
+    return true;
+}
+
+// BIOS: stmdb sp!, {r0-r3, r12, lr}; mov r0, #0x04000000; add/mov lr, pc...; ldr pc, [r0, #-4]
+bool BiosOk(melonDS::NDS& nds, State& s)
+{
+    if (s.bios) return s.bios > 0;
+    s.bios = -1;
+    const auto& b = nds.GetARM7BIOS();
+    auto w = [&](u32 a) { u32 v; memcpy(&v, &b[a], 4); return v; };
+    const u32 v18 = w(0x18);
+    if ((v18 >> 24) != 0xEA) return false;
+    const u32 h = 0x18 + 8 + (u32)((s32)(v18 << 8) >> 6);
+    if (h + 24 > b.size()) return false;
+    if (w(h) != 0xE92D500F || w(h + 4) != 0xE3A00301 || (w(h + 8) != 0xE28FE000 && w(h + 8) != kMovLrPc) || w(h + 12) != 0xE510F004
+        || w(h + 16) != 0xE8BD500F || w(h + 20) != 0xE25EF004) return false;
+    s.bios = 1; s.biosRet = h + 16;
+    return true;
+}
+
+// one segment at st.r[15]: 1 ran, 0 not ours (the guest runs from here)
+int Step(Run& R)
+{
+    St& st = R.st;
+    melonDS::NDS& nds = R.nds;
+    State& s = R.s;
+    const u32 pc = st.r[15];
+    if ((st.cpsr & 0x1F) != 0x12 || (pc & 3)) return 0;
+    auto at = [&](u8 seg, s32 cyc) { if (R.x.nseg < 24) R.x.seg[R.x.nseg++] = {pc, R.x.t, seg}; s.segs[seg]++; R.x.t += cyc; };
+    // the BIOS vector and its return stub
+    if (R.want == wBiosIn && pc == 0x18 && BiosOk(nds, s))
+    {
+        u32 h;
+        if (!Word(nds, 0x03FFFFFC, h)) return 0;
+        const Fn* fh = Chk(nds, s, h, kIrqHandler);
+        if (!fh) return 0;
+        R.env = &fh->e;
+        const u32 fr[6] = {st.r[0], st.r[1], st.r[2], st.r[3], st.r[12], st.r[14]};
+        if (!Push(R, fr, 6)) return 0;
+        at(sBiosIn, Cyc2Of(fh->e.fam).biosIn);
+        st.r[0] = 0x04000000; st.r[14] = s.biosRet; st.r[15] = h;
+        R.want = wIrqH;
+        return 1;
+    }
+    if (R.want == wBiosRet && s.bios > 0 && pc == s.biosRet)
+    {
+        u32 fr[6];
+        Env none; const Env* keep = R.env; if (!R.env) R.env = &none;
+        const bool ok = Pop(R, fr, 6);
+        R.env = keep;
+        if (!ok) return 0;
+        at(sBiosRet, kCyc2[0].biosRet);
+        st.r[0] = fr[0]; st.r[1] = fr[1]; st.r[2] = fr[2]; st.r[3] = fr[3]; st.r[12] = fr[4]; st.r[14] = fr[5];
+        st.ret = true;
+        st.r[15] = fr[5] - 4;           // (subs pc, lr, #4: CPSR = SPSR at apply)
+        R.want = wNone;
+        return 1;
+    }
+    u32 w0;
+    if (R.want >= wNone || !Word(nds, pc, w0)) return 0;
+    // an IRQ table stub: TWL ldr ip, [pc, #4]; mov r0, #n; bx ip / NTR mov r0, #n; ldr ip, [pc]; bx ip; then the dispatcher
+    {
+        u32 w1, w2, w3;
+        if (R.want == wStub && (w0 == 0xE59FC004 || (w0 & 0xFFFFFF00) == 0xE3A00000) && Word(nds, pc + 4, w1) && Word(nds, pc + 8, w2) && w2 == 0xE12FFF1C
+            && Word(nds, pc + 12, w3))
+        {
+            const bool twl = w0 == 0xE59FC004;
+            const u32 mv = twl ? w1 : w0, ld = twl ? w0 : w1;
+            if ((mv & 0xFFFFFF00) == 0xE3A00000 && ld == (twl ? 0xE59FC004u : 0xE59FC000u) && Chk(nds, s, w3, kIrqCallback))
+            {
+                at(sStub, kCyc2[0].stub);
+                st.r[0] = mv & 0xFF; st.r[12] = w3; st.r[15] = w3;
+                R.want = wIcb;
+                return 1;
+            }
+        }
+    }
+    static const u8 kWantKind[] = {kKinds, kIrqHandler, kKinds, kIrqCallback, kIrqCallback, kAlarmWrap, kAlarmWrap, kArrangeTimer,
+                                   kArrangeTimer, kThreadSwitch, kKinds, kKinds};
+    const u8 wk = kWantKind[R.want];
+    for (const A7NSig& g : kSigs)
+    {
+        if (g.kind != wk) continue;
+        const bool entry = g.w0 == w0, post = g.post && g.pw == w0;
+        if (!entry && !post) continue;
+        switch (g.kind)
+        {
+        case kIrqHandler:
+        {
+            if (!entry || R.want != wIrqH) break;
+            const Fn* f = Chk(nds, s, pc, kIrqHandler);
+            if (!f) break;
+            R.env = &f->e;
+            Ctx c{nds, f->e, R.x, R.t0, R.interp};
+            const u8 fam = f->e.kf[kIrqHandler];
+            const Cyc2& k = Cyc2Of(fam);
+            const u32 lr = st.r[14], sp0 = st.r[13];
+            u32 v;
+            // (stmdb sp!, {lr}: the frame is written below)
+            const u32 ime = nds.IME[1];
+            u32 pend = IE(c) & IF(c);
+            if (fam == famTWL && ime && !pend)
+            {
+                // TwlSDK: the DSi IRQ flags (IE2 / IF2); on a DS they read 0
+                if (nds.ARM7Read32(0x04000218) & nds.ARM7Read32(0x0400021C)) return 0;
+            }
+            if (!Push(R, &lr, 1)) { st.r[13] = sp0; return 0; }
+            if (!ime || !pend)
+            {
+                // ldmeq sp!, {pc}
+                at(sIrqH, k.irqhNone);
+                st.r[1] = ime ? 0 : 0; st.r[12] = 0x04000210 + (fam == famTWL && ime ? 8 : 0);
+                if (ime) st.r[2] = fam == famTWL ? nds.ARM7Read32(0x0400021C) : IF(c);
+                if (!Rd(c, st.r[13], v)) return 0;
+                st.r[13] += 4; st.r[15] = v;
+                R.want = wBiosRet;
+                return 1;
+            }
+            u32 idx = 0;
+            while (!(pend >> idx & 1)) idx++;
+            u32 fn;
+            if (!Rd(c, f->e.f[f_table] + 4 * idx, fn)) return 0;
+            if (fam == famTWL)
+            {
+                const u32 sv[9] = {st.r[4], st.r[5], st.r[6], st.r[7], st.r[8], st.r[9], st.r[10], st.r[11], st.r[13]};
+                for (int i = 0; i < 9; i++) if (!Wr(c, f->e.f[f_save] + 4 * i, sv[i])) return 0;
+            }
+            if (!Io(c, 0x04000214, 1u << idx, 3)) return 0;
+            at(sIrqH, k.irqh + k.irqhBit * (s32)idx + (fam == famTWL ? k.irqhSave : 0));
+            st.r[0] = fn; st.r[1] = f->e.f[f_table]; st.r[2] = fam == famTWL ? f->e.f[f_save] : 1u << idx; st.r[3] = 1;
+            st.r[12] = 0x04000210; st.r[14] = f->e.f[f_ts]; st.r[15] = fn;
+            // (bx r0 to Thumb code: the guest runs it)
+            R.want = wStub;
+            return 1;
+        }
+        case kIrqCallback:
+        {
+            if (R.want != (entry ? wIcb : wIcbPost)) break;
+            const Fn* f = Chk(nds, s, entry ? pc : pc - g.post, kIrqCallback);
+            if (!f || f->e.kf[kIrqCallback] != g.fam) break;
+            R.env = &f->e;
+            Ctx c{nds, f->e, R.x, R.t0, R.interp};
+            const bool twl = g.fam == famTWL;
+            const Cyc2& k = Cyc2Of(g.fam);
+            const u32 icbf = f->e.f[f_icbf], icba = f->e.f[f_icba], icbe = f->e.f[f_icbe], ibits = f->e.f[f_ibits];
+            if (entry)
+            {
+                const u32 n = st.r[0];
+                if (n > 31) return 0;
+                u32 fn, bit, arg = 0;
+                if (!Rd(c, icbf + 12 * n, fn) || !Rd16(c, ibits + 2 * n, bit)) return 0;
+                const u32 mask = 1u << (bit & 31);
+                if (fn && !Rd(c, icba + 12 * n, arg)) return 0;
+                if (twl) { const u32 fr[4] = {st.r[3], st.r[4], st.r[5], st.r[14]}; if (!Push(R, fr, 4)) return 0; }
+                else { const u32 fr[3] = {st.r[4], st.r[5], st.r[14]}; if (!Push(R, fr, 3)) return 0; st.r[13] -= 4; }
+                if (!Wr(c, icbf + 12 * n, 0)) return 0;
+                if (twl) { st.r[1] = fn; st.r[2] = icbf; st.r[3] = bit; st.r[4] = mask; st.r[5] = 12 * n; }
+                else { st.r[1] = fn; st.r[2] = icbf; st.r[3] = 1; st.r[4] = 12 * n; st.r[5] = mask; }
+                if (fn)
+                {
+                    at(sIcbPre, k.icbPre);
+                    st.r[0] = arg; st.r[14] = f->addr + g.post; st.r[15] = fn;
+                    R.want = wAw;
+                    return 1;
+                }
+                at(sIcbPre, k.icbNoCall);
+                st.r[0] = 0; st.r[15] = f->addr + g.post;
+                R.want = wIcbPost;
+                return 1;
+            }
+            // after the callback: the IRQ check flag, the IRQ off again unless the callback is kept
+            const u32 mask = twl ? st.r[4] : st.r[5], off = twl ? st.r[5] : st.r[4];
+            u32 flag, en, fr[4];
+            if (!Rd(c, 0x0380FFF8, flag) || !Rd(c, icbe + off, en)) return 0;
+            const u32 sp = st.r[13] + (twl ? 0 : 4);
+            for (int i = 0; i < (twl ? 4 : 3); i++) if (!Rd(c, sp + 4 * i, fr[i])) return 0;
+            if (!Wr(c, 0x0380FFF8, flag | mask)) return 0;
+            s32 cyc = k.icbPost;
+            if (!en)
+            {
+                const u32 old = IE(c);
+                if (!Io(c, 0, mask, 2)) return 0;
+                st.r[0] = old; st.r[1] = 0; st.r[2] = 0x04000208; st.r[3] = old; st.r[12] = 0x04000210;
+                cyc += k.icbDis;
+            }
+            else { st.r[0] = en; st.r[1] = flag | mask; st.r[2] = twl ? 0x0380FFF8 : st.r[2]; if (!twl) st.r[1] = 0x0380FFF8; }
+            st.r[13] = sp + 4 * (twl ? 4 : 3);
+            if (twl) { st.r[3] = fr[0]; st.r[4] = fr[1]; st.r[5] = fr[2]; st.r[14] = fr[3]; }
+            else { st.r[4] = fr[0]; st.r[5] = fr[1]; st.r[14] = fr[2]; }
+            at(sIcbPost, cyc);
+            st.r[15] = st.r[14];
+            R.want = wTs;
+            return 1;
+        }
+        case kAlarmWrap:
+        {
+            if (R.want != (entry ? wAw : wAwPost)) break;
+            const Fn* f = Chk(nds, s, entry ? pc : pc - g.post, kAlarmWrap);
+            if (!f || f->e.kf[kAlarmWrap] != g.fam) break;
+            R.env = &f->e;
+            const bool r0 = g.fam != famNTR05;
+            if (entry)
+            {
+                if (r0) { const u32 fr[2] = {st.r[0], st.r[14]}; if (!Push(R, fr, 2)) return 0; }
+                else if (!Push(R, &st.r[14], 1)) return 0;
+                at(sAwPre, Cyc2Of(g.fam).awPre - (g.fam == famNTR05));
+                st.r[14] = pc + 8; st.r[15] = f->e.ka[kArrangeTimer];
+                R.want = wArr;
+                return 1;
+            }
+            if (r0) { u32 fr[2]; if (!Pop(R, fr, 2)) return 0; st.r[0] = fr[0]; st.r[14] = fr[1]; }
+            else if (!Pop(R, &st.r[14], 1)) return 0;
+            at(sAwPost, Cyc2Of(g.fam).awPost - (g.fam == famNTR05));
+            st.r[15] = st.r[14];
+            R.want = wIcbPost;
+            return 1;
+        }
+        case kArrangeTimer:
+        {
+            if (R.want != (entry ? wArr : wArrPost)) break;
+            const Fn* f = Chk(nds, s, entry ? pc : pc - g.post, kArrangeTimer);
+            if (!f || f->e.kf[kArrangeTimer] != g.fam) break;
+            R.env = &f->e;
+            Ctx c{nds, f->e, R.x, R.t0, R.interp};
+            const bool twl = g.fam == famTWL;
+            const Cyc2& k = Cyc2Of(g.fam);
+            const u32 q = f->e.f[f_q], head = q + (twl ? 4 : 0), tail = head + 4;
+            // registers: TWL r4 = 0, r5 = alarm, r6 = handler; NTR r4 = alarm, r5 = handler
+            u32& ra = twl ? st.r[5] : st.r[4];
+            u32& rh = twl ? st.r[6] : st.r[5];
+            auto end = [&](s32 cyc) -> bool
+            {
+                if (twl) { u32 fr[4]; if (!Pop(R, fr, 4)) return false; st.r[4] = fr[0]; st.r[5] = fr[1]; st.r[6] = fr[2]; st.r[14] = fr[3]; }
+                else { st.r[13] += 4; u32 fr[3]; if (!Pop(R, fr, 3)) return false; st.r[4] = fr[0]; st.r[5] = fr[1]; st.r[14] = fr[2]; }
+                R.x.t += cyc;
+                st.r[15] = st.r[14];
+                R.want = wAwPost;
+                return true;
+            };
+            // the tail after the alarm (from the post-call instruction): re-insert a periodic alarm, re-arm the timer
+            auto tail2 = [&](u32 alarm, u32 handler) -> bool
+            {
+                u32 plo, phi;
+                if (!Rd(c, alarm + 0x1C, plo) || !Rd(c, alarm + 0x20, phi)) return false;
+                R.x.t += k.arrPost;
+                if (plo | phi)
+                {
+                    if (!Wr(c, alarm, handler)) return false;
+                    R.x.t += k.arrIns;
+                    if (!InsertAlarm(c, alarm, 0)) return false;
+                }
+                u32 h;
+                if (!Rd(c, head, h)) return false;
+                if (h) { R.x.t += k.arrHead; if (!SetTimer(c, h)) return false; }
+                return end(k.arrEnd);
+            };
+            if (!entry)
+            {
+                at(sArrPost, 0);
+                return tail2(ra, rh) ? 1 : 0;
+            }
+            if (twl) { const u32 fr[4] = {st.r[4], st.r[5], st.r[6], st.r[14]}; if (!Push(R, fr, 4)) return 0; }
+            else { const u32 fr[3] = {st.r[4], st.r[5], st.r[14]}; if (!Push(R, fr, 3)) return 0; st.r[13] -= 4; }
+            at(sArrPre, 0);
+            const s32 tio = R.x.t;
+            R.x.t += k.arrPre;
+            // everything that can fail before the IO (a segment that stops leaves no trace)
+            u32 flag, alarm, flo = 0, fhi = 0, next = 0, handler = 0, plo = 0, phi = 0, arg = 0;
+            u64 tick;
+            if (!Rd(c, 0x0380FFF8, flag) || !GetTick(c, tick) || !Rd(c, head, alarm)) return 0;
+            if (alarm && (!Rd(c, alarm + 0xC, flo) || !Rd(c, alarm + 0x10, fhi))) return 0;
+            const bool due = alarm && tick >= ((u64)fhi << 32 | flo);
+            if (due)
+            {
+                u8 reg;
+                if (!Rd(c, alarm + 0x18, next) || (next && !Host(nds, next + 0x14, reg)) || !Rd(c, alarm, handler)
+                    || !Rd(c, alarm + 0x1C, plo) || !Rd(c, alarm + 0x20, phi) || !Rd(c, alarm + 4, arg)) return 0;
+                if (!handler) return 0;         // ponytail: a due alarm without a handler: the guest (not seen)
+            }
+            {
+                const s32 t = R.x.t;
+                R.x.t = tio;
+                if (!Io(c, 0x04000106, 0, 0) || !Io(c, 0, 0x10, 2)) return 0;
+                R.x.t = t;
+            }
+            if (!Wr(c, 0x0380FFF8, flag | 0x10)) return 0;
+            if (twl) st.r[4] = 0;
+            ra = alarm;
+            if (!alarm) return end(k.arrEmpty) ? 1 : 0;
+            if (!due)
+            {
+                R.x.t += k.arrSet;
+                if (!SetTimer(c, alarm)) return 0;
+                return end(k.arrSetEnd) ? 1 : 0;
+            }
+            if (!Wr(c, head, next) || !(next ? Wr(c, next + 0x14, 0) : Wr(c, tail, 0))) return 0;
+            if (!(plo | phi) && !Wr(c, alarm, 0)) return 0;
+            rh = handler;
+            R.x.t += k.arrDue;
+            // the call: r0 = arg (TWL r1 = period lo, r2 = q, r3 = fire hi, ip = fire lo; NTR r1 = period hi, r2 = period lo)
+            st.r[0] = arg; st.r[3] = fhi; st.r[12] = flo;
+            if (twl) { st.r[1] = plo; st.r[2] = q; } else { st.r[1] = phi; st.r[2] = plo; }
+            st.r[14] = f->addr + g.post; st.r[15] = handler;
+            R.want = wNone;             // (the alarm handler: guest code)
+            return 1;
+        }
+        case kThreadSwitch:
+        {
+            if (!entry || R.want != wTs) break;
+            const Fn* f = Chk(nds, s, pc, kThreadSwitch);
+            if (!f) break;
+            R.env = &f->e;
+            Ctx c{nds, f->e, R.x, R.t0, R.interp};
+            const Cyc2& k = Cyc2Of(f->e.kf[kThreadSwitch]);
+            const u32 irqq = f->e.f[f_irqq], ti = f->e.f[f_tinfo];
+            s32 cyc = k.tsNone;
+            // wake the threads waiting for an IRQ (OS_WaitIrq)
+            u32 t;
+            if (!Rd(c, irqq, t)) return 0;
+            if (t)
+            {
+                for (int n = 0; t; n++)
+                {
+                    u32 nx;
+                    if (n > 64 || !Wr(c, t + 0x48, 1) || !Wr(c, t + 0x5C, 0) || !Wr(c, t + 0x60, 0) || !Rd(c, t + 0x64, nx) || !Wr(c, t + 0x64, 0))
+                        return 0;
+                    t = nx; cyc += k.tsWakeEach; R.x.tsWake++;
+                }
+                if (!Wr(c, irqq, 0) || !Wr(c, irqq + 4, 0) || !Wr16(c, ti, 1)) return 0;
+                cyc += k.tsWake;
+            }
+            u32 resched;
+            if (!Rd16(c, ti, resched)) return 0;
+            u32 to = 0, cur = 0;
+            if (resched)
+            {
+                cyc += k.tsResched; R.x.tsRes = 1;
+                if (!Rd(c, ti + 8, to)) return 0;
+                for (int n = 0; to; n++)
+                {
+                    u32 stt;
+                    if (n > 64 || !Rd16(c, to + 0x48, stt)) return 0;
+                    if (stt == 1) break;
+                    cyc += k.tsWalk + ((to >> 24) == 0x02 ? 11 : 0); R.x.tsWalk++;     // (main RAM: slower loads)
+                    if (!Rd(c, to + 0x4C, to)) return 0;
+                }
+                if (!Rd(c, ti + 4, cur)) return 0;
+                u32 cb;
+                if (to && to != cur && (!Rd(c, ti + 0xC, cb) || cb)) return 0;      // a thread switch callback: the guest
+                if (!Wr16(c, ti, 0)) return 0;
+            }
+            if (!resched || !to || to == cur)
+            {
+                // popeq {pc} / pop {pc}
+                at(sTs, cyc);
+                u32 v;
+                if (!Rd(c, st.r[13], v)) return 0;
+                st.r[13] += 4; st.r[15] = v;
+                if (resched) st.cpsr = (st.cpsr & ~0xFFu) | 0x92;
+                R.want = wBiosRet;
+                return 1;
+            }
+            // the context switch: the interrupted thread's registers (from the BIOS frame) into its OSThread, the next
+            // thread's into the frame
+            const u32 S0 = st.r[13];
+            u32 fr[7];                      // [S0] = the BIOS return, then r0-r3, r12, lr
+            for (int i = 0; i < 7; i++) if (!Rd(c, S0 + 4 * i, fr[i])) return 0;
+            const u32 old[18] = {st.spsr, fr[1], fr[2], fr[3], fr[4], st.r[4], st.r[5], st.r[6], st.r[7], st.r[8], st.r[9], st.r[10],
+                                 st.r[11], fr[5], st.usr13, st.usr14, fr[6], st.svc13};
+            if (!Wr(c, ti + 4, to)) return 0;
+            for (int i = 0; i < 18; i++) if (!Wr(c, cur + 4 * i, old[i])) return 0;
+            u32 nw[18];
+            for (int i = 0; i < 18; i++) if (!Rd(c, to + 4 * i, nw[i])) return 0;
+            // msr spsr_fc, r2; lr = pc + 4; ldmib r1, {r0-r14}^; stmda sp!, {r0-r3, ip, lr}; ldmia sp!, {pc}
+            st.spsr = (st.spsr & 0x00FFFF00) | (nw[0] & 0xFF0000FF);
+            st.svc13 = nw[17];
+            for (int i = 0; i < 13; i++) st.r[i] = nw[1 + i];
+            st.usr13 = nw[14]; st.usr14 = nw[15]; st.r[14] = nw[16];
+            const u32 nf[6] = {nw[1], nw[2], nw[3], nw[4], nw[13], nw[16]};
+            for (int i = 0; i < 6; i++) if (!Wr(c, S0 + 4 + 4 * i, nf[i])) return 0;
+            st.cpsr = (st.cpsr & ~0xFFu) | 0xD2;
+            R.x.tsSw = 1;
+            at(sTs, cyc + k.tsSwitch + (((cur | to) >> 24) == 0x02 ? 48 : 0));   // ponytail: main-RAM contexts: one fit
+            st.r[13] = S0 + 4; st.r[15] = fr[0];
+            R.want = wBiosRet;
+            return 1;
+        }
+        default: break;
+        }
+    }
+    return 0;
+}
+
+void Load(melonDS::ARM* cpu, St& st, u32 pc)
+{
+    for (int i = 0; i < 15; i++) st.r[i] = cpu->R[i];
+    st.r[15] = pc;
+    st.usr13 = cpu->R_IRQ[0]; st.usr14 = cpu->R_IRQ[1]; st.svc13 = cpu->R_SVC[0]; st.spsr = cpu->R_IRQ[2]; st.cpsr = cpu->CPSR;
+    st.ret = false;
+}
+void Apply(melonDS::ARM* cpu, const St& st)
+{
+    for (int i = 0; i < 15; i++) cpu->R[i] = st.r[i];
+    cpu->R_IRQ[0] = st.usr13; cpu->R_IRQ[1] = st.usr14; cpu->R_SVC[0] = st.svc13; cpu->R_IRQ[2] = st.spsr;
+    const s32 cyc = cpu->Cycles;
+    if (st.ret) cpu->JumpTo(st.r[15], true);       // (subs pc, lr, #4)
+    else
+    {
+        cpu->CPSR = (cpu->CPSR & ~0xFFu) | (st.cpsr & 0xDF);
+        cpu->JumpTo(st.r[15]);
+    }
+    cpu->Cycles = cyc;                              // (the fetch is in the fitted cycles)
+}
+
+// step from the CPU's state at pc; n segments stepped (0: nothing ran)
+int Chain(melonDS::ARM* cpu, State& s, u32 pc, u8 want, St& st, Txn& x, bool interp, u64 t0)
+{
+    Load(cpu, st, pc);
+    s.run++;
+    Run R{cpu->NDS, s, x, t0, interp, st, want};
+    int n = 0;
+    while (n < 24 && !st.ret)
+    {
+        const St s0 = st;
+        const u8 w0 = R.want;
+        const u32 nw = x.nw, nio = x.nio, nt = x.nticks, ns = x.nseg, nu = x.nu;
+        const s32 t = x.t;
+        int ok;
+#if defined(__APPLE__) && defined(LITEV_HLE_DIAG)
+        u64 c0[2] = {}, c1[2] = {};
+        if (g_Pmu) thread_selfcounts(1, c0, sizeof(c0));
+        ok = Step(R);
+        if (g_Pmu) { thread_selfcounts(1, c1, sizeof(c1)); if (ok > 0 && x.nseg) { const int sg = 6 + x.seg[x.nseg - 1].seg; g_PmuI[sg] += c1[0] - c0[0]; g_PmuN[sg]++; } }
+#else
+        ok = Step(R);
+#endif
+        if (ok <= 0)
+        {
+            Undo(cpu->NDS, x, nu);
+            st = s0; x.nw = nw; x.nio = nio; x.nticks = nt; x.nseg = ns; x.t = t; R.want = w0;
+            x.bloom = 0;
+            for (u32 i = 0; i < nw; i++) x.bloom |= 1ull << (x.w[i].a >> 2 & 63);
+            break;
+        }
+        n++;
+    }
+    return n;
+}
+}
+
+// ---- entry points ----------------------------------------------------------------------------------------------------
+int At(melonDS::NDS& nds, u32 target, u32* a, u32* b, int max)
+{
+    State& s = Get(nds);
+    if (!On(s) || (target & 3)) return 0;
+    u32 w0;
+    if (!Word(nds, target, w0)) return 0;
+    bool cand = false;
+    for (const A7NSig& g : kSigs)
+        for (u8 k : kTop) cand |= g.w0 == w0 && g.kind == k;
+    if (!cand) return 0;
+    for (size_t i = 0; i < s.ents.size(); i++)
+        if (s.ents[i].addr == target) { s.ents.erase(s.ents.begin() + i); break; }   // (re-verified: the code may have changed)
+    Rng d[kMaxDeps];
+    for (u8 k : kTop)
+    {
+        Env env;
+        int nd = 0;
+        if (!Verify(nds, target, k, env, d, nd, 0)) continue;
+        if (nd > max) return 0;
+        s.ents.push_back({target, k, env});
+        for (int i = 0; i < nd; i++) { a[i] = d[i].a; b[i] = d[i].b; }
+        return nd;
+    }
+    return 0;
+}
+
+namespace
+{
+void Call(melonDS::ARM* cpu, u32 t, u32 ret, bool interp)
+{
+    A7N_PMU(2);
+    melonDS::NDS& nds = cpu->NDS;
+    State& s = Get(nds);
+    const Entry* en = Find(nds, s, t, true);
+    u16 tm0;
+    if (en && nds.PeekTimer7(4, interp ? nds.ARM7Timestamp + 4000 : nds.ARM7Timestamp, tm0))
+    {
+        s.calls[en->kind]++;
+        Txn x;
+        if (Native(cpu, *en, x, interp))
+        {
+            s.native[en->kind]++;
+            Commit(cpu, x, interp, nds.ARM7Timestamp);
+            if (x.ret) { cpu->R[0] = x.r0; cpu->R[1] = x.r1; }
+            cpu->R[14] = ret;
+            cpu->Cycles += x.t;
+            return;
+        }
+        Undo(nds, x, 0);
+        s.guest[en->kind]++;
+    }
+    // the guest code, then back after the call as a non-branching instruction leaves the CPU
+    melonDS::ARMv4* c = (melonDS::ARMv4*)cpu;
+    const u32 r15 = c->R[15], cpsrT = c->CPSR & 0x20, n0 = c->NextInstr[0], n1 = c->NextInstr[1], cr = c->CodeRegion;
+    const s32 cc = c->CodeCycles;
+    Guest(c, t, ret);
+    c->CPSR = (c->CPSR & ~0x20u) | cpsrT;
+    c->R[15] = r15; c->NextInstr[0] = n0; c->NextInstr[1] = n1; c->CodeRegion = cr; c->CodeCycles = cc;
+}
+
 #ifdef LITEV_HLE_DIAG
+// ---- compare mode (interpreter) ----------------------------------------------------------------------------------------
 struct Pending
 {
     const melonDS::ARM* cpu = nullptr;
@@ -465,19 +1255,87 @@ struct Pending
     std::vector<u8> w7, sw;
     u32 innerRet[4] = {}; u32 nInner = 0;       // inner OS_GetTick calls of the guest: their return addresses
     u16 gticks[4] = {}; u32 ngt = 0;            // ... and the tick (low half) they returned
+    // an IRQ-path chain
+    bool chain = false;
+    St end;
+    u32 ime = 0, ifl = 0, n = 0, segi = 0;
+    s64 segT[24] = {};
+    u16 tmR = 0, tmC = 0;
 };
 thread_local Pending g_P;
 
+void Snap(melonDS::NDS& nds)
+{
+    g_P.w7.assign(nds.ARM7WRAM, nds.ARM7WRAM + nds.ARM7WRAMSize);
+    if (nds.SWRAM_ARM7.Mem) g_P.sw.assign(nds.SWRAM_ARM7.Mem, nds.SWRAM_ARM7.Mem + nds.SWRAM_ARM7.Mask + 1);
+    else g_P.sw.clear();
+}
 void Arm(melonDS::ARM* cpu, State& s, const Entry& en, const Txn& x, u32 ret)
 {
     melonDS::NDS& nds = cpu->NDS;
     g_P.cpu = cpu; g_P.s = &s; g_P.ret = ret; g_P.sp = cpu->R[13]; g_P.ie = nds.IE[1]; g_P.kind = en.kind; g_P.x = x;
     g_P.entry = en.addr; g_P.t0 = nds.ARM7Timestamp; g_P.irq = false; g_P.nInner = 0; g_P.ngt = 0;
-    g_P.mode = cpu->CPSR & 0x1F;
-    g_P.w7.assign(nds.ARM7WRAM, nds.ARM7WRAM + nds.ARM7WRAMSize);
-    if (nds.SWRAM_ARM7.Mem) g_P.sw.assign(nds.SWRAM_ARM7.Mem, nds.SWRAM_ARM7.Mem + nds.SWRAM_ARM7.Mask + 1);
-    else g_P.sw.clear();
+    g_P.mode = cpu->CPSR & 0x1F; g_P.chain = false;
+    Snap(nds);
     CheckPending = true;
+}
+void ArmChain(melonDS::ARM* cpu, State& s, const St& end, const Txn& x, u64 t0)
+{
+    melonDS::NDS& nds = cpu->NDS;
+    g_P.cpu = cpu; g_P.s = &s; g_P.chain = true; g_P.end = end; g_P.x = x; g_P.t0 = t0; g_P.ie = nds.IE[1]; g_P.ime = nds.IME[1];
+    g_P.ifl = nds.IF[1]; g_P.n = 0; g_P.segi = 0; g_P.irq = false;
+    g_P.tmR = nds.Timers[5].Reload; g_P.tmC = nds.Timers[5].Cnt; g_P.nInner = 0; g_P.ngt = 0;
+    // (an exit hook arms at its own instruction, which the guest is about to run: that segment starts now)
+    if (x.nseg && x.seg[0].pc == cpu->R[15] - 8 && x.seg[0].pc != 0x18) { g_P.segT[0] = 0; g_P.segi = 1; }
+    Snap(nds);
+    CheckPending = true;
+}
+
+int g_Nd = 0;
+void Diff(State& s, u64 d, const char* tag, const char* what, u32 a, u32 g, u32 n)
+{
+    if (d < 12 && g_Nd < 10) fprintf(stderr, "A7N CHECK %s: %s %08x guest %08x native %08x\n", tag, what, a, g, n);
+    g_Nd++;
+}
+// memory: every native write has the guest's value; the guest wrote nothing else in ARM7 / shared WRAM (but the stack below sp)
+void MemDiff(melonDS::NDS& nds, State& s, u64 d, const char* tag, const Txn& x, u32 spLo)
+{
+    std::vector<u8> w7 = g_P.w7, sw = g_P.sw;
+    for (u32 i = 0; i < x.nw; i++)
+    {
+        bool later = false;
+        for (u32 j = i + 1; j < x.nw && !later; j++) later = x.w[j].a == x.w[i].a;
+        if (later) continue;            // (only the last store to a word stays)
+        u32 g;
+        Word(nds, x.w[i].a, g);
+        if (g != x.w[i].v) Diff(s, d, tag, "mem", x.w[i].a, g, x.w[i].v);
+        u8 reg; u8* p = Host(nds, x.w[i].a, reg);
+        if (p >= nds.ARM7WRAM && p < nds.ARM7WRAM + nds.ARM7WRAMSize) memcpy(&w7[p - nds.ARM7WRAM], &x.w[i].v, 4);
+        else if (!sw.empty() && p >= nds.SWRAM_ARM7.Mem && p < nds.SWRAM_ARM7.Mem + sw.size()) memcpy(&sw[p - nds.SWRAM_ARM7.Mem], &x.w[i].v, 4);
+    }
+    const u32 spo = spLo & (nds.ARM7WRAMSize - 1);
+    for (u32 o = 0; o < nds.ARM7WRAMSize; o += 4)
+        if (R32(&w7[o]) != R32(&nds.ARM7WRAM[o]) && !(spLo >= 0x03800000 && o < spo && o + 0x200 >= spo))
+            Diff(s, d, tag, "guest-only mem", 0x03800000 + o, R32(&nds.ARM7WRAM[o]), R32(&w7[o]));
+    for (u32 o = 0; o < sw.size(); o += 4)
+        if (R32(&sw[o]) != R32(&nds.SWRAM_ARM7.Mem[o]) && !(spLo < 0x03800000 && (spLo & nds.SWRAM_ARM7.Mask) > o && (spLo & nds.SWRAM_ARM7.Mask) <= o + 0x100))
+            Diff(s, d, tag, "guest-only swram", 0x03000000 + o, R32(&nds.SWRAM_ARM7.Mem[o]), R32(&sw[o]));
+}
+void IoDiff(melonDS::NDS& nds, State& s, u64 d, const char* tag, const Txn& x, u32 ie0, u32 if0)
+{
+    u32 ie = ie0, ifl = if0; int rel = -1, cnt = -1;
+    for (u32 i = 0; i < x.nio; i++)
+    {
+        const Txn::Io& o = x.io[i];
+        if (o.op == 1) ie |= o.v; else if (o.op == 2) ie &= ~o.v; else if (o.op == 3) ifl &= ~o.v;
+        else if (o.a == 0x04000104) rel = o.v; else if (o.a == 0x04000106) cnt = o.v;
+    }
+    if (nds.IE[1] != ie) Diff(s, d, tag, "IE", 0x04000210, nds.IE[1], ie);
+    // (a timer may overflow again after the acknowledge: a timer bit the guest has and the native acknowledged is hardware)
+    const u32 ifg = nds.IF[1] & if0, ifn = ifl & if0;
+    if ((ifg ^ ifn) & ~(ifg & ~ifn & 0x78)) Diff(s, d, tag, "IF", 0x04000214, nds.IF[1], ifl);
+    if (rel >= 0 && nds.Timers[5].Reload != rel) Diff(s, d, tag, "TM1 reload", 0x04000104, nds.Timers[5].Reload, rel);
+    if (cnt >= 0 && nds.Timers[5].Cnt != (cnt & 0xC7)) Diff(s, d, tag, "TM1CNT", 0x04000106, nds.Timers[5].Cnt, cnt);
 }
 
 void Finish(melonDS::ARM* cpu)
@@ -488,7 +1346,7 @@ void Finish(melonDS::ARM* cpu)
     const u8 k = g_P.kind;
     const Txn& x = g_P.x;
     const s64 cyc = (s64)(nds.ARM7Timestamp + cpu->Cycles - g_P.t0);
-    if (g_P.irq) { CheckPending = false; return; }
+    if (g_P.irq) return;
     s.checks[k]++;
     // the guest's tick reads (an OS_GetTick call: its return value; inner calls: recorded at their returns)
     u16 gt[4]; u32 ngt = 0;
@@ -497,7 +1355,7 @@ void Finish(melonDS::ARM* cpu)
     if (g_Fit)
     {
         // TM0 read offsets consistent with each guest tick (the timer is linear back from its last update), TM1's start
-        fprintf(stderr, "A7NFIT %s cyc=%lld native=%d walk=%d ins=%d steps=%d set=%d inc=%d dpath=%d", kName[k], (long long)cyc, x.t,
+        fprintf(stderr, "A7NFIT %s cyc=%lld native=%d walk=%d ins=%d steps=%d set=%d inc=%d dpath=%d", KindName(k), (long long)cyc, x.t,
                 x.walk, x.ins, x.steps, x.set, x.inc, x.dpath);
         const Timer& t1 = nds.Timers[5];
         if (k != kGetTick && (t1.Cnt & 0x80))
@@ -520,100 +1378,111 @@ void Finish(melonDS::ARM* cpu)
     bool same = ngt == x.nticks;
     for (u32 i = 0; same && i < ngt; i++) same = gt[i] == x.ticks[i];
     if (!same) { s.timing[k]++; return; }      // the TM0 reads came out at another time: category B timing, not compared
-    int nd = 0;
-    auto diff = [&](const char* what, u32 a, u32 g, u32 n)
+    g_Nd = 0;
+    const char* tag = KindName(k);
+    if (x.ret && (cpu->R[0] != x.r0 || cpu->R[1] != x.r1)) Diff(s, s.diffs[k], tag, "r0/r1", 0, cpu->R[0], x.r0);
+    MemDiff(nds, s, s.diffs[k], tag, x, g_P.sp);
+    IoDiff(nds, s, s.diffs[k], tag, x, g_P.ie, nds.IF[1]);
+    if (g_Nd) s.diffs[k]++;
+}
+
+// the chain's stop: compare the whole state
+void FinishChain(melonDS::ARM* cpu)
+{
+    CheckPending = false;
+    melonDS::NDS& nds = cpu->NDS;
+    State& s = *g_P.s;
+    const St& e = g_P.end;
+    const Txn& x = g_P.x;
+    const s64 cyc = (s64)(nds.ARM7Timestamp + cpu->Cycles - g_P.t0);
+    s.chainChecks++;
+    if (g_Fit)
     {
-        if (s.diffs[k] < 10 && nd < 8) fprintf(stderr, "A7N CHECK %s: %s %08x guest %08x native %08x\n", kName[k], what, a, g, n);
-        nd++;
-    };
-    if (x.ret && (cpu->R[0] != x.r0 || cpu->R[1] != x.r1)) diff("r0/r1", 0, cpu->R[0], x.r0);
-    // memory: every native write has the guest's value; the guest wrote nothing else (ARM7 / shared WRAM; not the stack)
-    std::vector<u8> w7 = g_P.w7, sw = g_P.sw;
-    for (u32 i = 0; i < x.nw; i++)
-    {
-        u32 g;
-        Word(nds, x.w[i].a, g);
-        if (g != x.w[i].v) diff("mem", x.w[i].a, g, x.w[i].v);
-        u8 reg; u8* p = Host(nds, x.w[i].a, reg);
-        if (p >= nds.ARM7WRAM && p < nds.ARM7WRAM + nds.ARM7WRAMSize) memcpy(&w7[p - nds.ARM7WRAM], &x.w[i].v, 4);
-        else if (!sw.empty() && p >= nds.SWRAM_ARM7.Mem && p < nds.SWRAM_ARM7.Mem + sw.size()) memcpy(&sw[p - nds.SWRAM_ARM7.Mem], &x.w[i].v, 4);
+        fprintf(stderr, "A7NFIT2 cyc=%lld native=%d stop=%08x%s", (long long)cyc, x.t, e.r[15], e.ret ? "(ret)" : "");
+        for (u32 i = 0; i < x.nseg; i++)
+            fprintf(stderr, " %s:%lld/%d", kSegName[x.seg[i].seg], i < g_P.segi ? (long long)g_P.segT[i] : -1LL, x.seg[i].t);
+        fprintf(stderr, " walk=%d ins=%d steps=%d set=%d inc=%d tsw=%d tsr=%d tsl=%d tss=%d", x.walk, x.ins, x.steps, x.set, x.inc,
+                x.tsWake, x.tsRes, x.tsWalk, x.tsSw);
+        for (u32 i = 0; i < g_P.ngt; i++)
+        {
+            int lo = -1, hi = -1;
+            for (int off = 0; off < 1500; off++)
+            {
+                u16 v;
+                if (nds.PeekTimer7(4, g_P.t0 + off, v) && v == g_P.gticks[i]) { if (lo < 0) lo = off; hi = off; }
+            }
+            fprintf(stderr, " tick%u=[%d,%d]", i, lo, hi);
+        }
+        const Timer& t1 = nds.Timers[5];
+        if (x.set && (t1.Cnt & 0x80))
+        {
+            const s64 run = ((s64)t1.Counter - ((s64)t1.Reload << 10)) >> t1.CycleShift;
+            fprintf(stderr, " tm1start=%lld", (long long)((s64)nds.TimerTimestamp7() - run - (s64)g_P.t0));
+        }
+        fprintf(stderr, "\n");
     }
-    const u32 spo = g_P.sp & (nds.ARM7WRAMSize - 1);
-    for (u32 o = 0; o < nds.ARM7WRAMSize; o += 4)
-        if (R32(&w7[o]) != R32(&nds.ARM7WRAM[o]) && !(g_P.sp >= 0x03800000 && o < spo && o + 0x100 >= spo))
-            diff("guest-only mem", 0x03800000 + o, R32(&nds.ARM7WRAM[o]), R32(&w7[o]));
-    for (u32 o = 0; o < sw.size(); o += 4)
-        if (R32(&sw[o]) != R32(&nds.SWRAM_ARM7.Mem[o]) && !(g_P.sp < 0x03800000 && (g_P.sp & nds.SWRAM_ARM7.Mask) > o && (g_P.sp & nds.SWRAM_ARM7.Mask) <= o + 0x100))
-            diff("guest-only swram", 0x03000000 + o, R32(&nds.SWRAM_ARM7.Mem[o]), R32(&sw[o]));
-    // IO: TM1 reload / control and IE as the native's stores leave them
-    u32 ie = g_P.ie; int rel = -1, cnt = -1;
-    for (u32 i = 0; i < x.nio; i++)
+    // the guest's TM0 reads at other times than the native's: category B timing, not compared
+    bool same = g_P.ngt == x.nticks;
+    for (u32 i = 0; same && i < g_P.ngt; i++) same = g_P.gticks[i] == x.ticks[i];
+    if (!same) { s.chainTiming++; return; }
+    // the guest's tick reads vs the native's: another time = timing (category B), not compared
+    g_Nd = 0;
+    const char* tag = "irq-path";
+    const u64 d = s.chainDiffs;
+    St g;
+    Load(cpu, g, e.r[15]);
+    // in IRQ mode at the stop (a guest function's entry, or the BIOS's return instruction): all registers and the banks
+    for (int i = 0; i < 15; i++) if (cpu->R[i] != e.r[i]) Diff(s, d, tag, "reg", i, cpu->R[i], e.r[i]);
+    if (g.usr13 != e.usr13 || g.usr14 != e.usr14) Diff(s, d, tag, "usr13/14", 0, g.usr13, e.usr13);
+    if (g.svc13 != e.svc13) Diff(s, d, tag, "svc13", 0, g.svc13, e.svc13);
+    if (g.spsr != e.spsr) Diff(s, d, tag, "spsr", 0, g.spsr, e.spsr);
+    if (!e.ret && (g.cpsr & 0xFF) != (e.cpsr & 0xFF)) Diff(s, d, tag, "cpsr", 0, g.cpsr, e.cpsr);
+    MemDiff(nds, s, d, tag, x, e.r[13]);       // (the IRQ stack below the stop's sp: the guest's callees' dead frames)
+    IoDiff(nds, s, d, tag, x, g_P.ie, g_P.ifl);
+    if (g_Nd)
     {
-        const Txn::Io& o = x.io[i];
-        if (o.op == 1) ie |= o.v;
-        else if (o.a == 0x04000104) rel = o.v;
-        else if (o.a == 0x04000106) cnt = o.v;
+        // (a TM0 read at another time changes what follows: count that apart)
+        s.chainDiffs++;
+        if (s.chainDiffs <= 12)
+        {
+            fprintf(stderr, "A7N CHECK irq-path: stop %08x%s segs", e.r[15], e.ret ? " (ret)" : "");
+            for (u32 i = 0; i < x.nseg; i++) fprintf(stderr, " %s@%08x", kSegName[x.seg[i].seg], x.seg[i].pc);
+            fprintf(stderr, "\n");
+        }
     }
-    if (nds.IE[1] != ie) diff("IE", 0x04000210, nds.IE[1], ie);
-    if (rel >= 0 && nds.Timers[5].Reload != rel) diff("TM1 reload", 0x04000104, nds.Timers[5].Reload, rel);
-    if (cnt >= 0 && nds.Timers[5].Cnt != (cnt & 0xC7)) diff("TM1CNT", 0x04000106, nds.Timers[5].Cnt, cnt);
-    if (nd) s.diffs[k]++;
 }
 #endif
 
-void Call(melonDS::ARM* cpu, u32 t, u32 ret, bool interp)
+// a native run from pc (the vector or an exit hook): stepped, applied; false if nothing ran
+bool RunChain(melonDS::ARM* cpu, u32 pc, u8 want, bool interp)
 {
     melonDS::NDS& nds = cpu->NDS;
     State& s = Get(nds);
-    const Entry* en = Find(nds, s, t, true);
-    if (en)
+    St st;
+    Txn x;
+    const u64 t0 = nds.ARM7Timestamp + (interp ? cpu->Cycles : 0);
+    // (TM0 must not overflow within the run: every OS_GetTick on it then reads it natively, so nothing fails after IO)
+    u16 tm0;
+    if (!nds.PeekTimer7(4, interp ? t0 + 4000 : t0, tm0)) { s.stops[kSegs]++; return false; }
+#ifdef LITEV_HLE_DIAG
+    x.dry = g_Check && interp;
+#endif
+    int n;
+    { A7N_PMU(3); n = Chain(cpu, s, pc, want, st, x, interp, t0); }
+    if (!n) { s.stops[kSegs]++; return false; }
+#ifdef LITEV_HLE_DIAG
+    if (g_Check && interp)
     {
-        s.calls[en->kind]++;
-        Txn x;
-        if (Native(cpu, *en, x, interp))
-        {
-            s.native[en->kind]++;
-            Commit(cpu, x, interp);
-            if (x.ret) { cpu->R[0] = x.r0; cpu->R[1] = x.r1; }
-            cpu->R[14] = ret;
-            cpu->Cycles += x.t;
-            return;
-        }
-        s.guest[en->kind]++;
+        ArmChain(cpu, s, st, x, t0);
+        return false;                   // the guest runs; compared at the stop
     }
-    // the guest code, then back after the call as a non-branching instruction leaves the CPU
-    melonDS::ARMv4* c = (melonDS::ARMv4*)cpu;
-    const u32 r15 = c->R[15], cpsrT = c->CPSR & 0x20, n0 = c->NextInstr[0], n1 = c->NextInstr[1], cr = c->CodeRegion;
-    const s32 cc = c->CodeCycles;
-    Guest(c, t, ret);
-    c->CPSR = (c->CPSR & ~0x20u) | cpsrT;
-    c->R[15] = r15; c->NextInstr[0] = n0; c->NextInstr[1] = n1; c->CodeRegion = cr; c->CodeCycles = cc;
+#endif
+    s.stops[x.nseg ? x.seg[x.nseg - 1].seg : kSegs]++;
+    { A7N_PMU(4); Commit(cpu, x, interp, t0); }
+    { A7N_PMU(5); Apply(cpu, st); }
+    cpu->Cycles += x.t;
+    return true;
 }
-}
-
-int At(melonDS::NDS& nds, u32 target, u32* a, u32* b, int max)
-{
-    State& s = Get(nds);
-    if (!On(s) || (target & 3)) return 0;
-    u32 w0;
-    if (!Word(nds, target, w0)) return 0;
-    bool cand = false;
-    for (const A7NSig& g : kSigs) cand |= g.w0 == w0 && (g.kind == kGetTick || g.kind == kSetTimer || g.kind == kInsertAlarm);
-    if (!cand) return 0;
-    for (size_t i = 0; i < s.ents.size(); i++)
-        if (s.ents[i].addr == target) { s.ents.erase(s.ents.begin() + i); break; }   // (re-verified: the code may have changed)
-    Rng d[kMaxDeps];
-    for (u8 k : kTop)
-    {
-        Env env;
-        int nd = 0;
-        if (!Verify(nds, target, k, env, d, nd, 0)) continue;
-        if (nd > max) return 0;
-        s.ents.push_back({target, k, env});
-        for (int i = 0; i < nd; i++) { a[i] = d[i].a; b[i] = d[i].b; }
-        return nd;
-    }
-    return 0;
 }
 
 void CallA(melonDS::ARM* cpu)
@@ -641,8 +1510,12 @@ bool Interp(melonDS::ARM* cpu, bool thumb)
     {
         // the guest is being compared: record its inner OS_GetTick calls
         if (cpu == g_P.cpu && g_P.nInner < 4)
-            for (const Entry& e : s.ents)
-                if (e.addr == t && e.kind == kGetTick) { g_P.innerRet[g_P.nInner++] = r15 - 4; break; }
+        {
+            bool gt = false;
+            for (const Entry& e : s.ents) gt |= e.addr == t && e.kind == kGetTick;
+            for (const Fn& f : s.fns) gt |= f.e.ka[kGetTick] == t && (f.e.has >> f_tc & 1);
+            if (gt) g_P.innerRet[g_P.nInner++] = r15 - 4;
+        }
         return false;
     }
 #endif
@@ -660,6 +1533,7 @@ bool Interp(melonDS::ARM* cpu, bool thumb)
     if (g_Check)
     {
         Txn x;
+        x.dry = true;
         if (Native(cpu, *en, x, true)) Arm(cpu, s, *en, x, r15 - 4);
         return false;           // the guest runs
     }
@@ -668,10 +1542,135 @@ bool Interp(melonDS::ARM* cpu, bool thumb)
     return true;
 }
 
+void Irq(melonDS::ARM* cpu)
+{
+    if (cpu->Num != 1 || CheckPending) return;
+    State& s = Get(cpu->NDS);
+    if (!IrqOn(s)) return;
+    s.irqs++;
+    A7N_PMU(0);
+    if (RunChain(cpu, 0x18, wBiosIn, !cpu->NDS.IsJITEnabled())) s.irqNative++;
+}
+
+bool MaybeExit(u32 instr)
+{
+    for (const A7NSig& g : kSigs)
+        if ((g.kind == kThreadSwitch && g.w0 == instr) || ((g.kind == kIrqCallback || g.kind == kArrangeTimer) && g.pw == instr)) return true;
+    return false;
+}
+
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, u32* a, u32* b, int max)
+{
+    State& s = Get(nds);
+    if (!IrqOn(s) || !MaybeExit(instr)) return 0;
+    for (const A7NSig& g : kSigs)
+    {
+        u32 at;
+        if (g.kind == kThreadSwitch && g.w0 == instr) at = addr;
+        else if ((g.kind == kIrqCallback || g.kind == kArrangeTimer) && g.pw == instr)
+        {
+            u32 w;
+            if (!Word(nds, addr - 8, w) || w != kMovLrPc) continue;
+            at = addr - g.post;
+        }
+        else continue;
+        Env e;
+        Rng d[kMaxDeps];
+        int nd = 0;
+        if (!Verify(nds, at, g.kind, e, d, nd, 0) || e.kf[g.kind] != g.fam || nd > max) continue;
+        State::Cover cv{addr, {at, 0}, {g.kind, kKinds}};
+        if (g.kind == kArrangeTimer) { cv.a[1] = e.f[f_ah]; cv.k[1] = kAlarmWrap; }
+        if (g.kind == kThreadSwitch)
+        {
+            // the IRQ handler whose thread switch this is (the IRQ vector's target now): guarded by this block too
+            u32 h;
+            Env eh;
+            int n2 = nd;
+            if (Word(nds, 0x03FFFFFC, h) && Verify(nds, h, kIrqHandler, eh, d, n2, 0) && eh.f[f_ts] == addr && n2 <= max)
+            { nd = n2; cv.a[1] = h; cv.k[1] = kIrqHandler; }
+        }
+        for (size_t i = 0; i < s.cover.size(); i++) if (s.cover[i].hook == addr) { s.cover.erase(s.cover.begin() + i); break; }
+        s.cover.push_back(cv);
+        for (int i = 0; i < nd; i++) { a[i] = d[i].a; b[i] = d[i].b; }
+        return nd;
+    }
+    return 0;
+}
+
+void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block)
+{
+    State& s = Get(nds);
+    for (size_t i = 0; i < s.cover.size(); i++)
+    {
+        if (s.cover[i].hook != addr) continue;
+        const State::Cover cv = s.cover[i];
+        s.cover.erase(s.cover.begin() + i);
+        s.run++;
+        for (int j = 0; j < 2; j++)
+            if (cv.k[j] < kKinds)
+                if (const Fn* f = Chk(nds, s, cv.a[j], cv.k[j])) const_cast<Fn*>(f)->guard = block;
+        return;
+    }
+}
+void BlockGone(melonDS::NDS& nds, const void* block)
+{
+    State& s = Get(nds);
+    for (Fn& f : s.fns) if (f.guard == block) f.guard = nullptr;
+}
+void GuardsReset(melonDS::NDS& nds)
+{
+    State& s = Get(nds);
+    for (Fn& f : s.fns) f.guard = nullptr;
+}
+
+bool Hook(melonDS::ARM* cpu, bool jit)
+{
+    if (cpu->Num != 1 || (cpu->CPSR & 0x20) || CheckPending || !MaybeExit(cpu->CurInstr)) return false;
+    State& s = Get(cpu->NDS);
+    if (!IrqOn(s)) return false;
+    const u32 pc = cpu->R[15] - 8, w = cpu->CurInstr;
+    u8 want = wNone;
+    for (const A7NSig& g : kSigs)
+        if (g.kind == kThreadSwitch && g.w0 == w) want = wTs;
+        else if (g.kind == kIrqCallback && g.pw == w) want = wIcbPost;
+        else if (g.kind == kArrangeTimer && g.pw == w) want = wArrPost;
+    A7N_PMU(1);
+    if (want != wNone && RunChain(cpu, pc, want, !jit))
+    {
+        s.exits++;
+        return true;
+    }
+    if (!jit) return false;
+    // (the JIT compiled the hook as an undefined instruction: run the real one)
+    if (cpu->CheckCondition(cpu->CurInstr >> 28))
+        ARMInterpreter::ARMInstrTable[((cpu->CurInstr >> 4) & 0xF) | ((cpu->CurInstr >> 16) & 0xFF0)](cpu);
+    else cpu->AddCycles_C();
+    return true;
+}
+
 #ifdef LITEV_HLE_DIAG
 void CheckAt(melonDS::ARM* cpu, u32 pc)
 {
     if (cpu != g_P.cpu) return;
+    melonDS::NDS& nds = cpu->NDS;
+    if (g_P.chain)
+    {
+        // the guest reaches the native's segments in order: their times (cycle fits)
+        if (g_P.segi < g_P.x.nseg && pc == g_P.x.seg[g_P.segi].pc)
+            g_P.segT[g_P.segi++] = (s64)(nds.ARM7Timestamp + cpu->Cycles - g_P.t0);
+        if (g_P.nInner && pc == g_P.innerRet[g_P.nInner - 1])
+        {
+            if (g_P.ngt < 4) g_P.gticks[g_P.ngt++] = (u16)cpu->R[0];
+            g_P.nInner--;
+        }
+        const St& e = g_P.end;
+        const bool irq = (cpu->CPSR & 0x1F) == 0x12;
+        // (a return to the interrupted code is compared at the BIOS's subs pc, lr, #4: right after it, another pending IRQ
+        // may enter the handler again before the interrupted code runs an instruction)
+        if (irq && cpu->R[13] == e.r[13] && (e.ret ? pc == g_P.s->biosRet + 4 : pc == e.r[15])) FinishChain(cpu);
+        else if (++g_P.n > 50000) { CheckPending = false; g_P.s->chainLost++; }
+        return;
+    }
     if ((cpu->CPSR & 0x1F) == 0x12 && g_P.mode != 0x12) { g_P.irq = true; return; }   // an IRQ inside the guest window
     if (g_P.nInner && pc == g_P.innerRet[g_P.nInner - 1])
     {

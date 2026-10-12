@@ -1069,6 +1069,9 @@ void ARMJIT::RetireJitBlock(JitBlock* block) noexcept
 #ifdef LITEV_A9HLE
     A9HLE::BlockGone(NDS, block);
 #endif
+#ifdef LITEV_A7HLE
+    if (block->Num == 1) A7Native::BlockGone(NDS, block);
+#endif
     auto it = RestoreCandidates.find(block->InstrHash);
     if (it != RestoreCandidates.end())
     {
@@ -1472,6 +1475,7 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
 #endif
 #ifdef LITEV_A7HLE
     bool a7Hook = false;        // block compiled with a verified A7HLE hook
+    u32 a7nAt = 0;              // an A7Native IRQ-path hook in this block (its address): it guards the functions it depends on
 #endif
     u32 addressRanges[maxRanges];
     u32 addressMasks[maxRanges];
@@ -1638,6 +1642,20 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
                 in.Kind = ARMInstrInfo::ak_HLECALL;
                 in.SrcRegs = 0x7FFF; in.DstRegs = 0x500F; in.NotStrictlyNeeded = 0;
                 in.SpecialKind = 0; in.ReadFlags = 0; in.WriteFlags = 0xF; in.EndBlock = false;
+            }
+        }
+        // an instruction the ARM7 OS IRQ path returns to (A7Native: thread switch, after the IRQ callback / the alarm
+        // handler): a hook that steps the rest natively; the block depends on that function's code
+        if (cpu->Num == 1 && !thumb && A7Native::MaybeExit(instrs[i].Instr))
+        {
+            u32 la[48], lb[48];
+            const int nh = A7Native::IsHook(NDS, instrs[i].Addr, instrs[i].Instr, la, lb, 48);
+            if (nh > 0)
+            {
+                for (int d = 0; d < nh; d++) addDeps(1, la[d], lb[d]);
+                instrs[i].Info = ARMInstrInfo::Decode(false, 1, 0xE7F000F0, false);
+                a7Hook = true;
+                a7nAt = instrs[i].Addr;
             }
         }
         // HLE'd ARM7 function entry: compile it as an interpreter fallback that ends the block
@@ -2132,7 +2150,12 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
 #endif
     }
     else
+    {
         JitBlocks7[blockAddr] = block;
+#ifdef LITEV_A7HLE
+        if (a7nAt) A7Native::HookCompiled(NDS, a7nAt, block);
+#endif
+    }
 
     u64* entry = &FastBlockLookupRegions[(localAddr >> 27)][(localAddr & 0x7FFFFFF) / 2];
     *entry = ((u64)blockAddr | cpu->Num) << 32;
@@ -2271,6 +2294,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
         {
 #ifdef LITEV_A9HLE
             A9HLE::BlockGone(NDS, block);
+#endif
+#ifdef LITEV_A7HLE
+            if (block->Num == 1) A7Native::BlockGone(NDS, block);
 #endif
             delete block;
         }
@@ -2425,6 +2451,9 @@ void ARMJIT::ResetBlockCache() noexcept
     InvalidLiterals.Clear();
 #ifdef LITEV_A9HLE
     A9HLE::BlockGone(NDS, nullptr);     // (all of them)
+#endif
+#ifdef LITEV_A7HLE
+    A7Native::GuardsReset(NDS);
 #endif
     for (int i = 0; i < ARMJIT_Memory::memregions_Count; i++)
     {

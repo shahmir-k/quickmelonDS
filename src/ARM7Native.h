@@ -32,6 +32,17 @@ void CallT(melonDS::ARM* cpu);
 // interpreter: the current instruction is an ARM BL (thumb: the second half of a BL pair) whose condition passed;
 // true if it ran natively (PC is past the call as after a non-branching instruction)
 bool Interp(melonDS::ARM* cpu, bool thumb);
+// The IRQ path: ARM::TriggerIRQ (the ARM7 at its BIOS IRQ vector) steps the OS IRQ path natively (Irq); the instructions guest
+// functions return to on that path (the thread switch, the IRQ callback dispatcher's and OSi_ArrangeTimer's post-call
+// instruction) are JIT hooks (IsHook at compile: their code ranges into a / b; Hook at run: false if not one)
+void Irq(melonDS::ARM* cpu);
+bool MaybeExit(u32 instr);
+int IsHook(melonDS::NDS& nds, u32 addr, u32 instr, u32* a, u32* b, int max);
+bool Hook(melonDS::ARM* cpu, bool jit);
+// ARMJIT: an exit hook block was compiled (it guards the functions it depends on) / a block is gone / the cache reset
+void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block);
+void BlockGone(melonDS::NDS& nds, const void* block);
+void GuardsReset(melonDS::NDS& nds);
 #ifdef LITEV_HLE_DIAG
 extern thread_local bool CheckPending;
 void CheckAt(melonDS::ARM* cpu, u32 pc);
