@@ -159,6 +159,10 @@ private:
     int NumSprites;
     bool SpriteUseMosaic;
     bool SpriteMosaicAttr = true;   // some sprite has the mosaic attribute (debug.litev.glhimos)
+    bool SpriteAffine = true;       // some listed sprite is rotscaled (debug.litev.glhi1x)
+    bool AffineUncomposited = true; // ... or was, in an OAM list used since the last composite
+    GLuint LowFB = 0, LowTex = 0;   // native-resolution compositor target (debug.litev.glhi1x)
+    int CompSF = 1;                 // scale of the compositor's current target
     GLint ObjMosULoc[2] = {-1, -1};
 
     struct sScanlineConfig
