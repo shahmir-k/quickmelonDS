@@ -142,6 +142,9 @@ void GPU::Reset() noexcept
     VCountOverride = false;
     NextVCount = 0;
     TotalScanlines = 0;
+#ifdef LITEV_LCD_EVT
+    LcdNextKind = LcdNone;   // no LCD step pending until StartFrame (as Event_LCD)
+#endif
 
     DispStat[0] = 0;
     DispStat[1] = 0;
@@ -1271,11 +1274,31 @@ void GPU::StartFrame() noexcept
 #endif
 
     TotalScanlines = 0;
+#ifdef LITEV_LCD_EVT
+    if (LcdEvt)
+    {
+        LcdCurTs = NDS.SchedList[Event_LCD].Timestamp;   // the grid base StartScanline(0) schedules from
+        StartScanline(0);
+        LcdPlan();
+        return;
+    }
+#endif
     StartScanline(0);
 }
 
 void GPU::StartHBlank(u32 line) noexcept
 {
+#ifdef LITEV_NPSCHED_STATS
+    {   // why this line needs its LCD events: HBlank IRQ 9/7, HBlank DMA9, display-start DMA9, display FIFO, capture, VCount IRQ, any
+        auto& w = NDS.SchedStats.LcdWhy;
+        bool r[7] = { !!(DispStat[0] & (1<<4)), !!(DispStat[1] & (1<<4)), VCount < 192 && NDS.DMAsInMode(0, 0x02),
+                      VCount >= 1 && VCount < 194 && NDS.DMAsInMode(0, 0x03), RunFIFO, !!(CaptureCnt & (1u<<31)),
+                      !!((DispStat[0] | DispStat[1]) & (1<<5)) };
+        bool any = false;
+        for (int q = 0; q < 7; q++) { w[q] += r[q]; any |= r[q]; }
+        w[7] += any;
+    }
+#endif
     DispStat[0] |= (1<<1);
     DispStat[1] |= (1<<1);
 
@@ -1350,6 +1373,10 @@ void GPU::StartHBlank(u32 line) noexcept
     if (DispStat[0] & (1<<4)) NDS.SetIRQ(0, IRQ_HBlank);
     if (DispStat[1] & (1<<4)) NDS.SetIRQ(1, IRQ_HBlank);
 
+#ifdef LITEV_LCD_EVT
+    if (LcdEvt)
+        return LcdSetNext((VCount == 262) || (VCount == 511) ? LCD_FinishFrame : LCD_StartScanline, line+1, LINE_CYCLES - HBLANK_CYCLES);
+#endif
     if ((VCount == 262) || (VCount == 511))
         NDS.ScheduleEvent(Event_LCD, true, (LINE_CYCLES - HBLANK_CYCLES), LCD_FinishFrame, line+1);
     else
@@ -1541,8 +1568,76 @@ void GPU::StartScanline(u32 line) noexcept
     else
         DispStat[1] &= ~(1<<2);
 
+#ifdef LITEV_LCD_EVT
+    if (LcdEvt)
+        return LcdSetNext(LCD_StartHBlank, line, HBLANK_CYCLES);
+#endif
     NDS.ScheduleEvent(Event_LCD, true, HBLANK_CYCLES, LCD_StartHBlank, line);
 }
+
+#ifdef LITEV_LCD_EVT
+void GPU::LcdSetNext(u32 kind, u32 param, s32 delay) noexcept
+{
+    LcdNextKind = kind;
+    LcdNextParam = param;
+    LcdNextTs = LcdCurTs + delay;
+}
+
+// RunSystem(ts), before the events (Event_LCD has index 0): the step Event_LCD would fire now. Stock
+// fires one LCD step per RunSystem (the next one, if already due, after a 1-cycle slice); `all` = the
+// slice ran with both CPUs halted (NextTarget): the steps it skipped, in order (none can be observed)
+void GPU::LcdRun(u64 ts, bool all) noexcept
+{
+    bool replan = false;
+    do
+    {
+        const u32 k = LcdNextKind, p = LcdNextParam;
+        replan |= LcdNextTs >= LcdSchedTs;
+        LcdCurTs = LcdNextTs;
+        NDS.SchedList[Event_LCD].Timestamp = LcdCurTs;   // as if it had fired (savestates, LcdEvt off)
+        LcdNextKind = LcdNone;
+        if (k == LCD_StartHBlank) StartHBlank(p);
+        else if (k == LCD_StartScanline) StartScanline(p);
+        else FinishFrame(p);
+    } while (all && LcdNextKind != LcdNone && LcdNextTs <= ts);
+    if (replan) LcdPlan();
+}
+
+// LcdSchedTs = the first step from LcdNext on that something can observe; the steps before it only move
+// VCOUNT and the DISPSTAT HBlank / VCount-match flags (no CPU runs to read them) and the 2D line state
+void GPU::LcdPlan() noexcept
+{
+    if (LcdNextKind == LcdNone) return;   // after FinishFrame: StartFrame goes on
+    u32 k = LcdNextKind, p = LcdNextParam;
+    u64 ts = LcdNextTs;
+    if (!(CaptureEnable || VCountOverride || RunFIFO || ((DispStat[0] | DispStat[1]) & (1<<4))))
+    {
+        const bool dma2 = NDS.DMAsInMode(0, 0x02), dma3 = NDS.DMAsInMode(0, 0x03);
+        const s32 vm0 = (DispStat[0] & (1<<5)) ? VMatch[0] : -1, vm1 = (DispStat[1] & (1<<5)) ? VMatch[1] : -1;
+        u16 v = VCount;
+        for (;;)
+        {
+            if (k == LCD_StartScanline)
+            {
+                const u16 nv = p == 0 ? 0 : ((v + 1) & 0x1FF);
+                if (p == 0 || nv == 192 || nv == 262 || (dma3 && nv >= 2 && nv <= 194) || nv == vm0 || nv == vm1)
+                    break;
+                v = nv; k = LCD_StartHBlank; ts += HBLANK_CYCLES;
+            }
+            else if (k == LCD_StartHBlank)
+            {
+                if (v == 215 || v == 262 || (dma2 && v < 192))
+                    break;
+                k = (v == 511) ? LCD_FinishFrame : LCD_StartScanline;
+                p++; ts += LINE_CYCLES - HBLANK_CYCLES;
+            }
+            else
+                break;   // FinishFrame
+        }
+    }
+    LcdSchedTs = ts;
+}
+#endif
 
 
 void GPU::Restart3DFrame() noexcept
@@ -1578,6 +1673,9 @@ void GPU::SetDispStat(u32 cpu, u16 val, u16 mask) noexcept
     DispStat[cpu] |= val;
 
     VMatch[cpu] = (DispStat[cpu] >> 8) | ((DispStat[cpu] & 0x80) << 1);
+#ifdef LITEV_LCD_EVT
+    if (LcdEvt) LcdPlan();
+#endif
 }
 
 void GPU::SetVCount(u16 val, u16 mask) noexcept
@@ -1596,6 +1694,9 @@ void GPU::SetVCount(u16 val, u16 mask) noexcept
     GPU3D.AbortFrame |= NextVCount != nextvc;
     NextVCount = nextvc;
     VCountOverride = true;
+#ifdef LITEV_LCD_EVT
+    if (LcdEvt) LcdPlan();
+#endif
 }
 
 template <u32 Size, u32 MappingGranularity>

@@ -924,6 +924,16 @@ u64 NDS::NextTarget()
 #endif
     }
 
+#ifdef LITEV_LCD_EVT
+    // Event_LCD's place: the next LCD step, or with both CPUs halted the next one something observes
+    // (both stay halted until an event, a timer or the GX engine wakes one; all bound this slice too)
+    if (GPU.LcdEvt && GPU.LcdNextKind != GPU::LcdNone)
+    {
+        LcdMerge = !CPUStop && ARM9.Halted == 1 && ARM7.Halted == 1 && !HaltInterrupted(0) && !HaltInterrupted(1);
+        const u64 lcd = LcdMerge ? GPU.LcdSchedTs : GPU.LcdNextTs;
+        if (lcd < minEvent) minEvent = lcd;
+    }
+#endif
 #if defined(LITEV_EVENT_SLICES)
     // Unit 5 (M2.1): event-true slices. Drop the fixed kMaxIterationCycles cap and
     // run straight to the next scheduled event. Mid-slice actions that create an
@@ -1023,6 +1033,9 @@ u64 NDS::NextTimerDeadline()
 }
 #endif
 
+#if defined(LITEV_LCD_EVT) && !defined(LITEV_EVENT_SLICES)
+#error "LITEV_LCD_EVT needs LITEV_EVENT_SLICES (slices end at the next event, not a fixed cap)"
+#endif
 #if defined(LITEV_SCHED_LEAN) && !(defined(LITEV_TIMER_FAST) && defined(LITEV_EVENT_SLICES))
 #error "LITEV_SCHED_LEAN needs LITEV_TIMER_FAST and LITEV_EVENT_SLICES (cached, slice-bounding timer deadline)"
 #endif
@@ -1062,6 +1075,15 @@ void (*LitevEventTrace)(NDS* nds, int id, u64 eventTime, u64 sysTime) = nullptr;
 void NDS::RunSystem(u64 timestamp)
 {
     SysTimestamp = timestamp;
+#ifdef LITEV_LCD_EVT
+    if (GPU.LcdEvt && GPU.LcdNextKind != GPU::LcdNone && GPU.LcdNextTs <= timestamp)
+    {
+#ifdef LITEV_NPSCHED_STATS
+        SchedStats.Ev[Event_LCD]++;
+#endif
+        GPU.LcdRun(timestamp, LcdMerge);
+    }
+#endif
 #ifdef LITEV_MP_CLOCKWAKE
     if (MPWakeAt && timestamp >= MPWakeAt->load(std::memory_order_relaxed)) MPWake();
 #endif

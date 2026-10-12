@@ -270,7 +270,7 @@ public: // TODO: Encapsulate the rest of these members
 #endif
 #ifdef LITEV_NPSCHED_STATS
     // diagnostic: per frame window, read and reset by the headless harness
-    struct SchedStatsT { u64 Iter = 0, Both = 0, A9Only = 0, Exec[2] = {}, HaltedSkip[2] = {}, Disp[2] = {}, Ev[Event_MAX] = {}, Irq[2][32] = {}, Native[3] = {}, WifiWhy[8] = {}; } SchedStats;
+    struct SchedStatsT { u64 Iter = 0, Both = 0, A9Only = 0, Exec[2] = {}, HaltedSkip[2] = {}, Disp[2] = {}, Ev[Event_MAX] = {}, Irq[2][32] = {}, Native[3] = {}, WifiWhy[8] = {}, LcdWhy[8] = {}; } SchedStats;
 #endif
     u8 ARM9MemTimings[0x40000][8];
     u32 ARM9Regions[0x40000];
@@ -487,6 +487,9 @@ public: // TODO: Encapsulate the rest of these members
     void* MPHostPollCtx = nullptr;
     int MPHostPollInst = 0;
 #endif
+#endif
+#ifdef LITEV_LCD_EVT
+    bool LcdMerge = false;   // this slice runs with both CPUs halted (GPU::LcdRun runs every LCD step due)
 #endif
 #ifdef LITEV_WIFI_EVT
     // LockstepMP (SetWake; not under RecordMP): see LockstepMP::HostQuiet. nullptr = the client polls every tick

@@ -724,6 +724,9 @@ int main(int argc, char** argv)
 
 #ifdef LITEV_FF_HEADLESS3D
     if (getenv("LITEV_FFHEADLESS")) nds->GPU.FFHeadless3D = atoi(getenv("LITEV_FFHEADLESS")) != 0;   // the app's fast-forward mode
+#ifdef LITEV_LCD_EVT
+    if (getenv("LITEV_LCDEVT")) nds->GPU.LcdEvt = atoi(getenv("LITEV_LCDEVT")) != 0;   // A/B (default on)
+#endif
 #endif
     // LITEV_LOOP=<n>: run the --frames window n more times from --savestate (profile a short burst)
     int loopsLeft = getenv("LITEV_LOOP") ? atoi(getenv("LITEV_LOOP")) : 0;
