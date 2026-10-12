@@ -864,6 +864,12 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
             const u32 rDI = (x < OutWidth-1) ? depthid[x+1] : borderDI;
             const u32 rC  = (x < OutWidth-1) ? color[x+1]   : borderC;
 
+#ifdef LITEV_TILE_POSTFAST
+            // an edge needs a neighbour with another polygon id: none -> the scan below finds nothing
+            if (!(((lDI ^ cdi) | (rDI ^ cdi) | (upDepthId[x] ^ cdi) | (downDepthId[x] ^ cdi)) & (ID_POLY_MASK << 24)))
+                goto postfog;
+#endif
+            {
             u32 nDI[4] = { lDI, rDI, upDepthId[x], downDepthId[x] };
             u32 nC [4] = { lC,  rC,  upColor[x],   downColor[x]   };
 
@@ -899,7 +905,11 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
                          | (outc & 0xFF000000);
                 }
             }
+            }
         }
+#ifdef LITEV_TILE_POSTFAST
+    postfog:
+#endif
 
         if (fog && ((cdi >> 24) & ID_FOG))
         {
