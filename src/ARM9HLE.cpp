@@ -329,7 +329,14 @@ struct State
     bool ftabD = false, ftab2D = false;     // in DTCM
     u32 fkey[3] = {~0u, ~0u, ~0u};
 };
-std::unordered_map<const melonDS::NDS*, State> g_State;
+// a console's state, owned by its NDS (NDS::HLEState[0]): never shared between consoles (one thread each in 8P)
+void DumpStats(const State& s);
+State& Own(melonDS::NDS& nds)
+{
+    std::shared_ptr<void>& p = nds.HLEState[0];
+    if (!p) p = std::shared_ptr<State>(new State, [](State* s) { DumpStats(*s); delete s; });
+    return *(State*)p.get();
+}
 bool g_Stats = getenv("LITEV_A9HLE_STATS") && atoi(getenv("LITEV_A9HLE_STATS"));
 #ifdef LITEV_HLE_DIAG
 bool g_Check = getenv("LITEV_A9HLE_CHECK") && atoi(getenv("LITEV_A9HLE_CHECK"));
@@ -504,7 +511,7 @@ bool GxIntact(melonDS::ARMv5* c, const State& s)
 // the console's state with the runtime switch read (no variant probing)
 __attribute__((noinline, cold)) State& Init(melonDS::ARMv5* c)
 {
-    State& s = g_State[&c->NDS];         // map nodes are stable
+    State& s = Own(c->NDS);
     c->A9HLEState = &s;
     if (s.init) return s;
     s.init = true;
@@ -1375,14 +1382,17 @@ u32 GxSend(melonDS::ARMv5* c, const State& s, u32 src, u32 len, u32 n)
     if ((src & mask) + n * 4 <= mask + 1)
     {
         const u32* w = (const u32*)(ram + (src & mask));
-        static u32 cum[2][kGxChunk / 4 + 1];
-        static bool cumOk[2];
+        // (built once, thread-safe: consoles run on their own threads)
+        static const auto cum = [] {
+            std::array<std::array<u32, kGxChunk / 4 + 1>, 2> c{};
+            for (int t = 0; t < 2; t++)
+            {
+                const u8* tb = DMATiming::MRAMRead32Bursts[t].data();
+                for (u32 i = 0, b = 0, c2 = 0; i < kGxChunk / 4; i++) { if (tb[b] == 0) b = 0; c2 += tb[b++]; c[t][i + 1] = c2; }
+            }
+            return c;
+        }();
         const int t = bt == DMATiming::MRAMRead32Bursts[0].data() ? 0 : 1;
-        if (!cumOk[t])
-        {
-            for (u32 i = 0, b = 0, c2 = 0; i < per; i++) { if (bt[b] == 0) b = 0; c2 += bt[b++]; cum[t][i + 1] = c2; }
-            cumOk[t] = true;
-        }
         while (done < n && gx.BulkReady())
         {
             const u32 m = n - done < 64 ? n - done : 64;
@@ -1792,7 +1802,7 @@ __attribute__((noinline, cold)) void CardCheckStart(melonDS::ARMv5* c, State& s,
 __attribute__((noinline, cold)) void CardCheckAt(melonDS::ARMv5* c, u32 pc)
 {
     melonDS::NDS& nds = c->NDS;
-    State& s = g_State[&nds];
+    State& s = Own(nds);
     if (++g_Card.steps > 2000000) { fprintf(stderr, "A9HLE CHECK cardread: guest never left the loop\n"); g_Card.on = CheckPending = false; s.diffs[7]++; return; }
     if (pc == c->ExceptionBase + 0x18 && !g_Card.irq) { s.irqDuring[7]++; g_Card.irq = true; }
     if (pc != g_Card.exit || (c->CPSR & 0x3F) != (g_Card.cpsr & 0x3F)) return;
@@ -4469,37 +4479,29 @@ __attribute__((noinline)) bool RunSdiv(melonDS::ARMv5* c, State& s, bool jit)
     return true;
 }
 
-struct StatsDump
+// LITEV_A9HLE_STATS: a console's counts when its NDS goes away
+void DumpStats(const State& s)
 {
-    ~StatsDump()
-    {
-        if (!g_Stats) return;
-        for (auto& [k, s] : g_State)
-            for (int i = 0; i < kKinds; i++)
-                fprintf(stderr, "A9HLE %s: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu irq_during=%llu guest_cyc_avg=%.0f\n",
-                        kName[i], s.status, (unsigned long long)s.calls[i], (unsigned long long)s.native[i],
-                        (unsigned long long)s.fallback[i], (unsigned long long)s.checks[i], (unsigned long long)s.diffs[i],
-                        (unsigned long long)s.irqDuring[i], s.guestN[i] ? (double)s.guestCyc[i] / s.guestN[i] : 0.0);
-        for (auto& [k, s] : g_State)
-        {
-            u64 n = s.native[0] + s.native[1] + s.native[2] + s.native[3] + s.native[4] + s.native[5];
-            if (s.native[5]) fprintf(stderr, "A9HLE gxsend: %.1f words per native call\n", (double)s.gxWords / s.native[5]);
-            if (s.native[6]) fprintf(stderr, "A9HLE lz: %.1f bytes per native call\n", (double)s.lzBytes / s.native[6]);
-            if (s.native[7]) fprintf(stderr, "A9HLE cardread: %.1f words per native call\n", (double)s.cardWords / s.native[7]);
-            if (s.checks[6] && s.guestN[6]) fprintf(stderr, "A9HLE lz check: %.1f bytes per call, guest cycles %llu, estimate %llu\n",
-                                                   (double)s.lzBytes / s.checks[6], (unsigned long long)s.guestCyc[6], (unsigned long long)s.lzEst);
-            if (n && g_Time) fprintf(stderr, "A9HLE: %.1f ns per native call (Run, timer pair %.1f ns subtracted)\n", (double)s.ns / n - TimerNs(), TimerNs());
-        }
-        for (auto& [k, s] : g_State)
-            if (s.checks[2]) fprintf(stderr, "A9HLE getirqfn: avg lowest set bit %.2f\n", (double)s.getBits / s.checks[2]);
+    if (!g_Stats) return;
+    for (int i = 0; i < kKinds; i++)
+        fprintf(stderr, "A9HLE %s: status=%d calls=%llu native=%llu fallback=%llu checks=%llu check_diffs=%llu irq_during=%llu guest_cyc_avg=%.0f\n",
+                kName[i], s.status, (unsigned long long)s.calls[i], (unsigned long long)s.native[i],
+                (unsigned long long)s.fallback[i], (unsigned long long)s.checks[i], (unsigned long long)s.diffs[i],
+                (unsigned long long)s.irqDuring[i], s.guestN[i] ? (double)s.guestCyc[i] / s.guestN[i] : 0.0);
+    u64 n = s.native[0] + s.native[1] + s.native[2] + s.native[3] + s.native[4] + s.native[5];
+    if (s.native[5]) fprintf(stderr, "A9HLE gxsend: %.1f words per native call\n", (double)s.gxWords / s.native[5]);
+    if (s.native[6]) fprintf(stderr, "A9HLE lz: %.1f bytes per native call\n", (double)s.lzBytes / s.native[6]);
+    if (s.native[7]) fprintf(stderr, "A9HLE cardread: %.1f words per native call\n", (double)s.cardWords / s.native[7]);
+    if (s.checks[6] && s.guestN[6]) fprintf(stderr, "A9HLE lz check: %.1f bytes per call, guest cycles %llu, estimate %llu\n",
+                                           (double)s.lzBytes / s.checks[6], (unsigned long long)s.guestCyc[6], (unsigned long long)s.lzEst);
+    if (n && g_Time) fprintf(stderr, "A9HLE: %.1f ns per native call (Run, timer pair %.1f ns subtracted)\n", (double)s.ns / n - TimerNs(), TimerNs());
+    if (s.checks[2]) fprintf(stderr, "A9HLE getirqfn: avg lowest set bit %.2f\n", (double)s.getBits / s.checks[2]);
 #ifdef LITEV_A9HLE_GXCHECK
-        for (auto& [k, s] : g_State)
-            if (s.checks[5]) fprintf(stderr, "A9HLE gxsend check: %llu resolved (irq_during above), %.0f guest cycles per elided chunk, of them DMA %.0f\n",
-                                     (unsigned long long)s.irqDuring[5], s.guestN[5] ? (double)s.guestCyc[5] / s.guestN[5] : 0.0,
-                                     s.guestN[5] ? (double)g_GxDmaCyc / s.guestN[5] : 0.0);
+    if (s.checks[5]) fprintf(stderr, "A9HLE gxsend check: %llu resolved (irq_during above), %.0f guest cycles per elided chunk, of them DMA %.0f\n",
+                             (unsigned long long)s.irqDuring[5], s.guestN[5] ? (double)s.guestCyc[5] / s.guestN[5] : 0.0,
+                             s.guestN[5] ? (double)g_GxDmaCyc / s.guestN[5] : 0.0);
 #endif
-    }
-} g_StatsDump;
+}
 }
 
 void HookCompiled(melonDS::NDS& nds, u32 addr, const void* block)
@@ -4524,7 +4526,7 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
     if (!f->Saving)
     {
         // as a new console (host caches and stats start empty), then what the saving one had
-        g_State[&nds] = State{};                // (in place: the node stays where it is)
+        Own(nds) = State{};                     // (in place)
         c->A9HLEState = nullptr;
         c->A9HLEGuard = nullptr;                // (the JIT's section sets it again with its blocks)
         c->A9HLEDefer = false;
@@ -4542,7 +4544,7 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
     u32 has = f->Saving && c->A9HLEState;
     f->Var32(&has);
     if (!has) return;
-    if (!f->Saving) c->A9HLEState = &g_State[&nds];
+    if (!f->Saving) c->A9HLEState = &Own(nds);
     State& s = *(State*)c->A9HLEState;
     s32 vi = -1;
     for (int i = 0; i < kNumVariants; i++) if (s.v == kVariants[i]) vi = i;
@@ -6119,7 +6121,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
         }
         g_P.stage2 = CheckPending = false;
         c->Idle2Log = nullptr;
-        State& s = g_State[&c->NDS];
+        State& s = Own(c->NDS);
         char b[512]; int bl = 0, nd = 0;
         for (int i = 0; i < 15; i++)
             if (cpu->R[i] != f.R[i]) { if (nd < 8) bl += snprintf(b + bl, sizeof(b) - bl, " r%d guest %08x native %08x;", i, cpu->R[i], f.R[i]); nd++; }
@@ -6162,7 +6164,7 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
 #endif
         CheckPending = false;
         c->Idle2Log = nullptr;
-        g_State[&c->NDS].diffs[g_P.kind]++;
+        Own(c->NDS).diffs[g_P.kind]++;
         return;
     }
     if (!atVec && (pc != (e.retPc & ~1u) || ((cpu->CPSR ^ e.CPSR) & (g_P.kind == 15 || g_P.kind == 17 ? 0x0FFFFFFFu : ~0u)))) return;
@@ -6171,10 +6173,10 @@ void CheckAt(melonDS::ARM* cpu, u32 pc)
     if (g_P.kind == 20 && (cpu->R[1] != e.R[1] || cpu->R[3] != e.R[3])) return;
     if (g_P.kind == 22 && (cpu->R[0] != e.R[0] || cpu->R[1] != e.R[1])) return;                          // KCL: the same prism                          // streaming LZ: the same
     melonDS::NDS& nds = c->NDS;
-    if ((g_P.kind == 0 || g_P.kind == 4) && R32(&nds.MainRAM[(g_State[&nds].v->info + 4) & nds.MainRAMMask]) != e.cur) return;
+    if ((g_P.kind == 0 || g_P.kind == 4) && R32(&nds.MainRAM[(Own(nds).v->info + 4) & nds.MainRAMMask]) != e.cur) return;
     CheckPending = false;
     c->Idle2Log = nullptr;
-    State& s = g_State[&nds];
+    State& s = Own(nds);
     const int k = g_P.kind;
     if (g_P.irq && (k == 1 || k == 2))
     {

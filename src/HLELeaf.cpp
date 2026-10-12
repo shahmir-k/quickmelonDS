@@ -78,7 +78,7 @@ int KindAt(melonDS::ARMv5* c, u32 t, u32& len, bool verify = true)
 }
 
 struct Stats { u64 calls[kKinds] = {}, native[kKinds] = {}, checks[kKinds] = {}, diffs[kKinds] = {}; ~Stats(); };
-Stats g_St;
+Stats g_St;     // ponytail: one process-wide count, touched only with LITEV_HLELEAF_STATS (racy with several consoles: diagnostics)
 const bool g_Stats = getenv("LITEV_HLELEAF_STATS") != nullptr;
 #ifdef LITEV_HLE_DIAG
 const bool g_Check = getenv("LITEV_HLELEAF_CHECK") != nullptr;
@@ -231,7 +231,7 @@ void Call(melonDS::ARMv5* c, u32 target, u32 ret, u32 r15)
     const u32 codeRegion = c->CodeRegion, cpsrT = c->CPSR & 0x20;
     const s32 codeCycles = c->CodeCycles, regionCycles = c->RegionCodeCycles;
     const u32 next0 = c->NextInstr[0], next1 = c->NextInstr[1];
-    g_St.calls[k ? k : kHook]++;
+    if (g_Stats) g_St.calls[k ? k : kHook]++;
     Out o;
     if (!k)
     {
@@ -242,7 +242,7 @@ void Call(melonDS::ARMv5* c, u32 target, u32 ret, u32 r15)
         c->CurInstr = Code(c, target);
         if (!melonDS::A9HLE::Run(c, true)) Guest(c, target, ret);
         else if (c->R[15] != (ret & 1 ? (ret & ~1u) + 2 : ret + 4)) Guest(c, target, ret, true);
-        else g_St.native[kHook]++;
+        else if (g_Stats) g_St.native[kHook]++;
     }
     else if (melonDS::A9HLE::MaskOn(c->NDS, 16777216) && Native(c, k, o, ret))
     {
@@ -269,7 +269,7 @@ void Call(melonDS::ARMv5* c, u32 target, u32 ret, u32 r15)
         }
         else
         {
-            g_St.native[k]++;
+            if (g_Stats) g_St.native[k]++;
             Commit(c, o);
             for (int i = 0; i < 4; i++) c->R[i] = o.r[i];
             c->R[12] = o.ip;
