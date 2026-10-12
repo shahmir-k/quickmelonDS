@@ -1406,9 +1406,17 @@ void SoftRenderer::VBlank()
         if (cap) HybridReadback3D(Hyb3D[slot]);
     }
 
-    for (int y = 0; y < 192; y++)   // banks this render captures into (DoCapture's own checks)
+    for (int y = 0; y < 192; y++)   // banks this render captures into or from (DoCapture's own checks)
         if (FrameSnap[y].Valid && FrameSnap[y].CaptureEnable)
-            AsyncCapBanks |= FrameSnap[y].VRAMMapLCDC & (1u << ((FrameSnap[y].CaptureCnt >> 16) & 0x3));
+        {
+            const u32 cnt = FrameSnap[y].CaptureCnt;
+            u32 banks = 1u << ((cnt >> 16) & 0x3);
+            if (((cnt >> 29) & 0x3) && !(cnt & (1u << 25)))   // source B = VRAM: the emulator must not write it first
+                banks |= 1u << ((FrameSnap[y].DispCntA >> 18) & 0x3);
+            // ponytail: source B = main memory display FIFO (bit 25) still reads the live
+            // GPU::DispFIFOBuffer; snapshot it per line if a game captures from the FIFO
+            AsyncCapBanks |= FrameSnap[y].VRAMMapLCDC & banks;
+        }
 
     // (c) SIGNAL the render thread to raster frame N into the current back buffer.
     // Capture the buffer index now: FinishFrame will swap BackBuffer while the render
