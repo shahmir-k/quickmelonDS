@@ -919,6 +919,13 @@ int main(int argc, char** argv)
         }
 #endif
         nds->RunFrame();
+        // LITEV_FRAME_LOAD_MS=<ms> (tests): busy-wait that long a frame, as a slower device's emulation (the RG DS
+        // needs ~10 ms a frame where the Mac needs ~2): link round trips then cost frames as they do there
+        if (static const double loadMs = getenv("LITEV_FRAME_LOAD_MS") ? atof(getenv("LITEV_FRAME_LOAD_MS")) : 0; loadMs > 0)
+        {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(loadMs * 1000));
+            while (std::chrono::steady_clock::now() < until) {}
+        }
         if (inputScript.HasProgram())   // closed-loop script steps (@until / @repeat ... rgb) see this frame's screens
         {
             void* top = nullptr; void* bot = nullptr;
@@ -1010,8 +1017,18 @@ int main(int argc, char** argv)
         {
             melonDS::MPInterface::Get().Process();
 #ifdef LITEV_AMBIENT_LAN
+            if (ambient && ambient->TakePrompt())     // step 2: what the app asks the player
+            {
+                const auto d = ambient->GetDiag();
+                printf("AMBIENT SLOWDOWN f%d: %.1f fps, link wait %.1f ms/frame, %.2f exchanges/frame, rtt %.0f ms, ceiling %.0f fps\n",
+                       frame, d.Fps, d.WaitMs, d.ExchPerFrame, d.RttMs, d.CeilingFps);
+            }
             if (ambient && frame % 120 == 0)
             {
+                const auto d = ambient->GetDiag();
+                if (d.Linked)
+                    printf("AMBIENT DIAG f%d: %.1f fps, link wait %.1f ms/frame, %.2f exch/frame, rtt %.0f ms, ceiling %.0f fps, slow %us\n",
+                           frame, d.Fps, d.WaitMs, d.ExchPerFrame, d.RttMs, d.CeilingFps, d.SlowSeconds);
                 const auto st = ambient->GetStats();
                 printf("AMBIENT f%d: nearby=%u links=%u opened=%llu presence tx=%llu rx=%llu link tx=%llu rx=%llu beacons=%llu blocked=%.1fms exch=%llu rtt=%ums\n",
                        frame, st.Nearby, st.Links, (unsigned long long)st.LinksOpened, (unsigned long long)st.PresenceTx, (unsigned long long)st.PresenceRx,

@@ -33,7 +33,7 @@ namespace
 {
 constexpr u32 kPresMagic = 0x4E534453;      // "SDSN"
 constexpr u8 kPresVersion = 1;
-enum : u8 { P_Live = 1, P_Full = 2, P_Req = 3, P_Bye = 4 };
+enum : u8 { P_Live = 1, P_Full = 2, P_Req = 3, P_Bye = 4, P_Ping = 5, P_Pong = 6 };   // (ping / pong: + u64 sender time, us)
 constexpr u32 kNifi = 0x4946494E;           // MPPacketHeader magic (LAN.cpp)
 enum { Chan_Ctl = 0, Chan_MP = 1 };
 constexpr u32 kLiveMs = 2000, kFullMinMs = 500, kExpireMs = 6000, kIdleMs = 10000, kOwnBeaconStaleMs = 3000;
@@ -132,6 +132,7 @@ void AmbientLAN::MacFromID(u64 id, u8* mac)
 
 AmbientLAN::AmbientLAN(const Config& cfg) : Cfg(cfg), Vis(cfg.Vis)
 {
+    if (const char* d = getenv("LITEV_AMBIENT_DELAY_MS")) DelayUs = (u64)(atof(d) * 1000);
     MacFromID(Cfg.DeviceID, MyMAC);
     if (Cfg.Name.size() > 32) Cfg.Name.resize(32);
     Snap = std::make_shared<const std::vector<Peer>>();
@@ -176,6 +177,7 @@ AmbientLAN::~AmbientLAN()
         for (int s = 0; s < 16; s++) if (Links[s].P) enet_peer_disconnect(Links[s].P, 0);
         enet_host_flush(Host);
         while (!RX.empty()) { enet_packet_destroy(RX.front()); RX.pop_front(); }
+        for (auto& d : Delayed) enet_packet_destroy(d.second);
         enet_host_destroy(Host);
         enet_deinitialize();
     }
@@ -226,6 +228,14 @@ std::vector<u8> AmbientLAN::BuildPresence(u8 kind)
     return v;
 }
 
+std::vector<u8> AmbientLAN::BuildPing(u8 kind, u64 t)
+{
+    std::vector<u8> v;
+    P32(v, kPresMagic); v.push_back(kPresVersion); v.push_back(kind); P16(v, LinkPort);
+    P64(v, Cfg.DeviceID); P32(v, Cfg.BuildID); P32(v, 0); P64(v, t);
+    return v;
+}
+
 void AmbientLAN::SendPresence(const std::vector<u8>& pkt, bool bcast, const std::vector<std::pair<u32, u16>>& to)
 {
     sockaddr_in a = {};
@@ -252,6 +262,17 @@ u8 AmbientLAN::HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, boo
     auto it = std::find_if(Peers.begin(), Peers.end(), [&](const Peer& x) { return x.ID == id; });
     if (kind == P_Bye) { if (it != Peers.end()) Peers.erase(it); return 0; }
     if (kind == P_Req && it == Peers.end()) return 0;     // (a request alone does not make a device nearby)
+    // link round trip, measured here (the presence thread answers at once; ENet's rtt includes up to a frame of the
+    // other side's servicing delay)
+    if (kind == P_Ping || kind == P_Pong)
+    {
+        if (it == Peers.end() || n < 32) return 0;
+        u64 t; memcpy(&t, p + 24, 8);
+        if (kind == P_Ping) { PingEcho = t; return P_Pong; }
+        const u32 rtt = (u32)std::min<u64>(NowUs() - t, 1000000);
+        it->RttUs = it->RttUs ? (it->RttUs * 3 + rtt) / 4 : rtt;
+        return 0;
+    }
     if (it == Peers.end()) { Peers.emplace_back(); it = Peers.end() - 1; it->ID = id; }
     Peer& e = *it;
     e.IP = ip; e.UniPort = port; e.LinkPort = G16(p + 6); e.BuildID = G32(p + 16); e.SeenMs = now;
@@ -286,7 +307,7 @@ u8 AmbientLAN::HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, boo
 
 void AmbientLAN::PresenceLoop()
 {
-    u32 lastLive = 0, lastUni = 0, lastFull = 0, lastPub = 0;
+    u32 lastLive = 0, lastUni = 0, lastFull = 0, lastPub = 0, lastPing = 0;
     u32 lastHash = 0;
     bool wasVisible = false;
     u8 buf[4096];
@@ -315,7 +336,8 @@ void AmbientLAN::PresenceLoop()
                     if (n <= 0) break;
                     u8 reply;
                     { std::lock_guard<std::mutex> g(Mu); reply = HandlePresence(buf, n, from.sin_addr.s_addr, ntohs(from.sin_port), now, s == BcastSock); }
-                    if (reply) SendPresence(BuildPresence(reply), false, {{from.sin_addr.s_addr, ntohs(from.sin_port)}});
+                    if (reply == P_Pong) SendPresence(BuildPing(P_Pong, PingEcho), false, {{from.sin_addr.s_addr, ntohs(from.sin_port)}});
+                    else if (reply) SendPresence(BuildPresence(reply), false, {{from.sin_addr.s_addr, ntohs(from.sin_port)}});
                     changed = true;
 #ifndef MSG_DONTWAIT
                     break;
@@ -324,6 +346,20 @@ void AmbientLAN::PresenceLoop()
             }
         }
         const u32 now = NowMs();
+        // the linked devices get a ping a second (the link's round trip for the step-2 slowdown detector)
+        if (now - lastPing >= 1000)
+        {
+            lastPing = now;
+            std::vector<std::pair<u32, u16>> linked;
+            u32 rtt = 0;
+            {
+                std::lock_guard<std::mutex> g(Mu);
+                for (auto& p : Peers)
+                    if (std::find(LinkedIDs.begin(), LinkedIDs.end(), p.ID) != LinkedIDs.end()) { linked.push_back({p.IP, p.UniPort}); rtt = std::max(rtt, p.RttUs); }
+            }
+            LinkRttUs = rtt;
+            if (!linked.empty()) SendPresence(BuildPing(P_Ping, NowUs()), false, linked);
+        }
         // unicast goes to the devices broadcast does not reach (not heard by broadcast lately: a router that drops it)
         // and to NSD finds not known yet; all of them for a goodbye
         std::vector<std::pair<u32, u16>> to, all;
@@ -691,28 +727,57 @@ void AmbientLAN::Pump(int type)
     int timeout = type == 2 ? RecvTimeout : 0;
     u32 last = NowMs();
     ENetEvent ev;
-    while (enet_host_service(Host, &ev, timeout) > 0)
+    for (;;)
     {
-        if (ev.type == ENET_EVENT_TYPE_RECEIVE && ev.channelID == Chan_MP)
+        if (DelayUs && ReleaseDelayed()) return;
+        int t = timeout;
+        if (DelayUs && !Delayed.empty()) t = std::clamp<int>((int)((s64)(Delayed.front().first - NowUs() + 999) / 1000), 0, timeout);
+        const int r = enet_host_service(Host, &ev, t);
+        if (r > 0)
         {
-            if (Admit(ev))
+            if (ev.type == ENET_EVENT_TYPE_RECEIVE && ev.channelID == Chan_MP)
             {
-                ((MPPacketHeader*)ev.packet->data)->Magic = NowMs();
-                ev.packet->userData = ev.peer->data;
-                RX.push_back(ev.packet);
-                return;
+                if (Admit(ev))
+                {
+                    ev.packet->userData = ev.peer->data;
+                    if (DelayUs) Delayed.push_back({NowUs() + DelayUs, ev.packet});
+                    else
+                    {
+                        ((MPPacketHeader*)ev.packet->data)->Magic = NowMs();
+                        RX.push_back(ev.packet);
+                        return;
+                    }
+                }
+                else enet_packet_destroy(ev.packet);
             }
-            enet_packet_destroy(ev.packet);
+            else OnEvent(ev);
         }
-        else OnEvent(ev);
+        else if (r < 0 || t == timeout) { if (DelayUs) ReleaseDelayed(); return; }    // nothing within the wait
         if (type == 2)
         {
-            const u32 t = NowMs();
-            timeout -= (int)(t - last);
-            last = t;
-            if (timeout <= 0) return;
+            const u32 n = NowMs();
+            timeout -= (int)(n - last);
+            last = n;
+            if (timeout <= 0) { if (DelayUs) ReleaseDelayed(); return; }
         }
     }
+}
+
+// LITEV_AMBIENT_DELAY_MS (tests): received MP frames reach RX that much later (a slower network)
+bool AmbientLAN::ReleaseDelayed()
+{
+    bool any = false;
+    const u64 now = NowUs();
+    while (!Delayed.empty() && Delayed.front().first <= now)
+    {
+        ENetPacket* p = Delayed.front().second;
+        Delayed.pop_front();
+        if (!p->userData || !((Link*)p->userData)->P) { enet_packet_destroy(p); continue; }   // (its link closed meanwhile)
+        ((MPPacketHeader*)p->data)->Magic = NowMs();
+        RX.push_back(p);
+        any = true;
+    }
+    return any;
 }
 
 int AmbientLAN::Pop(u8* data, u64* timestamp)
@@ -752,7 +817,63 @@ void AmbientLAN::Process()
         if (l.CloseAtMs && (s32)(now - l.CloseAtMs) >= 0) CloseLink(s, "deauth");
         else if (now - l.ActiveMs > kIdleMs) CloseLink(s, "idle");
     }
-    StMaxRtt = rtt;
+    StMaxRtt = rtt;     // (ENet's)
+    Detect(now);
+}
+
+// Step 2: a link-caused slowdown = below 58 fps for 5 s in a row while linked AND waiting on the link more than 3 ms a
+// frame (a CPU-bound slowdown waits little and never counts). Once per session (links up -> all down).
+void AmbientLAN::Detect(u32 nowMs)
+{
+    const bool linked = NumLinks > 0;
+    if (linked && !WasLinked) { SessionPrompted = false; SlowSeconds = 0; Win = {}; }
+    WasLinked = linked;
+    const u64 now = NowUs();
+    if (!Win.T0) { Win.T0 = now; return; }
+    Win.Frames++;
+    Win.BlockedUs += StLastBlocked;
+    Win.Exch += StLastExch;
+    if (now - Win.T0 < 1000000) return;
+    LinkDiag d;
+    const double sec = (now - Win.T0) / 1e6;
+    d.Linked = linked;
+    d.Fps = (float)(Win.Frames / sec);
+    d.WaitMs = Win.Frames ? (float)(Win.BlockedUs / 1000.0 / Win.Frames) : 0;
+    d.ExchPerFrame = Win.Frames ? (float)Win.Exch / Win.Frames : 0;
+    d.RttMs = (LinkRttUs + 2 * DelayUs) / 1000.0f;   // (presence ping; + the injected delay both ways in tests)
+    // the frame without its link waits, plus one round trip per exchange: the most this link allows
+    const float busy = std::max(0.0f, (float)(sec * 1000.0 / std::max<u32>(Win.Frames, 1)) - d.WaitMs);
+    const float perFrame = busy + d.ExchPerFrame * d.RttMs;
+    d.CeilingFps = perFrame > 0 ? std::min(60.0f, 1000.0f / perFrame) : 60.0f;
+    // the link's own latency must explain the wait (exchanges x round trip >= 3 ms a frame): a device waiting on a
+    // slower partner (CPU-bound) over a fast link never counts; the first 10 s of a session (joining) neither
+    if (linked && !LinkedSinceUs) LinkedSinceUs = now;
+    if (!linked) LinkedSinceUs = 0;
+    const bool settled = linked && now - LinkedSinceUs >= 10000000;
+    // ... and must make up a fair part of it (a loading partner or a timeout makes long waits a short round trip does
+    // not explain: on RG DS + Mac over Wi-Fi a menu change waited 289 ms a frame at a 5 ms round trip)
+    const float linkMs = d.ExchPerFrame * d.RttMs;
+    SlowSeconds = (settled && d.Fps < 58 && d.WaitMs > 3 && linkMs >= 3 && linkMs >= 0.35f * d.WaitMs) ? SlowSeconds + 1 : 0;
+    d.SlowSeconds = SlowSeconds;
+    if (SlowSeconds >= 5 && !SessionPrompted)
+    {
+        SessionPrompted = true;
+        PromptPending = true;
+        Platform::Log(Platform::LogLevel::Info, "Ambient: link slowdown: %.1f fps, link wait %.1f ms/frame, %.2f exchanges/frame, rtt %.0f ms, ceiling %.0f fps\n",
+                      d.Fps, d.WaitMs, d.ExchPerFrame, d.RttMs, d.CeilingFps);
+    }
+    {
+        std::lock_guard<std::mutex> g(Mu);
+        Diag = d;
+    }
+    Win = {};
+    Win.T0 = now;
+}
+
+AmbientLAN::LinkDiag AmbientLAN::GetDiag()
+{
+    std::lock_guard<std::mutex> g(Mu);
+    return Diag;
 }
 
 void AmbientLAN::Begin(int inst)

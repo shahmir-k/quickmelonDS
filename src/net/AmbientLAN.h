@@ -80,6 +80,18 @@ public:
     std::vector<std::string> NearbyRows();
     Stats GetStats();
 
+    // Step 2: link-caused slowdown, measured over the last second (Process = one emulated frame)
+    struct LinkDiag
+    {
+        bool Linked = false;
+        float Fps = 0, WaitMs = 0, ExchPerFrame = 0, RttMs = 0;
+        float CeilingFps = 60;          // the most this link allows: 1000 / (frame without link waits + exchanges x RTT)
+        u32 SlowSeconds = 0;            // seconds in a row below 58 fps while waiting > 3 ms a frame on the link
+    };
+    LinkDiag GetDiag();
+    // true once per session (links up until all are down) when the slowdown held 5 s: ask the player
+    bool TakePrompt() { return PromptPending.exchange(false); }
+
     void Process() override;
     void Begin(int inst) override;
     void End(int inst) override;
@@ -97,7 +109,8 @@ public:
         u32 IP = 0;                 // network order
         u16 UniPort = 0, LinkPort = 0;
         u32 SeenMs = 0, ReqMs = 0, Hash = 0, BuildID = 0;
-        u32 BcastMs = 0;            // last heard by broadcast (0: never; then it gets our presence by unicast)
+        u32 BcastMs = 0;
+        u32 RttUs = 0;              // presence ping round trip (linked devices only)            // last heard by broadcast (0: never; then it gets our presence by unicast)
         bool Full = false;          // details received
         bool HasGGID = false;
         u32 GGID = 0;
@@ -141,6 +154,9 @@ private:
     void PresenceLoop();
     u8 HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, bool bcast);     // (under Mu) the reply to send
     std::vector<u8> BuildPresence(u8 kind);
+    std::vector<u8> BuildPing(u8 kind, u64 t);
+    u64 PingEcho = 0;                                       // presence thread
+    std::atomic<u32> LinkRttUs{0};
     void SendPresence(const std::vector<u8>& pkt, bool bcast, const std::vector<std::pair<u32, u16>>& to);
 
     // ---- links + synthesis (emulator thread) ----
@@ -178,6 +194,19 @@ private:
     bool Admit(ENetEvent& ev);
     int Pop(u8* data, u64* timestamp);
     u32 UpMask() const;
+
+    // step 2 (emulator thread; Diag under Mu)
+    struct Window { u64 T0 = 0, BlockedUs = 0; u32 Frames = 0, Exch = 0; } Win;
+    bool WasLinked = false, SessionPrompted = false;
+    u64 LinkedSinceUs = 0;
+    u32 SlowSeconds = 0;
+    LinkDiag Diag;
+    std::atomic<bool> PromptPending{false};
+    void Detect(u32 nowMs);
+    // tests: LITEV_AMBIENT_DELAY_MS
+    u64 DelayUs = 0;
+    std::deque<std::pair<u64, ENetPacket*>> Delayed;
+    bool ReleaseDelayed();
 };
 
 }
