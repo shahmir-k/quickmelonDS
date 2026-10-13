@@ -737,6 +737,10 @@ void GLRenderer2D::UpdateAndRender(int line)
     if (layer_pre_dirty)
         comp_dirty = true;
 
+    // the same for the OBJ extended palettes (derived above, never used upstream)
+    if (objExtPalDirty.CheckRange(0, 16))
+        SpriteDirty = true;
+
     if (Parent.NeedPartialRender)
         comp_dirty = true;
 
@@ -2276,6 +2280,16 @@ void GLRenderer2D::DrawSprites(u32 line)
                         1024, end - start,
                         GL_RED_INTEGER, GL_UNSIGNED_BYTE,
                         &vram[start * 1024]);
+        dirty = true;
+    }
+
+    // the OBJ palette (standard: bit 1, colour 0: bit 5, of this engine's pair) is uploaded with
+    // the sprites: a palette-only change must redo them too (upstream rendered the old colours
+    // until the OAM or OBJ VRAM changed)
+    const u32 objpalmask = 0x22u << (GPU2D.Num * 2);
+    if (GPU.PaletteDirty & objpalmask)
+    {
+        GPU.PaletteDirty &= ~objpalmask;
         dirty = true;
     }
 
