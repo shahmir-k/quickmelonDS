@@ -919,7 +919,7 @@ int main(int argc, char** argv)
         }
 #endif
         nds->RunFrame();
-        if (inputScript.HasProgram())   // closed-loop script steps see this frame's screens
+        if (inputScript.HasProgram())   // closed-loop script steps (@until / @repeat ... rgb) see this frame's screens
         {
             void* top = nullptr; void* bot = nullptr;
             if (nds->GPU.GetFramebuffers(&top, &bot) && top && bot) inputScript.OnFrame(frame, (const u32*)top, (const u32*)bot);
@@ -1213,6 +1213,10 @@ int main(int argc, char** argv)
 #if defined(LITEV_A9HLE) && defined(LITEV_HLE_DIAG)
     if (getenv("LITEV_HLESIG_SCAN")) melonDS::A9HLE::SigScan(*nds);
 #endif
+    // LITEV_HEADLESS_SAVOUT=<path> (test only): the game save memory at the end (e.g. after a LAN trade)
+    if (const char* so = getenv("LITEV_HEADLESS_SAVOUT"))
+        if (const u8* sv = nds->GetNDSSave())
+            if (FILE* fp = fopen(so, "wb")) { fwrite(sv, 1, nds->GetNDSSaveLength(), fp); fclose(fp); }
     printf("=== liteDS-headless summary ===\n");
     printf("mode:        %s\n", opt.jit ? "jit" : "interp");
     printf("frames:      %d\n", opt.frames);

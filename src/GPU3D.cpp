@@ -553,7 +553,7 @@ void GPU3D::AsyncStop(bool copyBack) noexcept
 }
 #endif
 #ifndef LITEV_GX_ASYNC_LOCAL
-GPU3D::~GPU3D() noexcept {}     // (LITEV_GX_ASYNC_LOCAL off: nothing to stop)
+GPU3D::~GPU3D() noexcept {}   // (the header declares it unconditionally)
 #endif
 
 GPU3D::GPU3D(melonDS::GPU& gpu) noexcept :
