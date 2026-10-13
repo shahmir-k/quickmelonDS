@@ -350,7 +350,7 @@ void Process(Ctx& c);
 void OnEvent(void* that, u32)
 {
     Ctx& c = *(Ctx*)that;
-    c.now = c.wake;
+    c.now = std::max(c.now, c.wake);         // (monotonic: a V-line runs at its line's start, which can be behind)
     c.wake = ~0ull;
     c.stEv++;
     Process(c);
@@ -1535,7 +1535,11 @@ void IndMpEnd(Ctx& c, const std::vector<u8>& B)
         else if (len == 0)
         {
             const u64 last = S64(c, ST_lastRx + 8 * aid), life = S64(c, ST_life);
-            if (last && life && now - last > life) { SS64(c, ST_lastRx + 8 * aid, 0); PostInternal(c, 0x25, (1u << aid) | (0x8001u << 16)); }
+            if (last && life && (s64)(now - last) > (s64)life)
+            {
+                if (g_Dbg) fprintf(stderr, "A7WM inst%d f%u parent lifetime aid %u: now %llx last %llx life %llx\n", c.inst, c.nds.NumFrames, aid, (unsigned long long)now, (unsigned long long)last, (unsigned long long)life);
+                SS64(c, ST_lastRx + 8 * aid, 0); PostInternal(c, 0x25, (1u << aid) | (0x8001u << 16));
+            }
         }
     }
     SendComplete(c, false, Rd16(c, rb));
@@ -1694,7 +1698,11 @@ void VAlarm(Ctx& c, u16 x)
         {
             ArmVLine(c, 0xC8);
             const u64 life = S64(c, ST_life), last = S64(c, ST_lastRx);
-            if (life && last && (Tick(c) | 1) - last > life) { SS64(c, ST_lastRx, 0); PostInternal(c, 0x25, 0 | (0x8001u << 16)); }
+            if (life && last && (s64)((Tick(c) | 1) - last) > (s64)life)
+            {
+                if (g_Dbg) fprintf(stderr, "A7WM inst%d f%u child lifetime: now %llx last %llx life %llx\n", c.inst, c.nds.NumFrames, (unsigned long long)Tick(c), (unsigned long long)last, (unsigned long long)life);
+                SS64(c, ST_lastRx, 0); PostInternal(c, 0x25, 0 | (0x8001u << 16));
+            }
             else PostVAlarmMP(c);
         }
         else ArmVLine(c, -1);
@@ -2102,6 +2110,7 @@ bool Request(Ctx& c, const Rq& q)
         break;
     }
     case 0x25:              // AUTO_DISCONNECT (internal)
+        if (g_Dbg) fprintf(stderr, "A7WM inst%d f%u AUTO_DISCONNECT %x reason %x\n", c.inst, c.nds.NumFrames, q.a1 & 0xFFFF, q.a1 >> 16);
         DisconnectCore(c, q.a1 & 0xFFFF, true, q.a1 >> 16, nullptr);
         break;
     case 0x22:              // AUTO_DEAUTH (internal)
