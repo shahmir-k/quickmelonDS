@@ -269,7 +269,11 @@ u8 AmbientLAN::HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, boo
         if (it == Peers.end() || n < 32) return 0;
         u64 t; memcpy(&t, p + 24, 8);
         if (kind == P_Ping) { PingEcho = t; return P_Pong; }
-        const u32 rtt = (u32)std::min<u64>(NowUs() - t, 1000000);
+        const u64 nowUs = NowUs();
+        // A malformed/future timestamp must not wrap the unsigned subtraction into
+        // an apparent one-second RTT (which would falsely blame the link for slowdown).
+        if (t > nowUs || nowUs - t > 10000000) return 0;
+        const u32 rtt = (u32)std::min<u64>(nowUs - t, 1000000);
         it->RttUs = it->RttUs ? (it->RttUs * 3 + rtt) / 4 : rtt;
         return 0;
     }
