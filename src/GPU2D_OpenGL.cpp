@@ -56,7 +56,7 @@ using Platform::LogLevel;
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
-#ifdef LITEV_GLHI_DEFER
+#if defined(LITEV_GLHI_DEFER) && defined(__ANDROID__)   // GLES entry points (glad on other platforms)
 }
 #include "GLDeferCalls.h"
 namespace melonDS

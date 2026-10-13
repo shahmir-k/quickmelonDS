@@ -27,7 +27,7 @@
 #include <sys/system_properties.h>
 #endif
 #include "GLDefer.h"
-#ifdef LITEV_GLHI_DEFER
+#if defined(LITEV_GLHI_DEFER) && defined(__ANDROID__)   // GLES entry points (glad on other platforms)
 #include "GLDeferCalls.h"
 #endif
 
@@ -206,7 +206,7 @@ GLuint GLRenderer::Get3DTex()
         }();
         OutputTex3D = Thread3D->SyncColor(late ? Prev3DColor : Thread3D->GL->GetCurColor());
         Synced3D = true;
-        static const bool dbg = [] { char b[92] = {}; return __system_property_get("debug.litev.glhidbg", b) > 0 && atoi(b) != 0; }();
+        static const bool dbg = OpenGL::Prop("glhidbg", 0) != 0;
         if (dbg) Platform::Log(Platform::Info, "LITEV_GLHIC frame %u c %d\n", GPU.NDS.NumFrames, late ? Prev3DColor : Thread3D->GL->GetCurColor());
     }
     return OutputTex3D;
@@ -229,13 +229,13 @@ void GLRenderer::Bind3DTex()
         const u64 seq = t->ColorSeq[c];
         const u32 fr = GPU.NDS.NumFrames;
         {
-            static const bool dbg = [] { char b[92] = {}; return __system_property_get("debug.litev.glhidbg", b) > 0 && atoi(b) != 0; }();
+            static const bool dbg = OpenGL::Prop("glhidbg", 0) != 0;
             static u32 lastFr = ~0u; static int lastC = -1;
             if (dbg && (fr != lastFr || c != lastC)) Platform::Log(Platform::Info, "LITEV_GLHIC frame %u c %d\n", fr, c);
             lastFr = fr; lastC = c;
         }
         GLDefer::Exec([t, c, seq, fr] {
-            static const bool dbg = [] { char b[92] = {}; return __system_property_get("debug.litev.glhidbg", b) > 0 && atoi(b) != 0; }();
+            static const bool dbg = OpenGL::Prop("glhidbg", 0) != 0;
             if (dbg && t->ColorSeq[c] != seq)
                 Platform::Log(Platform::Info, "LITEV_GLHIDBG frame %u colour %d seq %llu -> %llu (done %llu)\n", fr, c,
                               (unsigned long long)seq, (unsigned long long)t->ColorSeq[c], (unsigned long long)t->DoneSeq.load());
