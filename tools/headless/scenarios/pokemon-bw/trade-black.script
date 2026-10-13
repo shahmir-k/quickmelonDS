@@ -1,0 +1,29 @@
+# Black (parent console 0): attendant -> save -> Union Room -> walk to White -> talk -> menu
+@repeat A every 40 until rgb bot 10 10 100 8 113 209 241 20 timeout 4000
+@until rgb bot 10 65 100 8 105 200 234 20 timeout 4000
+@log shimmer is in the room
+@wait 60
+@press UP hold 48 gap 4
+@press RIGHT hold 32 gap 4
+@press UP hold 4 gap 30
+@press UP hold 16 gap 30
+@press A hold 4 gap 30
+@until !rgb top 240 178 8 3 251 251 251 60 & rgb top 10 150 200 12 232 231 232 20 timeout 900
+@press A hold 4 gap 10
+@until rgb top 5 5 50 40 223 222 223 15 timeout 900
+@log menu open
+@press DOWN hold 4 gap 20
+@press DOWN hold 4 gap 20
+@press A hold 4 gap 60
+@log trade requested
+@repeat A every 40 until rgb top 0 0 120 14 73 73 73 10 & rgb bot 4 10 120 14 208 206 208 15 timeout 20000
+@log trade screen
+@wait 120
+@press T:108:60 hold 6 gap 200
+@press T:108:36 hold 6 gap 200
+@press T:200:157 hold 6 gap 400
+@press T:217:179 hold 6 gap 500
+@press T:200:55 hold 6 gap 300
+@log offered
+@repeat A every 60 until rgb bot 10 10 100 8 113 209 241 20 timeout 9000
+@log back in the union room

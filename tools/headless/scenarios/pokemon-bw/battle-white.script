@@ -1,0 +1,29 @@
+@repeat A every 40 until rgb bot 10 10 100 8 113 209 241 20 timeout 4000
+@log in the room
+@until rgb top 10 150 200 12 232 231 232 15 timeout 6000
+@log offer
+@repeat A every 40 until rgb bot 100 60 50 40 0 50 72 12 timeout 4000
+@log in the battle room
+@wait 400
+@press UP hold 48 gap 4
+@press RIGHT hold 48 gap 10
+@until rgb top 10 150 200 12 232 231 232 15 timeout 90 soft
+@skipif rgb top 10 150 200 12 232 231 232 15 6
+@press DOWN hold 16 gap 10
+@until rgb top 10 150 200 12 232 231 232 15 timeout 90 soft
+@skipif rgb top 10 150 200 12 232 231 232 15 3
+@press UP hold 32 gap 10
+@until rgb top 10 150 200 12 232 231 232 15 timeout 90 soft
+@skipif rgb top 10 150 200 12 232 231 232 15 0
+@until rgb top 10 150 200 12 232 231 232 15 timeout 900
+@log on the marker
+@until rgb bot 0 180 60 12 2 2 2 6 & rgb top 100 60 50 40 25 76 96 20 timeout 3000
+@log selection screen
+@wait 60
+@press T:64:32 hold 10 gap 60
+@press T:179:133 hold 10 gap 60
+@press T:204:178 hold 10 gap 90
+@log lead entered
+@until !rgb top 100 60 50 40 25 76 96 20 timeout 3000
+@repeat A every 30 until rgb bot 100 60 50 40 0 50 72 12 & rgb top 100 60 50 40 132 208 187 25 timeout 20000
+@log back in the battle room

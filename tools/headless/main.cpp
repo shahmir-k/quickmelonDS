@@ -124,6 +124,7 @@ struct Options
     // frame:path pairs to dump as PPM. Multiple frames in ONE run (comma-separated in a single
     // --fb-dump-ppm, or the flag repeated) so a visual A/B needs one replay, not one-per-frame.
     std::vector<std::pair<int, std::string>> fbDumps;
+    std::string scriptShotDir;          // capture both screens on each reactive @log milestone
     std::string videoMp4;               // --video-mp4: every frame, through ffmpeg
     std::string checkRecording;         // --check-recording: an app recording's frames.csv
     int reloadAt = -1;                  // --reload-at: load --savestate again after this many frames
@@ -182,6 +183,7 @@ struct Options
         "  --fastmem on|off          JIT fast-memory path (default on; no-op where unsupported)\n"
         "  --fb-hash-every N         print xxhash of both framebuffers every N frames\n"
         "  --fb-dump-ppm <f>:<path>[,<f>:<path>...]  dump both framebuffers at each frame as PPM\n"
+        "  --script-shot-dir <dir>   dump both screens at each @log milestone (directory must exist)\n"
         "                            (multiple frames in ONE run; flag may also repeat)\n"
         "  --audio-interp <mode>     SPU interpolation: none|linear|cosine|cubic|gaussian (default none)\n"
         "  --frameskip N             skip N of every N+1 frames' rasterization (LITEV_AGGRESSIVE_SKIP build)\n"
@@ -283,6 +285,7 @@ bool ParseArgs(int argc, char** argv, Options& o)
                 pos = comma + 1;
             }
         }
+        else if (a == "--script-shot-dir") o.scriptShotDir = next("--script-shot-dir");
         else if (a == "--audio-interp")
         {
             std::string m = next("--audio-interp");
@@ -932,6 +935,7 @@ int main(int argc, char** argv)
             if (nds->GPU.GetFramebuffers(&top, &bot) && top && bot) inputScript.OnFrame(frame, (const u32*)top, (const u32*)bot);
             else inputScript.OnFrame(frame, nullptr, nullptr);
         }
+        const auto scriptMilestones = inputScript.TakeMilestones();
         if (static const bool p2d = getenv("LITEV_PRINT_2D") != nullptr; p2d)   // display registers after the frame
             fprintf(stderr, "2D f%d A: dispcnt=%08x bldcnt=%04x eva=%d evb=%d evy=%d mb=%04x  B: dispcnt=%08x bldcnt=%04x evy=%d mb=%04x cap=%08x\n", frame,
                     nds->GPU.GPU2D_A.DispCnt, nds->GPU.GPU2D_A.BlendCnt, nds->GPU.GPU2D_A.EVA, nds->GPU.GPU2D_A.EVB, nds->GPU.GPU2D_A.EVY, nds->GPU.MasterBrightnessA,
@@ -1157,6 +1161,23 @@ int main(int argc, char** argv)
 
             lastTopHash = topHash;
             lastBotHash = botHash;
+
+            if (!opt.scriptShotDir.empty())
+            {
+                for (const auto& label : scriptMilestones)
+                {
+                    std::string safe;
+                    for (unsigned char c : label)
+                        safe += std::isalnum(c) ? (char)c : '_';
+                    if (safe.size() > 48) safe.resize(48);
+                    const std::string path = opt.scriptShotDir + "/f" + std::to_string(frame + 1) + "_" + safe + ".ppm";
+                    if (!DumpPPM(path, (const u32*)top, (const u32*)bot))
+                        fprintf(stderr, "warning: milestone screenshot failed: %s\n", path.c_str());
+                    printf("MILESTONE frame=%d name=%s top=%016llx bottom=%016llx file=%s\n", frame + 1,
+                           safe.c_str(), (unsigned long long)topHash, (unsigned long long)botHash, path.c_str());
+                    fflush(stdout);
+                }
+            }
 
             if (opt.fbHashEvery > 0 && ((frame + 1) % opt.fbHashEvery) == 0)
             {
