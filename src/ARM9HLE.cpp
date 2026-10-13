@@ -227,6 +227,7 @@ struct State
     EntryTrace traces[8]; u32 nTrace = 0, lastTrace = 0;    // 3c.: recorded IRQ entries (the last one replayed)
     u64 trRec = 0, trHit = 0, trChk = 0, trDiff = 0, trChkFail = 0;    // (stats; replay check)
     std::vector<u32> tried;         // wake-loop candidates probed (no OS build found there)
+    u64 rehook = 0;                 // a group was found (UpdateOk) at frame rehook - 1: the JIT resets in a later frame (Irq)
     bool hbLive = false, dmaLive = false;   // 3. / 11. verified when the wake hook block (A9HLEGuard) was compiled
     const void* listBlk[4] = {};            // 11.: the live blocks that start display lists (host; A9HLEGuardDma = any of them)
     u32 biosRet = 0;                // BIOS IRQ entry verified (once): its return address, else 0
@@ -509,6 +510,7 @@ __attribute__((noinline, cold)) bool MatchGroup(melonDS::ARMv5* c, State& s, int
 __attribute__((noinline, cold)) void UpdateOk(melonDS::ARMv5* c, State& s)
 {
     if (s.build != 1 && s.build != 2) return;
+    s.rehook = c->NDS.NumFrames + 1;
     Variant& v = s.f.var;
     const int b = s.build, gx = b == 1 ? gGxA : gGxT, shp = b == 1 ? gShpA : gShpT;
     v.matT = b == 2 && s.gs[gMatT] == 1 ? &s.f.matT : nullptr;
@@ -5258,6 +5260,16 @@ int IrqOne(melonDS::ARMv5* c, State& s, bool halted, u32 low)
 int Irq(melonDS::ARMv5* c, bool halted)
 {
     if (CheckPending) return 0;
+    // a group found after code it hooks was compiled (a state loaded into a fresh JIT compiles whatever runs first, before
+    // the OS build is probed: PW's town then ran SHP unhooked for good, +17% emu instructions, and its GXFIFO IRQs no longer
+    // met the GX DMA): the JIT starts over once the groups settle (the first IRQ of a frame after the last one was found),
+    // and the hook blocks compile with the hooks. About once per boot / state load. (Invalidating the hook candidates'
+    // blocks alone does not do it: SHP's callers keep reaching the old code.) Here the CPU is between blocks
+    if (State* r = (State*)c->A9HLEState; __builtin_expect(r && r->rehook, 0) && c->NDS.NumFrames >= r->rehook)
+    {
+        r->rehook = 0;
+        if (c->NDS.IsJITEnabled()) c->NDS.JIT.ResetBlockCache();
+    }
 #ifdef LITEV_HLE_DIAG
     static bool dryHalted = false;      // dry: the halted call already computed this delivery
     if (__builtin_expect(g_DryIrq, 0) && dryHalted) { dryHalted = false; return 0; }
