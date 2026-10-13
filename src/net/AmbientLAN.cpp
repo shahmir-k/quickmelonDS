@@ -406,6 +406,8 @@ AmbientLAN::Stats AmbientLAN::GetStats()
     s.Frames = StFrames; s.PresenceTx = StPresTx; s.PresenceRx = StPresRx; s.LinkTx = StLinkTx; s.LinkRx = StLinkRx;
     s.BeaconsInjected = StInjected; s.LinksOpened = StOpened; s.BlockedUs = StBlockedUs; s.Exchanges = StExchanges;
     s.LastFrameBlockedUs = StLastBlocked; s.LastFrameExchanges = StLastExch; s.Links = StLinks; s.Nearby = StNearby; s.MaxRttMs = StMaxRtt;
+    s.SlowFpsX100 = StSlowFps; s.SlowWaitUsPerFrame = StSlowWait;
+    s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending;
     return s;
 }
 
@@ -767,6 +769,7 @@ int AmbientLAN::Pop(u8* data, u64* timestamp)
 
 void AmbientLAN::Process()
 {
+    const u32 frameBlocked = FrameBlockedUs, frameExchanges = FrameExchanges;
     StFrames++;
     StLastBlocked = FrameBlockedUs; StLastExch = FrameExchanges;
     StBlockedUs += FrameBlockedUs; StExchanges += FrameExchanges;
@@ -785,6 +788,12 @@ void AmbientLAN::Process()
         else if (now - l.ActiveMs > kIdleMs) CloseLink(s, "idle");
     }
     StMaxRtt = rtt;
+    if (StSlowDismissRequested.exchange(false)) Slowdown.Dismiss();
+    const auto slow = Slowdown.Observe(NowUs(), UpMask() != 0, frameBlocked, frameExchanges);
+    StSlowFps = slow.FpsX100;
+    StSlowWait = slow.WaitUsPerFrame;
+    StSlowExch = slow.ExchangesPerFrameX100;
+    StSlowPending = slow.Pending;
 }
 
 void AmbientLAN::Begin(int inst)

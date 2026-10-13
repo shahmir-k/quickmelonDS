@@ -33,6 +33,7 @@
 
 #include "types.h"
 #include "MPInterface.h"
+#include "AmbientSlowdown.h"
 
 namespace melonDS
 {
@@ -59,6 +60,8 @@ public:
     {
         u64 Frames, PresenceTx, PresenceRx, LinkTx, LinkRx, BeaconsInjected, LinksOpened, BlockedUs, Exchanges;
         u32 LastFrameBlockedUs, LastFrameExchanges, Links, Nearby, MaxRttMs;
+        u32 SlowFpsX100, SlowWaitUsPerFrame, SlowExchangesPerFrameX100;
+        bool SlowdownPending;
     };
 
     explicit AmbientLAN(const Config& cfg);
@@ -79,6 +82,7 @@ public:
     // nearby devices: "id \t name \t game \t ip:port \t ggid \t build \t linked"
     std::vector<std::string> NearbyRows();
     Stats GetStats();
+    void DismissSlowdownPrompt() { StSlowDismissRequested = true; StSlowPending = false; }
     bool HasLinks() const { return StLinks.load(std::memory_order_relaxed) != 0; }
 
     void Process() override;
@@ -168,9 +172,12 @@ private:
     std::vector<Cand> Cands;
     u64 NextInjectUs = ~0ull;
     u32 FrameBlockedUs = 0, FrameExchanges = 0;
+    AmbientSlowdown Slowdown;
 
     std::atomic<u64> StFrames{0}, StPresTx{0}, StPresRx{0}, StLinkTx{0}, StLinkRx{0}, StInjected{0}, StOpened{0}, StBlockedUs{0}, StExchanges{0};
     std::atomic<u32> StLastBlocked{0}, StLastExch{0}, StLinks{0}, StNearby{0}, StMaxRtt{0};
+    std::atomic<u32> StSlowFps{0}, StSlowWait{0}, StSlowExch{0};
+    std::atomic<bool> StSlowPending{false}, StSlowDismissRequested{false};
 
     void RefreshView(bool force);
     void RebuildCands();
