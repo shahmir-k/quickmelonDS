@@ -1031,6 +1031,31 @@ void GLRenderer::DownscaleCapture(int width, int height, int layer)
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
 }
 
+// Read rows of the RGB5_A1 capture sync target into VRAM as DS 1555 (R in the low bits).
+// GLES3 only guarantees RGBA/UNSIGNED_BYTE readback. It has no 1_5_5_5_REV: the GLES_Compat alias
+// reads 5_5_5_1, which is either rejected (VRAM keeps stale data) or comes back with R in the high
+// bits; both leave the wrong picture in VRAM, e.g. the white background behind Pokemon White's
+// trainer battle "VS" screen in hi-res 2D. Each 8-bit channel is the exact expansion of the stored
+// 5-bit value, so the round trip is lossless.
+static void ReadCapture1555(int y, int w, int h, u8* dst)
+{
+    static std::vector<u8> rgba;
+    rgba.resize((size_t)w * h * 4);
+    glReadPixels(0, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+#ifdef __ANDROID__
+    const int r = 2, b = 0;   // the GLES pipeline keeps DS red in .b (GLES_Compat 5_5_5_1 uploads)
+#else
+    const int r = 0, b = 2;
+#endif
+    u16* out = (u16*)dst;
+    for (size_t i = 0, n = (size_t)w * h; i < n; i++)
+    {
+        const u8* c = &rgba[i * 4];
+        out[i] = (u16)(((c[r] * 31 + 127) / 255) | (((c[1] * 31 + 127) / 255) << 5) |
+                       (((c[b] * 31 + 127) / 255) << 10) | ((c[3] >> 7) << 15));
+    }
+}
+
 void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
 {
     if (!complete)
@@ -1046,8 +1071,7 @@ void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
 
         glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureSyncFB);
 
-        glReadPixels(0, 0, 128, 128,
-                     GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, &vram[start * 64 * 512]);
+        ReadCapture1555(0, 128, 128, &vram[start * 64 * 512]);
 
         for (u32 j = start * 64; j < (start+1) * 64; j++)
             GPU.VRAMDirty[bank][j] = true;
@@ -1065,8 +1089,7 @@ void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
             if (end > 4)
                 end = 4;
 
-            glReadPixels(0, pos * 64, 256, (end - pos) * 64,
-                         GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, &vram[pos * 64 * 512]);
+            ReadCapture1555(pos * 64, 256, (end - pos) * 64, &vram[pos * 64 * 512]);
 
             for (u32 j = pos * 64; j < end * 64; j++)
                 GPU.VRAMDirty[bank][j] = true;
