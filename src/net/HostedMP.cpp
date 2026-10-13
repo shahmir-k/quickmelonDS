@@ -86,11 +86,12 @@ void RecordMP::Put(int inst, u8 kind, u32 call, s32 result, u64 timestamp, const
     out.insert(out.end(), data, data + len);
 }
 
-void RecordMP::EndFrame(int inst, int frame, u64 state, const NetplayFrameInput& in)
+void RecordMP::EndFrame(int inst, int frame, u64 state, const NetplayFrameInput& in, u32 speed)
 {
     if (frame == 0) Calls[inst].OpenTrace("server", inst);
     if (Calls[inst].Trace) fprintf(Calls[inst].Trace, "frame %d\n", frame);
-    u8 data[16];
+    u8 data[20];
+    memcpy(data + 16, &speed, 4);
     memcpy(data, &state, 8);
     memcpy(data + 8, &in.Keys, 4);
     memcpy(data + 12, &in.TouchX, 2);
@@ -330,6 +331,12 @@ bool ReplayMP::EndFrame(int frame, u64 state)
     Queue.pop_front();
     u64 serverState = 0;
     if (m.Data.size() >= sizeof(serverState)) memcpy(&serverState, m.Data.data(), sizeof(serverState));
+    if (m.Data.size() >= 20)
+    {
+        u32 speed;
+        memcpy(&speed, &m.Data[16], 4);
+        Speed = (u64)(u32)m.Result << 32 | speed;
+    }
     if (m.Result != frame) Fail("frame " + std::to_string(frame) + ": the server's marker is for frame " + std::to_string(m.Result));
     else if (m.Call != Calls.Count || m.Timestamp != Calls.Hash)
         Fail("frame " + std::to_string(frame) + ": link calls differ (server " + std::to_string(m.Call) + " calls, here " + std::to_string(Calls.Count) + ")");

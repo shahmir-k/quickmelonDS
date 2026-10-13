@@ -67,21 +67,23 @@ struct NetplayFrameInput
 };
 
 #ifdef LITEV_NP_SPEED
-// Netplay speed (fast-forward / uncapped) travels in the input stream: bits 16..21 of a player's
-// Keys (NDS::SetKeyMask reads only bits 0..11) hold the speed that player requests for that applied
-// frame. Every device knows every player's input for frame F before it runs F, so every device
-// derives the same session speed at the same frame (SpeedAt). Speed is pacing only: emulation is
-// unaffected, so even a device that paced differently could not desync.
-// Code: 0 = no request (1x), 1..62 = multiplier x4 (0.25x steps, 2x = 8), 63 = uncapped.
+// Netplay speed (fast-forward / uncapped) is ONE session state, changed by any player's fast-forward
+// key. A key press travels in the input stream: bits 16..23 of a player's Keys (NDS::SetKeyMask reads
+// only bits 0..11) hold the speed that player last asked for (bits 16..21) and a press counter
+// (bits 22..23). A change of those bits at applied frame F is an event "set the session speed to
+// this"; every device knows every player's input for F before it runs F, so every device applies the
+// same events at the same frame (SpeedAt). Speed is pacing only: emulation is unaffected.
+// Code: 0 = normal (1x), 1..62 = multiplier x4 (0.25x steps, 2x = 8), 63 = uncapped.
 namespace NetplaySpeed
 {
 constexpr int kShift = 16;
-constexpr u32 kMask = 0x3Fu << kShift;
+constexpr u32 kMask = 0xFFu << kShift;      // code + press counter
 constexpr int kUncapped = 63;
 inline int Encode(float m) { return m <= 0 ? kUncapped : m == 1.0f ? 0 : (int)std::min(62.0f, std::max(1.0f, m * 4 + 0.5f)); }
 inline float Multiplier(int code) { return code == kUncapped ? 0.0f : code == 0 ? 1.0f : code / 4.0f; }  // 0 = uncapped
-inline int Of(const NetplayFrameInput& in) { return (int)((in.Keys & kMask) >> kShift); }
-inline void Set(NetplayFrameInput& in, int code) { in.Keys = (in.Keys & ~kMask) | ((u32)code << kShift); }
+inline int Field(const NetplayFrameInput& in) { return (int)((in.Keys & kMask) >> kShift); }   // code | presses << 6
+inline int Of(const NetplayFrameInput& in) { return Field(in) & 63; }
+inline void Set(NetplayFrameInput& in, int field) { in.Keys = (in.Keys & ~kMask) | ((u32)(field & 0xFF) << kShift); }
 }
 #endif
 
@@ -122,19 +124,34 @@ public:
     // the slowest peer's round trip (90th percentile, last 2 s, ms), -1 = no measurement yet
     double PeerRttMs() const { return RttMaxUs.load() / 1000.0; }
 #ifdef LITEV_NP_SPEED
-    // The session speed for local frame `frame`, NEVER waiting: the fastest request (any player may
-    // fast-forward the session; nobody vetoes) at input frame frame - kSpeedLag, decided from the inputs
-    // already here. If some player's input for that frame has not arrived, the speed decided last stays
-    // (a device behind applies a switch late; pacing only, emulation is untouched).
-    // History: v1 waited until every input for frame - kSpeedLag was here. On the RG DS (2P Shrek race) and
-    // on the Mac with LITEV_MP_PREROLL=1:45 the consoles' frame counts sit more than kSpeedLag + delay apart
-    // at the same emulated time, so the local console waited for an input the peer's console could only
-    // produce after our replica got our next input: deadlock.
-    // requesters: bit p = player p asks for more than 1x; inputFrame: the input frame where the speed
-    // returned took effect (+ kSpeedLag = the nominal switch frame, equal on every device). Called by one
+    // The session speed for local frame `frame`, NEVER waiting: the speed events (a player's fast-forward
+    // press, NetplaySpeed) of input frames up to frame - kSpeedLag, applied in frame order from the inputs
+    // already here; at one frame, a press for normal speed beats one for fast-forward. If some player's
+    // input for a frame has not arrived, the speed decided last stays (a device behind applies a switch
+    // late; pacing only, emulation is untouched).
+    // History: v1 waited until every input for frame - kSpeedLag was here: deadlock (the consoles' frame
+    // counts sit more than kSpeedLag + delay apart at the same emulated time). v2 took the fastest of
+    // every player's held request: one player could hold the session in fast-forward, and a player
+    // whose key showed "off" while another's request ran it could not end it ("stuck").
+    // requesters: bit p = player p's press set the speed returned; inputFrame: the input frame where it
+    // took effect (+ kSpeedLag = the nominal switch frame, equal on every device). Called by one
     // thread, frames ascending.
     static constexpr int kSpeedLag = 30;
     int SpeedAt(int frame, u32* requesters = nullptr, int* inputFrame = nullptr);
+    // The local player's fast-forward key (any thread): toggles what this device shows, from fast
+    // (onCode) to normal or back, and sends that as an event with its next input. Returns the code shown.
+    int ToggleSpeed(int onCode);
+    // Asks for `code` (sent as an event even if it is what this player asked for last). Testing.
+    void RequestSpeed(int code);
+    // What the key shows: the session speed, or this player's own press while it is still in flight.
+    int ShownSpeed() const { return Shown.load(); }
+    // Puts the local request into an input about to be submitted (SubmitLocal records it).
+    void StampSpeed(NetplayFrameInput& in) const { NetplaySpeed::Set(in, (int)Request.load()); }
+    // Hosted Netplay: the server submits nothing, so it records its own input's speed bits here
+    // (frames ascending) before SpeedAt(frame).
+    void NoteLocalSpeed(int frame, const NetplayFrameInput& in);
+    // Hosted Netplay replica: the server's session speed as of its record for `frame`.
+    void ServerSpeed(int frame, int code);
     // The frontend's frame period (us) now: the adaptive delay turns the round trip into frames with
     // it (fast-forward = more frames of delay for the same network). Default 60 fps.
     void SetFramePeriodUs(int us) { FramePeriodUs = std::max(us, 500); }
@@ -214,13 +231,16 @@ private:
     std::deque<std::pair<u64, u32>> Rtt[kMaxPlayers];   // (when, round trip us), the last second
 #endif
 #ifdef LITEV_NP_SPEED
-    std::map<int, int> SpeedChanges[kMaxPlayers];  // applied frame -> speed code, where it changes
-    int SpeedLast[kMaxPlayers] {};                 // the code at the newest frame recorded
+    std::map<int, int> SpeedChanges[kMaxPlayers];  // applied frame -> speed field, where it changes (= an event)
+    int SpeedLast[kMaxPlayers] {};                 // the field at the newest frame recorded
     int LocalUpTo = -1;                            // our own inputs are recorded up to this applied frame
     std::atomic<int> FramePeriodUs {16667};
     int SpeedCursor = -1, SpeedCode = 0, SpeedFrom = -1;   // decided up to this input frame: code, since
     u32 SpeedWho = 0;
+    std::atomic<u32> Request {0};                  // the local field: code | presses << 6 (changes only on a press)
+    std::atomic<int> Shown {0};                    // what the key shows (Lock to write)
     void NoteSpeed(int player, int frame, const NetplayFrameInput& in);   // frames ascending, under Lock
+    void FollowSession(int code);                  // under Lock: the key shows `code` unless our press is in flight
 #endif
 #ifdef LITEV_NP_ADAPTIVE_DELAY
     int LastApplied = -1;               // the local input's newest applied frame
