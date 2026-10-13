@@ -5041,7 +5041,17 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
     // pointers, set again)
     u32 vi = s.v ? 1 : 0;
     f->Var32(&vi);
-    f->VarArray(&s.f, sizeof(Found));
+    if (f->Saving)
+    {
+        // the two host pointers (set again on load) as fixed values: equal states save equal bytes
+        Found ff;
+        memcpy(&ff, &s.f, sizeof(Found));   // (padding included)
+        ff.var.name = nullptr;
+        ff.var.matT = ff.var.matT ? (const MatT*)(uintptr_t)1 : nullptr;
+        f->VarArray(&ff, sizeof(Found));
+    }
+    else
+        f->VarArray(&s.f, sizeof(Found));
     if (!f->Saving)
     {
         s.v = vi ? &s.f.var : nullptr;
