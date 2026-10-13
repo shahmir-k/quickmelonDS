@@ -1399,6 +1399,20 @@ int main(int argc, char** argv)
                             setenv("LITEV_MP_FW1", host ? peerFirmware.c_str() : localFirmware.c_str(), 1);
                             setenv("LITEV_MP_HANDOFF_PROBE", "1", 1);
                             setenv("LITEV_MP_HANDOFF_STARTUP_GATE", "1", 1);
+                            char epochText[32], tokenText[33];
+                            snprintf(epochText, sizeof(epochText), "%llu", (unsigned long long)local.Epoch);
+                            for (int i = 0; i < 16; i++) snprintf(tokenText + i * 2, 3, "%02x", local.FenceToken[i]);
+                            setenv("LITEV_MP_HANDOFF_EPOCH", epochText, 1);
+                            setenv("LITEV_MP_HANDOFF_TOKEN", tokenText, 1);
+                            const int startPort = (int)cutXferPort + 50 + (host ? 0 : 1);
+                            const int peerStartPort = (int)cutXferPort + 50 + (host ? 1 : 0);
+                            const std::string startPortText = std::to_string(startPort);
+                            const std::string startPeerText = std::string("127.0.0.1:") + std::to_string(peerStartPort);
+                            setenv("LITEV_MP_HANDOFF_START_PORT", startPortText.c_str(), 1);
+                            setenv("LITEV_MP_HANDOFF_START_PEER", startPeerText.c_str(), 1);
+                            if (getenv("LITEV_AMBIENT_CUT_STALE_FIRST_INPUT") &&
+                                *getenv("LITEV_AMBIENT_CUT_STALE_FIRST_INPUT"))
+                                setenv("LITEV_MP_INJECT_STALE_INPUT", "1", 1);
                             liteds::TraceRunConfig trialCfg;
                             trialCfg.rom = opt.rom;
                             trialCfg.roms = opt.roms;

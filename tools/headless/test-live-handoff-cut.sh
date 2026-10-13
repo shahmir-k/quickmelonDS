@@ -21,6 +21,7 @@ expect=${LITEV_HANDOFF_EXPECT:-pass}
 retry=; [[ $expect == retry ]] && retry=1
 stale=${LITEV_HANDOFF_TEST_STALE_REPLAY:-}
 slow_reset=${LITEV_HANDOFF_TEST_SLOW_RESET_ROLE:-}
+stale_input=${LITEV_HANDOFF_TEST_STALE_FIRST_INPUT:-}
 fault=${LITEV_HANDOFF_TEST_FAULT:-}
 postfence=${LITEV_HANDOFF_TEST_POSTFENCE_SEND:-}
 
@@ -50,6 +51,7 @@ printf 'IP=%s\nPRESENCE=%s\nTRANSFER=%s\nNETPLAY=%s\nCUT_FRAME=%s\nTRIAL_FRAMES=
         LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT="$retry" \
         LITEV_AMBIENT_CUT_STALE_REPLAY="$stale" \
         LITEV_AMBIENT_CUT_DELAY_RESET_ROLE="$slow_reset" \
+        LITEV_AMBIENT_CUT_STALE_FIRST_INPUT="$stale_input" \
         LITEV_NETPLAY="player=1,delay=3,port=$((netplay + 1)),peer=127.0.0.1:$netplay" \
         LITEV_MP_TXLOG="$out_dir/tx1" "$exe" --rom "$rom_guest" --rom1 "$rom_host" \
         --savestate "$state_guest" --input-script "$input_guest" --frames "$frames" \
@@ -66,6 +68,7 @@ client_pid=$!
         LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT="$retry" \
         LITEV_AMBIENT_CUT_STALE_REPLAY="$stale" \
         LITEV_AMBIENT_CUT_DELAY_RESET_ROLE="$slow_reset" \
+        LITEV_AMBIENT_CUT_STALE_FIRST_INPUT="$stale_input" \
         LITEV_NETPLAY="player=0,delay=3,port=$netplay,peer=127.0.0.1:$((netplay + 1))" \
         LITEV_MP_TXLOG="$out_dir/tx0" "$exe" --rom "$rom_host" --rom1 "$rom_guest" \
         --savestate "$state_host" --input-script "$input_host" --frames "$frames" \
@@ -145,6 +148,11 @@ elif [[ $expect == abort ]]; then
            grep -q 'handoff startup peer input confirmed' "$out_dir/p0/log.txt" "$out_dir/p1/log.txt" ||
            grep -q 'swap trial pass' "$out_dir/p0/log.txt" "$out_dir/p1/log.txt"; then
             echo "FAIL: a replica advanced after asymmetric live-start response ($out_dir)" >&2; exit 1
+        fi
+        if [[ -n $stale_input ]] &&
+           { ! grep -q 'injected stale frame-0 proof' "$out_dir/p1/log.txt" ||
+             ! grep -q 'rejected stale frame-0 proof' "$out_dir/p1/log.txt"; }; then
+            echo "FAIL: stale frame-0 proof was not rejected ($out_dir)" >&2; exit 1
         fi
     elif grep -q 'swap trial begin' "$out_dir/p0/log.txt" "$out_dir/p1/log.txt"; then
         echo "FAIL: trial ran despite expected abort ($out_dir)" >&2; exit 1

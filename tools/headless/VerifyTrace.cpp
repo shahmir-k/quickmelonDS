@@ -1199,6 +1199,18 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     const bool handoffStartupGate = getenv("LITEV_MP_HANDOFF_STARTUP_GATE") && net && np && players == 0;
     if (handoffStartupGate)
     {
+        const char* epochText = getenv("LITEV_MP_HANDOFF_EPOCH");
+        const char* tokenText = getenv("LITEV_MP_HANDOFF_TOKEN");
+        const char* startPortText = getenv("LITEV_MP_HANDOFF_START_PORT");
+        const char* startPeerText = getenv("LITEV_MP_HANDOFF_START_PEER");
+        std::array<u8, 16> token{};
+        if (!epochText || !tokenText || strlen(tokenText) != 32 || !startPortText || !startPeerText)
+        { fprintf(stderr, "handoff startup epoch/token/endpoint missing\n"); return 2; }
+        for (int i = 0; i < 16; i++)
+            token[i] = (u8)strtoul(std::string(tokenText + i * 2, 2).c_str(), nullptr, 16);
+        if (!net->ArmHandoffSession(strtoull(epochText, nullptr, 10), token,
+                                    atoi(startPortText), {{1 - player, startPeerText}}))
+        { fprintf(stderr, "handoff startup arm failed\n"); return 2; }
         // The source consoles are still frozen outside this function. Publish
         // the actual first local input, then require the remote's frame-0 input
         // before allowing *any* replica console to execute a frame. This
