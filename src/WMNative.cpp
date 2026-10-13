@@ -3093,6 +3093,14 @@ void DoSavestate(NDS& nds, Savestate* f)
         nds.RegisterEventFuncs(Event_WMN, &d, {[](void* that, u32 p) { OnEvent(that, p); }});
         nds.Wifi.WMNOwns = true;
         nds.GPU.WMLine = d.vX;
+        // Reset() cancelled Event_WMN after NDS restored its scheduler mask.
+        // Re-arm the saved wakeup so the native wireless driver resumes work.
+        if (d.wake != ~0ull)
+        {
+            const u64 wake = d.wake;
+            d.wake = ~0ull;
+            WakeAt(d, wake);
+        }
     }
 }
 
