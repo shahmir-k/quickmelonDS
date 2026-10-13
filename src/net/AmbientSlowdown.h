@@ -27,17 +27,18 @@ public:
         }
 
         // A paused/backgrounded emulator has no measurable play rate. Do not turn
-        // that gap into an apparent low-FPS LAN interval or offer a second prompt.
-        if (LastFrameUs && (nowUs <= LastFrameUs || nowUs - LastFrameUs > 250000))
+        // that gap into an apparent low-FPS LAN interval. Network wait itself can
+        // exceed 250 ms, so only treat an unexplained frame gap as a pause.
+        if (!LinkedSinceUs) LinkedSinceUs = nowUs;
+        if (LastFrameUs && (nowUs <= LastFrameUs ||
+            (nowUs - LastFrameUs > 250000 && blockedUs < (nowUs - LastFrameUs) / 2)))
+        {
             RestartWindow(nowUs);
+            LinkedSinceUs = nowUs;
+        }
         LastFrameUs = nowUs;
         if (!WindowStartUs) WindowStartUs = nowUs;
-        if (blockedUs > 3000 && exchanges)
-        {
-            if (!SlowSinceUs || nowUs - LastCandidateUs > 100000) SlowSinceUs = nowUs;
-            LastCandidateUs = nowUs;
-        }
-        else if (SlowSinceUs && nowUs - LastCandidateUs > 100000) SlowSinceUs = 0;
+        const bool inStartupGrace = nowUs - LinkedSinceUs < 10000000;
         Frames++;
         BlockedUs += blockedUs;
         Exchanges += exchanges;
@@ -51,13 +52,23 @@ public:
         const bool networkSlow = Last.FpsX100 < 5800 && Last.WaitUsPerFrame > 3000 && Exchanges > 0;
         if (networkSlow)
         {
-            if (SlowSinceUs && !Offered && nowUs - SlowSinceUs >= 5000000)
-            {
-                Offered = true;
+            RecoverySinceUs = 0;
+            // Judge sustained slowdown by complete windows, not frame spacing:
+            // at 5-8 FPS a valid network-waiting frame can take >100 ms.
+            if (inStartupGrace) SlowSinceUs = 0;
+            else if (!SlowSinceUs) SlowSinceUs = nowUs;
+            else if (!Dismissed && nowUs - SlowSinceUs >= 5000000)
                 Last.Pending = true;
-            }
         }
-        else SlowSinceUs = 0;
+        else
+        {
+            SlowSinceUs = 0;
+            if (!RecoverySinceUs) RecoverySinceUs = nowUs;
+            // Pending describes an offer not yet accepted by the frontend. A
+            // recovered link must not keep surfacing that stale offer forever.
+            if (Last.Pending && nowUs - RecoverySinceUs >= 2000000)
+                Last.Pending = false;
+        }
 
         WindowStartUs = nowUs;
         Frames = 0;
@@ -66,7 +77,7 @@ public:
         return Last;
     }
 
-    void Dismiss() { Last.Pending = false; }
+    void Dismiss() { Last.Pending = false; Dismissed = true; }
     Sample Current() const { return Last; }
 
 private:
@@ -74,16 +85,17 @@ private:
     {
         WindowStartUs = nowUs;
         SlowSinceUs = 0;
-        LastCandidateUs = 0;
+        RecoverySinceUs = 0;
         Frames = 0;
         BlockedUs = 0;
         Exchanges = 0;
     }
 
-    u64 LastFrameUs = 0, WindowStartUs = 0, SlowSinceUs = 0, LastCandidateUs = 0;
+    u64 LastFrameUs = 0, WindowStartUs = 0, LinkedSinceUs = 0;
+    u64 SlowSinceUs = 0, RecoverySinceUs = 0;
     u64 BlockedUs = 0, Exchanges = 0;
     u32 Frames = 0;
-    bool Offered = false;
+    bool Dismissed = false;
     Sample Last;
 };
 
