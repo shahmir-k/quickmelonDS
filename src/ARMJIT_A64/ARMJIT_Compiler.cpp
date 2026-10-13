@@ -2457,8 +2457,13 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
         patchOffset = site;
         const u32 off = site * 8;
         LDR(INDEX_UNSIGNED, X16, RCPU, offsetof(ARM, JitLinks));
-        ADD(X16, X16, off >> 12, true);
-        LDR(INDEX_UNSIGNED, X16, X16, off & 0xFFF);
+        if (off <= 32760)
+            LDR(INDEX_UNSIGNED, X16, X16, off);   // (scaled 12-bit offset: the first 4096 sites)
+        else
+        {
+            ADD(X16, X16, off >> 12, true);
+            LDR(INDEX_UNSIGNED, X16, X16, off & 0xFFF);
+        }
         sharedUnlinked = CBZ(X16);
         BR(X16);
     }
