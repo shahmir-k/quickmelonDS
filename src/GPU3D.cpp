@@ -552,6 +552,9 @@ void GPU3D::AsyncStop(bool copyBack) noexcept
     Async.reset();
 }
 #endif
+#ifndef LITEV_GX_ASYNC_LOCAL
+GPU3D::~GPU3D() noexcept {}     // (LITEV_GX_ASYNC_LOCAL off: nothing to stop)
+#endif
 
 GPU3D::GPU3D(melonDS::GPU& gpu) noexcept :
     NDS(gpu.NDS),
