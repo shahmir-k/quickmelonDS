@@ -23,6 +23,7 @@
 #include "GPU2D_OpenGL.h"
 #include "GPU.h"
 #include "GPU3D.h"
+#include "NDS.h"
 
 namespace melonDS
 {
@@ -2292,6 +2293,11 @@ void GLRenderer2D::DrawSprites(u32 line)
         GPU.PaletteDirty &= ~objpalmask;
         dirty = true;
     }
+
+    // debug.litev.palfixlog=1: log the lines where only the OBJ palette changed (the fix's redo)
+    static const bool palLog = OpenGL::Prop("palfixlog", 0) != 0;
+    if (palLog && dirty && !(GPU.OAMDirty & oammask) && !SpriteConfigDirty && !objDirty.CheckRange(0, GPU2D.Num ? 256 : 512) && !(dispcnt_diff & 0x80F000F0))
+        Log(LogLevel::Info, "LITEV_PALFIX engine %d line %u frame %u\n", GPU2D.Num, line, GPU.NDS.NumFrames);
 
     if ((GPU.OAMDirty & oammask) || SpriteConfigDirty)
     {
