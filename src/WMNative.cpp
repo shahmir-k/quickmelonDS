@@ -3123,6 +3123,8 @@ void SetInstance(NDS& nds, int inst, int allow)
 bool Fifo9(NDS& nds, u32 val)
 {
     const u32 a = val >> 6;
+    static int seen = 0;
+    if (seen < 2) { seen++; Platform::Log(Platform::LogLevel::Info, "A7_NATIVE_WM: ARM9 WM FIFO word %08x (address %07x, error bit %u)\n", val, a, (val >> 5) & 1); }
     if ((a >> 24) != 2) return false;
     Ctx* p = Get(nds);
     if (!p || !p->active)
