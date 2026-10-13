@@ -58,12 +58,18 @@ GLRenderer::GLRenderer(melonDS::NDS& nds, bool compute)
         char b[92] = {};
         const bool threaded = !(__system_property_get("debug.litev.glhithread", b) > 0 && atoi(b) == 0);
 #else
-        const bool threaded = false;
+        // desktop (Mac headless): debug.litev.glhithread=1 runs the same wrapper inline, so the
+        // device's one-frame-late 3D (glhilate) can be reproduced without a second context
+        const bool threaded = OpenGL::Prop("glhithread", 0) != 0;
 #endif
         if (threaded)
         {
             auto t = std::make_unique<GLThread3D>(GPU.GPU3D, this, "glhi-gl3d");
+#ifdef __ANDROID__
             if (t->Threaded) Thread3D = t.get();
+#else
+            Thread3D = t.get();
+#endif
             Rend3D = std::move(t);
         }
         else
@@ -153,7 +159,7 @@ GLuint GLRenderer::Get3DTex()
 #ifdef __ANDROID__
             char b[92] = {}; return !(__system_property_get("debug.litev.glhilate", b) > 0 && atoi(b) == 0);
 #else
-            return true;
+            return OpenGL::Prop("glhilate", 1) != 0;
 #endif
         }();
         OutputTex3D = Thread3D->SyncColor(late ? Prev3DColor : Thread3D->GL->GetCurColor());
