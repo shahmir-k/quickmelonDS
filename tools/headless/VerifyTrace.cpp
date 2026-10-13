@@ -964,6 +964,13 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #endif
         if (!BuildAndBoot(c, std::nullopt, b[k], err)) { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
         printf("console %d rom: %s (xxh3 %016llx)\n", k, c.rom.c_str(), (unsigned long long)b[k].romHash);
+        // LITEV_MP_SAV<k>=<file> (test only): console k's game save (.sav), read-only (the harness saves to its data dir)
+        if (const char* sv = getenv(("LITEV_MP_SAV" + std::to_string(k)).c_str()))
+        {
+            u32 len = 0;
+            if (auto d = ReadFile(sv, len)) { b[k].nds->SetNDSSave(d.get(), len); printf("console %d save: %s (%u bytes)\n", k, sv, len); }
+            else { fprintf(stderr, "error (mp%d): cannot read save '%s'\n", k, sv); return 1; }
+        }
     }
 #ifdef LITEV_JIT_SHARED_CODE
     ARMJIT_Global::SetSharedCode(false);
