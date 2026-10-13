@@ -194,6 +194,10 @@ private:
     void AsyncPublish() noexcept;   // hand the logged entries to the worker
     void AsyncFlush() noexcept { if (Async) AsyncPublish(); }
     void CopyGeoFrom(const GPU3D& s) noexcept;
+    bool AsyncSorted = false;   // (shadow) RenderPolygonRAM holds the bank's VBlank order
+#endif
+    void SortRenderPolygons() noexcept;   // VBlank: split the bank's polygons, Y-sort the opaque ones
+#ifdef LITEV_GX_ASYNC_LOCAL
 #endif
 #ifdef LITEV_GX_LAZY
     // LITEV_GX_LAZY (inspired by DSperate's geometry command log, https://github.com/beebono/DSperate,
