@@ -146,25 +146,11 @@ public:
     bool FastMemoryEnabled() const noexcept { return FastMemory; }
 
 #ifdef LITEV_JIT_SHARED_CODE
-    // LITEV_JIT_SHARED_CODE: ARM::JitValid of this console (one byte per shared code object: its
-    // block is this console's live block for the address, read by the link-entry guard)
-    u8* JitValid = nullptr;
-    void SetValid(JitBlock* b, u8 v) noexcept
-    {
-        if (JitValid && b->SharedId) JitValid[b->SharedId] = v;
-    }
+    // LITEV_JIT_SHARED_CODE: this console's link table (ARM::JitLinks; shared code's link exits
+    // branch through it, so every console keeps exactly its own links)
+    u64* JitLinks = nullptr;
     JitBlockEntry SharedEmit(ARM* cpu, JitBlock* block, bool thumb, FetchedInstr* instrs, int n, bool hasMem) noexcept;
 #endif
-    // a link site's target: the block entry, or its link entry when shared code guards it
-    u32 LinkTargetOff(JitBlock* b, u32 entryOff) noexcept
-    {
-#ifdef LITEV_JIT_SHARED_CODE
-        return JITCompiler.LinkEntryOff(entryOff, b->SharedId);
-#else
-        (void)b;
-        return entryOff;
-#endif
-    }
     void SetJITArgs(JITArgs args) noexcept;
     void SetMaxBlockSize(int size) noexcept;
     void SetLiteralOptimizations(bool enabled) noexcept;

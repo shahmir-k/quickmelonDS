@@ -326,15 +326,15 @@ static constexpr u16 GlobalRegPinnedMask =
 // console only ever reuses code emitted for exactly the bytes in its own memory; blocks of two
 // different games share code only where the bytes are identical (common SDK functions), which is
 // the same code either would emit. Each console keeps its own block maps and invalidation (a write
-// to its code drops its block, the shared code stays for the others), and a link patched by
-// another console is entered only through the target's ARM::JitValid guard, i.e. only if that
-// block is this console's own live block for the address.
+// to its code drops its block, the shared code stays for the others) and its own links: a shared
+// block's link exits branch through the console's table (ARM::JitLinks), which only that console's
+// LinkBlock / UnlinkBlock write, exactly where the unshared JIT patches and unpatches its link sites.
 SharedArena& JitArena() { static SharedArena a; return a; }
 namespace
 {
 
 constexpr size_t SharedArenaSize = (size_t)120 << 20, SharedFarSize = (size_t)16 << 20;
-static_assert(offsetof(ARM, JitValid) % 8 == 0 && offsetof(ARM, JitIdle2Enable) + 8 <= 32760, "RCPU-relative 64-bit loads");
+static_assert(offsetof(ARM, JitLinks) % 8 == 0 && offsetof(ARM, JitIdle2Enable) + 8 <= 32760, "RCPU-relative 64-bit loads");
 static_assert(offsetof(ARM, JitICacheTable) % 8 == 0 && offsetof(ARM, JitMainRAM) % 8 == 0 && offsetof(ARM, JitVRAMPtr7) % 8 == 0
               && offsetof(ARM, JitNDS) % 8 == 0 && offsetof(ARM, JitIdle2Enable) % 8 == 0, "RCPU-relative 64-bit loads");
 
@@ -420,7 +420,7 @@ JitBlockEntry Compiler::SharedCompile(JitEmitJob& job, u32& id)
     }
     SetCodePtr(a.Near);
     OtherCodeRegion = a.Far;
-    CurSharedId = a.NextId < ValidSize ? a.NextId++ : 0;
+    CurSharedId = a.NextId++;
     CurJob = &job;
     NDS.JIT.JitEnableWrite();
     JitBlockEntry entry = CompileBlock(job.Cpu, job.Thumb, job.Instrs, job.Count, job.HasMem);
@@ -1163,7 +1163,7 @@ Compiler::~Compiler()
             a.Mem = nullptr; a.Base = nullptr;
             a.Dispatchers = false;
             a.Near = a.Far = 0;
-            a.NextId = a.NextSite = 1;
+            a.NextId = a.NextSite = a.NextLinkSite = 1;
             a.Patches.clear();
             a.Objs.clear();
             a.Hits = a.Misses = 0;
@@ -2293,8 +2293,32 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
     FixupBranch toCold = B(CC_LE);
     MOVI2R(RCycles, 0);
     u32 patchOffset = (u32)((u8*)GetRXPtr() - GetRXBase());
+#ifdef LITEV_JIT_SHARED_CODE
+    // Shared code: no patch slot. The hop branches through this console's link table entry for
+    // the site (0 = unlinked: the stub below, as the unlinked slot does), so each console's links
+    // are exactly the ones its own block cache made (UnlinkBlock clears them where the unshared
+    // JIT unpatches). The site's table index takes the place of the patch offset.
+    FixupBranch sharedUnlinked;
+    const bool sharedSite = Shared;
+    if (sharedSite)
+    {
+        SharedArena& a = JitArena();
+        if (a.NextLinkSite >= LinkSites) { fprintf(stderr, "LITEV_JIT_SHARED_CODE: out of link sites\n"); abort(); }
+        const u32 site = a.NextLinkSite++;
+        patchOffset = site;
+        const u32 off = site * 8;
+        LDR(INDEX_UNSIGNED, X16, RCPU, offsetof(ARM, JitLinks));
+        ADD(X16, X16, off >> 12, true);
+        LDR(INDEX_UNSIGNED, X16, X16, off & 0xFFF);
+        sharedUnlinked = CBZ(X16);
+        BR(X16);
+    }
+    else
+#endif
+    {
     FixupBranch slot = B();   // the patch slot; unlinked it branches to the stub below
     SetJumpTarget(slot);
+    }
 #ifdef LITEV_JIT_EXIT_TAIL
     if (JitQOn(jitq_ExitTail))
     {
@@ -2304,6 +2328,11 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
         TailStub t{};
         t.Kind = 0;
         t.A = toCold;
+#ifdef LITEV_JIT_SHARED_CODE
+        if (sharedSite)
+            t.B = sharedUnlinked;   // (the table entry is 0: to the stub)
+        else
+#endif
         t.B = B();
   #ifdef LITEV_EXIT_PROTO_PC
         t.PCElided = PCElided;
@@ -2322,6 +2351,9 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
     }
 #endif
     const void* stub = GetRXPtr();
+#ifdef LITEV_JIT_SHARED_CODE
+    if (sharedSite) SetJumpTarget(sharedUnlinked);
+#endif
   #ifdef LITEV_JIT_ICACHE
     MOVI2R(W9, 0);   // a linkable exit opts out of the per-site cache (0 = no cache)
   #endif
@@ -2414,6 +2446,14 @@ void Compiler::EmitLinkExit(u32 targetAddr, u32 newPC)
 
 void Compiler::PatchLinkSite(u32 rxOffset, u32 targetRxOffset)
 {
+#ifdef LITEV_JIT_SHARED_CODE
+    if (Shared)
+    {
+        // (rxOffset: the site's index in this console's link table)
+        SharedLinks[rxOffset] = targetRxOffset == SharedUnlinked ? 0 : (u64)(GetRXBase() + targetRxOffset);
+        return;
+    }
+#endif
     ptrdiff_t delta = (ptrdiff_t)targetRxOffset - (ptrdiff_t)rxOffset;
     // A64 unconditional B reaches +-128MB; the whole block cache is a few MB.
     assert(delta >= -(1 << 27) && delta < (1 << 27));
@@ -3230,31 +3270,6 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 {
     // (the cache-full reset happens in ARMJIT::CompileBlock, see NearlyFull)
 
-#ifdef LITEV_JIT_SHARED_CODE
-    if (Shared && CurSharedId)
-    {
-        // Link entry (LITEV_JIT_SHARED_CODE). Link sites in shared code are patched by whichever
-        // console links them, so a linked hop arrives here on any console that runs the source:
-        // go on only if this block is that console's live block for the address (ARM::JitValid,
-        // kept by ARMJIT), else take the unlinked path (the dispatcher looks up the right one).
-        const u8* unlinked = (const u8*)GetRXPtr();
-        MOVI2R(W9, 0);   // as an unlinked link site's stub (no per-site cache)
-#ifdef LITEV_JIT_RAS
-        if (RasOn)
-            MOVI2R(W10, 0);
-#endif
-        MOVI2R(W0, instrs[0].Addr + (thumb ? 2 : 4));
-        STR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, R[15]));
-        B(DispatcherEntry[cpu->Num]);
-        const u8* guard = (const u8*)GetRXPtr();
-        LDR(INDEX_UNSIGNED, X16, RCPU, offsetof(ARM, JitValid));
-        ADD(X16, X16, CurSharedId >> 12, true);
-        LDRB(INDEX_UNSIGNED, W16, X16, CurSharedId & 0xFFF);
-        CBZ(W16, unlinked);
-        assert((const u8*)GetRXPtr() - guard == (ptrdiff_t)LinkGuardBytes);
-        (void)guard;
-    }
-#endif
     JitBlockEntry res = (JitBlockEntry)GetRXPtr();
 #ifdef LITEV_BLOCKPROF
     {

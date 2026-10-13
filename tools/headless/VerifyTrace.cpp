@@ -958,9 +958,11 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         // Per-instance scripts (host vs client differ). Fall back to cfg.inputScript.
         c.inputScript = (k < (int)scripts.size() && !scripts[k].empty()) ? scripts[k] : cfg.inputScript;
         instScripts[k] = c.inputScript;
+        // LITEV_MP_STATE<k>=<file>: console k starts from its own savestate (e.g. two games at a Union Room door)
+        if (const char* st = getenv(("LITEV_MP_STATE" + std::to_string(k)).c_str())) c.savestate = st;
         std::string err;
 #ifdef LITEV_JIT_SHARED_CODE
-        ARMJIT_Global::SetSharedCode(jitShared == 1 || (jitShared == 2 && k > 0));
+        ARMJIT_Global::SetSharedCode(jitShared == 1 || (jitShared == 2 && k > 0) || (jitShared == 3 && k == 0));   // (3: console 0 only)
 #endif
         if (!BuildAndBoot(c, std::nullopt, b[k], err)) { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
         printf("console %d rom: %s (xxh3 %016llx)\n", k, c.rom.c_str(), (unsigned long long)b[k].romHash);
