@@ -93,6 +93,9 @@ public:
     std::vector<JitProfileInstr> Profile;
     u32 A9HookAt = 0;
     u8 Thumb = 0, HasMemInstr = 0;
+#ifdef LITEV_JIT_SHARED_CODE
+    u32 SharedId = 0;   // LITEV_JIT_SHARED_CODE: its code object (0 = none / no link guard)
+#endif
 #ifdef LITEV_JIT_BGEMIT
     // emitted in the background: EntryPoint is the block's entry stub, Job holds the code
     JitEmitJob* Job = nullptr;
