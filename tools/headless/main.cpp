@@ -776,6 +776,11 @@ int main(int argc, char** argv)
         video = popen(cmd.c_str(), "w");
     }
 
+#ifdef LITEV_REMOTE_GX_SINK
+    // (measurement) LITEV_SP_GXSINK=1: this console as a Netplay remote's geometry (fixed GX timing + sink: no 3D output)
+    if (getenv("LITEV_SP_GXSINK")) { nds->GPU.GPU3D.TimingFixed = true; nds->GPU.GPU3D.Sink = atoi(getenv("LITEV_SP_GXSINK")) != 0; }
+    if (getenv("LITEV_SP_GXFIXED")) nds->GPU.GPU3D.TimingFixed = true;   // (measurement) fixed GX timing only
+#endif
 #ifdef LITEV_FF_HEADLESS3D
     if (getenv("LITEV_FFHEADLESS")) nds->GPU.FFHeadless3D = atoi(getenv("LITEV_FFHEADLESS")) != 0;   // the app's fast-forward mode
 #ifdef LITEV_LCD_EVT

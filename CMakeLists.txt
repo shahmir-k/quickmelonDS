@@ -967,6 +967,11 @@ endif()
 # geometry command log, src/core/gpu/gpu3d.cpp; exact relative to GX_UNTIMED; runtime debug.litev.gxlazy)
 # Measured 2026-10-12: exact (PW 8 segments states identical) but SLOWER (Mac emu instr PW town +5.4%, gift box +5.2%,
 # title +7.0%, overworld +1.2%, Golden Sun +2.5%): untimed, deferring the batch removes no work. Keep OFF.
+option(LITEV_GX_ASYNC_LOCAL "Local console: the geometry engine on a worker thread, the emulator thread keeps the guest-visible state as a Netplay sink (category B; debug.litev.gxasync)" OFF)
+if (LITEV_GX_ASYNC_LOCAL)
+    add_compile_definitions(LITEV_GX_ASYNC_LOCAL=1)
+endif()
+
 option(LITEV_GX_LAZY "Log bulk geometry batches, run them when observed (exact vs LITEV_GX_UNTIMED; needs GX_UNTIMED + GX_BULK)" OFF)
 if (LITEV_GX_LAZY)
     add_compile_definitions(LITEV_GX_LAZY=1)
