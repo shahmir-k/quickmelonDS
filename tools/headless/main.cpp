@@ -1185,7 +1185,43 @@ int main(int argc, char** argv)
                         // destroyed save-path context.
                         std::unique_ptr<HeadlessHost::InstanceUserData> preparedUser;
                         std::unique_ptr<NDS> preparedReplica;
+                        std::unique_ptr<HeadlessHost::InstanceUserData> preparedLocalUser;
+                        std::unique_ptr<NDS> preparedLocalReplica;
                         NetplayLiveCheckpoint local, remote;
+                        auto prepareScratch = [&](const NetplayLiveCheckpoint& candidate,
+                                                  const std::string& romPath,
+                                                  std::unique_ptr<HeadlessHost::InstanceUserData>& user,
+                                                  std::unique_ptr<NDS>& instance,
+                                                  std::string& reason) {
+                            auto scratch = std::make_unique<HeadlessHost::InstanceUserData>();
+                            scratch->savePrefix = candidate.Player == 0 ? "handoff-scratch-host" : "handoff-scratch-client";
+                            u32 romLength = 0;
+                            auto romData = ReadFile(romPath, romLength);
+                            if (!romData) { reason = "scratch replica ROM unavailable"; return false; }
+                            auto cart = NDSCart::ParseROM(std::move(romData), romLength, scratch.get(), std::nullopt);
+                            if (!cart) { reason = "scratch replica ROM parse failed"; return false; }
+                            NDSArgs replicaArgs;
+                            replicaArgs.Firmware = Firmware(candidate.Firmware.data(), (u32)candidate.Firmware.size());
+#ifdef JIT_ENABLED
+                            replicaArgs.JIT = opt.jit ? std::optional<JITArgs>(JITArgs{}) : std::nullopt;
+#endif
+                            auto replica = std::make_unique<NDS>(std::move(replicaArgs), scratch.get());
+                            replica->SetRenderer(std::make_unique<SoftRenderer>(*replica));
+                            replica->SetNDSCart(std::move(cart));
+                            replica->Reset();
+                            replica->SetupDirectBoot("headless.nds");
+                            replica->Start();
+                            Savestate parsed((void*)candidate.State.data(), (u32)candidate.State.size(), false);
+                            if (parsed.Error || !replica->DoSavestate(&parsed) || parsed.Error)
+                            { reason = "scratch replica savestate load failed"; return false; }
+                            const Firmware& loaded = replica->GetFirmware();
+                            if (loaded.Length() != candidate.Firmware.size() ||
+                                memcmp(loaded.Buffer(), candidate.Firmware.data(), loaded.Length()) != 0)
+                            { reason = "scratch replica firmware mismatch"; return false; }
+                            user = std::move(scratch);
+                            instance = std::move(replica);
+                            return true;
+                        };
                         if (cutXferPort)
                         {
                             local.Epoch = epoch;
@@ -1212,34 +1248,8 @@ int main(int argc, char** argv)
                                     if (fail && strcmp(fail, cutRole) == 0)
                                     { reason = "injected post-transfer prepare failure"; return false; }
                                     const char* peerRomPath = getenv("LITEV_AMBIENT_CUT_PEER_ROM");
-                                    auto scratch = std::make_unique<HeadlessHost::InstanceUserData>();
-                                    scratch->savePrefix = host ? "handoff-scratch-client" : "handoff-scratch-host";
-                                    u32 romLength = 0;
-                                    auto romData = ReadFile(peerRomPath, romLength);
-                                    if (!romData) { reason = "scratch replica ROM unavailable"; return false; }
-                                    auto cart = NDSCart::ParseROM(std::move(romData), romLength, scratch.get(), std::nullopt);
-                                    if (!cart) { reason = "scratch replica ROM parse failed"; return false; }
-                                    NDSArgs replicaArgs;
-                                    replicaArgs.Firmware = Firmware(candidate.Firmware.data(), (u32)candidate.Firmware.size());
-#ifdef JIT_ENABLED
-                                    replicaArgs.JIT = opt.jit ? std::optional<JITArgs>(JITArgs{}) : std::nullopt;
-#endif
-                                    auto replica = std::make_unique<NDS>(std::move(replicaArgs), scratch.get());
-                                    replica->SetRenderer(std::make_unique<SoftRenderer>(*replica));
-                                    replica->SetNDSCart(std::move(cart));
-                                    replica->Reset();
-                                    replica->SetupDirectBoot("headless.nds");
-                                    replica->Start();
-                                    Savestate parsed((void*)candidate.State.data(), (u32)candidate.State.size(), false);
-                                    if (parsed.Error || !replica->DoSavestate(&parsed) || parsed.Error)
-                                    { reason = "scratch replica savestate load failed"; return false; }
-                                    const Firmware& loaded = replica->GetFirmware();
-                                    if (loaded.Length() != candidate.Firmware.size() ||
-                                        memcmp(loaded.Buffer(), candidate.Firmware.data(), loaded.Length()) != 0)
-                                    { reason = "scratch replica firmware mismatch"; return false; }
-                                    preparedUser = std::move(scratch);
-                                    preparedReplica = std::move(replica);
-                                    return true;
+                                    return peerRomPath && prepareScratch(candidate, peerRomPath,
+                                                                         preparedUser, preparedReplica, reason);
                                 };
                                 transferOk = NetplayExchangeLiveCheckpoints(cutXferPort, address, "192.168.18.3", local,
                                                                              cutPeerRom, prepare, transferCancel, remote, transferError);
@@ -1261,6 +1271,21 @@ int main(int argc, char** argv)
                                 transferFailed = true;
                             }
                             else
+                            {
+                                const char* inject = getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE");
+                                std::string localError;
+                                if ((inject && std::string(inject) == std::string(cutRole) + ":localprepare") ||
+                                    !prepareScratch(local, opt.rom, preparedLocalUser, preparedLocalReplica, localError))
+                                {
+                                    if (localError.empty())
+                                    { localError = "injected localprepare failure"; printf("CUTFENCE %s %s\n", cutRole, localError.c_str()); }
+                                    ambient->AbortHandoffFence();
+                                    mark(abort);
+                                    transferFailed = true;
+                                    printf("CUTFENCE %s local scratch abort: %s\n", cutRole, localError.c_str());
+                                }
+                            }
+                            if (!transferFailed)
                             {
                                 const std::string remotePath = std::string(cutDir) + (host ? "/remote-client.mln" : "/remote-host.mln");
                                 FILE* f = fopen(remotePath.c_str(), "wb");
@@ -1332,7 +1357,7 @@ int main(int argc, char** argv)
                             // ARMED currently verifies that replica/ROM resources exist. The
                             // production coordinator must additionally stage paused Netplay
                             // sockets/backend before voting ARMED.
-                            if (!preparedReplica || !preparedUser ||
+                            if (!preparedReplica || !preparedUser || !preparedLocalReplica || !preparedLocalUser ||
                                 !phase("prepared", [&] { return ambient->AcknowledgeHandoffPrepared(); },
                                       [&] { return ambient->HandoffPreparedComplete(); }) ||
                                 !phase("armed", [&] { return ambient->AcknowledgeHandoffArmed(); },
@@ -1389,14 +1414,6 @@ int main(int argc, char** argv)
                             // ROM restart or writing the owner's save.
                             const u64 sourceClock = nds->GetSysTimestamp();
                             const u64 sourceRAM = XXH3_64bits(nds->MainRAM, nds->MainRAMMask + 1);
-                            const std::string localState = std::string(cutDir) + (host ? "/host.mln" : "/client.mln");
-                            const std::string peerState = std::string(cutDir) + (host ? "/remote-client.mln" : "/remote-host.mln");
-                            const std::string localFirmware = std::string(cutDir) + (host ? "/host.fw" : "/client.fw");
-                            const std::string peerFirmware = std::string(cutDir) + (host ? "/remote-client.fw" : "/remote-host.fw");
-                            setenv("LITEV_MP_SS0", host ? localState.c_str() : peerState.c_str(), 1);
-                            setenv("LITEV_MP_SS1", host ? peerState.c_str() : localState.c_str(), 1);
-                            setenv("LITEV_MP_FW0", host ? localFirmware.c_str() : peerFirmware.c_str(), 1);
-                            setenv("LITEV_MP_FW1", host ? peerFirmware.c_str() : localFirmware.c_str(), 1);
                             setenv("LITEV_MP_HANDOFF_PROBE", "1", 1);
                             setenv("LITEV_MP_HANDOFF_STARTUP_GATE", "1", 1);
                             char epochText[32], tokenText[33];
@@ -1414,8 +1431,10 @@ int main(int argc, char** argv)
                                 *getenv("LITEV_AMBIENT_CUT_STALE_FIRST_INPUT"))
                                 setenv("LITEV_MP_INJECT_STALE_INPUT", "1", 1);
                             liteds::TraceRunConfig trialCfg;
-                            trialCfg.rom = opt.rom;
-                            trialCfg.roms = opt.roms;
+                            const std::string peerRomPath = getenv("LITEV_AMBIENT_CUT_PEER_ROM");
+                            trialCfg.rom = host ? opt.rom : peerRomPath;
+                            trialCfg.roms = {host ? opt.rom : peerRomPath,
+                                             host ? peerRomPath : opt.rom};
                             trialCfg.dataDir = opt.dataDir;
                             trialCfg.jit = opt.jit;
                             trialCfg.fixedRtcEpoch = opt.fixedRtc;
@@ -1427,7 +1446,19 @@ int main(int argc, char** argv)
                                 while (keepAmbient.load(std::memory_order_acquire))
                                 { ambient->Process(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
                             });
-                            const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, {});
+                            std::vector<liteds::PreparedMPConsole> replicas(2);
+                            auto& own = replicas[host ? 0 : 1];
+                            own.identity = preparedLocalReplica.get();
+                            own.udata = std::move(preparedLocalUser);
+                            own.nds = std::move(preparedLocalReplica);
+                            auto& other = replicas[host ? 1 : 0];
+                            other.identity = preparedReplica.get();
+                            other.udata = std::move(preparedUser);
+                            other.nds = std::move(preparedReplica);
+                            printf("CUTFENCE %s trial exact local=%p peer=%p\n", cutRole,
+                                   (void*)own.identity, (void*)other.identity);
+                            fflush(stdout);
+                            const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, {}, std::move(replicas));
                             keepAmbient.store(false, std::memory_order_release);
                             ambientService.join();
                             auto trialLink = melonDS::MPInterface::Take();
@@ -1454,6 +1485,8 @@ int main(int argc, char** argv)
                         }
                         preparedReplica.reset();
                         preparedUser.reset();
+                        preparedLocalReplica.reset();
+                        preparedLocalUser.reset();
                         nds->JIT.JitEnableExecute();
                         if (!transferFailed) break;
                     }

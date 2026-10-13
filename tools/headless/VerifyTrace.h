@@ -14,7 +14,11 @@
 
 #include <string>
 #include <vector>
+#include <memory>
 #include "types.h"
+
+namespace melonDS { class NDS; }
+namespace HeadlessHost { struct InstanceUserData; }
 
 namespace liteds
 {
@@ -59,7 +63,16 @@ int VerifyInterpConverge(const TraceRunConfig& cfg, int frames);
 // shared LocalMP + health metrics. Returns 0 iff both instances complete all
 // frames without a crash.
 // LITEV_MP_PLAYERS=N (default 2) runs N instances; scripts[k] = instance k's input script.
-int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts);
+// Test-only ownership transfer: these exact, already-loaded scratch objects
+// become the Lockstep consoles. The original Ambient NDS is never passed in.
+struct PreparedMPConsole
+{
+    std::unique_ptr<HeadlessHost::InstanceUserData> udata;
+    std::unique_ptr<melonDS::NDS> nds;
+    melonDS::NDS* identity = nullptr;
+};
+int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts,
+           std::vector<PreparedMPConsole> prepared = {});
 
 // --replay-console K: Hosted Netplay replica of --mp-test's console K (scripts[K] = its input),
 // its link served from the records in logDir (LITEV_MP_RECORD) or, logDir empty, from a server
