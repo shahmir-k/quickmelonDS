@@ -352,6 +352,34 @@ std::string SpeedName(int code)
 }
 #endif
 
+// ff=F:M/F:M... (see MPTest): sampled frame -> multiplier, or kFfToggle (a press of the fast-forward key)
+constexpr float kFfToggle = -100;
+std::map<int, float> ParseFfPlan(const std::string& v)
+{
+    std::map<int, float> plan;
+    for (size_t q = 0; q < v.size();)
+    {
+        size_t sl = v.find('/', q), c = v.find(':', q);
+        if (c < sl) plan[atoi(v.substr(q, c - q).c_str())] = v[c + 1] == 't' ? kFfToggle : (float)atof(v.substr(c + 1, sl - c - 1).c_str());
+        if (sl == std::string::npos) break;
+        q = sl + 1;
+    }
+    return plan;
+}
+#ifdef LITEV_NP_SPEED
+// the local player's presses due at sampled frame f, then its speed request into `local`
+void FfPress(NetplayInput& net, const std::map<int, float>& plan, int inst, int f, NetplayFrameInput& local)
+{
+    if (auto it = plan.find(f); it != plan.end())
+    {
+        if (it->second == kFfToggle) net.ToggleSpeed(NetplaySpeed::Encode(2));
+        else net.RequestSpeed(NetplaySpeed::Encode(it->second));
+        printf("inst%d npspeed press frame %d: shows %s\n", inst, f, SpeedName(net.ShownSpeed()).c_str());
+    }
+    net.StampSpeed(local);
+}
+#endif
+
 // Netplay's way to apply an input
 void ApplyNetInput(NDS& nds, const NetplayFrameInput& in)
 {
@@ -832,8 +860,9 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     // jitter=MS, loss=PCT: more simulated network faults on receive; pace=FPS: this player's own
     // console runs at most FPS frames per second (the app: 60), the others as their inputs allow.
     // adaptive=0|1: input delay follows the measured round trip (NetplayInput::Adaptive).
-    // ff=F:M/F:M...: (LITEV_NP_SPEED) from this player's sampled frame F on, it requests session speed
-    // M (multiplier of pace; 1 = none, 0 or -1 = uncapped), as the app's fast-forward key does.
+    // ff=F:M/F:M...: (LITEV_NP_SPEED) at this player's sampled frame F it presses for session speed M
+    // (multiplier of pace; 1 = normal, 0 or -1 = uncapped); M = t: presses the fast-forward key (a
+    // toggle of what its key shows, to 2x or back), as the app does. Also LITEV_HOSTED.
     std::map<int, float> ffPlan;
     int player = 0, delay = -1, port = 7100, latency = 0, players = 0, jitter = 0, loss = 0, pace = 0, adaptive = -1, seed = -1;
     std::string peer, host = "127.0.0.1:7100";
@@ -859,14 +888,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             else if (k == "pace") pace = atoi(v.c_str());
             else if (k == "adaptive") adaptive = atoi(v.c_str());
             else if (k == "seed") seed = atoi(v.c_str());   // jitter/loss random sequence (default: 12345, every player)
-            else if (k == "ff")
-                for (size_t q = 0; q < v.size();)
-                {
-                    size_t sl = v.find('/', q), c = v.find(':', q);
-                    if (c < sl) ffPlan[atoi(v.substr(q, c - q).c_str())] = (float)atof(v.substr(c + 1, sl - c - 1).c_str());
-                    if (sl == std::string::npos) break;
-                    q = sl + 1;
-                }
+            else if (k == "ff") ffPlan = ParseFfPlan(v);
             if (end == std::string::npos) break;
             pos = end + 1;
         }
@@ -887,6 +909,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     auto hosted = ParseSpec(hostedSpec);
     const bool hostedPlay = hosted.count("play") > 0;
     if (hostedSpec) players = SpecInt(hosted, "players", 2);
+    if (hostedSpec && hosted.count("ff")) ffPlan = ParseFfPlan(hosted["ff"]);   // play: console 0's presses
     if (hostedSpec && np) { fprintf(stderr, "error: LITEV_HOSTED and LITEV_NETPLAY\n"); return 1; }
     if (hostedSpec && players > kHostedServerId) { fprintf(stderr, "error: Hosted Netplay: at most %d consoles\n", kHostedServerId); return 1; }
 #else
@@ -1335,8 +1358,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                         int tx, ty;
                         if (bi.inputScript.HasTouch() && bi.inputScript.TouchForFrame(sf, tx, ty)) { local.TouchX = tx; local.TouchY = ty; }
 #ifdef LITEV_NP_SPEED
-                        auto plan = ffPlan.upper_bound(f);
-                        if (plan != ffPlan.begin()) NetplaySpeed::Set(local, NetplaySpeed::Encode(std::prev(plan)->second));
+                        FfPress(*net, ffPlan, inst, f, local);
 #endif
                         net->SubmitLocal(f, local);
                     }
@@ -1401,6 +1423,8 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                         printf("inst%d npspeed switch frame %d: %s requested by 0x%x (applied at %d, %d late)\n", inst, nominal, SpeedName(code).c_str(), who, f, f - nominal);
                         lastCode = code;
                     }
+                    static thread_local int lastShown = 0;
+                    if (net->ShownSpeed() != lastShown) { lastShown = net->ShownSpeed(); printf("inst%d npspeed shown frame %d: %s\n", inst, f, SpeedName(lastShown).c_str()); }
                     float m = NetplaySpeed::Multiplier(code);
 #ifdef LITEV_AGGRESSIVE_SKIP
                     // LITEV_NP_FFSKIP=N: while the session runs faster than 1x the local console draws
@@ -1428,9 +1452,30 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                     std::this_thread::sleep_until(next);
                 }
 #ifdef LITEV_HOSTED_NETPLAY
+                static std::atomic<u32> hostedSpeed {0};   // the session speed sent with every marker
+#ifdef LITEV_NP_SPEED
+                if (record && hostedPlay && inst == 0 && f < frames)
+                {   // the server decides the session speed from its own presses and the replicas' (their inputs)
+                    NetplayFrameInput me;
+                    FfPress(*net, ffPlan, inst, f, me);
+                    net->NoteLocalSpeed(f, me);
+                    u32 who = 0;
+                    int from = -1;
+                    const int code = net->SpeedAt(f, &who, &from);
+                    static int lastCode = 0, lastShown = 0;
+                    if (code != lastCode)
+                    {
+                        printf("inst%d npspeed switch frame %d: %s requested by 0x%x (applied at %d, %d late)\n", inst, from + NetplayInput::kSpeedLag,
+                               SpeedName(code).c_str(), who, f, f - from - NetplayInput::kSpeedLag);
+                        lastCode = code;
+                    }
+                    if (net->ShownSpeed() != lastShown) { lastShown = net->ShownSpeed(); printf("inst%d npspeed shown frame %d: %s\n", inst, f, SpeedName(lastShown).c_str()); }
+                    hostedSpeed = (u32)code | who << 8;
+                }
+#endif
                 if (record && f < frames)
                 {
-                    record->EndFrame(inst, f, HostedState(*bi.nds, applied, f), applied);
+                    record->EndFrame(inst, f, HostedState(*bi.nds, applied, f), applied, hostedSpeed.load());
                     std::vector<u8> out;
                     record->TakeRecords(inst, out);
                     if (recordFiles[inst]) fwrite(out.data(), 1, out.size(), recordFiles[inst]);
@@ -1698,6 +1743,7 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
     // LITEV_HOSTED="host=IP:PORT,port=N[,latency=MS][,jitter=MS][,loss=PCT]" (no --replay-log):
     // join the server at IP:PORT (its LITEV_HOSTED port); inputs from UDP port N.
     auto spec = ParseSpec(getenv("LITEV_HOSTED"));
+    const std::map<int, float> ffPlan = spec.count("ff") ? ParseFfPlan(spec["ff"]) : std::map<int, float> {};   // ff= as MPTest's
     if (logDir.empty() && !spec.count("host")) { fprintf(stderr, "error: --replay-console needs --replay-log or LITEV_HOSTED=host=...\n"); return 1; }
 
     // console K exactly as --mp-test builds it
@@ -1783,6 +1829,9 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
         {
             NetplayFrameInput local = ScriptInput(b, f);
             if (!b.inputScript.Loaded()) local.Keys = 0xFFF;
+#ifdef LITEV_NP_SPEED
+            FfPress(*net, ffPlan, k, f, local);
+#endif
             net->SubmitLocal(f, local);
             in = net->Get(k, f);
         }
@@ -1810,6 +1859,17 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
         }
         b.nds->RunFrame();
         bool ok = replay->EndFrame(f, HostedState(*b.nds, marker, f));
+#ifdef LITEV_NP_SPEED
+        int sf;
+        u32 sp;
+        if (net && replay->ServerSpeed(sf, sp))
+        {
+            static int lastCode = 0, lastShown = 0;
+            net->ServerSpeed(sf, (int)(sp & 63));
+            if ((int)(sp & 63) != lastCode) { lastCode = sp & 63; printf("inst%d npspeed server frame %d: %s requested by 0x%x (here at %d)\n", k, sf, SpeedName(lastCode).c_str(), sp >> 8, f); }
+            if (net->ShownSpeed() != lastShown) { lastShown = net->ShownSpeed(); printf("inst%d npspeed shown frame %d: %s\n", k, f, SpeedName(lastShown).c_str()); }
+        }
+#endif
         if (const char* sh = getenv("LITEV_REPLAY_STATEHASH")) // diagnostics: full-state hash after these frames ("f1,f2,...")
             if (("," + std::string(sh) + ",").find("," + std::to_string(f) + ",") != std::string::npos)
             {

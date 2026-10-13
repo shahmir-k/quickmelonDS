@@ -327,9 +327,49 @@ void NetplayInput::Send(bool all)
 #ifdef LITEV_NP_SPEED
 void NetplayInput::NoteSpeed(int player, int frame, const NetplayFrameInput& in)
 {
-    int code = NetplaySpeed::Of(in);
+    int field = NetplaySpeed::Field(in);
     if (player == Local) LocalUpTo = std::max(LocalUpTo, frame);
-    if (code != SpeedLast[player]) { SpeedChanges[player][frame] = code; SpeedLast[player] = code; }
+    if (field != SpeedLast[player]) { SpeedChanges[player][frame] = field; SpeedLast[player] = field; }
+}
+
+void NetplayInput::FollowSession(int code)
+{
+    // our own press still in flight (not submitted yet, or its frame not decided yet): keep showing it
+    if (SpeedLast[Local] != (int)Request.load() || !SpeedChanges[Local].empty()) return;
+    Shown = code;
+}
+
+int NetplayInput::ToggleSpeed(int onCode)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    const int code = Shown.load() ? 0 : onCode & 63;
+    Request = (u32)code | (((Request.load() >> 6) + 1) & 3) << 6;
+    Shown = code;
+    return code;
+}
+
+void NetplayInput::RequestSpeed(int code)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    Request = (u32)(code & 63) | (((Request.load() >> 6) + 1) & 3) << 6;
+    Shown = code & 63;
+}
+
+void NetplayInput::NoteLocalSpeed(int frame, const NetplayFrameInput& in)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    NoteSpeed(Local, frame, in);
+}
+
+void NetplayInput::ServerSpeed(int frame, int code)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    // the server decided input frames up to about frame - kSpeedLag (its own frame count, a few
+    // frames off ours): our presses up to there are no longer in flight
+    auto& ch = SpeedChanges[Local];
+    ch.erase(ch.begin(), ch.upper_bound(frame - kSpeedLag - 4));
+    SpeedCode = code;
+    FollowSession(code);
 }
 
 int NetplayInput::SpeedAt(int frame, u32* requesters, int* inputFrame)
@@ -342,18 +382,24 @@ int NetplayInput::SpeedAt(int frame, u32* requesters, int* inputFrame)
         const int f = SpeedCursor + 1;
         int best = 0;
         u32 who = 0;
+        bool event = false, normal = false;
         for (int p = 0; p < kMaxPlayers; p++)
         {
             auto& ch = SpeedChanges[p];
-            auto it = ch.upper_bound(f);
-            if (it == ch.begin()) continue;
-            int code = std::prev(it)->second;
-            ch.erase(ch.begin(), std::prev(it));    // older changes are never asked for again
-            if (code) who |= 1u << p;
-            best = std::max(best, code);
+            while (!ch.empty() && ch.begin()->first < f) ch.erase(ch.begin());   // (a dropped player's late ones)
+            if (ch.empty() || ch.begin()->first != f) continue;
+            const int code = ch.begin()->second & 63;
+            ch.erase(ch.begin());
+            event = true;
+            if (!code) normal = true;
+            else if (code > best) { best = code; who = 1u << p; }
+            else if (code == best) who |= 1u << p;
         }
+        if (!event) continue;
+        if (normal) { best = 0; who = 0; }   // a press for normal speed wins: nobody holds the others in fast-forward
         if (best != SpeedCode || who != SpeedWho) { SpeedCode = best; SpeedWho = who; SpeedFrom = f; }
     }
+    FollowSession(SpeedCode);
     if (requesters) *requesters = SpeedWho;
     if (inputFrame) *inputFrame = SpeedFrom;
     return SpeedCode;

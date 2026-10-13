@@ -54,6 +54,7 @@ namespace melonDS
 // HostedFrame: call = calls so far, result = frame, timestamp = call hash, bytes = u64 state, then
 // the input the server applied that frame (u32 keys, s16 touch x, s16 touch y), so a replica can
 // follow the server's input (a dropped player, a second replica of the same console).
+// Then u32 session speed (LITEV_NP_SPEED: code | requesters << 8; pacing only, never compared).
 enum : u8
 {
     HostedBegin, HostedEnd, HostedSendPacket, HostedRecvPacket, HostedSendCmd, HostedSendReply,
@@ -92,8 +93,9 @@ public:
     LockstepMP& Link() { return *Inner; }
     void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = clock; Inner->SetClock(inst, std::move(clock)); }
     // console `inst` finished emulated frame `frame` with input `in` applied; `state` = the
-    // frontend's state hash
-    void EndFrame(int inst, int frame, u64 state, const NetplayFrameInput& in);
+    // frontend's state hash; speed: the session speed (LITEV_NP_SPEED: code | requesters << 8), sent
+    // with the marker (pacing only, not compared)
+    void EndFrame(int inst, int frame, u64 state, const NetplayFrameInput& in, u32 speed = 0);
     // moves console `inst`'s records so far to the end of `out`
     void TakeRecords(int inst, std::vector<u8>& out) { out.insert(out.end(), Out[inst].begin(), Out[inst].end()); Out[inst].clear(); }
 
@@ -145,6 +147,9 @@ public:
     // the input the server applied at `frame`, if its marker for it has arrived (wait: until it
     // does). false = not yet (or stopped).
     bool ServerInput(int frame, NetplayFrameInput& in, bool wait);
+    // the session speed the server sent with its newest marker taken by EndFrame (code | requesters
+    // << 8) and that marker's frame; false = none yet
+    bool ServerSpeed(int& frame, u32& speed) const { u64 v = Speed.load(); frame = (int)(v >> 32); speed = (u32)v; return v != ~0ull; }
     // ends every wait (the session is shutting down)
     void Stop();
     // how long since the server was last heard from (ms): a wait for the stream ends the session
@@ -188,6 +193,7 @@ private:
     bool Stopped = false;
     std::string Err;
     std::atomic<u64> StallUs {0};
+    std::atomic<u64> Speed {~0ull};     // frame << 32 | speed
     std::function<double()> ServerSilentMs;
     std::atomic<bool> LostServer {false};
     const u64 CreatedUs;
