@@ -243,6 +243,9 @@ struct Ctx
     const struct Build* bd = nullptr; bool v31 = false, v4 = false, pw = false;
     bool nullKey = false;                       // WL NullKeyResponseMode (3.1 MP: the child's W_AIDLow stays set)
     u64 keyNext = 0;                            // child: the next key data not before this (3.1 childInterval)
+    // 3.1+: the next-MP / next-key-data requests the parent / child interval OS alarm posts when it fires (the guest posts
+    // them then, so ARM9 requests arriving meanwhile - SET_MP_DATA - are processed first and go into that MP)
+    u64 kickAt[2] = {}; u16 kickArg[2] = {};
     // START_SCAN_EX (4.x): channels left / requested, the result buffer, the SSID filter, the BSS descriptors found
     bool opEx = false; u16 opList = 0, opListAll = 0, opBufSize = 0, opSsidLen = 0, opMatch = 0, opType = 0; u8 opSsid[32] = {};
     std::vector<std::vector<u8>> opDescs;
@@ -1727,8 +1730,9 @@ void IndMpEnd(Ctx& c, const std::vector<u8>& B)
     if ((s16)S16(c, ST_limit) > 0) SS16(c, ST_limit, S16(c, ST_limit) - 1);
     if ((s16)S16(c, ST_count) > 0 && (s16)S16(c, ST_limit) > 0)
     {
-        if (c.v31 && N16(c, N_pInt)) c.mpNext = std::max(c.mpNext, c.now) + N64(c, N_pTick) * 64;    // (parentInterval alarm)
-        PostInternal(c, IdMP(c), Rd16(c, rb) ? G16(B, 0) : 0xFFFF);
+        const u16 arg = Rd16(c, rb) ? G16(B, 0) : 0xFFFF;
+        if (c.v31 && N16(c, N_pInt)) { c.kickAt[0] = c.now + N64(c, N_pTick) * 64; c.kickArg[0] = arg; }   // (parentInterval alarm)
+        else PostInternal(c, IdMP(c), arg);
     }
 }
 void IndMpInd(Ctx& c, const std::vector<u8>& B)
@@ -1813,8 +1817,8 @@ void IndMpAck(Ctx& c, const std::vector<u8>& B, bool fake)
     {
         // ponytail: 3.1's childInterval alarm writes these flags when it fires; here at once (the post is what is timed)
         SS16(c, ST_c030, 0); SS16(c, ST_c032, 0); SS16(c, ST_newFrame, 0);
-        if (c.v31 && N16(c, N_cInt)) c.keyNext = c.now + N64(c, N_cTick) * 64;
-        PostInternal(c, IdKey(c), 0);
+        if (c.v31 && N16(c, N_cInt)) c.kickAt[1] = c.now + N64(c, N_cTick) * 64;   // (childInterval alarm)
+        else PostInternal(c, IdKey(c), 0);
     }
     else { SS16(c, ST_c030, 0); SS16(c, ST_c032, 1); SS16(c, ST_newFrame, 0); }
 }
@@ -2898,6 +2902,13 @@ void Process(Ctx& c)
     {
         if (c.irqPending) { c.irqPending = false; HandleChip(c); }
         FireTimers(c);
+        for (int k = 0; k < 2; k++)
+            if (c.kickAt[k] && c.now >= c.kickAt[k])
+            {
+                c.kickAt[k] = 0;
+                if (k == 0) { PostInternal(c, IdMP(c), c.kickArg[0]); c.mpNext = c.now + Us(c.bd->mpGapUs); }
+                else PostInternal(c, IdKey(c), 0);
+            }
         if (c.lineDue) { c.lineDue = false; VAlarm(c, c.lineDueV); }
         PumpCbs(c);
         if (!c.cbs.empty()) break;              // (WMSP waits for the ARM9 to take the callback)
@@ -2917,13 +2928,14 @@ void Process(Ctx& c)
     if (c.release && c.cbs.empty() && c.op == OpNone && c.inds.empty() && c.reqs.empty()) { Release(c); c.inside = false; return; }
     u64 next = ~0ull;
     for (u64 t : c.tm) if (t && t < next) next = t;
+    for (u64 t : c.kickAt) if (t && t < next) next = t;
     if (c.irqPending || c.lineDue) next = c.now + 1;
     if (next != ~0ull) WakeAt(c, std::max(next, c.now + 1));
     c.inside = false;
 }
 
 // ---- savestate (section "WMNA"; layout kSaveVer) ----
-constexpr u32 kSaveVer = 3;          // (3: + nullKey, keyNext; 2 still loads)
+constexpr u32 kSaveVer = 4;          // (3: + nullKey, keyNext; 4: + interval kicks; 2 and 3 still load)
 struct SS
 {
     Savestate* f;
@@ -2960,6 +2972,7 @@ void Visit(Ctx& c, SS& z, u32 ver)
     if (ver >= 3)
     {
         z.B(c.nullKey); z.V(c.keyNext);
+        if (ver >= 4) { z.V(c.kickAt); z.V(c.kickArg); }
         z.B(c.opEx); z.V(c.opList); z.V(c.opListAll); z.V(c.opBufSize); z.V(c.opSsidLen); z.V(c.opMatch); z.V(c.opType); z.V(c.opSsid);
         z.Seq(c.opDescs, [&](std::vector<u8>& v) { z.Bytes(v); });
     }
@@ -2997,7 +3010,7 @@ void Release(Ctx& c)
     c.op = OpNone; c.opStage = 0; c.opDesc.clear();
     c.wl = 0; c.mode = 0; c.mgmtQ.clear(); c.mgmtBusy = false; c.txWindow = false; c.gameInfoPending = false;
     c.mpBusy = false; c.mpInd.clear(); c.aid = 0; c.bufBusy[0] = c.bufBusy[1] = false; c.lastCmdSeq = 0xFFFF;
-    c.nullKey = false; c.keyNext = 0; c.mpNext = 0;
+    c.nullKey = false; c.keyNext = 0; c.mpNext = 0; c.kickAt[0] = c.kickAt[1] = 0;
     SetBuild(c, -1);
     for (Sta& t : c.sta) t = Sta{};
     c.pending.clear();
@@ -3021,7 +3034,7 @@ void DoSavestate(NDS& nds, Savestate* f)
     f->Section("WMNA");
     u32 ver = kSaveVer;
     f->Var32(&ver);
-    if (ver != kSaveVer && ver != 2) { f->Error = true; return; }
+    if (ver < 2 || ver > kSaveVer) { f->Error = true; return; }
     SS z{f};
     Visit(d, z, ver);
     if (!f->Saving && d.active)
