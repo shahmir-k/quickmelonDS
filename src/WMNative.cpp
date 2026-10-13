@@ -238,6 +238,7 @@ struct Ctx
     std::deque<std::vector<u8>> autoDeAuth;     // MACs for internal AUTO_DEAUTH (0x22)
     u8 joinDesc[0x40] = {}; u16 joinTgid = 0, joinPSize = 0, joinCSize = 0; u8 joinAttr = 0, joinRssi = 0;
     u16 mpTxopOrig = 0;
+    u64 mpNext = 0;                             // the next MP of a sequence not before this (the guest's MP end -> CMD path)
     std::deque<Cb> held;                        // a request's callbacks held until the guest would have finished it
     ~Ctx();
 };
@@ -360,8 +361,8 @@ void WakeAt(Ctx& c, u64 t)
     if (t >= c.wake) return;
     NDS& nds = c.nds;
     nds.CancelEvent(Event_WMN);
-    SchedEvent& e = nds.SchedList[Event_WMN];
-    nds.ScheduleEvent(Event_WMN, true, (s32)(t - e.Timestamp), 0, 0);
+    nds.SchedList[Event_WMN].Timestamp = t;           // (absolute: as Wifi::EvtScheduleAt)
+    nds.ScheduleEvent(Event_WMN, true, 0, 0, 0);
     c.wake = t;
 }
 void SetTimer(Ctx& c, Timer k, u64 at) { c.tm[k] = at ? at : 1; WakeAt(c, c.tm[k]); }
@@ -1030,6 +1031,7 @@ void RxReply(Ctx& c, const u8* h, const u8* f, u32 len)
 void MpEnd(Ctx& c)
 {
     if (!c.mpBusy) return;
+    c.mpNext = c.now + Us(1100);
     RxRing(c);                                  // (late replies)
     c.mpBusy = false;
     B16(c.mpInd, 2, c.mpRemain ^ M16(c, 2));
@@ -2421,7 +2423,14 @@ void Process(Ctx& c)
         PumpCbs(c);
         if (!c.cbs.empty()) break;              // (WMSP waits for the ARM9 to take the callback)
         if (!c.inds.empty()) { Ind in = std::move(c.inds.front()); c.inds.pop_front(); HandleInd(c, in); continue; }
-        if (c.op == OpNone && !c.reqs.empty()) { Rq q = c.reqs.front(); c.reqs.pop_front(); Request(c, q); continue; }
+        if (c.op == OpNone && !c.reqs.empty())
+        {
+            const Rq& f = c.reqs.front();
+            // the guest's parent starts the next MP of a sequence >= ~0.84 ms (median 1.2) after the MP end (WL task ->
+            // WMSP indication -> request thread -> MA_MP); emulated children need that time to arm their next reply
+            if (!f.addr && (f.api == 0x29 || f.api == 0x2B) && c.now < c.mpNext) { SetTimer(c, T_POLL, c.mpNext); break; }
+            Rq q = f; c.reqs.pop_front(); Request(c, q); continue;
+        }
         break;
     }
     PumpCbs(c);
@@ -2460,7 +2469,7 @@ void Visit(Ctx& c, SS& z)
     z.Seq(c.mgmtQ, mg); z.B(c.mgmtBusy); mg(c.mgmtCur); z.B(c.txWindow);
     z.V(c.beaconLen); z.V(c.gameInfoOff); z.Bytes(c.pendingGameInfo); z.B(c.gameInfoPending);
     z.B(c.mpBusy); z.V(c.mpPoll); z.V(c.mpGot); z.V(c.mpN); z.V(c.mpStride); z.V(c.mpTxopUs); z.V(c.mpLen); z.V(c.mpHdr); z.V(c.mpTmptt);
-    z.V(c.mpRemain); z.Bytes(c.mpInd); z.V(c.mpFailed); z.V(c.mpTxopOrig);
+    z.V(c.mpRemain); z.Bytes(c.mpInd); z.V(c.mpFailed); z.V(c.mpTxopOrig); z.V(c.mpNext);
     z.V(c.aid); z.V(c.pmac); z.V(c.bufBusy); z.V(c.lastCmdSeq); z.V(c.cmdFlags); z.V(c.beaconPeriod);
     z.V(c.vX); z.V(c.rssi); z.V(c.rssiIdx); z.V(c.camLife);
     z.Seq(c.inds, [&](Ind& in) { z.V(in.code); z.Bytes(in.b); });
