@@ -69,6 +69,13 @@ void TraceFifo(NDS& nds, int fromArm7, u32 val)
         u32 w0; memcpy(&w0, &nds.MainRAM[data & nds.MainRAMMask], 4);
         if (!fromArm7 && (w0 & 0x7fff) == 0) { u32 st; memcpy(&st, &nds.MainRAM[(data + 8) & nds.MainRAMMask], 4); std::lock_guard<std::mutex> l(g_TrM); g_TrSt[&nds].status = st; }
         StatusDiff(f, nds);
+        // a START_SCAN_EX "found" callback: the BSS descriptors it points to
+        if (fromArm7 && (w0 & 0xffff) == 0x26)
+        {
+            u32 st8; memcpy(&st8, &nds.MainRAM[(data + 8) & nds.MainRAMMask], 4);
+            u32 n; memcpy(&n, &nds.MainRAM[(data + 0xc) & nds.MainRAMMask], 4);
+            if ((st8 & 0xffff) == 5) for (u32 i = 0; i < ((n >> 16) & 0xff) && i < 4; i++) { u32 d; memcpy(&d, &nds.MainRAM[(data + 0x10 + 4 * i) & nds.MainRAMMask], 4); fprintf(f, "  DESC%u", i); Dump(f, nds, d, 0xc0); }
+        }
         // LITEV_WMTRACE_MEM=<from>:<to>: at each SET_MP_DATA request, the ARM7 WRAM / ARM7 VRAM words changed since the last one
         static const char* e = getenv("LITEV_WMTRACE_MEM");
         static const u32 from = e ? (u32)atoi(e) : 0, to = e && strchr(e, ':') ? (u32)atoi(strchr(e, ':') + 1) : 0;
@@ -354,7 +361,8 @@ bool Allowed(Ctx& c)
 #endif
     return v ? atoi(v) != 0 : true;
 }
-// debug.litev.a7wmtwl=1 (prop / env): also the TWL 5.x build (PB/PW/B2W2/Sims 3); off by default until its MP path is proven
+// debug.litev.a7wmtwl=0 (prop / env): the TWL 5.x build (PB/PW/B2W2/Sims 3) stays emulated (default on: its MP path matched
+// the emulated driver through a PB<->PW Union Room trainer-card exchange)
 bool TwlAllowed()
 {
 #if defined(__ANDROID__)
@@ -363,7 +371,7 @@ bool TwlAllowed()
 #else
     const char* v = getenv("debug.litev.a7wmtwl");
 #endif
-    return v && atoi(v) != 0;
+    return !v || atoi(v) != 0;
 }
 
 // ---- WM build recognition ----
@@ -3089,7 +3097,7 @@ bool Fifo9(NDS& nds, u32 val)
             const Build* b = nds.ConsoleType == 0 && Allowed(c) ? FindBuild(c, &table) : nullptr;
             if (b && b->gen >= 50 && !TwlAllowed())
             {
-                if (g_Stats) fprintf(stderr, "A7WM inst%d: WM build %s: emulated (debug.litev.a7wmtwl not set)\n", c.inst, b->name);
+                if (g_Stats) fprintf(stderr, "A7WM inst%d: WM build %s: emulated (debug.litev.a7wmtwl=0)\n", c.inst, b->name);
                 b = nullptr;
             }
             SetBuild(c, b ? (int)(b - kBuilds) + 1 : 0);
