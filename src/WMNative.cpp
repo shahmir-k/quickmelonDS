@@ -557,6 +557,8 @@ void MacStart(Ctx& c, u16 mode)
     SetTimer(c, T_TICK, c.now + Ms(100));
 }
 
+void DeauthFinish(Ctx& c);
+void DevIdle(Ctx& c);
 // ---- frames ----
 // a 12-byte TX header + 24-byte 802.11 header at chip RAM a; returns the body offset
 u32 Hdr(Ctx& c, u32 a, u16 fc, const u8* a1, const u8* a2, const u8* a3, u32 bodyLen)
@@ -956,6 +958,7 @@ void MgmtDone(Ctx& c)
         }
     }
     else if (m.kind == MK_ASSOC_RESP && m.sta && c.sta[m.sta].state == 0x10) c.sta[m.sta] = Sta{};
+    else if (m.kind == MK_DEAUTH && c.op == OpDeauth && c.mgmtQ.empty()) { c.mgmtBusy = false; DeauthFinish(c); return; }
     else if (m.kind == MK_AUTH_REQ) { if (c.op == OpConnect && c.opStage == 2) SetTimer(c, T_OP, c.now + Ms(2000)); }
     else if (m.kind == MK_ASSOC_REQ) { if (c.op == OpConnect && c.opStage == 3) SetTimer(c, T_OP, c.now + Ms(2000)); }
     MgmtKick(c);
@@ -1765,15 +1768,8 @@ int DisconnectCore(Ctx& c, u16 bitmap, bool autoMode, u16 reason, u16* disc)
     }
     if (state == S_CHILD || state == S_MP_CHILD)
     {
-        SendDeauth(c, c.pmac, 3);
-        SS16(c, ST_indOn, 0);
-        SS16(c, ST_state, S_CLASS1);
-        // MlmeReset + DevIdle
-        MacStop(c); c.mode = 0; c.aid = 0; c.wl = 0x10; PowerUp(c);
-        SS16(c, ST_state, S_IDLE);
-        if (autoMode) Send(c, CbB(0x0C, E_OK).P16(8, SC_DISCONNECTED).P16(0xC, reason).P16(0xA, S16(c, ST_aid)));
-        SS16(c, ST_maxSend, 0); SS16(c, ST_maxRecv, 0);
-        if (wasMP) CleanSendQueue(c, 1);
+        SendDeauth(c, c.pmac, 3);           // (the rest when it is out: DeauthFinish)
+        c.opWasMP = wasMP; c.opAuto = autoMode; c.opReason = reason; c.opBitmap = bitmap;
         d = 1;
     }
     else
@@ -1795,6 +1791,53 @@ int DisconnectCore(Ctx& c, u16 bitmap, bool autoMode, u16 reason, u16* disc)
     }
     if (disc) *disc = d;
     return 1;
+}
+
+// requests that send deauthentications first (DISCONNECT, AUTO_DISCONNECT, END_PARENT, RESET): the guest's WL confirms a
+// deauth when it is on air (the parent's only in the beacon window), then the request goes on
+void OpFinish(Ctx& c);
+void DeauthFinish(Ctx& c)
+{
+    const u16 api = c.opApi;
+    const bool child = c.mode == 2;
+    if ((api == 0x0D || api == 0x25) && child)
+    {
+        SS16(c, ST_indOn, 0);
+        SS16(c, ST_state, S_CLASS1);
+        MacStop(c); c.mode = 0; c.aid = 0; c.wl = 0x10; PowerUp(c);
+        SS16(c, ST_state, S_IDLE);
+        if (c.opAuto) Send(c, CbB(0x0C, E_OK).P16(8, SC_DISCONNECTED).P16(0xC, c.opReason).P16(0xA, S16(c, ST_aid)));
+        SS16(c, ST_maxSend, 0); SS16(c, ST_maxRecv, 0);
+        if (c.opWasMP) CleanSendQueue(c, 1);
+    }
+    if (api == 0x0D) Send(c, CbB(0xD, E_OK).P16(8, c.opBitmap).P16(0xA, c.opDone));
+    else if (api == 0x09)
+    {
+        for (Sta& t : c.sta) t = Sta{};
+        c.pending.clear();
+        SS16(c, ST_indOn, 0); SS16(c, ST_state, S_CLASS1);
+        DevIdle(c);
+        SS16(c, ST_state, S_IDLE); SS16(c, ST_maxSend, 0); SS16(c, ST_maxRecv, 0);
+        Send(c, CbB(0x09, E_OK));
+    }
+    else if (api == 0x01)
+    {
+        for (Sta& t : c.sta) t = Sta{};
+        c.pending.clear();
+        DevIdle(c);
+        SS16(c, ST_preamble, 1);
+        SS16(c, ST_state, S_IDLE);
+        Send(c, CbB(0x01, E_OK));
+    }
+    OpFinish(c);
+}
+// returns false: the request waits (op OpDeauth) until the queued deauths are out (or 2 s)
+bool DeauthWait(Ctx& c, const Rq& q)
+{
+    c.op = OpDeauth; c.opApi = q.api; c.opRq = q;
+    if (c.mgmtQ.empty() && !c.mgmtBusy) { DeauthFinish(c); return true; }
+    SetTimer(c, T_OP, c.now + Ms(2000));
+    return false;
 }
 
 // ---- WL indications in WMSP (0.2 HandleInd) ----
@@ -1972,12 +2015,7 @@ bool Request(Ctx& c, const Rq& q)
         SS16(c, ST_conn, 0); SS16(c, ST_ready, 0); SS32(c, ST_ks, 0); SS32(c, ST_dcf, 0); SS32(c, ST_vsync, 0); SS16(c, ST_indOn, 0);
         if (c.mode == 1) for (int a = 1; a < 16; a++) if (c.sta[a].state) SendDeauth(c, c.sta[a].mac, 3);
         if (c.mode == 2 && c.wl >= 0x30) SendDeauth(c, c.pmac, 3);
-        for (Sta& s : c.sta) s = Sta{};
-        c.pending.clear();
-        DevIdle(c);
-        SS16(c, ST_preamble, 1);
-        SS16(c, ST_state, S_IDLE);
-        cb0(E_OK);
+        done = DeauthWait(c, q);
         break;
     }
     case 0x07:              // SET_P_PARAM
@@ -2029,12 +2067,7 @@ bool Request(Ctx& c, const Rq& q)
                 SS16(c, ST_conn, S16(c, ST_conn) & ~(1 << aid)); SS16(c, ST_ready, S16(c, ST_ready) & ~(1 << aid));
                 SS64(c, ST_lastRx + 8 * aid, 0);
             }
-        for (Sta& s : c.sta) s = Sta{};
-        c.pending.clear();
-        SS16(c, ST_indOn, 0); SS16(c, ST_state, S_CLASS1);
-        DevIdle(c);
-        SS16(c, ST_state, S_IDLE); SS16(c, ST_maxSend, 0); SS16(c, ST_maxRecv, 0);
-        cb0(E_OK);
+        done = DeauthWait(c, q);
         break;
     }
     case 0x0A:              // START_SCAN
@@ -2108,12 +2141,12 @@ bool Request(Ctx& c, const Rq& q)
     case 0x0D:              // DISCONNECT
     {
         u16 d = 0;
-        if (DisconnectCore(c, (u16)RqArg(c, q, 4), false, 0, &d)) Send(c, CbB(0xD, E_OK).P16(8, (u16)RqArg(c, q, 4)).P16(0xA, d));
+        if (DisconnectCore(c, (u16)RqArg(c, q, 4), false, 0, &d)) { c.opBitmap = (u16)RqArg(c, q, 4); c.opDone = d; done = DeauthWait(c, q); }
         break;
     }
     case 0x25:              // AUTO_DISCONNECT (internal)
         if (g_Dbg) fprintf(stderr, "A7WM inst%d f%u AUTO_DISCONNECT %x reason %x\n", c.inst, c.nds.NumFrames, q.a1 & 0xFFFF, q.a1 >> 16);
-        DisconnectCore(c, q.a1 & 0xFFFF, true, q.a1 >> 16, nullptr);
+        if (DisconnectCore(c, q.a1 & 0xFFFF, true, q.a1 >> 16, nullptr)) done = DeauthWait(c, q);
         break;
     case 0x22:              // AUTO_DEAUTH (internal)
         if (!c.autoDeAuth.empty())
@@ -2392,6 +2425,7 @@ void FireTimers(Ctx& c)
             else if (c.op == OpScan) ScanDone(c);
             else if (c.op == OpMeasure && c.opStage == 1) { MacStop(c); c.mode = 0; DevIdle(c); c.opStage = 2; SetTimer(c, T_OP, c.now + Us(12600)); }
             else if (c.op == OpMeasure) MeasureDone(c);
+            else if (c.op == OpDeauth) { c.mgmtQ.clear(); c.mgmtBusy = false; DeauthFinish(c); }
             else if (c.op == OpHold)
             {
                 while (!c.held.empty()) { c.cbs.push_back(c.held.front()); c.held.pop_front(); }
