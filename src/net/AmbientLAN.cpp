@@ -826,7 +826,8 @@ void AmbientLAN::Process()
 void AmbientLAN::Detect(u32 nowMs)
 {
     const bool linked = NumLinks > 0;
-    if (linked && !WasLinked) { SessionPrompted = false; SlowSeconds = 0; Win = {}; }
+    if (linked && !WasLinked) { SessionPrompted = false; PromptPending = false; SlowSeconds = 0; Win = {}; }
+    if (!linked && WasLinked) { PromptPending = false; SlowSeconds = 0; }
     WasLinked = linked;
     const u64 now = NowUs();
     if (!Win.T0) { Win.T0 = now; return; }
@@ -838,7 +839,7 @@ void AmbientLAN::Detect(u32 nowMs)
     const double sec = (now - Win.T0) / 1e6;
     d.Linked = linked;
     d.Fps = (float)(Win.Frames / sec);
-    if (const float shown = ShownFps; shown > 0 && shown < d.Fps) d.Fps = shown;     // (frames hidden by frameskip)
+    d.ShownFps = ShownFps;
     d.WaitMs = Win.Frames ? (float)(Win.BlockedUs / 1000.0 / Win.Frames) : 0;
     d.ExchPerFrame = Win.Frames ? (float)Win.Exch / Win.Frames : 0;
     d.RttMs = (LinkRttUs + 2 * DelayUs) / 1000.0f;   // (presence ping; + the injected delay both ways in tests)
@@ -860,8 +861,8 @@ void AmbientLAN::Detect(u32 nowMs)
     {
         SessionPrompted = true;
         PromptPending = true;
-        Platform::Log(Platform::LogLevel::Info, "Ambient: link slowdown: %.1f fps, link wait %.1f ms/frame, %.2f exchanges/frame, rtt %.0f ms, ceiling %.0f fps\n",
-                      d.Fps, d.WaitMs, d.ExchPerFrame, d.RttMs, d.CeilingFps);
+        Platform::Log(Platform::LogLevel::Info, "Ambient: link slowdown: %.1f emulated fps, %.1f shown fps, link wait %.1f ms/frame, %.2f exchanges/frame, rtt %.0f ms, ceiling %.0f fps\n",
+                      d.Fps, d.ShownFps, d.WaitMs, d.ExchPerFrame, d.RttMs, d.CeilingFps);
     }
     {
         std::lock_guard<std::mutex> g(Mu);
@@ -871,8 +872,8 @@ void AmbientLAN::Detect(u32 nowMs)
     if (linked && ++DiagLogN >= 5)
     {
         DiagLogN = 0;
-        Platform::Log(Platform::LogLevel::Info, "Ambient: diag %.1f fps, link wait %.1f ms/frame, %.2f exch/frame, rtt %.1f ms, ceiling %.0f fps, slow %us | host waits %u timeouts %u, stale drops %u\n",
-                      d.Fps, d.WaitMs, d.ExchPerFrame, d.RttMs, d.CeilingFps, d.SlowSeconds, WinHostWaits, WinHostTimeouts, WinStale);
+        Platform::Log(Platform::LogLevel::Info, "Ambient: diag %.1f emulated fps, %.1f shown fps, link wait %.1f ms/frame, %.2f exch/frame, rtt %.1f ms, ceiling %.0f fps, slow %us | host waits %u timeouts %u, stale drops %u\n",
+                      d.Fps, d.ShownFps, d.WaitMs, d.ExchPerFrame, d.RttMs, d.CeilingFps, d.SlowSeconds, WinHostWaits, WinHostTimeouts, WinStale);
     }
     WinHostWaits = WinHostTimeouts = WinStale = 0;
     Win = {};

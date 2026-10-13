@@ -84,15 +84,15 @@ public:
     struct LinkDiag
     {
         bool Linked = false;
-        float Fps = 0, WaitMs = 0, ExchPerFrame = 0, RttMs = 0;
+        float Fps = 0, ShownFps = 0, WaitMs = 0, ExchPerFrame = 0, RttMs = 0;
         float CeilingFps = 60;          // the most this link allows: 1000 / (frame without link waits + exchanges x RTT)
         u32 SlowSeconds = 0;            // seconds in a row below 58 fps while waiting > 3 ms a frame on the link
     };
     LinkDiag GetDiag();
     // true once per session (links up until all are down) when the slowdown held 5 s: ask the player
     bool TakePrompt() { return PromptPending.exchange(false); }
-    // the frames the player saw a second (the app: frameskip / dropped presents hide frames that were emulated); the
-    // detector uses the lower of that and the emulated rate. Headless: not set = the emulated rate.
+    // the frames the player saw a second (the app: frameskip / dropped presents hide frames that were emulated).
+    // Diagnostic only: a low shown rate with 60 emulated fps is not evidence that the link slowed emulation.
     void SetShownFps(float fps) { ShownFps = fps; }
 
     void Process() override;
