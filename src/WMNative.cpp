@@ -62,7 +62,7 @@ void TraceFifo(NDS& nds, int fromArm7, u32 val)
     FILE* f = Tr(nds);
     if (!f) return;
     const u32 tag = val & 31, data = val >> 6;
-    fprintf(f, "%s f%u t%llu tag%u err%u data %07x\n", fromArm7 ? "F7" : "F9", nds.NumFrames, (unsigned long long)nds.ARM7Timestamp, tag, (val >> 5) & 1, data);
+    fprintf(f, "%s f%u t%llu tag%u err%u data %07x\n", fromArm7 ? "F7" : "F9", nds.NumFrames, (unsigned long long)(nds.CurCPU == 0 ? nds.ARM9Timestamp >> nds.ARM9ClockShift : nds.ARM7Timestamp), tag, (val >> 5) & 1, data);
     if (tag == 10 && (data >> 24) == 2)
     {
         Dump(f, nds, data, fromArm7 ? 0x100 : 0x80);
@@ -250,6 +250,7 @@ struct Ctx
     const struct Build* bd = nullptr; bool v31 = false, v4 = false, pw = false;
     bool nullKey = false;                       // WL NullKeyResponseMode (3.1 MP: the child's W_AIDLow stays set)
     u64 keyNext = 0;
+    u64 reqAt = 0;                              // the front ARM9 request runs then (the guest's WL processing time)
     u64 vaNext = 0;                             // the MP V-alarm request (0x1c) is handled not before this                            // child: the next key data not before this (3.1 childInterval)
     // 3.1+: the next-MP / next-key-data requests the parent / child interval OS alarm posts when it fires (the guest posts
     // them then, so ARM9 requests arriving meanwhile - SET_MP_DATA - are processed first and go into that MP)
@@ -404,7 +405,7 @@ constexpr Build kBuilds[] = {
     {0x32abc95715c0a7fdull, "NitroSDK 4.x WM (Dragon Quest IX)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
     {0x44459275eff97ba4ull, "NitroSDK 4.x WM (Pokemon HeartGold / SoulSilver)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
     {0x8f8c5c9ada28f3c0ull, "NitroSDK 4.x WM (Pokemon Platinum)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
-    {0x5c3f3bbdb2cacf4bull, "TwlSDK 5.x WM, NITRO mode (Pokemon Black / White / B2W2, The Sims 3)", 50, "2.88.00", 5930, 3570, 320, 180, 12580, 3800, 120, 12580, 1600, 12000, 12160, 1589, 1176, 700},
+    {0x5c3f3bbdb2cacf4bull, "TwlSDK 5.x WM, NITRO mode (Pokemon Black / White / B2W2, The Sims 3)", 50, "2.88.00", 6070, 3570, 320, 180, 11780, 3800, 120, 12580, 1600, 12000, 12700, 1589, 1176, 700},
 };
 // NitroSDK 3.1 WMStatus: 3.0 offset -> 3.1 offset (spec-shrek-delta 1.2); 4.x: + the MP engine's current parameters
 const u16* Map31(bool v4)
@@ -2015,6 +2016,28 @@ int DisconnectCore(Ctx& c, u16 bitmap, bool autoMode, u16 reason, u16* disc)
     return 1;
 }
 
+// the guest's request -> callback time of the short requests (us; traces of each build's guest, medians): native runs
+// them that long after taking them, so state changes and callbacks land when the guest's would
+u32 QuickUs(Ctx& c, u16 api)
+{
+    //                         SET_GAMEINFO START_MP(parent/child) END_MP SET_P_PARAM END SET_ENTRY
+    static const u16 k30[] = {232, 362, 283, 400, 163, 198, 228};      // (MKDS; END_MP estimated)
+    static const u16 k31[] = {280, 396, 359, 450, 181, 200, 276};      // (Shrek; SET_GAMEINFO / END_MP / END estimated)
+    static const u16 k40[] = {300, 440, 647, 590, 199, 246, 223};      // (Kirby; SET_GAMEINFO / END_MP / END estimated)
+    static const u16 k50[] = {346, 469, 464, 585, 220, 226, 400};      // (PB / PW; SET_ENTRY estimated)
+    if (!c.bd) return 0;
+    const u16* t = c.bd->gen >= 50 ? k50 : c.bd->gen >= 40 ? k40 : c.bd->gen >= 31 ? k31 : k30;
+    switch (api)
+    {
+    case 0x18: return t[0];
+    case 0x0E: return AmParent(c) ? t[1] : t[2];
+    case 0x10: return t[3];
+    case 0x07: return t[4];
+    case 0x02: return t[5];
+    case 0x21: return t[6];
+    }
+    return 0;
+}
 // requests that send deauthentications first (DISCONNECT, AUTO_DISCONNECT, END_PARENT, RESET): the guest's WL confirms a
 // deauth when it is on air (the parent's only in the beacon window), then the request goes on
 void OpFinish(Ctx& c);
@@ -2935,6 +2958,10 @@ void Process(Ctx& c)
             if (!f.addr && (f.api == IdMP(c) || f.api == IdResend(c)) && c.now < c.mpNext) { SetTimer(c, T_POLL, c.mpNext); break; }
             if (!f.addr && f.api == IdKey(c) && c.now < c.keyNext) { SetTimer(c, T_POLL, c.keyNext); break; }
             if (!f.addr && f.api == 0x1C && c.now < c.vaNext) { SetTimer(c, T_POLL, c.vaNext); break; }
+            if (f.addr && !c.reqAt)
+                if (const u32 us = QuickUs(c, f.api)) { c.reqAt = c.now + Us(us); if (f.api < ApiBound(c)) { SS32(c, ST_apiBusy, 1); SS16(c, ST_busyApi, f.api); } }
+            if (c.reqAt && c.now < c.reqAt) { SetTimer(c, T_POLL, c.reqAt); break; }
+            c.reqAt = 0;
             Rq q = f; c.reqs.pop_front(); Request(c, q); continue;
         }
         break;
@@ -2950,7 +2977,7 @@ void Process(Ctx& c)
 }
 
 // ---- savestate (section "WMNA"; layout kSaveVer) ----
-constexpr u32 kSaveVer = 5;          // (3: + nullKey, keyNext; 4: + interval kicks; 2 and 3 still load)
+constexpr u32 kSaveVer = 6;          // (3: + nullKey, keyNext; 4: + interval kicks; 2 and 3 still load)
 struct SS
 {
     Savestate* f;
@@ -2989,6 +3016,7 @@ void Visit(Ctx& c, SS& z, u32 ver)
         z.B(c.nullKey); z.V(c.keyNext);
         if (ver >= 4) { z.V(c.kickAt); z.V(c.kickArg); }
         if (ver >= 5) z.V(c.vaNext);
+        if (ver >= 6) z.V(c.reqAt);
         z.B(c.opEx); z.V(c.opList); z.V(c.opListAll); z.V(c.opBufSize); z.V(c.opSsidLen); z.V(c.opMatch); z.V(c.opType); z.V(c.opSsid);
         z.Seq(c.opDescs, [&](std::vector<u8>& v) { z.Bytes(v); });
     }
@@ -3026,7 +3054,7 @@ void Release(Ctx& c)
     c.op = OpNone; c.opStage = 0; c.opDesc.clear();
     c.wl = 0; c.mode = 0; c.mgmtQ.clear(); c.mgmtBusy = false; c.txWindow = false; c.gameInfoPending = false;
     c.mpBusy = false; c.mpInd.clear(); c.aid = 0; c.bufBusy[0] = c.bufBusy[1] = false; c.lastCmdSeq = 0xFFFF;
-    c.nullKey = false; c.keyNext = 0; c.mpNext = 0; c.kickAt[0] = c.kickAt[1] = 0; c.vaNext = 0;
+    c.nullKey = false; c.keyNext = 0; c.mpNext = 0; c.kickAt[0] = c.kickAt[1] = 0; c.vaNext = 0; c.reqAt = 0;
     SetBuild(c, -1);
     for (Sta& t : c.sta) t = Sta{};
     c.pending.clear();
