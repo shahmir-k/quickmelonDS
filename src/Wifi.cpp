@@ -379,7 +379,7 @@ static inline s32 WifiTickDelay(s32& err)
 
 static constexpr int kEvtMaxIdle = 2048;            // ticks per event at most (16 ms)
 static constexpr u64 kEvtQuietSpan = 268 * 64;      // MP client: ask the link about the next ~512 us of polls
-static constexpr u64 kEvtAskAhead = 33514 * 2;      // ... only up to 2 ms past our clock (< LockstepMP::kDelay: no deadlock)
+static constexpr u64 kEvtAskAhead = 33514 * 2;      // ... only up to 2 ms past our clock (< LockstepMP::kDelay; a deadlock through a third console: LockstepMP::ResolveDeadlock)
 
 // USTick on a tick EvtSchedule found idle: counters, and a transfer's in-between steps (TX phase
 // countdown / address, RX halfword copy from the frame already in RXBuffer); no IRQ, no link call
@@ -1150,7 +1150,7 @@ void Wifi::FireTX()
 
 void Wifi::SendMPDefaultReply()
 {
-    u8 reply[12 + 28];
+    u8 reply[12 + 28] = {};   // (zeroed: header bytes 0-7 reach the host's RX header, and the link's tx hash)
 
     *(u16*)&reply[0xA] = 28; // length
 
