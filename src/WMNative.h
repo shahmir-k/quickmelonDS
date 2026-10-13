@@ -2,9 +2,11 @@
 #pragma once
 #ifdef LITEV_A7_NATIVE_WM
 #include "types.h"
-namespace melonDS { class NDS; }
+namespace melonDS { class NDS; class Savestate; }
 namespace melonDS::WMNative
 {
+// NDS::DoSavestate: section "WMNA" (the driver's state; absent = not active)
+void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* file);
 // Wifi::Reset: the native driver lets go of the WM (a console reset ends the session)
 void Reset(melonDS::NDS& nds);
 // headless: name / allow per console (allow -1: debug.litev.a7wm decides)

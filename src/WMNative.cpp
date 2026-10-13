@@ -2,6 +2,7 @@
 #ifdef LITEV_A7_NATIVE_WM
 #include "WMNative.h"
 #include "NDS.h"
+#include "Savestate.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2422,6 +2423,42 @@ void Process(Ctx& c)
     c.inside = false;
 }
 
+// ---- savestate (section "WMNA"; layout kSaveVer) ----
+constexpr u32 kSaveVer = 1;
+struct SS
+{
+    Savestate* f;
+    template <class T> void V(T& v) { f->VarArray(&v, sizeof(T)); }
+    void B(bool& v) { u8 x = v; f->Var8(&x); v = x; }
+    void Bytes(std::vector<u8>& v) { u32 n = (u32)v.size(); f->Var32(&n); if (!f->Saving) v.assign(n, 0); if (n) f->VarArray(v.data(), n); }
+    template <class C, class G> void Seq(C& q, G g) { u32 n = (u32)q.size(); f->Var32(&n); if (!f->Saving) { q.clear(); q.resize(n); } for (auto& e : q) g(e); }
+};
+void Visit(Ctx& c, SS& z)
+{
+    z.B(c.active); z.V(c.w7); z.V(c.st); z.V(c.cbuf);
+    z.Seq(c.reqs, [&](Rq& q) { z.V(q.addr); z.V(q.api); z.V(q.a1); });
+    auto cb = [&](Ctx::Cb& b) { z.V(b.d); z.V(b.m); z.V(b.n); };
+    z.Seq(c.cbs, cb); z.Seq(c.held, cb);
+    z.V(c.wake); z.V(c.tm); z.B(c.irqPending); z.B(c.lineDue); z.V(c.lineDueV);
+    z.V(c.op); z.V(c.opAddr); z.V(c.opApi); z.V(c.opStage); z.V(c.opCh); z.V(c.opTime); z.V(c.opScanBuf); z.V(c.opBssid); z.Bytes(c.opDesc);
+    z.V(c.opRq.addr); z.V(c.opRq.api); z.V(c.opRq.a1);
+    z.V(c.wl); z.V(c.mode); z.V(c.mac); z.V(c.bssid); z.V(c.channel); z.V(c.rxBegin); z.B(c.pm); z.V(c.activeZone); z.V(c.vtsf);
+    auto sta = [&](Sta& t) { z.V(t.state); z.V(t.mac); z.V(t.aid); z.V(t.life); z.V(t.lifeReload); z.V(t.ssid); };
+    for (Sta& t : c.sta) sta(t);
+    z.Seq(c.pending, sta);
+    z.V(c.maxChild);
+    auto mg = [&](Mgmt& m) { z.Bytes(m.f); z.V(m.kind); z.V(m.sta); z.V(m.status); };
+    z.Seq(c.mgmtQ, mg); z.B(c.mgmtBusy); mg(c.mgmtCur); z.B(c.txWindow);
+    z.V(c.beaconLen); z.V(c.gameInfoOff); z.Bytes(c.pendingGameInfo); z.B(c.gameInfoPending);
+    z.B(c.mpBusy); z.V(c.mpPoll); z.V(c.mpGot); z.V(c.mpN); z.V(c.mpStride); z.V(c.mpTxopUs); z.V(c.mpLen); z.V(c.mpHdr); z.V(c.mpTmptt);
+    z.V(c.mpRemain); z.Bytes(c.mpInd); z.V(c.mpFailed); z.V(c.mpTxopOrig);
+    z.V(c.aid); z.V(c.pmac); z.V(c.bufBusy); z.V(c.lastCmdSeq); z.V(c.cmdFlags); z.V(c.beaconPeriod);
+    z.V(c.vX); z.V(c.rssi); z.V(c.rssiIdx); z.V(c.camLife);
+    z.Seq(c.inds, [&](Ind& in) { z.V(in.code); z.Bytes(in.b); });
+    z.Seq(c.autoDeAuth, [&](std::vector<u8>& v) { z.Bytes(v); });
+    z.V(c.joinDesc); z.V(c.joinTgid); z.V(c.joinPSize); z.V(c.joinCSize); z.V(c.joinAttr); z.V(c.joinRssi);
+}
+
 bool Activate(Ctx& c, u32 req)
 {
     NDS& nds = c.nds;
@@ -2438,7 +2475,36 @@ bool Activate(Ctx& c, u32 req)
 }
 }
 
+
+
+void DoSavestate(NDS& nds, Savestate* f)
+{
+    Ctx& c = GetOrMake(nds);
+    if (!f->Saving)
+    {
+        const int inst = c.inst, allow = c.allow;
+        Reset(nds);
+        Get(nds)->inst = inst; Get(nds)->allow = allow;
+        if (!f->HasSection("WMNA")) return;
+    }
+    Ctx& d = *Get(nds);
+    f->Section("WMNA");
+    u32 ver = kSaveVer;
+    f->Var32(&ver);
+    if (ver != kSaveVer) { f->Error = true; return; }
+    SS z{f};
+    Visit(d, z);
+    if (!f->Saving && d.active)
+    {
+        nds.RegisterEventFuncs(Event_WMN, &d, {[](void* that, u32 p) { OnEvent(that, p); }});
+        nds.Wifi.WMNOwns = true;
+        nds.GPU.WMLine = d.vX;
+        d.wake = (nds.SchedListMask & (1 << Event_WMN)) ? nds.SchedList[Event_WMN].Timestamp : ~0ull;
+    }
+}
+
 void Reset(NDS& nds)
+{(NDS& nds)
 {
     Ctx* p = Get(nds);
     if (!p) return;

@@ -869,6 +869,9 @@ bool NDS::DoSavestate(Savestate* file)
 #ifdef LITEV_A7HLE
     A7HLE::DoSavestate(*this, file);
 #endif
+#ifdef LITEV_A7_NATIVE_WM
+    WMNative::DoSavestate(*this, file);
+#endif
 #ifdef JIT_ENABLED
     // last: loading rebuilds the block cache against the memory, CPU and HLE state loaded above
     JIT.DoSavestate(file);
