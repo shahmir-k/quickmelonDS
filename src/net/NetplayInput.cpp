@@ -120,7 +120,7 @@ static sockaddr_in ParseAddr(const std::string& ipPort)
 }
 
 NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::vector<std::pair<int, std::string>>& peers, int latencyMs, const NetFaults& faults)
-    : Local(localPlayer), DelayFrames(delayFrames), Faults(faults), CurDelay(delayFrames)
+    : Local(localPlayer), DelayFrames(delayFrames), BindPort(bindPort), Faults(faults), CurDelay(delayFrames)
 {
     Faults.LatencyMs = latencyMs;
     for (int p = 0; p < kMaxPlayers; p++)
@@ -241,15 +241,158 @@ void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
     Send();
 }
 
+bool NetplayInput::ArmHandoffSession(u64 epoch, const std::array<u8, 16>& token,
+                                     int localStartupPort,
+                                     const std::vector<std::pair<int, std::string>>& startupPeers)
+{
+    if (!epoch || token == std::array<u8, 16>{} || localStartupPort <= 0 || localStartupPort > 65535 ||
+        localStartupPort == BindPort || localStartupPort == BindPort + 2 ||
+        startupPeers.size() != Peers.size()) return false;
+    bool seen[kMaxPlayers]{};
+    u8 addresses[kMaxPlayers][16]{};
+    for (const auto& [player, address] : startupPeers)
+    {
+        if (!IsPeer(player) || seen[player]) return false;
+        seen[player] = true;
+        const sockaddr_in parsed = ParseAddr(address);
+        if (!parsed.sin_port || !parsed.sin_addr.s_addr) return false;
+        for (int prior : Peers)
+        {
+            if (prior == player || !seen[prior]) continue;
+            sockaddr_in old{};
+            memcpy(&old, addresses[prior], sizeof(old));
+            if (old.sin_addr.s_addr == parsed.sin_addr.s_addr && old.sin_port == parsed.sin_port)
+                return false;
+        }
+        memcpy(addresses[player], &parsed, sizeof(parsed));
+    }
+    for (int peer : Peers)
+    {
+        if (!seen[peer]) return false;
+    }
+    std::lock_guard<std::mutex> lk(Lock);
+    HandoffStartPort = localStartupPort;
+    HandoffEpoch = epoch;
+    HandoffToken = token;
+    memcpy(HandoffStartAddr, addresses, sizeof(addresses));
+    for (int peer : Peers)
+    {
+        Inputs[peer].clear();
+        RemoteUpTo[peer] = PeerAck[peer] = DelayFrames - 1;
+    }
+    return true;
+}
+
 bool NetplayInput::WaitForHandoffPeerInput(int timeoutMs)
 {
-    std::unique_lock<std::mutex> lk(Lock);
-    return Changed.wait_for(lk, std::chrono::milliseconds(timeoutMs), [&] {
-        if (!Running) return true;
+    if (!HandoffEpoch || timeoutMs <= 0) return false;
+#pragma pack(push, 1)
+    struct Proof
+    {
+        u32 Magic;
+        u8 Player;
+        u8 Ack;
+        u8 Reserved[2];
+        u64 Epoch;
+        u8 Token[16];
+        u32 Keys;
+        s16 TouchX, TouchY;
+    };
+#pragma pack(pop)
+    Proof mine{};
+    mine.Magic = 0x3150484e; // NHP1: handoff first input proof
+    mine.Player = (u8)Local;
+    mine.Epoch = HandoffEpoch;
+    memcpy(mine.Token, HandoffToken.data(), 16);
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        auto it = Inputs[Local].find(DelayFrames);
+        if (it == Inputs[Local].end()) return false;
+        mine.Keys = it->second.Keys;
+        mine.TouchX = it->second.TouchX;
+        mine.TouchY = it->second.TouchY;
+    }
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons((u16)HandoffStartPort);
+    if (bind(fd, (sockaddr*)&local, sizeof(local)) != 0) { close(fd); return false; }
+    bool proven[kMaxPlayers]{};
+    bool peerAcked[kMaxPlayers]{};
+    int ackSends = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    bool injectedStale = false;
+    while (Running && std::chrono::steady_clock::now() < deadline)
+    {
+        bool haveAll = true;
+        for (int peer : Peers) haveAll &= proven[peer];
+        mine.Ack = haveAll ? 1 : 0;
         for (int peer : Peers)
-            if (Inputs[peer].find(DelayFrames) == Inputs[peer].end()) return false;
-        return true;
-    }) && Running;
+        {
+            sockaddr_in target{};
+            memcpy(&target, HandoffStartAddr[peer], sizeof(target));
+            sendto(fd, &mine, sizeof(mine), 0, (sockaddr*)&target, sizeof(target));
+        }
+        if (haveAll) ackSends++;
+        if (!injectedStale && getenv("LITEV_MP_INJECT_STALE_INPUT"))
+        {
+            injectedStale = true;
+            int stale = socket(AF_INET, SOCK_DGRAM, 0);
+            if (stale >= 0)
+            {
+                Proof bad = mine;
+                bad.Player = (u8)Peers.front();
+                bad.Token[0] ^= 1;
+                sockaddr_in target{}; target.sin_family = AF_INET;
+                target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                target.sin_port = htons((u16)HandoffStartPort);
+                sendto(stale, &bad, sizeof(bad), 0, (sockaddr*)&target, sizeof(target));
+                close(stale);
+                fprintf(stderr, "handoff injected stale frame-0 proof\n");
+            }
+        }
+        pollfd p{fd, POLLIN, 0};
+        if (poll(&p, 1, 50) > 0 && (p.revents & POLLIN))
+        {
+            Proof incoming{};
+            sockaddr_in from{}; socklen_t fromSize = sizeof(from);
+            const ssize_t n = recvfrom(fd, &incoming, sizeof(incoming), 0, (sockaddr*)&from, &fromSize);
+            if (n == sizeof(incoming) && incoming.Magic == mine.Magic &&
+                incoming.Player < kMaxPlayers && PeerSet[incoming.Player])
+            {
+                sockaddr_in expected{};
+                memcpy(&expected, HandoffStartAddr[incoming.Player], sizeof(expected));
+                const bool valid = from.sin_family == AF_INET &&
+                    from.sin_addr.s_addr == expected.sin_addr.s_addr &&
+                    from.sin_port == expected.sin_port &&
+                    incoming.Epoch == HandoffEpoch &&
+                    memcmp(incoming.Token, HandoffToken.data(), 16) == 0;
+                if (valid)
+                {
+                    const int peer = incoming.Player;
+                    if (!proven[peer])
+                    {
+                        std::lock_guard<std::mutex> lk(Lock);
+                        Inputs[peer].clear();
+                        Inputs[peer].emplace(DelayFrames, NetplayFrameInput{incoming.Keys, incoming.TouchX, incoming.TouchY});
+                        RemoteUpTo[peer] = DelayFrames;
+                        Changed.notify_all();
+                    }
+                    proven[peer] = true;
+                    peerAcked[peer] |= incoming.Ack == 1;
+                }
+                else if (getenv("LITEV_MP_INJECT_STALE_INPUT"))
+                    fprintf(stderr, "handoff rejected stale frame-0 proof\n");
+            }
+        }
+        bool all = ackSends >= 3;
+        for (int peer : Peers) all &= proven[peer] && peerAcked[peer];
+        if (all) { close(fd); return true; }
+    }
+    close(fd);
+    return false;
 }
 
 #ifdef LITEV_NP_QUIET_HB

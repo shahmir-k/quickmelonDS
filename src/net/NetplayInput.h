@@ -161,9 +161,13 @@ public:
 
     // The local player's input sampled at `frame` (applied at frame + Delay everywhere).
     void SubmitLocal(int frame, const NetplayFrameInput& input);
-    // Startup fence for a live handoff: after SubmitLocal(0), wait until every
-    // peer has also submitted its real frame-0 input. Never consumes that input.
-    // No emulated frame may run until this succeeds.
+    // Handoff-only frame-zero proof over a separate UDP startup port. This
+    // rejects stale/wrong-endpoint first inputs, not active-LAN impersonation.
+    bool ArmHandoffSession(u64 epoch, const std::array<u8, 16>& token,
+                           int localStartupPort,
+                           const std::vector<std::pair<int, std::string>>& startupPeers);
+    // After SubmitLocal(0), wait until every expected peer proves its real
+    // frame-0 input, epoch and token. No frame may run until this succeeds.
     bool WaitForHandoffPeerInput(int timeoutMs);
 
     // The input of `player` for emulated frame `frame`; blocks until known (or Abort(), or the
@@ -209,7 +213,11 @@ private:
 #endif
     static constexpr int kResendMs = 10;
 
-    int Local, DelayFrames;
+    int Local, DelayFrames, BindPort;
+    int HandoffStartPort = 0;
+    u8 HandoffStartAddr[kMaxPlayers][16] {};
+    u64 HandoffEpoch = 0;
+    std::array<u8, 16> HandoffToken{};
     NetFaults Faults;
     int Socket = -1;
     std::vector<int> Peers;                 // the other players
