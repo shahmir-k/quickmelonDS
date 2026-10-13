@@ -850,6 +850,13 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
 
     const u32 borderDI = Cfg[GeomRead].ClearDepthIdVal;
     const u32 borderC  = Cfg[GeomRead].ClearColorVal;
+    // Antialiasing only (no edge marking): a neighbour outside the screen is never an edge. The
+    // reference AA blends by polygon edge coverage, which is full where a polygon meets the screen
+    // border, so it leaves those pixels alone; comparing against the clear border instead darkened
+    // a 1-pixel frame around any full-screen 3D layer (Pokemon White title screen).
+    const bool aaOnly = aa && !edgemark;
+    const bool upOut = aaOnly && upDepthId == Cfg[GeomRead].BorderDepthId;
+    const bool downOut = aaOnly && downDepthId == Cfg[GeomRead].BorderDepthId;
 
 #if defined(LITEV_TILE_POSTVEC) && defined(__aarch64__)
     auto pix = [&](int x) __attribute__((always_inline))
@@ -866,18 +873,20 @@ void TileRenderer3D::PostPassRow(s32 y, u32* dst, const u32* color, const u32* d
             const u32 cid = (cdi >> 24) & ID_POLY_MASK;
 
             // 4 neighbours (depth/id + colour); off-screen -> clear border.
-            const u32 lDI = (x > 0)          ? depthid[x-1] : borderDI;
+            const u32 lDI = (x > 0)          ? depthid[x-1] : aaOnly ? cdi : borderDI;
             const u32 lC  = (x > 0)          ? color[x-1]   : borderC;
-            const u32 rDI = (x < OutWidth-1) ? depthid[x+1] : borderDI;
+            const u32 rDI = (x < OutWidth-1) ? depthid[x+1] : aaOnly ? cdi : borderDI;
             const u32 rC  = (x < OutWidth-1) ? color[x+1]   : borderC;
+            const u32 uDI = upOut ? cdi : upDepthId[x];
+            const u32 dDI = downOut ? cdi : downDepthId[x];
 
 #ifdef LITEV_TILE_POSTFAST
             // an edge needs a neighbour with another polygon id: none -> the scan below finds nothing
-            if (!(((lDI ^ cdi) | (rDI ^ cdi) | (upDepthId[x] ^ cdi) | (downDepthId[x] ^ cdi)) & (ID_POLY_MASK << 24)))
+            if (!(((lDI ^ cdi) | (rDI ^ cdi) | (uDI ^ cdi) | (dDI ^ cdi)) & (ID_POLY_MASK << 24)))
                 goto postfog;
 #endif
             {
-            u32 nDI[4] = { lDI, rDI, upDepthId[x], downDepthId[x] };
+            u32 nDI[4] = { lDI, rDI, uDI, dDI };
             u32 nC [4] = { lC,  rC,  upColor[x],   downColor[x]   };
 
             bool edge = false;
