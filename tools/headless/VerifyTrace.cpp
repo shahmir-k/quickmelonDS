@@ -832,7 +832,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     // ff=F:M/F:M...: (LITEV_NP_SPEED) from this player's sampled frame F on, it requests session speed
     // M (multiplier of pace; 1 = none, 0 or -1 = uncapped), as the app's fast-forward key does.
     std::map<int, float> ffPlan;
-    int player = 0, delay = -1, port = 7100, latency = 0, players = 0, jitter = 0, loss = 0, pace = 0, adaptive = -1;
+    int player = 0, delay = -1, port = 7100, latency = 0, players = 0, jitter = 0, loss = 0, pace = 0, adaptive = -1, seed = -1;
     std::string peer, host = "127.0.0.1:7100";
     const char* np = getenv("LITEV_NETPLAY");
     if (np)
@@ -855,6 +855,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             else if (k == "loss") loss = atoi(v.c_str());
             else if (k == "pace") pace = atoi(v.c_str());
             else if (k == "adaptive") adaptive = atoi(v.c_str());
+            else if (k == "seed") seed = atoi(v.c_str());   // jitter/loss random sequence (default: 12345, every player)
             else if (k == "ff")
                 for (size_t q = 0; q < v.size();)
                 {
@@ -1090,6 +1091,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         NetFaults faults;
         faults.JitterMs = jitter;
         faults.LossPct = loss;
+        if (seed >= 0) faults.Rng.seed(seed * 16 + player);
         net = std::make_unique<NetplayInput>(player, delay, port, std::vector<std::pair<int, std::string>> {{1 - player, peer}}, latency, faults);
         if (!net->Ok()) { fprintf(stderr, "netplay: socket setup failed\n"); return 1; }
         printf("netplay: player %d, delay %d frames, port %d, peer %s, faults latency %d jitter %d loss %d%%\n", player, delay, port, peer.c_str(), latency, jitter, loss);
@@ -1107,6 +1109,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         NetFaults faults;
         faults.JitterMs = jitter;
         faults.LossPct = loss;
+        if (seed >= 0) faults.Rng.seed(seed * 16 + player);
         net = std::make_unique<NetplayInput>(player, setup.Delay, port, setup.Peers, latency, faults);
         if (!net->Ok()) { fprintf(stderr, "netplay: socket setup failed\n"); return 1; }
         printf("netplay: player %d of %d, delay %d frames, port %d, peers", player, n, setup.Delay, port);

@@ -106,6 +106,23 @@ public:
     // (ClientHost), as RecvPacket's on-time rule.
     static int HostQuiet(void* self, int inst, u64 until, u64* time, int* sender);
 #endif
+private:
+#ifdef LITEV_WIFI_EVT
+    // (Lock) consoles sleeping in a wait, and what ends it; see ResolveDeadlock
+    u16 BlockedMask = 0, InQuiet = 0, QuietGiveUp = 0;
+    const std::function<bool()>* BlockedPred[kMaxInst] {};
+    u64 QuietOff[kMaxInst] {};   // HostQuiet answers -1 while the console's clock is below this
+    void ResolveDeadlock();
+    // (Lock held) about to sleep in a wait that `pred` ends; one that has lasted 2 ms (a deadlock
+    // only costs latency to find) looks for a deadlock
+    void Blocked(int inst, const std::function<bool()>* pred, std::chrono::steady_clock::time_point start)
+    {
+        BlockedMask |= (u16)(1 << inst);
+        BlockedPred[inst] = pred;
+        if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(2)) ResolveDeadlock();
+    }
+#endif
+public:
     // (RecordMP) a Hosted server's link: every link call of its consoles is recorded for the replicas,
     // so no inline host poll (LITEV_MP_POLL_INLINE: its skips depend on the host thread's timing, which
     // left the record short of polls the replica makes), and HostQuiet goes through RecordMP, which
