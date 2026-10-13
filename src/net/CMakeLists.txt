@@ -11,6 +11,7 @@ add_library(net-utils STATIC
     NetplayInput.cpp
     ../teakra/src/makedsp1/sha256.cpp
     LAN.cpp
+    AmbientLAN.cpp
     Netplay.cpp
     MPInterface.cpp
 )

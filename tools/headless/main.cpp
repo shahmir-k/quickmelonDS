@@ -93,6 +93,11 @@ static void DumpAccessStats()
 #include <thread>
 #include "MPInterface.h"
 #include "LAN.h"
+#ifdef LITEV_AMBIENT_LAN
+#include "AmbientLAN.h"
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
 #endif
 
 using namespace melonDS;
@@ -142,7 +147,9 @@ struct Options
     std::string lanJoin;                // --lan-join <host>: join a LAN session (LITEV_HEADLESS_LAN)
     int lanHost = 0;                    // --lan-host <maxplayers>: host a LAN session instead
     int macXor = 0;                     // --mac-xor <n>: distinct firmware MAC per headless instance
-    std::string lanName = "Headless";   // --lan-name: player name shown in the host's lobby
+    std::string lanName = "Headless";
+    std::string ambient;                // --ambient <name>: Just Play local wireless (LITEV_AMBIENT_LAN)
+    bool paced = false;                 // --paced: real time (60 fps) as with a link, without one (A/B baselines)   // --lan-name: player name shown in the host's lobby
 
     // --bench-window <start>:<end>: measure avg FPS ONLY over frames [start,end]
     // (inclusive), while the total run still executes all --frames frames. Lets a
@@ -194,6 +201,13 @@ struct Options
         "                            device); runs paced at 60 fps (LITEV_HEADLESS_LAN build)\n"
         "  --lan-host <maxplayers>   host a LAN session instead (others --lan-join this machine)\n"
         "  --lan-name <name>         player name for --lan-join/--lan-host (default Headless)\n"
+        "  --ambient <name>          Just Play local wireless as <name> (LITEV_AMBIENT_LAN build): no lobby;\n"
+        "                            env LITEV_AMBIENT_ID=<hex> device id (MAC from it), LITEV_AMBIENT_PEERS=\n"
+        "                            ip:port,... unicast presence targets (as NSD), LITEV_AMBIENT_UPORT=<port>\n"
+        "                            this one's presence port, LITEV_AMBIENT_PPORT=<port> the broadcast port\n"
+        "                            (default 7065; tests), LITEV_AMBIENT_VIS=0|1|2 (everyone / while its\n"
+        "                            wireless is on / hidden); prints the nearby table + counters every 120 frames\n"
+        "  --paced                   run in real time (60 fps) as --lan-* / --ambient do, with no link (A/B baselines)\n"
         "  --mac-xor <n>             XOR the generated firmware's last MAC byte with n, so several\n"
         "                            headless instances are distinct wireless players\n"
         "  --input-script <path>     scripted button input: lines '<frame> <keys>'\n"
@@ -297,6 +311,8 @@ bool ParseArgs(int argc, char** argv, Options& o)
         else if (a == "--lan-host") o.lanHost = std::atoi(next("--lan-host").c_str());
         else if (a == "--mac-xor") o.macXor = std::atoi(next("--mac-xor").c_str());
         else if (a == "--lan-name") o.lanName = next("--lan-name");
+        else if (a == "--ambient") o.ambient = next("--ambient");
+        else if (a == "--paced") o.paced = true;
         else if (a == "--bench-window")
         {
             std::string spec = next("--bench-window");
@@ -713,9 +729,47 @@ int main(int argc, char** argv)
     // desktop melonDS on the same core version) before the game boots, then run in real time:
     // the other end is a live 60 fps instance, and DS wireless timing assumes both advance at
     // the same rate.
-    const bool lan = !opt.lanJoin.empty() || opt.lanHost > 0;
+    bool lan = !opt.lanJoin.empty() || opt.lanHost > 0 || opt.paced;
     auto lanNext = std::chrono::steady_clock::now();
-    if (lan)
+#ifdef LITEV_AMBIENT_LAN
+    melonDS::AmbientLAN* ambient = nullptr;
+    if (!opt.ambient.empty())
+    {
+        melonDS::AmbientLAN::Config c;
+        c.DeviceID = getenv("LITEV_AMBIENT_ID") ? strtoull(getenv("LITEV_AMBIENT_ID"), nullptr, 16)
+                                                : std::hash<std::string>()(opt.ambient) ^ ((u64)getpid() << 32);
+        c.Name = opt.ambient;
+        memcpy(c.GameCode, nds->NDSCartSlot.GetCart()->GetHeader().GameCode, 4);
+        if (getenv("LITEV_AMBIENT_UPORT")) c.UnicastPort = (u16)atoi(getenv("LITEV_AMBIENT_UPORT"));
+        if (getenv("LITEV_AMBIENT_PPORT")) c.PresencePort = (u16)atoi(getenv("LITEV_AMBIENT_PPORT"));   // (tests: a router that drops broadcast)
+        if (getenv("LITEV_AMBIENT_VIS")) c.Vis = atoi(getenv("LITEV_AMBIENT_VIS"));
+        auto a = std::make_unique<melonDS::AmbientLAN>(c);
+        if (!a->Ok()) { fprintf(stderr, "Ambient: could not start\n"); return 1; }
+        if (const char* peers = getenv("LITEV_AMBIENT_PEERS"))
+            for (std::string t : [&] { std::vector<std::string> v; std::string x; for (const char* q = peers;; q++) { if (!*q || *q == ',') { if (!x.empty()) v.push_back(x); x.clear(); if (!*q) break; } else x += *q; } return v; }())
+            {
+                auto colon = t.find(':');
+                if (colon == std::string::npos) continue;
+                in_addr ia;
+                if (inet_pton(AF_INET, t.substr(0, colon).c_str(), &ia) == 1) a->AddPeerAddress(ia.s_addr, (u16)atoi(t.c_str() + colon + 1));
+            }
+        // the console's MAC from the device id (two consoles with one MAC cannot see each other)
+        melonDS::Firmware& fw = nds->GetFirmware();
+        u8 mac[6];
+        melonDS::AmbientLAN::MacFromID(c.DeviceID, mac);
+        memcpy(fw.GetHeader().MacAddr.data(), mac, 6);
+        fw.UpdateChecksums();
+        printf("Ambient: '%s' id %016llx game %.4s presence port %u link port %u\n", c.Name.c_str(), (unsigned long long)c.DeviceID,
+               c.GameCode, a->GetUnicastPort(), a->GetLinkPort());
+        ambient = a.get();
+        // the app's wait for a peer's MP frame (kLanRecvTimeoutMs; LITEV_MPTIMEOUT overrides)
+        a->SetRecvTimeout(getenv("LITEV_MPTIMEOUT") ? atoi(getenv("LITEV_MPTIMEOUT")) : 50);
+        melonDS::MPInterface::Set(std::move(a), melonDS::MPInterface_Ambient);
+        lan = true;
+    }
+    else
+#endif
+    if (lan && !opt.paced)
     {
         melonDS::MPInterface::Set(melonDS::MPInterface_LAN);
         auto& l = (melonDS::LAN&) melonDS::MPInterface::Get();
@@ -955,7 +1009,20 @@ int main(int argc, char** argv)
         if (lan)
         {
             melonDS::MPInterface::Get().Process();
-            if (frame % 120 == 0)
+#ifdef LITEV_AMBIENT_LAN
+            if (ambient && frame % 120 == 0)
+            {
+                const auto st = ambient->GetStats();
+                printf("AMBIENT f%d: nearby=%u links=%u opened=%llu presence tx=%llu rx=%llu link tx=%llu rx=%llu beacons=%llu blocked=%.1fms exch=%llu rtt=%ums\n",
+                       frame, st.Nearby, st.Links, (unsigned long long)st.LinksOpened, (unsigned long long)st.PresenceTx, (unsigned long long)st.PresenceRx,
+                       (unsigned long long)st.LinkTx, (unsigned long long)st.LinkRx, (unsigned long long)st.BeaconsInjected, st.BlockedUs / 1000.0,
+                       (unsigned long long)st.Exchanges, st.MaxRttMs);
+                for (const auto& r : ambient->NearbyRows()) printf("AMBIENT  %s\n", r.c_str());
+                fflush(stdout);
+            }
+            else
+#endif
+            if (frame % 120 == 0 && melonDS::MPInterface::GetType() == melonDS::MPInterface_LAN)
             {
                 auto players = ((melonDS::LAN&) melonDS::MPInterface::Get()).GetPlayerList();
                 printf("LAN f%d:", frame);

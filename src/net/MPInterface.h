@@ -33,6 +33,7 @@ enum MPInterfaceType
     MPInterface_Local,
     MPInterface_LAN,
     MPInterface_Netplay,
+    MPInterface_Ambient,    // LITEV_AMBIENT_LAN: lobby-free local wireless (AmbientLAN)
 };
 
 struct MPPacketHeader
