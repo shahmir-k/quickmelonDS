@@ -114,11 +114,18 @@ private:
     struct Link
     {
         u64 ID = 0;
+        u64 Generation = 0;         // never reused by another occupant of this slot
         ENetPeer* P = nullptr;
         bool Up = false;
         u8 MAC[6] = {};
         u32 ActiveMs = 0, CloseAtMs = 0;
         std::vector<std::vector<u8>> Pending;   // frames sent while connecting
+    };
+    struct QueuedPacket
+    {
+        ENetPacket* Packet = nullptr;
+        u64 ID = 0, Generation = 0;
+        int Slot = -1;
     };
     struct Cand { size_t Idx; u64 ID; u64 DueUs; u32 IntervalUs; };
 
@@ -148,11 +155,12 @@ private:
     ENetHost* Host = nullptr;
     u16 LinkPort = 0;
     Link Links[16];
+    u64 NextLinkGeneration = 0;
     int NumLinks = 0;               // slots in use (connecting or up)
     int ParentSlot = -1;            // child: the link to the session's parent
     u64 LastHostID = 0;             // the device whose CMD came last (RecvHostPacket: -1 once it is gone)
     bool LastHostSet = false;
-    std::deque<ENetPacket*> RX;
+    std::deque<QueuedPacket> RX;
     std::shared_ptr<const std::vector<Peer>> View;
     u32 ViewMs = 0;
     std::set<u32> OwnGGIDs;
@@ -178,7 +186,10 @@ private:
     void OnEvent(ENetEvent& ev);
     bool Admit(ENetEvent& ev);
     int Pop(u8* data, u64* timestamp);
+    bool QueueCurrent(const QueuedPacket& q) const;
+    void DropQueuedForSlot(int slot);
     u32 UpMask() const;
+    friend struct AmbientLANQueueTestAccess;
 };
 
 }
