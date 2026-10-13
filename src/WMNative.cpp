@@ -102,7 +102,7 @@ void TraceChip(NDS& nds, int wr, u32 addr, u16 val, u64 us)
     if (!f) return;
     const u32 a = addr & 0x7FFE;
     if (a >= 0x4000 && a < 0x6000) fprintf(f, "CM %04x %04x\n", a - 0x4000, val);
-    else fprintf(f, "C%c %03x %04x us%llu pc %08x\n", wr ? 'W' : 'R', a, val, (unsigned long long)us, nds.ARM7.R[15]);
+    else fprintf(f, "C%c %03x %04x us%llu pc %08x v%u\n", wr ? 'W' : 'R', a, val, (unsigned long long)us, nds.ARM7.R[15], nds.GPU.VCount);
 }
 void TraceA7Write(NDS& nds, u32 addr, u32 val, int size)
 {

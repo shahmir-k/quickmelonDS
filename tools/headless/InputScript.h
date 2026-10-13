@@ -39,6 +39,20 @@
         90  START
         120 NONE
     -----------------------------------------------------------------------
+    Reactive steps (closed loop): lines starting with '@' form a program run in order next to the frame
+    directives (their keys are OR'ed; a program touch wins). Each step completes before the next starts:
+        @wait N                              N frames, nothing pressed
+        @until COND [timeout N]              until COND holds (checked on every finished frame)
+        @press KEYS [hold H] [gap G]         hold KEYS H frames (6), then release G frames (6)
+        @repeat KEYS every N until COND [hold H] [timeout M]   press KEYS every N frames until COND
+        @log TEXT
+        @skipif COND N                       skip the next N steps if COND holds now
+      @until / @repeat with "soft": a timeout goes on to the next step instead of stopping.
+      KEYS as above (buttons, 0x.., T:x:y). COND = one or more terms joined by '&':
+        rgb top|bot X Y W H R G B TOL        mean colour of the region within TOL per channel
+        !rgb ...                             negated
+      A timeout prints "script <file>: TIMEOUT at step N" and stops the program. Every finished step
+      prints "script <file>: step N (<line>) done at frame F" - the run log shows where a script went.
 
     Determinism: scripted input changes emulation, so a golden trace recorded
     with a script is only reproducible when replayed with the same script. The
@@ -108,7 +122,12 @@ public:
     bool TouchForFrame(int frame, int& x, int& y) const;
     bool HasTouch() const { return hasTouch_; }
 
-    // Number of parsed directives (diagnostics).
+    // Reactive program: call after every finished frame with that frame's screens (0xFFRRGGBB, 256x192
+    // each); sets the program's keys for the following frames.
+    bool HasProgram() const { return !steps_.empty(); }
+    void OnFrame(int frame, const melonDS::u32* top, const melonDS::u32* bot);
+
+        // Number of parsed directives (diagnostics).
     size_t DirectiveCount() const { return directives_.size(); }
 
     // Map a single button name (case-insensitive) to its pressed-mask bit,
@@ -118,7 +137,17 @@ public:
 private:
     struct Directive { int frame; melonDS::u32 pressed; int touchX = -1, touchY = -1; };
 
-    bool loaded_ = false;
+    struct Cond { bool neg = false; int scr = 0, x = 0, y = 0, w = 1, h = 1, r = 0, g = 0, b = 0, tol = 0; };
+    struct Step { int op = 0, n = 0, hold = 6, gap = 6, every = 30, timeout = 0; bool soft = false; melonDS::u32 keys = 0; int tx = -1, ty = -1;
+                  std::vector<Cond> conds; std::string text; };
+    std::vector<Step> steps_;
+    size_t pc_ = 0; int stepStart_ = -1; bool failed_ = false;
+    melonDS::u32 progKeys_ = 0; int progTx_ = -1, progTy_ = -1;
+    std::string path_;
+    bool Eval(const std::vector<Cond>& c, const melonDS::u32* top, const melonDS::u32* bot) const;
+    bool ParseStep(const std::string& line, std::string& err);
+
+        bool loaded_ = false;
     bool hasTouch_ = false;
     melonDS::u64 hash_ = 0;
     // Sorted ascending by frame after LoadFile().
