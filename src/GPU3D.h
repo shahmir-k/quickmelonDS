@@ -192,6 +192,7 @@ private:
     void AsyncSync() noexcept;
     void AsyncPush(const CmdFIFOEntry& e) noexcept;
     void AsyncPublish() noexcept;   // hand the logged entries to the worker
+    void AsyncPushWords(const u32* words, u32 k, u32 numCmds, u32 cur, u32 pc, u32 tp) noexcept;
     void AsyncFlush() noexcept { if (Async) AsyncPublish(); }
     void CopyGeoFrom(const GPU3D& s) noexcept;
     bool AsyncSorted = false;   // (shadow) RenderPolygonRAM holds the bank's VBlank order
