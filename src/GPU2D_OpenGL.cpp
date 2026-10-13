@@ -56,6 +56,12 @@ using Platform::LogLevel;
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
+#ifdef LITEV_GLHI_DEFER
+}
+#include "GLDeferCalls.h"
+namespace melonDS
+{
+#endif
 
 
 
@@ -119,6 +125,21 @@ bool GLRenderer2D::InitShaders()
                 "2DCompositorRun", {{"vPosition", 0}}, {{"oColor", 0}}))
             CompositorRun = 0;
     }
+#ifdef LITEV_GLHI_SPLIT3D
+    // debug.litev.glhi3d=0: off
+    Split1Prog = Split2Prog = 0;
+    if (CompFast() && GLProp("debug.litev.glhi3d", 1) != 0)
+    {
+        std::string s1 = fastFS, s2 = fastFS;
+        s1.insert(s1.find('\n') + 1, "#define SPLIT3D_STAGE1\n");
+        s2.insert(s2.find('\n') + 1, "#define SPLIT3D_STAGE2\n");
+        if (!OpenGL::CompileVertexFragmentProgram(Split1Prog, k2DCompositorVS, s1, "2DCompositorSplit1",
+                {{"vPosition", 0}}, {{"oColor", 0}, {"oOther", 1}}) ||
+            !OpenGL::CompileVertexFragmentProgram(Split2Prog, k2DCompositorVS, s2, "2DCompositorSplit2",
+                {{"vPosition", 0}}, {{"oColor", 0}}))
+            Split1Prog = Split2Prog = 0;
+    }
+#endif
     CompositorRef = 0;
     if (CompCheck() && !OpenGL::CompileVertexFragmentProgram(CompositorRef,
                                               k2DCompositorVS, CompFast() ? k2DCompositorFS : k2DCompositorFastFS,
@@ -170,7 +191,7 @@ bool GLRenderer2D::InitShaders()
     SpriteRenderTransULoc = glGetUniformLocation(SpriteShader, "uRenderTransparent");
 
 
-    for (GLuint prog : {CompositorShader, CompositorRef, CompositorRun})
+    for (GLuint prog : {CompositorShader, CompositorRef, CompositorRun, Split1Prog, Split2Prog})
     {
     if (!prog) continue;
     glUseProgram(prog);
@@ -199,6 +220,13 @@ bool GLRenderer2D::InitShaders()
     uniloc = glGetUniformBlockIndex(prog, "ubCompositorConfig");
     glUniformBlockBinding(prog, uniloc, 23);
 
+    }
+    Split1MosLoc = Split1Prog ? glGetUniformLocation(Split1Prog, "uObjMosaicAny") : -1;
+    if (Split2Prog)
+    {
+        glUseProgram(Split2Prog);
+        glUniform1i(glGetUniformLocation(Split2Prog, "SplitTex0"), 8);
+        glUniform1i(glGetUniformLocation(Split2Prog, "SplitTex1"), 9);
     }
     CompositorScaleULoc = glGetUniformLocation(CompositorShader, "uScaleFactor");
     ObjMosULoc[0] = glGetUniformLocation(CompositorShader, "uObjMosaicAny");
@@ -245,6 +273,7 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     SpriteRenderTransULoc = other.SpriteRenderTransULoc;
     CompositorScaleULoc = other.CompositorScaleULoc;
     ObjMosULoc[0] = other.ObjMosULoc[0]; ObjMosULoc[1] = other.ObjMosULoc[1];
+    Split1Prog = other.Split1Prog; Split2Prog = other.Split2Prog; Split1MosLoc = other.Split1MosLoc;
 
     MosaicTex = other.MosaicTex;
 
@@ -448,6 +477,7 @@ GLRenderer2D::~GLRenderer2D()
     glDeleteTextures(1, &OutputTex);
     glDeleteFramebuffers(1, &OutputFB);
     if (LowFB) { glDeleteTextures(1, &LowTex); glDeleteFramebuffers(1, &LowFB); LowFB = LowTex = 0; }
+    if (SplitFB) { glDeleteTextures(2, SplitTex); glDeleteFramebuffers(1, &SplitFB); SplitFB = 0; }
 
     glDeleteBuffers(1, &ScanlineConfigUBO);
     glDeleteBuffers(1, &SpriteScanlineConfigUBO);
@@ -520,7 +550,7 @@ void GLRenderer2D::SetScaleFactor(int scale)
 
     glUseProgram(CompositorShader);
     glUniform1i(CompositorScaleULoc, ScaleFactor);
-    for (GLuint prog : {CompositorRef, CompositorRun})
+    for (GLuint prog : {CompositorRef, CompositorRun, Split1Prog, Split2Prog})
     {
         if (!prog) continue;
         glUseProgram(prog);
@@ -1520,6 +1550,7 @@ void GLRenderer2D::UpdateOAM(int ystart, int yend)
 
                 if (capblock != -1)
                 {
+                    SpriteAffine = true;   // a display-capture bitmap sprite: hi-res content (glhi1x)
                     if (!is256)
                     {
                         sprcfg.Type = 3;
@@ -1863,6 +1894,7 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
         const bool any = !skipMos || SpriteMosaicAttr;
         if (ObjMosULoc[0] >= 0) { glUseProgram(CompositorShader); glUniform1i(ObjMosULoc[0], any); }
         if (CompositorRun && ObjMosULoc[1] >= 0) { glUseProgram(CompositorRun); glUniform1i(ObjMosULoc[1], any); }
+        if (Split1Prog && Split1MosLoc >= 0) { glUseProgram(Split1Prog); glUniform1i(Split1MosLoc, any); }
     }
     // debug.litev.glhi1x (default on): a screen with no hi-res content (no 3D layer, no
     // rotscale/bitmap/capture BG, no rotscaled sprite) composites to the same value at every
@@ -1876,6 +1908,15 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
     for (int l = 0; l < 4 && low; l++)
         if ((LayerEnable & (1 << l)) && LayerConfig.uBGConfig[l].Type >= 2) low = false;
     if (comp1x == 2 && ScaleFactor > 1 && !CompositorRef) low = true;
+    // LITEV_GLHI_SPLIT3D: the same, except that BG0 is the 3D layer
+    bool split = false;
+    if (!low && Split2Prog && comp1x == 1 && ScaleFactor > 1 && !SpriteAffine && !AffineUncomposited && !CompositorRef
+        && !(OpenGL::GLSkip() & 260) && (LayerEnable & 1) && LayerConfig.uBGConfig[0].Type == 6)
+    {
+        split = true;
+        for (int l = 1; l < 4; l++)
+            if ((LayerEnable & (1 << l)) && LayerConfig.uBGConfig[l].Type >= 2) split = false;
+    }
     AffineUncomposited = false;
     CompSF = low ? 1 : ScaleFactor;
     if (low)
@@ -1925,7 +1966,7 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
         glActiveTexture(GL_TEXTURE0 + i);
 
         if ((i == 0) && (DispCnt & (1<<3)) && !(OpenGL::GLSkip() & 128))
-            glBindTexture(GL_TEXTURE_2D, Parent.Get3DTex());
+            Parent.Bind3DTex();
         else
             glBindTexture(GL_TEXTURE_2D, BGLayerTex[i]);
 
@@ -1949,7 +1990,46 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
     glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
     glBindVertexArray(Parent.RectVtxArray);
     OpenGL::GLStatAdd(OpenGL::GLStatComp);
-    if (!(OpenGL::GLSkip() & (4 | 256)) && CompositorRun && DrawRuns(ystart, yend)) {}
+    if (split)
+    {
+        if (!SplitFB)
+        {
+            glGenTextures(2, SplitTex);
+            for (int i = 0; i < 2; i++)
+            {
+                glBindTexture(GL_TEXTURE_2D, SplitTex[i]);
+                glDefaultTexParams(GL_TEXTURE_2D);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            }
+            glGenFramebuffers(1, &SplitFB);
+            glBindFramebuffer(GL_FRAMEBUFFER, SplitFB);
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, SplitTex[0], 0);
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, SplitTex[1], 0);
+            const GLenum bufs[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+            glDrawBuffers(2, bufs);
+        }
+        // stage 1 at 1x: everything but the 3D layer
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, SplitFB);
+        glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);   // the sprite pass leaves buffer 1's blue masked
+        glViewport(0, 0, 256, 192);
+        glScissor(0, ystart, 256, yend - ystart);
+        glUseProgram(Split1Prog);
+        glDrawArrays(GL_TRIANGLES, 0, 2*3);
+        // stage 2 at Nx: join the 3D
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+        glViewport(0, 0, ScreenW, ScreenH);
+        glScissor(0, ystart * ScaleFactor, ScreenW, (yend - ystart) * ScaleFactor);
+        glActiveTexture(GL_TEXTURE8);
+        glBindTexture(GL_TEXTURE_2D, SplitTex[0]);
+        glActiveTexture(GL_TEXTURE9);
+        glBindTexture(GL_TEXTURE_2D, SplitTex[1]);
+        glActiveTexture(GL_TEXTURE0);
+        glUseProgram(Split2Prog);
+        glDrawArrays(GL_TRIANGLES, 0, 2*3);
+        static const bool check = GLProp("debug.litev.glhi1xcheck", 0) != 0;
+        if (check) Check1x(ystart, yend);
+    }
+    else if (!(OpenGL::GLSkip() & (4 | 256)) && CompositorRun && DrawRuns(ystart, yend)) {}
     else
     {
         if (!(OpenGL::GLSkip() & 4)) glDrawArrays(GL_TRIANGLES, 0, 2*3);
@@ -2003,8 +2083,29 @@ void GLRenderer2D::Check1x(int ystart, int yend)
     glReadPixels(0, y0, ScreenW, h, GL_RGBA, GL_UNSIGNED_BYTE, r.data());
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+    static int logged = 0;
     for (size_t i = 0; i < a.size(); i += 4)
-        if (memcmp(&a[i], &r[i], 3)) bad++;
+        if (memcmp(&a[i], &r[i], 3))
+        {
+            if (!bad && logged < 30)
+            {
+                logged++;
+                const int p = (int)(i / 4);
+                u8 sp[2][4] = {};
+                if (CompSF != 1 && SplitFB)
+                    for (int k = 0; k < 2; k++)
+                    {
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, SplitFB);
+                        glReadBuffer(GL_COLOR_ATTACHMENT0 + k);
+                        glReadPixels((p % ScreenW) / ScaleFactor, (y0 + p / ScreenW) / ScaleFactor, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sp[k]);
+                        glReadBuffer(GL_COLOR_ATTACHMENT0);
+                    }
+                Platform::Log(Platform::Info, "LITEV_HI1XCHECK diff at x %d y %d (screen %d, %s): got %d %d %d want %d %d %d | split0 %d %d %d info %d other %d %d %d %d\n",
+                              p % ScreenW, y0 + p / ScreenW, GPU2D.Num, CompSF == 1 ? "1x" : "split", a[i], a[i+1], a[i+2], r[i], r[i+1], r[i+2],
+                              sp[0][0], sp[0][1], sp[0][2], sp[0][3], sp[1][0], sp[1][1], sp[1][2], sp[1][3]);
+            }
+            bad++;
+        }
     px += a.size() / 4;
     if (++checks % 20 == 0)
     {

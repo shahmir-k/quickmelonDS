@@ -17,6 +17,7 @@
 */
 
 #include <string.h>
+#include <vector>
 #include "NDS.h"
 #include "GPU_OpenGL.h"
 #include "GLThread3D.h"
@@ -25,11 +26,18 @@
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
+#include "GLDefer.h"
+#ifdef LITEV_GLHI_DEFER
+#include "GLDeferCalls.h"
+#endif
 
 namespace melonDS
 {
 using Platform::Log;
 using Platform::LogLevel;
+
+GLDefer::Recorder* GLDefer::Active = nullptr;
+thread_local bool GLDefer::RecordThread = false;
 
 #include "OpenGL_shaders/FinalPassVS.h"
 #include "OpenGL_shaders/FinalPassFS.h"
@@ -109,6 +117,23 @@ void GLRenderer::BlitFront(int front, GLuint dstTex, int dstWidth, GLuint readFB
 void GLRenderer::PresentIntoAsync(GLuint dstTex, int dstWidth, std::function<void()> pre, std::function<void()> post)
 {
     const int front = BackBuffer ^ 1;
+    if (GLDefer::Recording())
+    {
+        // the closures are not plain data: hand them over on the heap
+        struct Job { std::function<void()> Pre, Post; };
+        Job* job = new Job{std::move(pre), std::move(post)};
+        GLDefer::Exec([this, front, dstTex, dstWidth, job] {
+            PresentIntoImpl(front, dstTex, dstWidth, std::move(job->Pre), std::move(job->Post));
+            delete job;
+        });
+        Defer->Submit();
+        return;
+    }
+    PresentIntoImpl(front, dstTex, dstWidth, std::move(pre), std::move(post));
+}
+
+void GLRenderer::PresentIntoImpl(int front, GLuint dstTex, int dstWidth, std::function<void()> pre, std::function<void()> post)
+{
     if (!Present)
     {
         Present = std::make_unique<GLWorker>();
@@ -136,13 +161,30 @@ void GLRenderer::PresentIntoAsync(GLuint dstTex, int dstWidth, std::function<voi
     }, false);
 }
 
+
 void GLRenderer::WaitPresent()
 {
+    if (Defer && GLDefer::RecordThread) Defer->Drain();
     if (Present && PresDone.load(std::memory_order_acquire) < PresSeq) Present->Wait();
 }
 
 void GLRenderer::Start3DRendering()
 {
+    // the 3D job may texture from this frame's display captures: with LITEV_GLHI_DEFER they are
+    // written on the worker, so it waits on the worker's fence after them (the 3D kick's own
+    // fence would only cover this thread's context)
+    if (Defer && CapturedSince3D && Thread3D && GLDefer::Recording())
+    {
+        GLsync f = nullptr;
+        Defer->RunSync([&f] { f = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0); glFlush(); });
+        Thread3D->ExtInFence = f;
+    }
+    CapturedSince3D = false;
+    // an identical 3D frame keeps its colour buffer and its job may write it again while the
+    // worker still samples it for the frame before: let the worker finish first
+    static const bool skipSync = OpenGL::Prop("glhiskipsync", 1) != 0;
+    if (Defer && Thread3D && GLDefer::Recording() && GPU.GPU3D.RenderFrameIdentical && skipSync)
+        Defer->Drain();
     if (Thread3D) Prev3DColor = Thread3D->GL->GetCurColor();
     Rend3D->RenderFrame();
     Synced3D = false;
@@ -164,8 +206,50 @@ GLuint GLRenderer::Get3DTex()
         }();
         OutputTex3D = Thread3D->SyncColor(late ? Prev3DColor : Thread3D->GL->GetCurColor());
         Synced3D = true;
+        static const bool dbg = [] { char b[92] = {}; return __system_property_get("debug.litev.glhidbg", b) > 0 && atoi(b) != 0; }();
+        if (dbg) Platform::Log(Platform::Info, "LITEV_GLHIC frame %u c %d\n", GPU.NDS.NumFrames, late ? Prev3DColor : Thread3D->GL->GetCurColor());
     }
     return OutputTex3D;
+}
+
+void GLRenderer::Bind3DTex()
+{
+    if (Thread3D && GLDefer::Recording())
+    {
+        // which colour buffer is decided now; the worker waits for its render and binds it
+        static const bool late = [] {
+#ifdef __ANDROID__
+            char b[92] = {}; return !(__system_property_get("debug.litev.glhilate", b) > 0 && atoi(b) == 0);
+#else
+            return true;
+#endif
+        }();
+        const int c = late ? Prev3DColor : Thread3D->GL->GetCurColor();
+        GLThread3D* t = Thread3D;
+        const u64 seq = t->ColorSeq[c];
+        const u32 fr = GPU.NDS.NumFrames;
+        {
+            static const bool dbg = [] { char b[92] = {}; return __system_property_get("debug.litev.glhidbg", b) > 0 && atoi(b) != 0; }();
+            static u32 lastFr = ~0u; static int lastC = -1;
+            if (dbg && (fr != lastFr || c != lastC)) Platform::Log(Platform::Info, "LITEV_GLHIC frame %u c %d\n", fr, c);
+            lastFr = fr; lastC = c;
+        }
+        GLDefer::Exec([t, c, seq, fr] {
+            static const bool dbg = [] { char b[92] = {}; return __system_property_get("debug.litev.glhidbg", b) > 0 && atoi(b) != 0; }();
+            if (dbg && t->ColorSeq[c] != seq)
+                Platform::Log(Platform::Info, "LITEV_GLHIDBG frame %u colour %d seq %llu -> %llu (done %llu)\n", fr, c,
+                              (unsigned long long)seq, (unsigned long long)t->ColorSeq[c], (unsigned long long)t->DoneSeq.load());
+            glBindTexture(GL_TEXTURE_2D, t->SyncColor(c));
+        });
+        return;
+    }
+    glBindTexture(GL_TEXTURE_2D, Get3DTex());
+}
+
+void GLRenderer::RunGL(const std::function<void()>& f)
+{
+    if (Defer) Defer->RunSync(f);
+    else f();
 }
 
 #define glTexParams(target, wrap) \
@@ -175,6 +259,37 @@ GLuint GLRenderer::Get3DTex()
     glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
 bool GLRenderer::Init()
+{
+#ifdef LITEV_GLHI_DEFER
+    // debug.litev.glhidefer=0: GL calls on the emulator thread as before
+    static const bool defer = [] {
+#ifdef __ANDROID__
+        char b[92] = {}; return !(__system_property_get("debug.litev.glhidefer", b) > 0 && atoi(b) == 0);
+#else
+        return false;
+#endif
+    }();
+    if (defer && !IsCompute && Thread3D && !GLDefer::Active)
+    {
+        auto d = std::make_unique<GLDefer::Recorder>();
+        d->W = std::make_unique<GLWorker>();
+        d->W->StartThread("glhi-2d");
+        if (d->W->Threaded)
+        {
+            Defer = std::move(d);
+            Defer->MaxPending = OpenGL::Prop("glhidepth", 2);   // debug.litev.glhidepth: queued batches before the emulator waits
+            GLDefer::Active = Defer.get();
+            GLDefer::RecordThread = true;
+            bool ok = false;
+            Defer->RunSync([&] { ok = InitGL(); });
+            return ok;
+        }
+    }
+#endif
+    return InitGL();
+}
+
+bool GLRenderer::InitGL()
 {
     assert(glEnable != nullptr);
 
@@ -356,13 +471,33 @@ bool GLRenderer::Init()
     if (Thread3D)
         // a colour ring, so the frame shown keeps its 3D while the next one renders;
         // glFinish: the storage must be complete before this context uses it
-        Thread3D->Run([this] { Thread3D->GL->SetColorRing(4); glFinish(); }, true);
+    {
+        // LITEV_GLHI_DEFER: the worker samples a frame's 3D up to a frame later, while the 3D
+        // thread renders up to two ahead: more ring entries, so the one it reads is not reused
+        const int ring = Defer ? GLRenderer3D::MaxColorRing : 4;
+        Thread3D->Run([this, ring] { Thread3D->GL->SetColorRing(ring); glFinish(); }, true);
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return true;
 }
 
 GLRenderer::~GLRenderer()
+{
+    if (Defer)
+    {
+        // every object of this renderer lives on the worker's context: delete them there
+        WaitPresent();
+        Defer->RunSync([this] { DeleteGL(); Rend2D_A.reset(); Rend2D_B.reset(); });
+        GLDefer::Active = nullptr;
+        GLDefer::RecordThread = false;
+        Defer.reset();
+        return;
+    }
+    DeleteGL();
+}
+
+void GLRenderer::DeleteGL()
 {
     WaitPresent();
     if (Present)
@@ -408,6 +543,7 @@ GLRenderer::~GLRenderer()
 
 void GLRenderer::Reset()
 {
+    if (GLDefer::Recording()) { Defer->RunSync([this] { Reset(); }); return; }
     memset(&FinalPassConfig, 0, sizeof(FinalPassConfig));
     memset(&CaptureConfig, 0, sizeof(CaptureConfig));
 
@@ -443,6 +579,7 @@ void GLRenderer::PreSavestate()
 
 void GLRenderer::PostSavestate()
 {
+    if (GLDefer::Recording()) { Defer->RunSync([this] { PostSavestate(); }); return; }
     Reset();
 
     auto rend2D = dynamic_cast<GLRenderer2D*>(Rend2D_A.get());
@@ -454,6 +591,7 @@ void GLRenderer::PostSavestate()
 
 void GLRenderer::SetRenderSettings(RendererSettings& settings)
 {
+    if (GLDefer::Recording()) { Defer->RunSync([&] { SetRenderSettings(settings); }); return; }
     SetScaleFactor(settings.ScaleFactor);
 
     auto rend2d = dynamic_cast<GLRenderer2D*>(Rend2D_A.get());
@@ -666,14 +804,18 @@ void GLRenderer::DrawSprites(u32 line)
 void GLRenderer::RenderScreen(int ystart, int yend)
 {
     int backbuf = BackBuffer;
-    // the present thread may still be copying this buffer out (its previous frame)
-    if (Present && PresDone.load(std::memory_order_acquire) < BufPresSeq[backbuf]) LSP_WAIT("hi-present", GPU.NDS.NumFrames, Present->Wait());
-    if (BufFence[backbuf])
-    {
-        glWaitSync(BufFence[backbuf], 0, GL_TIMEOUT_IGNORED);
-        glDeleteSync(BufFence[backbuf]);
-        BufFence[backbuf] = nullptr;
-    }
+    // the present thread may still be copying this buffer out (its previous frame); with
+    // LITEV_GLHI_DEFER this runs on the worker, which also owns Present
+    const u32 nframe = GPU.NDS.NumFrames;
+    GLDefer::Exec([this, backbuf, nframe] {
+        if (Present && PresDone.load(std::memory_order_acquire) < BufPresSeq[backbuf]) LSP_WAIT("hi-present", nframe, Present->Wait());
+        if (BufFence[backbuf])
+        {
+            glWaitSync(BufFence[backbuf], 0, GL_TIMEOUT_IGNORED);
+            glDeleteSync(BufFence[backbuf]);
+            BufFence[backbuf] = nullptr;
+        }
+    });
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, FPOutputFB[backbuf]);
 
@@ -791,6 +933,41 @@ void GLRenderer::VBlank()
 
     LastLine = 0;
     LastCapLine = 0;
+
+    // debug.litev.glhihash=1: hash both screens of every frame's final output (LITEV_GLHIHASH),
+    // in the GL order (on the worker with LITEV_GLHI_DEFER): an exact per-frame output check
+    static const bool hashOn = OpenGL::Prop("glhihash", 0) != 0;
+    if (hashOn)
+    {
+        const int buf = BackBuffer; const u32 fr = GPU.NDS.NumFrames;
+        GLDefer::Exec([this, buf, fr] {
+            static GLuint fb = 0;
+            if (!fb) glGenFramebuffers(1, &fb);
+            static std::vector<u8> px;
+            px.resize((size_t)ScreenW * ScreenH * 4);
+            u64 h[2];
+            for (int l = 0; l < 2; l++)
+            {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+                glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, FPOutputTex[buf], 0, l);
+                glReadPixels(0, 0, ScreenW, ScreenH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                u64 x = 1469598103934665603ULL;
+                for (u8 b : px) { x ^= b; x *= 1099511628211ULL; }
+                h[l] = x;
+            }
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+            Log(LogLevel::Info, "LITEV_FBHASH frame=%u top=0x%016llx bot=0x%016llx\n", fr, (unsigned long long)h[0], (unsigned long long)h[1]);
+        });
+    }
+
+    if (GLDefer::Recording())
+    {
+        // at most MaxPending frames of calls queued: the emulator never runs far ahead
+        if (Defer->MaxPending <= 0) { Defer->Drain(); return; }   // glhidepth=0: in lockstep (diagnostic)
+        if (Defer->Pending.load(std::memory_order_acquire) >= Defer->MaxPending)
+            LSP_WAIT("hi-defer", GPU.NDS.NumFrames, Defer->W->WaitQueued());
+        Defer->Submit();
+    }
 }
 
 void GLRenderer::VBlankEnd()
@@ -801,6 +978,16 @@ void GLRenderer::VBlankEnd()
 
 void GLRenderer::DoCapture(int ystart, int yend)
 {
+    CapturedSince3D = true;
+    // LITEV_GLHI_DEFER: the 3D job kicked last may still read the capture textures this
+    // capture rewrites (3D textures from captures); the worker waits for it first (on the
+    // emulator thread that job runs long before the next frame's capture)
+    if (Thread3D && GLDefer::Recording())
+    {
+        GLThread3D* t = Thread3D;
+        const int c = t->GL->GetCurColor();
+        GLDefer::Exec([t, c] { t->SyncColor(c); });
+    }
     u32 dispcnt = DispCntA;
     u32 capcnt = CaptureCnt;
     u32 dispmode = (dispcnt >> 16) & 0x3;
@@ -837,11 +1024,7 @@ void GLRenderer::DoCapture(int ystart, int yend)
 
     glUseProgram(CaptureShader);
 
-    GLuint inputA;
-    if (srcA)
-        inputA = Get3DTex();
-    else
-        inputA = OutputTex2D[0];
+    const GLuint inputA2D = OutputTex2D[0];   // srcA: the 3D output (Bind3DTex below)
 
     bool useSrcB = (dstmode == 1) || (dstmode == 2 && evb > 0);
 
@@ -934,7 +1117,8 @@ void GLRenderer::DoCapture(int ystart, int yend)
     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, inputA);
+    if (srcA) Bind3DTex();
+    else glBindTexture(GL_TEXTURE_2D, inputA2D);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
 
@@ -1057,6 +1241,8 @@ static void ReadCapture1555(int y, int w, int h, u8* dst)
 
 void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
 {
+    // reads the capture back into emulated VRAM: needs every call so far, now
+    if (GLDefer::Recording()) { Defer->RunSync([&] { SyncVRAMCapture(bank, start, len, complete); }); return; }
     if (!complete)
         Log(LogLevel::Error, "GPU_OpenGL: !!! READING VRAM AS IT IS BEING CAPTURED TO\n");
 

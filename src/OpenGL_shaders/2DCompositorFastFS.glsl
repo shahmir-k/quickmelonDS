@@ -75,7 +75,18 @@ uniform bool uObjMosaicAny;
 
 smooth in vec4 fTexcoord;
 
+#ifdef SPLIT3D_STAGE1
+// LITEV_GLHI_SPLIT3D stage 1 (1x): the composite without the 3D layer, and how the 3D layer
+// would enter it: oColor = (that composite, info), oOther = the other layer's colour
+layout(location = 0) out vec4 oColor;
+layout(location = 1) out vec4 oOther;
+#else
 out vec4 oColor;
+#endif
+#ifdef SPLIT3D_STAGE2
+uniform sampler2D SplitTex0;   // stage 1 oColor (native)
+uniform sampler2D SplitTex1;   // stage 1 oOther (native)
+#endif
 
 int MosaicX = 0;
 
@@ -268,120 +279,9 @@ void CalcSpriteMosaic(in ivec2 coord, out ivec4 objflags, out vec4 objcolor)
     }
 }
 
-#ifndef COMPDIAG
-#define COMPDIAG 0   // diagnostic variants (debug.litev.glcomp=2..5), wrong pixels by design
-#endif
-// Fast variant (debug.litev.glcomp, default on; 0 = 2DCompositorFS.glsl). Same result:
-// - disabled BGs are not fetched (uniform branches)
-// - the 4x5 priority loop becomes a top-two selection over per-layer draw-order keys
-//   (key = the iteration at which the original loop would have written the layer; the
-//   last write wins, so the top layer is the max key and the second the next one)
-// - blend maths in mediump ints (values stay below 2^12)
-vec4 CompositeLayers()
+// the final colour from the top two layers (t: layer index, -1 backdrop) and their colours
+vec4 Resolve(mediump int t1, mediump int t2, vec4 c1, vec4 c2, ivec4 objflags, uint winsel, int line)
 {
-    ivec2 coord = ivec2(fTexcoord.zw);
-    vec2 bgcoord = vec2(fTexcoord.x, fract(fTexcoord.y));
-    int xpos = int(fTexcoord.x);
-#if COMPDIAG == 2
-    int line = 0;
-#else
-    int line = int(fTexcoord.y);
-#endif
-
-    ivec4 mosaicsize = SL(line).MosaicSize;
-    if (mosaicsize.x > 0)
-        MosaicX = texelFetch(MosaicTex, ivec2(bgcoord.x, mosaicsize.x), 0).r;
-
-    uint winregs = SL(line).WinRegs;
-    int winmask = SL(line).WinMask;
-    ivec4 winpos = SL(line).WinPos;
-
-    vec4 lc0 = vec4(0), lc1 = vec4(0), lc2 = vec4(0), lc3 = vec4(0), lc4 = vec4(0);
-#if COMPDIAG == 4
-    lc0 = lc1 = lc2 = lc3 = vec4(0.5);
-#elif COMPDIAG == 5
-    if (uBGPrio[0] >= 0) lc0 = BG0CalcAndFetch(bgcoord, line);
-#else
-    if (uBGPrio[0] >= 0) lc0 = BG0CalcAndFetch(bgcoord, line);
-    if (uBGPrio[1] >= 0) lc1 = BG1CalcAndFetch(bgcoord, line);
-    if (uBGPrio[2] >= 0) lc2 = BG2CalcAndFetch(bgcoord, line);
-    if (uBGPrio[3] >= 0) lc3 = BG3CalcAndFetch(bgcoord, line);
-#endif
-
-    ivec4 objflags = ivec4(0);
-#if COMPDIAG == 3
-    if (false)
-#else
-    if (mosaicsize.z > 0 && uObjMosaicAny)
-#endif
-    {
-        vec4 oc;
-        CalcSpriteMosaic(ivec2(fTexcoord.xy), objflags, oc);
-        lc4 = oc;
-    }
-#if COMPDIAG != 3
-    else if (mosaicsize.z > 0)
-    {
-        ivec2 p1 = ivec2(fTexcoord.xy) * uScaleFactor;
-        lc4 = texelFetch(OBJLayerTex, ivec3(p1, 0), 0);
-        objflags = ivec4(texelFetch(OBJLayerTex, ivec3(p1, 1), 0) * 255.0);
-    }
-#endif
-#if COMPDIAG != 3
-    else
-#else
-    if (false)
-#endif
-    {
-        lc4 = texelFetch(OBJLayerTex, ivec3(coord, 0), 0);
-        objflags = ivec4(texelFetch(OBJLayerTex, ivec3(coord, 1), 0) * 255.0);
-    }
-
-    bool inside_win0, inside_win1;
-
-    if (xpos < winpos[0])
-        inside_win0 = ((winmask & (1<<0)) != 0);
-    else if (xpos < winpos[1])
-        inside_win0 = ((winmask & (1<<1)) != 0);
-    else
-        inside_win0 = ((winmask & (1<<2)) != 0);
-
-    if (xpos < winpos[2])
-        inside_win1 = ((winmask & (1<<3)) != 0);
-    else if (xpos < winpos[3])
-        inside_win1 = ((winmask & (1<<4)) != 0);
-    else
-        inside_win1 = ((winmask & (1<<5)) != 0);
-
-    uint winsel = winregs;
-    if (objflags.b > 0)
-        winsel = winregs >> 8;
-    if (inside_win1)
-        winsel = winregs >> 16;
-    if (inside_win0)
-        winsel = winregs >> 24;
-
-    // draw-order keys (-1: not drawn). Original order: prio 3..0, within a prio BG3..BG0 then OBJ.
-    mediump int k0 = (uBGPrio[0] >= 0 && lc0.a > 0.0 && (winsel & 1u) != 0u) ? (3 - uBGPrio[0]) * 5 + 3 : -1;
-    mediump int k1 = (uBGPrio[1] >= 0 && lc1.a > 0.0 && (winsel & 2u) != 0u) ? (3 - uBGPrio[1]) * 5 + 2 : -1;
-    mediump int k2 = (uBGPrio[2] >= 0 && lc2.a > 0.0 && (winsel & 4u) != 0u) ? (3 - uBGPrio[2]) * 5 + 1 : -1;
-    mediump int k3 = (uBGPrio[3] >= 0 && lc3.a > 0.0 && (winsel & 8u) != 0u) ? (3 - uBGPrio[3]) * 5 + 0 : -1;
-    mediump int k4 = (uEnableOBJ && lc4.a > 0.0 && (winsel & 16u) != 0u) ? (3 - objflags.a) * 5 + 4 : -1;
-
-    // top two by key; the backdrop (key -1, mask 0x20) sits under everything
-    mediump int t1 = -1, t2 = -1;         // layer index of top / second (-1 backdrop, -2 none)
-    mediump int kb1 = -1, kb2 = -2;
-    vec4 c1 = vec4(0), c2 = vec4(0);
-#define TOP2(k, i, c) \
-    if (k > kb1) { kb2 = kb1; t2 = t1; c2 = c1; kb1 = k; t1 = i; c1 = c; } \
-    else if (k > kb2) { kb2 = k; t2 = i; c2 = c; }
-    if (k0 >= 0) { TOP2(k0, 0, lc0) }
-    if (k1 >= 0) { TOP2(k1, 1, lc1) }
-    if (k2 >= 0) { TOP2(k2, 2, lc2) }
-    if (k3 >= 0) { TOP2(k3, 3, lc3) }
-    if (k4 >= 0) { TOP2(k4, 4, lc4) }
-#undef TOP2
-
     mediump ivec4 back = ivec4(ConvertColor(SL(line).BackColor), 0x20);
     mediump ivec4 col1, col2;
     mediump int mask1, mask2;
@@ -462,7 +362,166 @@ vec4 CompositeLayers()
     return vec4(vec3(col1.rgb << 2) / 255.0, 1);
 }
 
+#ifndef COMPDIAG
+#define COMPDIAG 0   // diagnostic variants (debug.litev.glcomp=2..5), wrong pixels by design
+#endif
+// Fast variant (debug.litev.glcomp, default on; 0 = 2DCompositorFS.glsl). Same result:
+// - disabled BGs are not fetched (uniform branches)
+// - the 4x5 priority loop becomes a top-two selection over per-layer draw-order keys
+//   (key = the iteration at which the original loop would have written the layer; the
+//   last write wins, so the top layer is the max key and the second the next one)
+// - blend maths in mediump ints (values stay below 2^12)
+vec4 CompositeLayers()
+{
+    ivec2 coord = ivec2(fTexcoord.zw);
+    vec2 bgcoord = vec2(fTexcoord.x, fract(fTexcoord.y));
+    int xpos = int(fTexcoord.x);
+#if COMPDIAG == 2
+    int line = 0;
+#else
+    int line = int(fTexcoord.y);
+#endif
+
+    ivec4 mosaicsize = SL(line).MosaicSize;
+    if (mosaicsize.x > 0)
+        MosaicX = texelFetch(MosaicTex, ivec2(bgcoord.x, mosaicsize.x), 0).r;
+
+    uint winregs = SL(line).WinRegs;
+    int winmask = SL(line).WinMask;
+    ivec4 winpos = SL(line).WinPos;
+
+    vec4 lc0 = vec4(0), lc1 = vec4(0), lc2 = vec4(0), lc3 = vec4(0), lc4 = vec4(0);
+#if COMPDIAG == 4
+    lc0 = lc1 = lc2 = lc3 = vec4(0.5);
+#elif COMPDIAG == 5
+    if (uBGPrio[0] >= 0) lc0 = BG0CalcAndFetch(bgcoord, line);
+#else
+#ifndef SPLIT3D_STAGE1
+    if (uBGPrio[0] >= 0) lc0 = BG0CalcAndFetch(bgcoord, line);
+#endif
+    if (uBGPrio[1] >= 0) lc1 = BG1CalcAndFetch(bgcoord, line);
+    if (uBGPrio[2] >= 0) lc2 = BG2CalcAndFetch(bgcoord, line);
+    if (uBGPrio[3] >= 0) lc3 = BG3CalcAndFetch(bgcoord, line);
+#endif
+
+    ivec4 objflags = ivec4(0);
+#if COMPDIAG == 3
+    if (false)
+#else
+    if (mosaicsize.z > 0 && uObjMosaicAny)
+#endif
+    {
+        vec4 oc;
+        CalcSpriteMosaic(ivec2(fTexcoord.xy), objflags, oc);
+        lc4 = oc;
+    }
+#if COMPDIAG != 3
+    else if (mosaicsize.z > 0)
+    {
+        ivec2 p1 = ivec2(fTexcoord.xy) * uScaleFactor;
+        lc4 = texelFetch(OBJLayerTex, ivec3(p1, 0), 0);
+        objflags = ivec4(texelFetch(OBJLayerTex, ivec3(p1, 1), 0) * 255.0);
+    }
+#endif
+#if COMPDIAG != 3
+    else
+#else
+    if (false)
+#endif
+    {
+        lc4 = texelFetch(OBJLayerTex, ivec3(coord, 0), 0);
+        objflags = ivec4(texelFetch(OBJLayerTex, ivec3(coord, 1), 0) * 255.0);
+    }
+
+    bool inside_win0, inside_win1;
+
+    if (xpos < winpos[0])
+        inside_win0 = ((winmask & (1<<0)) != 0);
+    else if (xpos < winpos[1])
+        inside_win0 = ((winmask & (1<<1)) != 0);
+    else
+        inside_win0 = ((winmask & (1<<2)) != 0);
+
+    if (xpos < winpos[2])
+        inside_win1 = ((winmask & (1<<3)) != 0);
+    else if (xpos < winpos[3])
+        inside_win1 = ((winmask & (1<<4)) != 0);
+    else
+        inside_win1 = ((winmask & (1<<5)) != 0);
+
+    uint winsel = winregs;
+    if (objflags.b > 0)
+        winsel = winregs >> 8;
+    if (inside_win1)
+        winsel = winregs >> 16;
+    if (inside_win0)
+        winsel = winregs >> 24;
+
+    // draw-order keys (-1: not drawn). Original order: prio 3..0, within a prio BG3..BG0 then OBJ.
+    mediump int k0 = (uBGPrio[0] >= 0 && lc0.a > 0.0 && (winsel & 1u) != 0u) ? (3 - uBGPrio[0]) * 5 + 3 : -1;
+    mediump int k1 = (uBGPrio[1] >= 0 && lc1.a > 0.0 && (winsel & 2u) != 0u) ? (3 - uBGPrio[1]) * 5 + 2 : -1;
+    mediump int k2 = (uBGPrio[2] >= 0 && lc2.a > 0.0 && (winsel & 4u) != 0u) ? (3 - uBGPrio[2]) * 5 + 1 : -1;
+    mediump int k3 = (uBGPrio[3] >= 0 && lc3.a > 0.0 && (winsel & 8u) != 0u) ? (3 - uBGPrio[3]) * 5 + 0 : -1;
+    mediump int k4 = (uEnableOBJ && lc4.a > 0.0 && (winsel & 16u) != 0u) ? (3 - objflags.a) * 5 + 4 : -1;
+
+    // top two by key; the backdrop (key -1, mask 0x20) sits under everything
+    mediump int t1 = -1, t2 = -1;         // layer index of top / second (-1 backdrop, -2 none)
+    mediump int kb1 = -1, kb2 = -2;
+    vec4 c1 = vec4(0), c2 = vec4(0);
+#define TOP2(k, i, c) \
+    if (k > kb1) { kb2 = kb1; t2 = t1; c2 = c1; kb1 = k; t1 = i; c1 = c; } \
+    else if (k > kb2) { kb2 = k; t2 = i; c2 = c; }
+    if (k0 >= 0) { TOP2(k0, 0, lc0) }
+    if (k1 >= 0) { TOP2(k1, 1, lc1) }
+    if (k2 >= 0) { TOP2(k2, 2, lc2) }
+    if (k3 >= 0) { TOP2(k3, 3, lc3) }
+    if (k4 >= 0) { TOP2(k4, 4, lc4) }
+#undef TOP2
+
+#ifdef SPLIT3D_STAGE1
+    // the others' top two (k0 is -1 here: BG0 was not fetched); where the 3D layer would go
+    mediump int k0s = (uBGPrio[0] >= 0 && (winsel & 1u) != 0u) ? (3 - uBGPrio[0]) * 5 + 3 : -1;
+    int mode = (k0s < 0) ? 0 : (k0s > kb1) ? 1 : (k0s > kb2) ? 2 : 0;
+    int info = mode | ((t1 + 1) << 2) | (objflags.r << 5) | (((winsel >> 5) & 1u) != 0u ? 128 : 0);
+    oOther = c1;
+    return vec4(Resolve(t1, t2, c1, c2, objflags, winsel, line).rgb, float(info) / 255.0);
+#else
+    return Resolve(t1, t2, c1, c2, objflags, winsel, line);
+#endif
+}
+
+#ifdef SPLIT3D_STAGE2
+// stage 2 (Nx): the 3D texel of this pixel joins the stage 1 result exactly as the full
+// compositor would have put it in (same Resolve, same inputs)
 void main()
 {
-    oColor = CompositeLayers();
+    ivec2 np = ivec2(fTexcoord.xy);
+    vec4 s0 = texelFetch(SplitTex0, np, 0);
+    int info = int(s0.a * 255.0 + 0.5);
+    int mode = info & 3;
+    if (mode != 0)
+    {
+        int line = int(fTexcoord.y);
+        vec4 lc0 = BG0CalcAndFetch(vec2(fTexcoord.x, fract(fTexcoord.y)), line);
+        if (lc0.a > 0.0)
+        {
+            mediump int t = ((info >> 2) & 7) - 1;
+            ivec4 of = ivec4((info >> 5) & 3, 0, 0, 0);
+            uint win = ((info & 128) != 0) ? 32u : 0u;
+            vec4 co = texelFetch(SplitTex1, np, 0);
+            oColor = (mode == 1) ? Resolve(0, t, lc0, co, of, win, line) : Resolve(t, 0, co, lc0, of, win, line);
+            return;
+        }
+    }
+    oColor = vec4(s0.rgb, 1.0);
 }
+#else
+void main()
+{
+#ifdef SPLIT3D_STAGE1
+    oColor = CompositeLayers();
+#else
+    oColor = CompositeLayers();
+#endif
+}
+#endif

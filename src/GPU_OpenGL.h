@@ -33,6 +33,7 @@ namespace melonDS
 
 class GLThread3D;
 class GLWorker;
+namespace GLDefer { class Recorder; }
 
 class GLRenderer : public Renderer
 {
@@ -69,8 +70,18 @@ public:
     // copy is issued (fence + hand-off). debug.litev.glhiasync=0: on the calling thread.
     void PresentIntoAsync(GLuint dstTex, int dstWidth, std::function<void()> pre, std::function<void()> post);
     void WaitPresent();
+    // run f with this renderer's GL objects current and up to date (LITEV_GLHI_DEFER: on its
+    // GL worker, after every call made so far; else here)
+    void RunGL(const std::function<void()>& f);
 
 private:
+    // LITEV_GLHI_DEFER: this renderer's GL calls are recorded here and issued by its worker
+    std::unique_ptr<GLDefer::Recorder> Defer;
+    bool InitGL();
+    void DeleteGL();
+    void PresentIntoImpl(int front, GLuint dstTex, int dstWidth, std::function<void()> pre, std::function<void()> post);
+    // bind the 3D output the current frame shows to GL_TEXTURE_2D of the active unit
+    void Bind3DTex();
     std::unique_ptr<GLWorker> Present;
     GLuint PresReadFB = 0, PresDrawFB = 0;          // present-thread objects
     u64 PresSeq = 0, BufPresSeq[2] {};
@@ -82,6 +93,7 @@ private:
     // 3D output the current frame shows, waiting (GPU-side) for its render on first use.
     GLThread3D* Thread3D = nullptr;
     bool Synced3D = false;
+    bool CapturedSince3D = false;   // LITEV_GLHI_DEFER: a display capture was recorded since the last 3D kick
     int Prev3DColor = 0;
     GLuint Get3DTex();
 

@@ -11,7 +11,13 @@
 // SoftRenderer2D::HybridResolvePixel and SoftRenderer::ApplyMasterBrightness exactly.
 // Port of classic melonDS kCompositorFS_Nearest (removed upstream in ba317e2e).
 
+#ifdef DESC_TBO
+// LITEV_HYB_DESC_TBO: the same descriptors in a buffer texture, row-major, screen after screen,
+// four 32-bit descriptors per RGBA32UI texel (the Mali's buffer textures hold 65536 texels)
+uniform highp usamplerBuffer DescBuf;
+#else
 uniform usampler2DArray DescTex;   // 513x192x2 RGBA8UI: 2 planes x 256 + control column
+#endif
 uniform sampler2D Tex3D;           // Nx 3D colour buffer
 uniform sampler2D EdgeTex;         // 256x192 edge-marking overlay of that 3D frame (3DFinalPassEdgeFS)
 uniform int uEdge;                 // 1: the frame has one
@@ -30,7 +36,15 @@ FRAGLOC(1) out vec4 oBottomColor;
 
 ivec4 Desc(int x, int y, int layer)
 {
+#ifdef DESC_TBO
+    // up to 196991: computed in highp (the merge may run in mediump)
+    highp int L = layer, Y = y, X = x;
+    highp int i = (L * 192 + Y) * 513 + X;
+    highp uint v = texelFetch(DescBuf, i >> 2)[i & 3];
+    return ivec4(uvec4(v, v >> 8, v >> 16, v >> 24) & 0xFFu);
+#else
     return ivec4(texelFetch(DescTex, ivec3(x, y, layer), 0));
+#endif
 }
 
 ivec4 Get3D(ivec2 pos)
