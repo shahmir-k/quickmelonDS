@@ -33,6 +33,15 @@ and a JSON result in a new directory; the runner never removes previous results.
 are copied (not symlinked or hardlinked), input copies are read-only, and hashes are
 checked before and after. The original game files are never passed to the emulators.
 
+For the fixed trade fixtures, the last script step waits passively for the trade
+selection panel (the game does not return to the Union Room). The runner compares
+the trainer-board icon colors at `offered` and `returned to trade selection` on
+**both** consoles: blue/orange must become orange/blue on Black, and the reverse on
+White. Missing, grayscale or unexpectedly colored icons fail closed. The historical
+final screenshots match the expected *post*-trade colors, but there is no saved
+`offered` frame from that run, so this before/after oracle remains unproven until a
+fresh zero-delay baseline. No trade latency claim may be made before it passes.
+
 `LITEV_AMBIENT_DELAY_MS` delays only delivered MP frames. It does not delay the ENet
 connection, ACKs or control traffic; it adds no jitter, loss or relay. The reported
 `nominal_added_rtt_ms = 2 × delay` is an injected component, **not measured path RTT**.

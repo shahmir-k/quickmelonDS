@@ -12,5 +12,7 @@
 @press T:217:179 hold 6 gap 500
 @press T:200:55 hold 6 gap 300
 @log offered
-@repeat A every 60 until rgb bot 10 10 100 8 113 209 241 20 timeout 9000
-@log back in the union room
+# The exchange returns here, not to the Union Room. Do not send more A presses.
+@wait 120
+@until rgb top 0 0 120 14 73 73 73 10 & rgb bot 4 10 120 14 208 206 208 15 timeout 9000
+@log returned to trade selection

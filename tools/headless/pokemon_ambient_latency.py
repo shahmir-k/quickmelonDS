@@ -23,8 +23,8 @@ import time
 
 SCENARIOS = {
     "trade": {
-        "black": ["shimmer is in the room", "menu open", "trade requested", "trade screen", "offered", "back in the union room"],
-        "white": ["in the room", "offer", "trade screen", "offered", "back in the union room"],
+        "black": ["shimmer is in the room", "menu open", "trade requested", "trade screen", "offered", "returned to trade selection"],
+        "white": ["in the room", "offer", "trade screen", "offered", "returned to trade selection"],
         "frames": 18000,
     },
     "battle": {
@@ -55,6 +55,50 @@ def ppm_evidence(path):
     if len(pixels) != 256 * 384 * 3 or len(set(pixels[::97])) < 4:
         raise ValueError(f"empty/truncated framebuffer: {path}")
     return {"sha256": sha(path), "bytes": path.stat().st_size}
+
+
+def trade_icon_scores(path):
+    """Mean R-B in the two trainer-board icon boxes of these fixed BW savestates.
+
+    The Black trainer initially owns a blue icon and White an orange one. A
+    completed trade swaps them. This is a *visual oracle for these fixtures*,
+    not a general Pokémon save parser. A changed UI or sprite invalidates the
+    case (unknown), never silently turns it into a pass.
+    """
+    with path.open("rb") as f:
+        if f.readline() != b"P6\n" or f.readline() != b"256 384\n" or f.readline() != b"255\n":
+            raise ValueError(f"bad PPM: {path}")
+        pixels = f.read()
+    if len(pixels) != 256 * 384 * 3:
+        raise ValueError(f"truncated PPM: {path}")
+    boxes = ((23, 92, 38, 104), (153, 92, 170, 104))
+    scores = []
+    for x0, y0, x1, y1 in boxes:
+        delta = 0
+        for y in range(y0, y1):
+            for x in range(x0, x1):
+                off = (y * 256 + x) * 3
+                delta += pixels[off] - pixels[off + 2]
+        scores.append(delta / ((x1 - x0) * (y1 - y0)))
+    return scores
+
+
+def trade_swapped(side, milestones):
+    """Require original → opposite icon colors at the two exact phase captures."""
+    try:
+        before = trade_icon_scores(Path(milestones["offered"]["shot"]))
+        after = trade_icon_scores(Path(milestones["returned_to_trade_selection"]["shot"]))
+    except (KeyError, OSError, ValueError):
+        return {"verified": False, "reason": "missing or invalid before/after frame"}
+    # Thresholds are intentionally well outside grayscale (0): a sprite that
+    # moves/changes cannot be misreported as a trade. Verify both consoles.
+    blue, orange = -7, 25
+    if side == "black":
+        verified = before[0] < blue and before[1] > orange and after[0] > orange and after[1] < blue
+    else:
+        verified = before[0] > orange and before[1] < blue and after[0] < blue and after[1] > orange
+    return {"verified": verified, "before_rb": before, "after_rb": after,
+            "reason": "icon colors did not swap" if not verified else "both trainer icons swapped"}
 
 
 def free_udp_ports(n):
@@ -194,10 +238,14 @@ def run_one(args, root, inputs, delay, repeat):
         failed = ("TIMEOUT at step" in log or "Fatal signal" in log or "data abort" in log or
                   "prefetch abort" in log or procs[i].returncode != 0)
         valid = not failed and not missing and ordered == sorted(ordered) and distinct >= 3
+        exchange = trade_swapped(side, got) if args.scenario == "trade" else None
+        if exchange is not None:
+            valid = valid and exchange["verified"]
         fps = FPS.search(log)
         result["sides"][side] = {"returncode": procs[i].returncode, "script_failed": failed,
                                   "valid": valid, "missing": missing, "phase_frame_order_ok": ordered == sorted(ordered),
                                   "distinct_phase_images": distinct, "avg_fps": float(fps.group(1)) if fps else None,
+                                  "exchange": exchange,
                                   "diagnostics": DIAG.findall(log), "milestones": got,
                                   "log": str(d / "log.txt"), "save_copy_unchanged": sha(d / "input.sav") == inputs[f"{side}_save"]["sha256"]}
     result["valid"] = all(x["valid"] and x["save_copy_unchanged"] for x in result["sides"].values()) and not timed_out
