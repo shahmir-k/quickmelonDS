@@ -276,7 +276,7 @@ u8 AmbientLAN::HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, boo
     {
         if (now - e.ReqMs >= 1000 || !e.ReqMs) { e.ReqMs = now; return P_Full; }
     }
-    else if (kind == P_Live && (!e.Full || e.Hash != hash) && Vis != Vis_Hidden)
+    else if (kind == P_Live && (!e.Full || e.Hash != hash) && Announcing)     // (not announced: asking would be ignored)
     {
         // stale details: ask that device (unicast), at most once a second
         if (now - e.ReqMs >= 1000 || !e.ReqMs) { e.ReqMs = now; return P_Req; }
@@ -351,6 +351,7 @@ void AmbientLAN::PresenceLoop()
         }
         const int vis = Vis;
         const bool visible = Foreground && (vis == Vis_Everyone || (vis == Vis_WirelessOnly && WifiOn));
+        Announcing = visible;
         if (!visible)
         {
             if (wasVisible) SendPresence(BuildPresence(P_Bye), true, all);
@@ -524,13 +525,13 @@ int AmbientLAN::OpenLink(const Peer& p)
     return s;
 }
 
-void AmbientLAN::CloseLink(int s)
+void AmbientLAN::CloseLink(int s, const char* why)
 {
     Link& l = Links[s];
     if (!l.P) return;
     l.P->data = nullptr;
     enet_peer_disconnect(l.P, 0);
-    Platform::Log(Platform::LogLevel::Info, "Ambient: link %d to %016llx closed\n", s, (unsigned long long)l.ID);
+    Platform::Log(Platform::LogLevel::Info, "Ambient: link %d to %016llx closed (%s)\n", s, (unsigned long long)l.ID, why);
     if (ParentSlot == s) ParentSlot = -1;
     l = Link();
     LinksChanged();
@@ -649,7 +650,8 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         Link* l = (Link*)ev.peer->data;
         if (!l) break;
         const int s = (int)(l - Links);
-        Platform::Log(Platform::LogLevel::Info, "Ambient: link %d to %016llx lost\n", s, (unsigned long long)l->ID);
+        Platform::Log(Platform::LogLevel::Info, "Ambient: link %d to %016llx lost: rtt %u ms, last receive %u ms ago, last send %u ms ago\n", s,
+                      (unsigned long long)l->ID, ev.peer->roundTripTime, enet_time_get() - ev.peer->lastReceiveTime, enet_time_get() - ev.peer->lastSendTime);
         if (ParentSlot == s) ParentSlot = -1;
         *l = Link();
         LinksChanged();
@@ -747,7 +749,8 @@ void AmbientLAN::Process()
         Link& l = Links[s];
         if (!l.P) continue;
         if (l.Up) rtt = std::max<u32>(rtt, l.P->roundTripTime);
-        if ((l.CloseAtMs && (s32)(now - l.CloseAtMs) >= 0) || now - l.ActiveMs > kIdleMs) CloseLink(s);
+        if (l.CloseAtMs && (s32)(now - l.CloseAtMs) >= 0) CloseLink(s, "deauth");
+        else if (now - l.ActiveMs > kIdleMs) CloseLink(s, "idle");
     }
     StMaxRtt = rtt;
 }
@@ -763,7 +766,7 @@ void AmbientLAN::Begin(int inst)
 void AmbientLAN::End(int inst)
 {
     WifiOn = false;
-    for (int s = 0; s < 16; s++) CloseLink(s);
+    for (int s = 0; s < 16; s++) CloseLink(s, "Wi-Fi off");
     while (!RX.empty()) { enet_packet_destroy(RX.front()); RX.pop_front(); }
     if (Host) enet_host_flush(Host);
     ParentSlot = -1;
@@ -800,7 +803,7 @@ int AmbientLAN::SendPacket(int inst, u8* data, int len, u64 timestamp)
     if (f[0] == 0xB0 && len >= 12 + 24 + 4 && G16(f + 24 + 2) == 1)
     {
         ParentSlot = s;
-        for (int o = 0; o < 16; o++) if (o != s) CloseLink(o);
+        for (int o = 0; o < 16; o++) if (o != s) CloseLink(o, "joining another session");
     }
     Links[s].ActiveMs = NowMs();
     if (f[0] == 0xC0 && !Links[s].CloseAtMs) Links[s].CloseAtMs = NowMs() + 500;

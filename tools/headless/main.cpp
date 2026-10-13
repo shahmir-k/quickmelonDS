@@ -762,6 +762,8 @@ int main(int argc, char** argv)
         printf("Ambient: '%s' id %016llx game %.4s presence port %u link port %u\n", c.Name.c_str(), (unsigned long long)c.DeviceID,
                c.GameCode, a->GetUnicastPort(), a->GetLinkPort());
         ambient = a.get();
+        // the app's wait for a peer's MP frame (kLanRecvTimeoutMs; LITEV_MPTIMEOUT overrides)
+        a->SetRecvTimeout(getenv("LITEV_MPTIMEOUT") ? atoi(getenv("LITEV_MPTIMEOUT")) : 50);
         melonDS::MPInterface::Set(std::move(a), melonDS::MPInterface_Ambient);
         lan = true;
     }

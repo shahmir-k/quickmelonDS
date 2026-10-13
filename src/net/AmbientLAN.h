@@ -133,7 +133,7 @@ private:
     bool OwnDirty = true;                                   // under Mu
     std::vector<u64> LinkedIDs;                             // under Mu (UI)
     std::atomic<u32> OwnBeaconMs{0};
-    std::atomic<bool> WifiOn{false}, Foreground{true}, Quit{false};
+    std::atomic<bool> WifiOn{false}, Foreground{true}, Quit{false}, Announcing{false};
     std::atomic<int> Vis;
     int BcastSock = -1, UniSock = -1;
     u16 UniPort = 0;
@@ -169,7 +169,7 @@ private:
     const Peer* PeerByMAC(const u8* mac);
     int SlotByMAC(const u8* mac);
     int OpenLink(const Peer& p);
-    void CloseLink(int s);
+    void CloseLink(int s, const char* why);
     void LinksChanged();
     void NoteBeacon(const u8* data, int len);
     void SendTo(u32 slots, u32 type, const u8* data, int len, u64 timestamp);
