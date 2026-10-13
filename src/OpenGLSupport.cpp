@@ -197,7 +197,10 @@ int Prop(const char* name, int def)
     snprintf(key, sizeof(key), "debug.litev.%s", name);
     return __system_property_get(key, b) > 0 ? atoi(b) : def;
 #else
-    return def;
+    char key[92];   // desktop (Mac headless): the same switches as environment variables
+    snprintf(key, sizeof(key), "debug.litev.%s", name);
+    const char* e = getenv(key);
+    return e && *e ? atoi(e) : def;
 #endif
 }
 
