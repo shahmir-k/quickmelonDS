@@ -21,6 +21,7 @@ namespace { int InstOf(NDS& nds); }
 namespace
 {
 std::mutex g_TrM;
+thread_local u64 g_SendAt = 0;      // a native callback's send time (its event's; the CPUs can be past it)
 std::map<const NDS*, FILE*> g_Tr;
 struct TrSt { u32 status = 0; u32 last[0x7d0 / 4] = {}; };
 std::map<const NDS*, TrSt> g_TrSt;
@@ -62,7 +63,7 @@ void TraceFifo(NDS& nds, int fromArm7, u32 val)
     FILE* f = Tr(nds);
     if (!f) return;
     const u32 tag = val & 31, data = val >> 6;
-    fprintf(f, "%s f%u t%llu tag%u err%u data %07x\n", fromArm7 ? "F7" : "F9", nds.NumFrames, (unsigned long long)(nds.CurCPU == 0 ? nds.ARM9Timestamp >> nds.ARM9ClockShift : nds.ARM7Timestamp), tag, (val >> 5) & 1, data);
+    fprintf(f, "%s f%u t%llu tag%u err%u data %07x\n", fromArm7 ? "F7" : "F9", nds.NumFrames, (unsigned long long)(fromArm7 && g_SendAt ? g_SendAt : nds.CurCPU == 0 ? nds.ARM9Timestamp >> nds.ARM9ClockShift : nds.ARM7Timestamp), tag, (val >> 5) & 1, data);
     if (tag == 10 && (data >> 24) == 2)
     {
         Dump(f, nds, data, fromArm7 ? 0x100 : 0x80);
@@ -556,7 +557,13 @@ void PumpCbs(Ctx& c)
             else { Wr8(c, c.cbuf + i, b.d[i]); i++; }
         }
         Wr16(c, kCbFlag, Rd16(c, kCbFlag) | 1);
+#ifdef LITEV_HLE_DIAG
+        g_SendAt = c.now;
+#endif
         nds.ARM7IOWrite32(0x04000188, kTagWM | (c.cbuf << 6));
+#ifdef LITEV_HLE_DIAG
+        g_SendAt = 0;
+#endif
         c.cbs.pop_front();
         c.stCb++;
     }
@@ -2024,7 +2031,7 @@ u32 QuickUs(Ctx& c, u16 api)
     static const u16 k30[] = {232, 362, 283, 400, 163, 198, 228};      // (MKDS; END_MP estimated)
     static const u16 k31[] = {280, 396, 359, 450, 181, 200, 276};      // (Shrek; SET_GAMEINFO / END_MP / END estimated)
     static const u16 k40[] = {300, 440, 647, 590, 199, 246, 223};      // (Kirby; SET_GAMEINFO / END_MP / END estimated)
-    static const u16 k50[] = {346, 469, 464, 585, 220, 226, 400};      // (PB / PW; SET_ENTRY estimated)
+    static const u16 k50[] = {351, 469, 464, 585, 220, 226, 400};      // (PB / PW; SET_ENTRY estimated)
     if (!c.bd) return 0;
     const u16* t = c.bd->gen >= 50 ? k50 : c.bd->gen >= 40 ? k40 : c.bd->gen >= 31 ? k31 : k30;
     switch (api)
@@ -3154,6 +3161,7 @@ bool Fifo9(NDS& nds, u32 val)
     if ((val >> 5) & 1) return true;            // (error bit: ignored)
     if (c.reqs.size() >= 32) { Send(c, CbB(nds.ARM7Read16(a) & 0x7FFF, E_FIFO).P16(4, 0).P16(6, 0)); }
     else c.reqs.push_back({a, (u16)(nds.ARM7Read16(a) & 0x7FFF), 0});
+    if (c.reqAt) c.reqAt += Us(16);             // (the guest's WL request in progress yields to the PXI IRQ taking this one)
     WakeAt(c, CpuNow(nds) + 64);                // (the ARM7 takes the request in its PXI IRQ)
     return true;
 }
