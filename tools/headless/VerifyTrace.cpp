@@ -1531,7 +1531,13 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                 {   // diagnostics: ARM7 WRAM (0x037F8000, 64 KB) to disassemble the hot ARM7 code
                     if (FILE* fp = fopen("arm7wram.bin", "wb")) { fwrite(bi.nds->ARM7WRAM, 1, 0x10000, fp); fclose(fp); }
                 }
-                if (dumpDir && dumpEvery > 0 && ((f + 1) % dumpEvery) == 0)
+                if (bi.inputScript.HasProgram())   // closed-loop script steps see this frame's screens
+                {
+                    void* top = nullptr; void* bot = nullptr;
+                    if (bi.nds->GPU.GetFramebuffers(&top, &bot) && top && bot) bi.inputScript.OnFrame(f, (const u32*)top, (const u32*)bot);
+                    else bi.inputScript.OnFrame(f, nullptr, nullptr);
+                }
+                                if (dumpDir && dumpEvery > 0 && ((f + 1) % dumpEvery) == 0)
                 {
                     void* top = nullptr; void* bot = nullptr;
                     if (bi.nds->GPU.GetFramebuffers(&top, &bot) && top && bot)
@@ -1670,6 +1676,11 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     printf("reply_frames:    %llu\n", (unsigned long long)reply);
     printf("packets:         %llu\n", (unsigned long long)pkt);
     printf("ran_clean:       %s\n", ranClean ? "yes" : "no");
+    // LITEV_MP_SAVDUMP=<dir> (test only): each console's game save memory at the end -> <dir>/save<k>.sav
+    if (const char* sd = getenv("LITEV_MP_SAVDUMP"))
+        for (int k = 0; k < n; k++)
+            if (const u8* sv = b[k].nds->GetNDSSave())
+                if (FILE* fp = fopen((std::string(sd) + "/save" + std::to_string(k) + ".sav").c_str(), "wb")) { fwrite(sv, 1, b[k].nds->GetNDSSaveLength(), fp); fclose(fp); }
     printf("associated:      %s\n", associated ? "yes" : "no");
     printf("exchanged:       %s\n", exchanged ? "yes" : "no");
     fflush(stdout);
