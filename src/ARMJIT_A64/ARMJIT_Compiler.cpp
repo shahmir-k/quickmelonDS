@@ -1560,7 +1560,51 @@ static bool IC32On()
     }();
     return on;
 }
-int Compiler::ICShift() const { return Shared && IC32On() ? 5 : ICacheEntryShift; }
+#endif
+#ifdef LITEV_JIT_SHARED_IC16
+// LITEV_JIT_SHARED_IC16: shared code's per-console ICACHE entries are 16 bytes, {~key0, off0, ~key1,
+// off1} (keys stored inverted, so a zero entry matches nothing; offsets into the code arena as in
+// FastBlockLookup), with no epoch: when a block leaves FastBlockLookup the console clears its used
+// entries (ICacheClearShared) before its JIT code runs again. One LDP per probe, a quarter of the
+// 64-byte layout's lines. Exact (host-only). Headless A/B: LITEV_JIT_SHARED_IC16=0; Android:
+// debug.litev.jitic16=0 (then IC32 / 64-byte entries as before).
+static bool IC16On()
+{
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.jitic16", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_JIT_SHARED_IC16");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on;
+}
+bool Compiler::IC16() const { return Shared && IC16On(); }
+void Compiler::ICacheClearShared()
+{
+    if (!IC16()) return;
+    const size_t bytes = (size_t)JitArena().NextSite << 4;
+    for (int c = 0; c < 2; c++)
+        if (ICacheTable[c]) memset(ICacheTable[c], 0, bytes);
+}
+#endif
+#if defined(LITEV_JIT_SHARED_IC32) || defined(LITEV_JIT_SHARED_IC16)
+int Compiler::ICShift() const
+{
+#ifdef LITEV_JIT_SHARED_IC16
+    if (IC16()) return 4;
+#endif
+#ifdef LITEV_JIT_SHARED_IC32
+    if (Shared && IC32On()) return 5;
+#endif
+    return ICacheEntryShift;
+}
+#ifndef LITEV_JIT_SHARED_IC16
+bool Compiler::IC16() const { return false; }
+void Compiler::ICacheClearShared() {}
+#endif
 #endif
 
 void Compiler::LoadICacheTable(u32 num)
@@ -1666,6 +1710,49 @@ void* Compiler::Gen_Dispatcher(u32 num)
     // instrAddr, then branches straight to the cached host block — skipping the region
     // bounds + the cache-cold FastBlockLookup gather. The commit (a)(b)(c) is already
     // done and the CPSR store is byte-identical to step (g), so a hit is timing-exact.
+#if defined(LITEV_JIT_SHARED_IC32) || defined(LITEV_JIT_SHARED_IC16)
+    const bool ic16 = IC16();
+#else
+    constexpr bool ic16 = false;
+#endif
+    // IC16 hit tail (inline): W4 = the matching way's code offset
+    auto ic16Tail = [&]() {
+  #ifndef LITEV_JIT_LAZYFLAGS
+        STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+  #endif
+        {   // the dispatchers sit at the start of the code arena: ADR reaches its base
+            const s64 d = (s64)((u8*)GetRXBase() - (u8*)GetRXPtr());
+            if (d >= -(1 << 20) && d < (1 << 20)) ADR(X3, (s32)d);
+            else MOVI2R(X3, (u64)GetRXBase());
+        }
+        ADD(X5, X3, W4, ArithOption(W4));
+  #if LITEV_PROFILE
+        MOVP2R(X4, (void*)&melonDS::LiteProfile::g_Frame.ICacheHits);
+        LDR(INDEX_UNSIGNED, X3, X4, 0);
+        ADD(X3, X3, 1);
+        STR(INDEX_UNSIGNED, X3, X4, 0);
+  #endif
+        BR(X5);
+    };
+    FixupBranch icHit0, icHit1;
+    if (ic16)
+    {
+        FixupBranch noCache16 = CBZ(W9);
+        LoadICacheTable(num);
+        ADD(X2, X2, X9, ArithOption(X9, ST_LSL, 4));
+        LDP(INDEX_SIGNED, W3, W4, X2, 0);            // ~key0, off0
+        EON(W3, W3, W0);                             // 0 <=> key0 == instrAddr
+        FixupBranch hit16 = CBZ(W3);
+        LDP(INDEX_SIGNED, W3, W4, X2, 8);            // ~key1, off1
+        EON(W3, W3, W0);
+        FixupBranch miss16 = CBNZ(W3);
+        SetJumpTarget(hit16);
+        ic16Tail();
+        SetJumpTarget(miss16);
+        SetJumpTarget(noCache16);
+    }
+    else
+    {
     FixupBranch icNoCache = CBZ(W9);
     LoadICacheTable(num);
     ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICShift())); // &ICacheTable[num][W9]
@@ -1675,19 +1762,32 @@ void* Compiler::Gen_Dispatcher(u32 num)
     FixupBranch icEpochMiss = B(CC_NEQ);
     LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key0));
     CMP(W3, W0);
-    FixupBranch icHit0 = B(CC_EQ);
+    icHit0 = B(CC_EQ);
     LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, key1));
     CMP(W3, W0);
-    FixupBranch icHit1 = B(CC_EQ);
+    icHit1 = B(CC_EQ);
     SetJumpTarget(icEpochMiss);
     SetJumpTarget(icNoCache);
+    }
     // miss -> fall through to the region-bounds + tag lookup, which WRITES BACK below.
 #endif
 #ifdef LITEV_JIT_RAS
     // (d.6-RAS) second chance: W10 = the caller's call-site slot popped by a guest
     // return (0 = none). Same epoch + key check as above, 1-way (key0/ptr0).
     FixupBranch rasHit;
-    if (RasOn)
+    if (RasOn && ic16)
+    {
+        FixupBranch rasNone16 = CBZ(W10);
+        LoadICacheTable(num);
+        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, 4));
+        LDP(INDEX_SIGNED, W3, W4, X2, 0);            // ~key0, off0 (1-way)
+        EON(W3, W3, W0);
+        FixupBranch rasMiss16 = CBNZ(W3);
+        ic16Tail();
+        SetJumpTarget(rasMiss16);
+        SetJumpTarget(rasNone16);
+    }
+    else if (RasOn)
     {
         FixupBranch rasNone = CBZ(W10);
         LoadICacheTable(num);
@@ -1782,6 +1882,19 @@ void* Compiler::Gen_Dispatcher(u32 num)
     // site's 2-way entry (LRU: demote slot0->slot1, new -> slot0) stamped with the
     // live epoch, then branch. W9 == 0 means the exiting site opted out of caching.
     ADD(X6, X3, W7, ArithOption(W7));                 // X6 = absolute host block entry
+    if (ic16)
+    {
+        // IC16: slot0 -> slot1, then {~instrAddr, offset} -> slot0 (no epoch: dead entries were cleared)
+        FixupBranch wbSkip = CBZ(W9);
+        LoadICacheTable(num);
+        ADD(X2, X2, X9, ArithOption(X9, ST_LSL, 4));
+        LDP(INDEX_SIGNED, W3, W4, X2, 0);
+        STP(INDEX_SIGNED, W3, W4, X2, 8);
+        ORN(W3, WZR, W0);
+        STP(INDEX_SIGNED, W3, W7, X2, 0);
+        SetJumpTarget(wbSkip);
+    }
+    else
     {
         FixupBranch wbSkip = CBZ(W9);
         LoadICacheTable(num);
@@ -1805,7 +1918,16 @@ void* Compiler::Gen_Dispatcher(u32 num)
         SetJumpTarget(wbSkip);
     }
 #ifdef LITEV_JIT_RAS
-    if (RasOn)
+    if (RasOn && ic16)
+    {
+        FixupBranch rasSkip16 = CBZ(W10);
+        LoadICacheTable(num);
+        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, 4));
+        ORN(W3, WZR, W0);
+        STP(INDEX_SIGNED, W3, W7, X2, 0);            // slot0 only (slot1 kept), as below
+        SetJumpTarget(rasSkip16);
+    }
+    else if (RasOn)
     {
         FixupBranch rasSkip = CBZ(W10);
         LoadICacheTable(num);
@@ -1869,7 +1991,7 @@ void* Compiler::Gen_Dispatcher(u32 num)
 #endif
 
 #ifdef LITEV_JIT_RAS
-    if (RasOn)
+    if (RasOn && !ic16)
     {
         // RAS hit (X2 = the call-site entry). CPSR is canonical in memory (LAZYFLAGS).
         SetJumpTarget(rasHit);
@@ -1890,6 +2012,8 @@ void* Compiler::Gen_Dispatcher(u32 num)
     // ICACHE hit tails (reached from (d.5-ICACHE); X2 still holds the entry pointer).
     // Under LAZYFLAGS ARM::CPSR is already canonical (as at step (g)); otherwise commit
     // the live RCPSR exactly as the plain hit path does.
+    if (!ic16)
+    {
     SetJumpTarget(icHit0);
   #ifndef LITEV_JIT_LAZYFLAGS
     STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
@@ -1953,6 +2077,7 @@ void* Compiler::Gen_Dispatcher(u32 num)
     STR(INDEX_UNSIGNED, WZR, X2, offsetof(ICacheEntry, hitCount));
 #endif
     BR(X5);
+    }
 #endif
 
 #if defined(LITEV_JIT_NATIVE_LOOP) && defined(LITEV_JIT_BUDGET_REG)

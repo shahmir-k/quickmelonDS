@@ -636,8 +636,10 @@ public:
     u32 ICacheAssignSite();
     static constexpr u32 SharedICacheSites = 1u << 18;   // site ids are process-wide when shared
     u32 ICacheTableSites() const { return Shared ? SharedICacheSites : ICacheSites; }
-#ifdef LITEV_JIT_SHARED_IC32
-    int ICShift() const;   // the dispatcher's entry stride (LITEV_JIT_SHARED_IC32: 32 bytes for shared code)
+#if defined(LITEV_JIT_SHARED_IC32) || defined(LITEV_JIT_SHARED_IC16)
+    int ICShift() const;   // the dispatcher's entry stride (shared code: 32 bytes IC32, 16 bytes IC16)
+    bool IC16() const;     // LITEV_JIT_SHARED_IC16 layout in use (shared code, runtime on)
+    void ICacheClearShared();   // IC16: forget this console's cached targets (a block left FastBlockLookup)
 #else
     int ICShift() const { return ICacheEntryShift; }
 #endif
