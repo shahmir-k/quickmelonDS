@@ -306,6 +306,45 @@ struct GPU3D::AsyncGeo
     std::mutex M;
     std::condition_variable CV;
     std::thread T;
+    // record kinds besides entries (commands are < 0x80): a bulk pass's decoder state and words
+    static constexpr u8 kHdrCur = 0xFD, kHdrState = 0xFE, kWord = 0xFC;
+    static constexpr u32 kEb = 1024;
+    CmdFIFOEntry Eb[kEb];   // decoded entries, run in order
+
+    // the entries a bulk sink pass (SinkWords) ran for its k words, from the decoder state before them
+    // (WriteToGXFIFO's decode; SinkWords' stop: the word that begins a swap or test command)
+    u32 DecodeWords(u32 at, u32 k, u32 numCmds, u32 cur, u32 pc, u32 tp, CmdFIFOEntry* out) noexcept
+    {
+        static const u8 kStop[256] = { [0x50] = 1, [0x70] = 1, [0x71] = 1, [0x72] = 1 };
+        u32 o = 0;
+        for (u32 i = 0; i < k; i++)
+        {
+            const u32 val = Buf[(at + i) & (Cap - 1)].Param;
+            if (numCmds == 0)
+            {
+                numCmds = 4; cur = val; pc = 0; tp = CmdNumParams[cur & 0xFF];
+                if (tp > 0) { if (kStop[cur & 0xFF]) break; continue; }
+            }
+            else
+                pc++;
+            for (;;)
+            {
+                if ((cur & 0xFF) || (numCmds == 4 && cur == 0))
+                {
+                    out[o]._contents = 0; out[o].Command = cur & 0xFF; out[o].Param = val; o++;
+                }
+                if (pc >= tp)
+                {
+                    cur >>= 8;
+                    if (--numCmds == 0) break;
+                    pc = 0; tp = CmdNumParams[cur & 0xFF];
+                    if (tp > 0 && kStop[cur & 0xFF]) return o;
+                }
+                if (pc < tp) break;
+            }
+        }
+        return o;
+    }
 
     void Run() noexcept
     {
@@ -340,34 +379,44 @@ struct GPU3D::AsyncGeo
                     continue;
                 }
             }
+            // records -> entries (a bulk pass's words decoded as the bulk sink pass took them) -> the
+            // bulk executor in order; a SWAP_BUFFERS completes the bank (sorted here for VBlank)
+            const u32 m = Cap - 1;
+            u32 ne = 0;
+            auto run = [&] {
+                if (!ne) return;
+                Sh->BulkPtr = Eb; Sh->BulkEnd = Eb + ne;
+                Sh->ExecuteCommandT<true>();
+                Sh->BulkPtr = Sh->BulkEnd = nullptr;
+                ne = 0;
+            };
             while (t != h)
             {
-                const u32 i = t & (Cap - 1), n = std::min(h - t, Cap - i);
-                const CmdFIFOEntry* p = &Buf[i];
-                // the entries in order through the bulk executor; a SWAP_BUFFERS only flags the
-                // swap (the emulator thread hands the bank to the renderer at VBlank)
-                for (u32 j = 0; j < n;)
+                const CmdFIFOEntry r = Buf[t & m];
+                if (r.Command == kHdrCur)
                 {
-                    u32 k = j;
-                    while (k < n && p[k].Command != 0x50) k++;
-                    if (k > j)
-                    {
-                        Sh->BulkPtr = p + j; Sh->BulkEnd = p + k;
-                        Sh->ExecuteCommandT<true>();
-                        Sh->BulkPtr = Sh->BulkEnd = nullptr;
-                    }
-                    if (k < n)
-                    {
-                        // the bank is complete: split and sort it for VBlank (the order VBlank computes)
-                        Sh->FlushAttributes = p[k].Param & 0x3;   // (the sort and SubmitPolygon read it)
-                        Sh->SortRenderPolygons();
-                        Sh->AsyncSorted = true;
-                    }
-                    j = k < n ? k + 1 : k;
+                    const u32 st = Buf[(t + 1) & m].Param, k = st >> 24;
+                    if (ne + 4 * k > kEb) run();
+                    ne += DecodeWords(t + 2, k, st & 0xFF, r.Param, (st >> 8) & 0xFF, (st >> 16) & 0xFF, Eb + ne);
+                    t += k + 2;
+                    continue;
                 }
-                t += n;
-                Tail.store(t, std::memory_order_release);
+                if (r.Command == 0x50)
+                {
+                    run();
+                    Sh->FlushAttributes = r.Param & 0x3;   // (the sort and SubmitPolygon read it)
+                    Sh->SortRenderPolygons();
+                    Sh->AsyncSorted = true;
+                }
+                else
+                {
+                    if (ne == kEb) run();
+                    Eb[ne++] = r;
+                }
+                t++;
             }
+            run();
+            Tail.store(t, std::memory_order_release);
         }
     }
 };
@@ -398,6 +447,28 @@ void GPU3D::AsyncPush(const CmdFIFOEntry& e) noexcept
     a.Buf[h & (AsyncGeo::Cap - 1)] = e;
     a.Pend = h + 1;
     if ((a.Pend & 63) == 0) AsyncPublish();   // (and at the end of each batch: AsyncFlush)
+}
+
+// a bulk sink pass's words: a header (the decoder state before them, the count), then the words
+void GPU3D::AsyncPushWords(const u32* words, u32 k, u32 numCmds, u32 cur, u32 pc, u32 tp) noexcept
+{
+    AsyncGeo& a = *Async;
+    const u32 need = k + 2;
+    u32 h = a.Pend;
+    if (__builtin_expect(h + need - a.Tail.load(std::memory_order_acquire) > AsyncGeo::Cap, 0))
+    {
+        AsyncPublish();
+        while (h + need - a.Tail.load(std::memory_order_acquire) > AsyncGeo::Cap) std::this_thread::yield();
+    }
+    CmdFIFOEntry* b = a.Buf.get();
+    const u32 m = AsyncGeo::Cap - 1;
+    CmdFIFOEntry e; e._contents = 0;
+    e.Command = AsyncGeo::kHdrCur; e.Param = cur; b[h++ & m] = e;
+    e.Command = AsyncGeo::kHdrState; e.Param = numCmds | (pc << 8) | (tp << 16) | (k << 24); b[h++ & m] = e;
+    e.Command = AsyncGeo::kWord;
+    for (u32 i = 0; i < k; i++) { e.Param = words[i]; b[h++ & m] = e; }
+    a.Pend = h;
+    if (h - a.Head.load(std::memory_order_relaxed) >= 64) AsyncPublish();
 }
 
 void GPU3D::AsyncSync() noexcept
@@ -4754,14 +4825,6 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
         if (pc + 1 < tp && numCmds && GXSinkSkipOn)
         {
             const u32 t = std::min(tp - 1 - pc, n - i);
-#ifdef LITEV_GX_ASYNC_LOCAL
-            if (Async)
-                for (u32 j = 0; j < t; j++)
-                {
-                    CmdFIFOEntry e; e._contents = 0; e.Command = cur & 0xFF; e.Param = words[i + j];
-                    AsyncPush(e);
-                }
-#endif
             ran = true;
             pc += t;
             i += t - 1;
@@ -4786,9 +4849,6 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
             if ((cur & 0xFF) || (numCmds == 4 && cur == 0))
             {
                 ran = true;   // an entry {cur & 0xFF, val}; the command runs on its last one
-#ifdef LITEV_GX_ASYNC_LOCAL
-                if (Async) { CmdFIFOEntry e; e._contents = 0; e.Command = cur & 0xFF; e.Param = val; AsyncPush(e); }
-#endif
                 if (pc >= tp) switch (kKind[cur & 0xFF])
                 {
                 case 1: // vertex: SubmitVertex's sink counting; AddCycles(3) (the pipeline counters aside)
@@ -4917,13 +4977,21 @@ void GPU3D::BulkWords(const u32* words, u32 n) noexcept
         bool ran = false;
 #ifdef LITEV_REMOTE_GX_SINKMEMO
 #ifdef LITEV_FF_HEADLESS3D
-        const bool memo = GXSinkMemoOn && LITEV_HEADLESS(Headless) && !FFHeadlessNow;   // SinkWords' lightCycles
+        bool memo = GXSinkMemoOn && LITEV_HEADLESS(Headless) && !FFHeadlessNow;   // SinkWords' lightCycles
 #else
-        const bool memo = GXSinkMemoOn && LITEV_HEADLESS(Headless);
+        bool memo = GXSinkMemoOn && LITEV_HEADLESS(Headless);
+#endif
+#ifdef LITEV_GX_ASYNC_LOCAL
+        if (Async) memo = GXSinkMemoOn;   // (SinkWords' lightCycles is on for it too)
+        const u32 st0 = NumCommands, st1 = CurCommand, st2 = ParamCount, st3 = TotalParams;
 #endif
         const u32 k = memo ? SinkMemo(words, n, ran) : SinkWords(words, n, ran);
 #else
         const u32 k = SinkWords(words, n, ran);
+#endif
+#ifdef LITEV_GX_ASYNC_LOCAL
+        // the worker decodes the words the pass took into the entries the executor would have run
+        if (Async && k) AsyncPushWords(words, k, st0, st1, st2, st3);
 #endif
         if (k == n)
         {
