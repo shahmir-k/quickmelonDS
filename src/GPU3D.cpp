@@ -285,14 +285,17 @@ void MatrixLoadIdentity(s32* m);
 
 #ifdef LITEV_GX_ASYNC_LOCAL
 // Runtime switch: debug.litev.gxasync (headless: env LITEV_GXASYNC), default on.
-static const bool GXAsyncOn = [] {
+// 0 off, 1 (default) only while the process runs one console (single player: spare cores; never
+// Netplay / LocalMP, where every core already has a console), 2 always (tests)
+static const int GXAsyncMode = [] {
 #if defined(__ANDROID__)
-    return litevGxPropDefault("debug.litev.gxasync", 1) != 0;
+    return litevGxPropDefault("debug.litev.gxasync", 1);
 #else
     const char* e = getenv("LITEV_GXASYNC");
-    return e ? atoi(e) != 0 : true;
+    return e ? atoi(e) : 1;
 #endif
 }();
+static std::atomic<int> GXConsoles {0};   // GPU3Ds of the process (not shadows)
 
 struct GPU3D::AsyncGeo
 {
@@ -421,7 +424,7 @@ struct GPU3D::AsyncGeo
     }
 };
 
-GPU3D::~GPU3D() noexcept { AsyncStop(false); }
+GPU3D::~GPU3D() noexcept { AsyncStop(false); if (!IsShadow) GXConsoles--; }
 
 void GPU3D::AsyncPublish() noexcept
 {
@@ -520,12 +523,12 @@ void GPU3D::CopyGeoFrom(const GPU3D& s) noexcept
 
 void GPU3D::AsyncMaybeStart() noexcept
 {
-    if (Async || IsShadow || !GXAsyncOn || !GXUntimedOn || LITEV_HEADLESS(Headless) || Sink || !GeometryEnabled
+    if (Async || IsShadow || GXAsyncMode == 0 || (GXAsyncMode == 1 && GXConsoles.load() != 1) || !GXUntimedOn || LITEV_HEADLESS(Headless) || Sink || !GeometryEnabled
         || SinkVeto.load(std::memory_order_relaxed)) return;
     auto a = std::make_unique<AsyncGeo>();
     a->Sh = std::make_unique<GPU3D>(GPU);
     GPU3D& sh = *a->Sh;
-    sh.IsShadow = true;
+    sh.IsShadow = true; GXConsoles--;
     sh.CopyGeoFrom(*this);
     sh.GeometryEnabled = true; sh.RenderingEnabled = RenderingEnabled;
     sh.ZeroDotWLimit = ZeroDotWLimit; sh.DispCnt = DispCnt; sh.FlushAttributes = FlushAttributes;
@@ -560,6 +563,9 @@ GPU3D::GPU3D(melonDS::GPU& gpu) noexcept :
     NDS(gpu.NDS),
     GPU(gpu)
 {
+#ifdef LITEV_GX_ASYNC_LOCAL
+    GXConsoles++;
+#endif
 }
 
 void Vertex::DoSavestate(Savestate* file) noexcept
@@ -5430,6 +5436,12 @@ void GPU3D::VBlank() noexcept
     LazySync();
 #endif
 #ifdef LITEV_GX_ASYNC_LOCAL
+    if (Async && GXAsyncMode == 1 && GXConsoles.load() != 1)
+    {
+        // another console joined the process (Netplay, LocalMP): the cores are its; full engine here again
+        AsyncStop(true);
+        Sink = false;
+    }
     if (Async)
     {
         // the bank the worker built (in this console's vertex/polygon RAM)
