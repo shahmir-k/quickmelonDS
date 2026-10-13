@@ -973,6 +973,14 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             if (auto d = ReadFile(sv, len)) { b[k].nds->SetNDSSave(d.get(), len); printf("console %d save: %s (%u bytes)\n", k, sv, len); }
             else { fprintf(stderr, "error (mp%d): cannot read save '%s'\n", k, sv); return 1; }
         }
+        // LITEV_MP_SS<k>=<file> (test only): console k starts from that melonDS savestate
+        if (const char* ss = getenv(("LITEV_MP_SS" + std::to_string(k)).c_str()))
+        {
+            u32 len = 0; auto d = ReadFile(ss, len);
+            Savestate st(d ? d.get() : nullptr, len, false);
+            if (!d || st.Error || !b[k].nds->DoSavestate(&st) || st.Error) { fprintf(stderr, "error (mp%d): cannot load savestate '%s'\n", k, ss); return 1; }
+            printf("console %d savestate: %s\n", k, ss);
+        }
     }
 #ifdef LITEV_JIT_SHARED_CODE
     ARMJIT_Global::SetSharedCode(false);
