@@ -162,6 +162,10 @@ private:
     bool SpriteAffine = true;       // some listed sprite is rotscaled (debug.litev.glhi1x)
     bool AffineUncomposited = true; // ... or was, in an OAM list used since the last composite
     GLuint LowFB = 0, LowTex = 0;   // native-resolution compositor target (debug.litev.glhi1x)
+    // LITEV_GLHI_SPLIT3D: a screen whose only hi-res layer is the 3D one composites the rest
+    // at 1x (stage 1, two targets) and joins the Nx 3D per pixel (stage 2)
+    GLuint Split1Prog = 0, Split2Prog = 0, SplitFB = 0, SplitTex[2] {};
+    GLint Split1MosLoc = -1;
     int CompSF = 1;                 // scale of the compositor's current target
     void Check1x(int ystart, int yend);
     GLint ObjMosULoc[2] = {-1, -1};
