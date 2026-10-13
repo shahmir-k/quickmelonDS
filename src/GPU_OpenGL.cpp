@@ -194,6 +194,8 @@ GLuint GLRenderer::Get3DTex()
         }();
         OutputTex3D = Thread3D->SyncColor(late ? Prev3DColor : Thread3D->GL->GetCurColor());
         Synced3D = true;
+        static const bool dbg = [] { char b[92] = {}; return __system_property_get("debug.litev.glhidbg", b) > 0 && atoi(b) != 0; }();
+        if (dbg) Platform::Log(Platform::Info, "LITEV_GLHIC frame %u c %d\n", GPU.NDS.NumFrames, late ? Prev3DColor : Thread3D->GL->GetCurColor());
     }
     return OutputTex3D;
 }
@@ -212,7 +214,21 @@ void GLRenderer::Bind3DTex()
         }();
         const int c = late ? Prev3DColor : Thread3D->GL->GetCurColor();
         GLThread3D* t = Thread3D;
-        GLDefer::Exec([t, c] { glBindTexture(GL_TEXTURE_2D, t->SyncColor(c)); });
+        const u64 seq = t->ColorSeq[c];
+        const u32 fr = GPU.NDS.NumFrames;
+        {
+            static const bool dbg = [] { char b[92] = {}; return __system_property_get("debug.litev.glhidbg", b) > 0 && atoi(b) != 0; }();
+            static u32 lastFr = ~0u; static int lastC = -1;
+            if (dbg && (fr != lastFr || c != lastC)) Platform::Log(Platform::Info, "LITEV_GLHIC frame %u c %d\n", fr, c);
+            lastFr = fr; lastC = c;
+        }
+        GLDefer::Exec([t, c, seq, fr] {
+            static const bool dbg = [] { char b[92] = {}; return __system_property_get("debug.litev.glhidbg", b) > 0 && atoi(b) != 0; }();
+            if (dbg && t->ColorSeq[c] != seq)
+                Platform::Log(Platform::Info, "LITEV_GLHIDBG frame %u colour %d seq %llu -> %llu (done %llu)\n", fr, c,
+                              (unsigned long long)seq, (unsigned long long)t->ColorSeq[c], (unsigned long long)t->DoneSeq.load());
+            glBindTexture(GL_TEXTURE_2D, t->SyncColor(c));
+        });
         return;
     }
     glBindTexture(GL_TEXTURE_2D, Get3DTex());
@@ -249,6 +265,7 @@ bool GLRenderer::Init()
         if (d->W->Threaded)
         {
             Defer = std::move(d);
+            Defer->MaxPending = OpenGL::Prop("glhidepth", 2);   // debug.litev.glhidepth: queued batches before the emulator waits
             GLDefer::Active = Defer.get();
             GLDefer::RecordThread = true;
             bool ok = false;
@@ -908,6 +925,7 @@ void GLRenderer::VBlank()
     if (GLDefer::Recording())
     {
         // at most MaxPending frames of calls queued: the emulator never runs far ahead
+        if (Defer->MaxPending <= 0) { Defer->Drain(); return; }   // glhidepth=0: in lockstep (diagnostic)
         if (Defer->Pending.load(std::memory_order_acquire) >= Defer->MaxPending)
             LSP_WAIT("hi-defer", GPU.NDS.NumFrames, Defer->W->WaitQueued());
         Defer->Submit();
@@ -923,6 +941,15 @@ void GLRenderer::VBlankEnd()
 void GLRenderer::DoCapture(int ystart, int yend)
 {
     CapturedSince3D = true;
+    // LITEV_GLHI_DEFER: the 3D job kicked last may still read the capture textures this
+    // capture rewrites (3D textures from captures); the worker waits for it first (on the
+    // emulator thread that job runs long before the next frame's capture)
+    if (Thread3D && GLDefer::Recording())
+    {
+        GLThread3D* t = Thread3D;
+        const int c = t->GL->GetCurColor();
+        GLDefer::Exec([t, c] { t->SyncColor(c); });
+    }
     u32 dispcnt = DispCntA;
     u32 capcnt = CaptureCnt;
     u32 dispmode = (dispcnt >> 16) & 0x3;

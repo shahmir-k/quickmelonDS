@@ -2009,6 +2009,7 @@ void GLRenderer2D::RenderScreen(int ystart, int yend)
         }
         // stage 1 at 1x: everything but the 3D layer
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, SplitFB);
+        glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);   // the sprite pass leaves buffer 1's blue masked
         glViewport(0, 0, 256, 192);
         glScissor(0, ystart, 256, yend - ystart);
         glUseProgram(Split1Prog);
@@ -2089,8 +2090,18 @@ void GLRenderer2D::Check1x(int ystart, int yend)
             {
                 logged++;
                 const int p = (int)(i / 4);
-                Platform::Log(Platform::Info, "LITEV_HI1XCHECK diff at x %d y %d (screen %d, %s): got %d %d %d want %d %d %d\n",
-                              p % ScreenW, y0 + p / ScreenW, GPU2D.Num, CompSF == 1 ? "1x" : "split", a[i], a[i+1], a[i+2], r[i], r[i+1], r[i+2]);
+                u8 sp[2][4] = {};
+                if (CompSF != 1 && SplitFB)
+                    for (int k = 0; k < 2; k++)
+                    {
+                        glBindFramebuffer(GL_READ_FRAMEBUFFER, SplitFB);
+                        glReadBuffer(GL_COLOR_ATTACHMENT0 + k);
+                        glReadPixels((p % ScreenW) / ScaleFactor, (y0 + p / ScreenW) / ScaleFactor, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, sp[k]);
+                        glReadBuffer(GL_COLOR_ATTACHMENT0);
+                    }
+                Platform::Log(Platform::Info, "LITEV_HI1XCHECK diff at x %d y %d (screen %d, %s): got %d %d %d want %d %d %d | split0 %d %d %d info %d other %d %d %d %d\n",
+                              p % ScreenW, y0 + p / ScreenW, GPU2D.Num, CompSF == 1 ? "1x" : "split", a[i], a[i+1], a[i+2], r[i], r[i+1], r[i+2],
+                              sp[0][0], sp[0][1], sp[0][2], sp[0][3], sp[1][0], sp[1][1], sp[1][2], sp[1][3]);
             }
             bad++;
         }
