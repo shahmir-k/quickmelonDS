@@ -356,7 +356,13 @@ struct GPU3D::AsyncGeo
                         Sh->ExecuteCommandT<true>();
                         Sh->BulkPtr = Sh->BulkEnd = nullptr;
                     }
-                    if (k < n) Sh->FlushAttributes = p[k].Param & 0x3;   // (SubmitPolygon reads the W-buffer bit)
+                    if (k < n)
+                    {
+                        // the bank is complete: split and sort it for VBlank (the order VBlank computes)
+                        Sh->FlushAttributes = p[k].Param & 0x3;   // (the sort and SubmitPolygon read it)
+                        Sh->SortRenderPolygons();
+                        Sh->AsyncSorted = true;
+                    }
                     j = k < n ? k + 1 : k;
                 }
                 t += n;
@@ -921,7 +927,7 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
         GPU3D& sh = *Async->Sh;
         sh.CopyGeoFrom(*this);
         sh.RenderingEnabled = RenderingEnabled; sh.ZeroDotWLimit = ZeroDotWLimit; sh.DispCnt = DispCnt;
-        sh.FlushAttributes = FlushAttributes;
+        sh.FlushAttributes = FlushAttributes; sh.AsyncSorted = false;
     }
 #endif
 }
@@ -5284,6 +5290,55 @@ bool YSort(Polygon* a, Polygon* b)
     return a->SortKey < b->SortKey;
 }
 
+void GPU3D::SortRenderPolygons() noexcept
+{
+    if (NumPolygons)
+    {
+        // separate translucent polygons from opaque ones
+
+        u32 io = 0, it = NumOpaquePolygons;
+        for (u32 i = 0; i < NumPolygons; i++)
+        {
+            Polygon* poly = &CurPolygonRAM[i];
+            if (poly->Translucent)
+                RenderPolygonRAM[it++] = poly;
+            else
+                RenderPolygonRAM[io++] = poly;
+        }
+
+        // apply Y-sorting
+
+#ifdef LITEV_POLY_RADIX
+        // 4-pass LSD radix on the u32 SortKey: each pass is a stable counting
+        // scatter, so the final permutation is IDENTICAL to
+        // std::stable_sort(YSort) (same single-key order; equal keys keep
+        // submission order) — but with zero per-frame allocation and linear
+        // scatters instead of merge memcpys. stable_sort here was the #2
+        // emu-thread backend-stall source (~13%, attribution 2026-07-17).
+        {
+            const u32 n = (FlushAttributes & 0x1) ? NumOpaquePolygons : NumPolygons;
+            Polygon** src = RenderPolygonRAM.data();
+            Polygon** dst = PolySortScratch.data();
+            for (int shift = 0; shift < 32; shift += 8)
+            {
+                u32 cnt[257] = {};
+                for (u32 i = 0; i < n; i++) cnt[((src[i]->SortKey >> shift) & 0xFF) + 1]++;
+                for (int b = 0; b < 256; b++) cnt[b + 1] += cnt[b];
+                for (u32 i = 0; i < n; i++) dst[cnt[(src[i]->SortKey >> shift) & 0xFF]++] = src[i];
+                std::swap(src, dst);
+            }
+            // 4 passes (even count) -> the sorted order is back in
+            // RenderPolygonRAM[0..n); entries >= n were never touched.
+        }
+#else
+        std::stable_sort(RenderPolygonRAM.begin(),
+            RenderPolygonRAM.begin() + ((FlushAttributes & 0x1) ? NumOpaquePolygons : NumPolygons),
+            YSort);
+#endif
+    }
+
+}
+
 void GPU3D::VBlank() noexcept
 {
 #ifdef LITEV_GX_LAZY
@@ -5339,51 +5394,16 @@ void GPU3D::VBlank() noexcept
         {
             if (FlushRequest)
             {
-                if (NumPolygons)
+#ifdef LITEV_GX_ASYNC_LOCAL
+                // the worker split and sorted the bank at the swap command: take its order
+                if (Async && Async->Sh->AsyncSorted)
                 {
-                    // separate translucent polygons from opaque ones
-
-                    u32 io = 0, it = NumOpaquePolygons;
-                    for (u32 i = 0; i < NumPolygons; i++)
-                    {
-                        Polygon* poly = &CurPolygonRAM[i];
-                        if (poly->Translucent)
-                            RenderPolygonRAM[it++] = poly;
-                        else
-                            RenderPolygonRAM[io++] = poly;
-                    }
-
-                    // apply Y-sorting
-
-#ifdef LITEV_POLY_RADIX
-                    // 4-pass LSD radix on the u32 SortKey: each pass is a stable counting
-                    // scatter, so the final permutation is IDENTICAL to
-                    // std::stable_sort(YSort) (same single-key order; equal keys keep
-                    // submission order) — but with zero per-frame allocation and linear
-                    // scatters instead of merge memcpys. stable_sort here was the #2
-                    // emu-thread backend-stall source (~13%, attribution 2026-07-17).
-                    {
-                        const u32 n = (FlushAttributes & 0x1) ? NumOpaquePolygons : NumPolygons;
-                        Polygon** src = RenderPolygonRAM.data();
-                        Polygon** dst = PolySortScratch.data();
-                        for (int shift = 0; shift < 32; shift += 8)
-                        {
-                            u32 cnt[257] = {};
-                            for (u32 i = 0; i < n; i++) cnt[((src[i]->SortKey >> shift) & 0xFF) + 1]++;
-                            for (int b = 0; b < 256; b++) cnt[b + 1] += cnt[b];
-                            for (u32 i = 0; i < n; i++) dst[cnt[(src[i]->SortKey >> shift) & 0xFF]++] = src[i];
-                            std::swap(src, dst);
-                        }
-                        // 4 passes (even count) -> the sorted order is back in
-                        // RenderPolygonRAM[0..n); entries >= n were never touched.
-                    }
-#else
-                    std::stable_sort(RenderPolygonRAM.begin(),
-                        RenderPolygonRAM.begin() + ((FlushAttributes & 0x1) ? NumOpaquePolygons : NumPolygons),
-                        YSort);
-#endif
+                    Async->Sh->AsyncSorted = false;
+                    memcpy(RenderPolygonRAM.data(), Async->Sh->RenderPolygonRAM.data(), NumPolygons * sizeof(Polygon*));
                 }
-
+                else
+#endif
+                SortRenderPolygons();
                 RenderNumPolygons = NumPolygons;
                 RenderFrameIdentical = false;
             }
@@ -5438,6 +5458,7 @@ void GPU3D::VBlank() noexcept
                 GPU3D& sh = *Async->Sh;
                 sh.CurRAMBank = CurRAMBank; sh.CurVertexRAM = CurVertexRAM; sh.CurPolygonRAM = CurPolygonRAM;
                 sh.NumVertices = sh.NumPolygons = sh.NumOpaquePolygons = 0;
+                sh.AsyncSorted = false;   // (a swap whose render list was not prepared)
             }
 #endif
         }
