@@ -78,8 +78,13 @@ smooth in vec4 fTexcoord;
 #ifdef SPLIT3D_STAGE1
 // LITEV_GLHI_SPLIT3D stage 1 (1x): the composite without the 3D layer, and how the 3D layer
 // would enter it: oColor = (that composite, info), oOther = the other layer's colour
+#ifdef GL_ES
 layout(location = 0) out vec4 oColor;
 layout(location = 1) out vec4 oOther;
+#else
+out vec4 oColor;   // locations bound by name (desktop GLSL 140)
+out vec4 oOther;
+#endif
 #else
 out vec4 oColor;
 #endif
