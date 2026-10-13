@@ -1518,10 +1518,10 @@ void SoftRenderer::HybridStage(int b)
 // which the GPU merge does per Nx pixel. l3d: the 1x 3D read back on capture frames.
 void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32* descB, const u32* l3d, bool has3D)
 {
+    // display capture writes emulated VRAM at 1x: resolve engine A's BG/OBJ+3D line on the CPU
+    alignas(8) u32 resA[256], line3d[256];
     if (f.CaptureEnable)
     {
-        // display capture writes emulated VRAM at 1x: resolve engine A on the CPU
-        alignas(8) u32 resA[256], line3d[256];
         u32 xpos = f.XPos3D & 0x1FF;
         for (int i = 0; i < 256; i++)
         {
@@ -1529,7 +1529,6 @@ void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32*
             line3d[i] = (l3d && x >= 0 && x < 256) ? l3d[x] : 0;
             resA[i] = has3D ? SoftRenderer2D::HybridResolvePixel(descA[i], descA[256+i], line3d[i]) : descA[i];
         }
-        DoCapture(line, resA, line3d, &f);
     }
 
     const u32 modeA = (f.DispCntA >> 16) & 0x3;
@@ -1542,6 +1541,12 @@ void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32*
     }
     if (modeB != 1)
         DrawScanlineB(line, descB, descB, f.DispCntB, 0);
+
+    // after the display read, as in the software path and on hardware: a VRAM-display line shows
+    // the bank before this line's capture overwrites it. Capturing first made engine A show the
+    // capture it had just taken (Golden Sun's dual-screen 3D title: both screens the same image)
+    if (f.CaptureEnable)
+        DoCapture(line, resA, line3d, &f);
 
     u32 ctlA = f.MasterBrightnessA | (modeA << 16) | ((f.XPos3D & 0xFF) << 24) | ((f.XPos3D & 0x100) << 15);
     u32 ctlB = f.MasterBrightnessB | (modeB << 16);
