@@ -386,16 +386,17 @@ struct Build
     // the guest's request-thread latency from the MP V-count alarm to the chip (parent: CMD armed, child: reply armed);
     // measured as V-count lines of the guest's W_TXSlotCmd / W_TXSlotReply1 write after the alarm line, x 63.56 us
     u32 vaParentUs, vaChildUs;
+    u32 kickChildUs;    // child: MPACK -> next reply armed (the guest's KICK_MP_CHILD request latency)
 };
 constexpr Build kBuilds[] = {
-    {0x408040ea75491a59ull, "NitroSDK 3.0 WM (Mario Kart DS, Animal Crossing WW)", 30, "2.64.00", 3000, 1500, 100, 800, 11200, 0, 0, 12600, 1100, 0, 0, 445, 190},
-    {0x29342b46397da78full, "NitroSDK 3.1 WM (Shrek SnCR, New Super Mario Bros.)", 31, "2.74.00", 4500, 3800, 112, 570, 11700, 3800, 120, 12050, 900, 0, 0, 1557, 1049},
-    {0x3e7897fa761e4bf8ull, "NitroSDK 4.x WM (Kirby SSU, Chrono Trigger, M&L BIS)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176},
-    {0x6d9f2d0d3ca0bd96ull, "NitroSDK 4.x WM (GTA CW, Sonic Chronicles)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176},
-    {0x32abc95715c0a7fdull, "NitroSDK 4.x WM (Dragon Quest IX)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176},
-    {0x44459275eff97ba4ull, "NitroSDK 4.x WM (Pokemon HeartGold / SoulSilver)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176},
-    {0x8f8c5c9ada28f3c0ull, "NitroSDK 4.x WM (Pokemon Platinum)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176},
-    {0x5c3f3bbdb2cacf4bull, "TwlSDK 5.x WM, NITRO mode (Pokemon Black / White / B2W2, The Sims 3)", 50, "2.88.00", 5930, 3570, 320, 180, 12580, 3800, 120, 12580, 1600, 12000, 12160, 1589, 1176},
+    {0x408040ea75491a59ull, "NitroSDK 3.0 WM (Mario Kart DS, Animal Crossing WW)", 30, "2.64.00", 3000, 1500, 100, 800, 11200, 0, 0, 12600, 1100, 0, 0, 445, 190, 0},
+    {0x29342b46397da78full, "NitroSDK 3.1 WM (Shrek SnCR, New Super Mario Bros.)", 31, "2.74.00", 4500, 3800, 112, 570, 11700, 3800, 120, 12050, 900, 0, 0, 1557, 1049, 510},
+    {0x3e7897fa761e4bf8ull, "NitroSDK 4.x WM (Kirby SSU, Chrono Trigger, M&L BIS)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x6d9f2d0d3ca0bd96ull, "NitroSDK 4.x WM (GTA CW, Sonic Chronicles)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x32abc95715c0a7fdull, "NitroSDK 4.x WM (Dragon Quest IX)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x44459275eff97ba4ull, "NitroSDK 4.x WM (Pokemon HeartGold / SoulSilver)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x8f8c5c9ada28f3c0ull, "NitroSDK 4.x WM (Pokemon Platinum)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x5c3f3bbdb2cacf4bull, "TwlSDK 5.x WM, NITRO mode (Pokemon Black / White / B2W2, The Sims 3)", 50, "2.88.00", 5930, 3570, 320, 180, 12580, 3800, 120, 12580, 1600, 12000, 12160, 1589, 1176, 700},
 };
 // NitroSDK 3.1 WMStatus: 3.0 offset -> 3.1 offset (spec-shrek-delta 1.2); 4.x: + the MP engine's current parameters
 const u16* Map31(bool v4)
@@ -1822,7 +1823,7 @@ void IndMpAck(Ctx& c, const std::vector<u8>& B, bool fake)
         // ponytail: 3.1's childInterval alarm writes these flags when it fires; here at once (the post is what is timed)
         SS16(c, ST_c030, 0); SS16(c, ST_c032, 0); SS16(c, ST_newFrame, 0);
         if (c.v31 && N16(c, N_cInt)) c.kickAt[1] = c.now + N64(c, N_cTick) * 64;   // (childInterval alarm)
-        else PostInternal(c, IdKey(c), 0);
+        else { c.keyNext = c.now + Us(c.bd->kickChildUs); PostInternal(c, IdKey(c), 0); }
     }
     else { SS16(c, ST_c030, 0); SS16(c, ST_c032, 1); SS16(c, ST_newFrame, 0); }
 }
