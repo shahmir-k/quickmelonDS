@@ -180,6 +180,7 @@ public:
     // public Read / Write, and CheckIRQ hands the chip's IRQ to it while it owns the chip
     std::unique_ptr<void, void (*)(void*)> WMN{nullptr, nullptr};
     bool WMNOwns = false;
+    u8* RAMPtr() { return RAM; }
 #endif
 
 private:
