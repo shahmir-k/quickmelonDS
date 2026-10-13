@@ -59,6 +59,8 @@ public:
     struct Stats
     {
         u64 Frames, PresenceTx, PresenceRx, LinkTx, LinkRx, BeaconsInjected, LinksOpened, BlockedUs, Exchanges;
+        u64 HostWaitUs, HostWaitCalls, HostWaitMisses, HostWaitTimeouts;
+        u64 ClientWaitUs, ClientWaitCalls, ClientWaitMisses;
         u32 LastFrameBlockedUs, LastFrameExchanges, Links, Nearby, MaxRttMs;
         u32 SlowFpsX100, SlowWaitUsPerFrame, SlowExchangesPerFrameX100;
         bool SlowdownPending;
@@ -175,6 +177,8 @@ private:
     AmbientSlowdown Slowdown;
 
     std::atomic<u64> StFrames{0}, StPresTx{0}, StPresRx{0}, StLinkTx{0}, StLinkRx{0}, StInjected{0}, StOpened{0}, StBlockedUs{0}, StExchanges{0};
+    std::atomic<u64> StHostWaitUs{0}, StHostWaitCalls{0}, StHostWaitMisses{0}, StHostWaitTimeouts{0};
+    std::atomic<u64> StClientWaitUs{0}, StClientWaitCalls{0}, StClientWaitMisses{0};
     std::atomic<u32> StLastBlocked{0}, StLastExch{0}, StLinks{0}, StNearby{0}, StMaxRtt{0};
     std::atomic<u32> StSlowFps{0}, StSlowWait{0}, StSlowExch{0};
     std::atomic<bool> StSlowPending{false}, StSlowDismissRequested{false};

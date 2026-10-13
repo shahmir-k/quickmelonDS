@@ -95,12 +95,13 @@ u32 BeaconHash(const u8* d, int len)
 }
 // LITEV_AMBIENT_TRACE=1 (env; tests): every frame sent / received / synthesized, logged
 const bool kTrace = getenv("LITEV_AMBIENT_TRACE") != nullptr;
-void Trace(const char* what, int slot, u32 type, const u8* d, int len)
+const bool kWaitTrace = getenv("LITEV_AMBIENT_WAIT_TRACE") != nullptr;
+void Trace(const char* what, int slot, u32 type, const u8* d, int len, u64 timestamp)
 {
     if (len < 12 + 24) return;
     const u8* f = d + 12;
-    Platform::Log(Platform::LogLevel::Info, "AMBTRACE %llu %s slot %d type %x fc %02x%02x ch %u a1 %02x:%02x:%02x:%02x:%02x:%02x a2 %02x:%02x:%02x:%02x:%02x:%02x len %d\n",
-                  (unsigned long long)(NowUs() / 1000), what, slot, type, f[1], f[0], d[9], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15], len);
+    Platform::Log(Platform::LogLevel::Info, "AMBTRACE %llu %s slot %d type %x fc %02x%02x ch %u a1 %02x:%02x:%02x:%02x:%02x:%02x a2 %02x:%02x:%02x:%02x:%02x:%02x len %d ts %llu\n",
+                  (unsigned long long)(NowUs() / 1000), what, slot, type, f[1], f[0], d[9], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15], len, (unsigned long long)timestamp);
 }
 bool SameGame(const char* a, const char* b) { return a[0] && !memcmp(a, b, 3); }
 
@@ -405,6 +406,9 @@ AmbientLAN::Stats AmbientLAN::GetStats()
     Stats s;
     s.Frames = StFrames; s.PresenceTx = StPresTx; s.PresenceRx = StPresRx; s.LinkTx = StLinkTx; s.LinkRx = StLinkRx;
     s.BeaconsInjected = StInjected; s.LinksOpened = StOpened; s.BlockedUs = StBlockedUs; s.Exchanges = StExchanges;
+    s.HostWaitUs = StHostWaitUs; s.HostWaitCalls = StHostWaitCalls;
+    s.HostWaitMisses = StHostWaitMisses; s.HostWaitTimeouts = StHostWaitTimeouts;
+    s.ClientWaitUs = StClientWaitUs; s.ClientWaitCalls = StClientWaitCalls; s.ClientWaitMisses = StClientWaitMisses;
     s.LastFrameBlockedUs = StLastBlocked; s.LastFrameExchanges = StLastExch; s.Links = StLinks; s.Nearby = StNearby; s.MaxRttMs = StMaxRtt;
     s.SlowFpsX100 = StSlowFps; s.SlowWaitUsPerFrame = StSlowWait;
     s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending;
@@ -468,7 +472,7 @@ int AmbientLAN::Inject(u8* data, u64* timestamp)
         memcpy(&data[12 + 24], &tsf, 8);
         best->DueUs = std::max(best->DueUs + best->IntervalUs, now);
         StInjected++;
-        if (kTrace) Trace("beacon", -1, 0, data, len);
+        if (kTrace) Trace("beacon", -1, 0, data, len, 0);
     }
     NextInjectUs = ~0ull;
     for (const auto& c : Cands) NextInjectUs = std::min(NextInjectUs, c.DueUs);
@@ -582,7 +586,7 @@ void AmbientLAN::SendTo(u32 slots, u32 type, const u8* data, int len, u64 timest
         }
         enet_peer_send(l.P, Chan_MP, pkt);
         StLinkTx++;
-        if (kTrace) Trace("tx", s, type, data, len);
+        if (kTrace) Trace("tx", s, type, data, len, timestamp);
         sent = true;
     }
     if (pkt && !pkt->referenceCount) enet_packet_destroy(pkt);
@@ -603,7 +607,7 @@ bool AmbientLAN::Admit(ENetEvent& ev)
     if (!(f[10] & 1)) memcpy(l->MAC, f + 10, 6);     // (the sender's own MAC)
     if (f[0] == 0xC0 && !l->CloseAtMs) l->CloseAtMs = NowMs() + 500;   // deauth: the session is over
     StLinkRx++;
-    if (kTrace) Trace("rx", s, h->Type, ev.packet->data + sizeof(MPPacketHeader), (int)h->Length);
+    if (kTrace) Trace("rx", s, h->Type, ev.packet->data + sizeof(MPPacketHeader), (int)h->Length, h->Timestamp);
     return true;
 }
 
@@ -706,7 +710,14 @@ void AmbientLAN::Pump(int type)
         // (it heard a synthesized one), so its auth request arrives while the parent dozes
         const u8 fc = p->data[sizeof(MPPacketHeader) + 12];
         const u32 keep = (h->Type == 0 && (fc & 0x0C) == 0 && fc != 0x80) ? 1000 : 16;
-        if (h->Magic > now || now - h->Magic > keep) { RX.pop_front(); enet_packet_destroy(p); continue; }
+        if (h->Magic > now || now - h->Magic > keep)
+        {
+            if (kWaitTrace)
+                Platform::Log(Platform::LogLevel::Info,
+                              "AMBWAIT stale frame type=%04x age_ms=%u keep_ms=%u slot=%d\n",
+                              h->Type, h->Magic > now ? 0u : now - h->Magic, keep, q.Slot);
+            RX.pop_front(); enet_packet_destroy(p); continue;
+        }
         if (type >= 2) return;
         if (type == 1)
         {
@@ -920,7 +931,11 @@ int AmbientLAN::RecvHostPacket(int inst, u8* data, u64* timestamp)
 #endif
     Pump(2);
     const int r = Pop(data, timestamp);
-    FrameBlockedUs += (u32)(NowUs() - t0);
+    const u64 waited = NowUs() - t0;
+    FrameBlockedUs += (u32)waited;
+    StClientWaitUs += waited;
+    StClientWaitCalls++;
+    if (r <= 0) StClientWaitMisses++;
     return r;
 }
 
@@ -954,10 +969,26 @@ u16 AmbientLAN::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
             replied |= 1u << q.Slot;
             if ((replied & up) == up || (ret & aidmask) == aidmask) { enet_packet_destroy(p); break; }
         }
+        else if (kWaitTrace && (h->Type & 0xFFFF) == 2)
+            Platform::Log(Platform::LogLevel::Info,
+                          "AMBWAIT old reply slot=%d reply_ts=%llu want_ts=%llu\n",
+                          q.Slot, (unsigned long long)h->Timestamp, (unsigned long long)timestamp);
         enet_packet_destroy(p);
     }
     RX.insert(RX.begin(), later.begin(), later.end());
-    FrameBlockedUs += (u32)(NowUs() - t0);
+    const u64 waited = NowUs() - t0;
+    FrameBlockedUs += (u32)waited;
+    StHostWaitUs += waited;
+    StHostWaitCalls++;
+    if ((ret & aidmask) != aidmask) StHostWaitMisses++;
+    if ((replied & up) != up && (ret & aidmask) != aidmask)
+    {
+        StHostWaitTimeouts++;
+        if (kWaitTrace)
+            Platform::Log(Platform::LogLevel::Info,
+                          "AMBWAIT host timeout waited_us=%llu up=%04x replied=%04x aidmask=%04x ret=%04x ts=%llu\n",
+                          (unsigned long long)waited, up, replied, aidmask, ret, (unsigned long long)timestamp);
+    }
     return ret;
 }
 
