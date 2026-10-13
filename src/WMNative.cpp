@@ -69,6 +69,13 @@ void TraceFifo(NDS& nds, int fromArm7, u32 val)
         u32 w0; memcpy(&w0, &nds.MainRAM[data & nds.MainRAMMask], 4);
         if (!fromArm7 && (w0 & 0x7fff) == 0) { u32 st; memcpy(&st, &nds.MainRAM[(data + 8) & nds.MainRAMMask], 4); std::lock_guard<std::mutex> l(g_TrM); g_TrSt[&nds].status = st; }
         StatusDiff(f, nds);
+        // a START_SCAN_EX "found" callback: the BSS descriptors it points to
+        if (fromArm7 && (w0 & 0xffff) == 0x26)
+        {
+            u32 st8; memcpy(&st8, &nds.MainRAM[(data + 8) & nds.MainRAMMask], 4);
+            u32 n; memcpy(&n, &nds.MainRAM[(data + 0xc) & nds.MainRAMMask], 4);
+            if ((st8 & 0xffff) == 5) for (u32 i = 0; i < ((n >> 16) & 0xff) && i < 4; i++) { u32 d; memcpy(&d, &nds.MainRAM[(data + 0x10 + 4 * i) & nds.MainRAMMask], 4); fprintf(f, "  DESC%u", i); Dump(f, nds, d, 0xc0); }
+        }
         // LITEV_WMTRACE_MEM=<from>:<to>: at each SET_MP_DATA request, the ARM7 WRAM / ARM7 VRAM words changed since the last one
         static const char* e = getenv("LITEV_WMTRACE_MEM");
         static const u32 from = e ? (u32)atoi(e) : 0, to = e && strchr(e, ':') ? (u32)atoi(strchr(e, ':') + 1) : 0;
@@ -242,7 +249,8 @@ struct Ctx
     const u16* stMap = nullptr;                 // WMStatus offset map of this build (nullptr: the 3.0 layout)
     const struct Build* bd = nullptr; bool v31 = false, v4 = false, pw = false;
     bool nullKey = false;                       // WL NullKeyResponseMode (3.1 MP: the child's W_AIDLow stays set)
-    u64 keyNext = 0;                            // child: the next key data not before this (3.1 childInterval)
+    u64 keyNext = 0;
+    u64 vaNext = 0;                             // the MP V-alarm request (0x1c) is handled not before this                            // child: the next key data not before this (3.1 childInterval)
     // 3.1+: the next-MP / next-key-data requests the parent / child interval OS alarm posts when it fires (the guest posts
     // them then, so ARM9 requests arriving meanwhile - SET_MP_DATA - are processed first and go into that MP)
     u64 kickAt[2] = {}; u16 kickArg[2] = {};
@@ -353,7 +361,8 @@ bool Allowed(Ctx& c)
 #endif
     return v ? atoi(v) != 0 : true;
 }
-// debug.litev.a7wmtwl=1 (prop / env): also the TWL 5.x build (PB/PW/B2W2/Sims 3); off by default until its MP path is proven
+// debug.litev.a7wmtwl=0 (prop / env): the TWL 5.x build (PB/PW/B2W2/Sims 3) stays emulated (default on: its MP path matched
+// the emulated driver through a PB<->PW Union Room trainer-card exchange)
 bool TwlAllowed()
 {
 #if defined(__ANDROID__)
@@ -362,7 +371,7 @@ bool TwlAllowed()
 #else
     const char* v = getenv("debug.litev.a7wmtwl");
 #endif
-    return v && atoi(v) != 0;
+    return !v || atoi(v) != 0;
 }
 
 // ---- WM build recognition ----
@@ -382,16 +391,20 @@ struct Build
 {
     u64 id; const char* name; u8 gen; char wlVer[8];
     u32 parentHoldUs, scanSetupUs, scanExtraUs, scanDownUs, endScanUs, measPreUs, measExtraUs, measPostUs, mpGapUs, resetUs, endParentUs;
+    // the guest's request-thread latency from the MP V-count alarm to the chip (parent: CMD armed, child: reply armed);
+    // measured as V-count lines of the guest's W_TXSlotCmd / W_TXSlotReply1 write after the alarm line, x 63.56 us
+    u32 vaParentUs, vaChildUs;
+    u32 kickChildUs;    // child: MPACK -> next reply armed (the guest's KICK_MP_CHILD request latency)
 };
 constexpr Build kBuilds[] = {
-    {0x408040ea75491a59ull, "NitroSDK 3.0 WM (Mario Kart DS, Animal Crossing WW)", 30, "2.64.00", 3000, 1500, 100, 800, 11200, 0, 0, 12600, 1100, 0, 0},
-    {0x29342b46397da78full, "NitroSDK 3.1 WM (Shrek SnCR, New Super Mario Bros.)", 31, "2.74.00", 4500, 3800, 112, 570, 11700, 3800, 120, 12050, 900, 0, 0},
-    {0x3e7897fa761e4bf8ull, "NitroSDK 4.x WM (Kirby SSU, Chrono Trigger, M&L BIS)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
-    {0x6d9f2d0d3ca0bd96ull, "NitroSDK 4.x WM (GTA CW, Sonic Chronicles)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
-    {0x32abc95715c0a7fdull, "NitroSDK 4.x WM (Dragon Quest IX)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
-    {0x44459275eff97ba4ull, "NitroSDK 4.x WM (Pokemon HeartGold / SoulSilver)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
-    {0x8f8c5c9ada28f3c0ull, "NitroSDK 4.x WM (Pokemon Platinum)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
-    {0x5c3f3bbdb2cacf4bull, "TwlSDK 5.x WM, NITRO mode (Pokemon Black / White / B2W2, The Sims 3)", 50, "2.88.00", 5930, 3570, 320, 180, 12580, 3800, 120, 12580, 1600, 12000, 12160},
+    {0x408040ea75491a59ull, "NitroSDK 3.0 WM (Mario Kart DS, Animal Crossing WW)", 30, "2.64.00", 3000, 1500, 100, 800, 11200, 0, 0, 12600, 1100, 0, 0, 445, 190, 0},
+    {0x29342b46397da78full, "NitroSDK 3.1 WM (Shrek SnCR, New Super Mario Bros.)", 31, "2.74.00", 4500, 3800, 112, 570, 11700, 3800, 120, 12050, 900, 0, 0, 1557, 1049, 510},
+    {0x3e7897fa761e4bf8ull, "NitroSDK 4.x WM (Kirby SSU, Chrono Trigger, M&L BIS)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x6d9f2d0d3ca0bd96ull, "NitroSDK 4.x WM (GTA CW, Sonic Chronicles)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x32abc95715c0a7fdull, "NitroSDK 4.x WM (Dragon Quest IX)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x44459275eff97ba4ull, "NitroSDK 4.x WM (Pokemon HeartGold / SoulSilver)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x8f8c5c9ada28f3c0ull, "NitroSDK 4.x WM (Pokemon Platinum)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160, 1843, 1176, 600},
+    {0x5c3f3bbdb2cacf4bull, "TwlSDK 5.x WM, NITRO mode (Pokemon Black / White / B2W2, The Sims 3)", 50, "2.88.00", 5930, 3570, 320, 180, 12580, 3800, 120, 12580, 1600, 12000, 12160, 1589, 1176, 700},
 };
 // NitroSDK 3.1 WMStatus: 3.0 offset -> 3.1 offset (spec-shrek-delta 1.2); 4.x: + the MP engine's current parameters
 const u16* Map31(bool v4)
@@ -1818,7 +1831,7 @@ void IndMpAck(Ctx& c, const std::vector<u8>& B, bool fake)
         // ponytail: 3.1's childInterval alarm writes these flags when it fires; here at once (the post is what is timed)
         SS16(c, ST_c030, 0); SS16(c, ST_c032, 0); SS16(c, ST_newFrame, 0);
         if (c.v31 && N16(c, N_cInt)) c.kickAt[1] = c.now + N64(c, N_cTick) * 64;   // (childInterval alarm)
-        else PostInternal(c, IdKey(c), 0);
+        else { c.keyNext = c.now + Us(c.bd->kickChildUs); PostInternal(c, IdKey(c), 0); }
     }
     else { SS16(c, ST_c030, 0); SS16(c, ST_c032, 1); SS16(c, ST_newFrame, 0); }
 }
@@ -1832,6 +1845,7 @@ void PostVAlarmMP(Ctx& c)
 {
     if (S16(c, ST_vaPend) == 1) return;
     SS16(c, ST_vaPend, 1);
+    c.vaNext = c.now + Us(S16(c, ST_mode) == 1 ? c.bd->vaParentUs : c.bd->vaChildUs);
     PostInternal(c, 0x1C, 0);
 }
 void SetVCount(Ctx& c, u16 v) { c.nds.ARM7IOWrite16(0x04000006, v); }
@@ -2920,6 +2934,7 @@ void Process(Ctx& c)
             // WMSP indication -> request thread -> MA_MP); emulated children need that time to arm their next reply
             if (!f.addr && (f.api == IdMP(c) || f.api == IdResend(c)) && c.now < c.mpNext) { SetTimer(c, T_POLL, c.mpNext); break; }
             if (!f.addr && f.api == IdKey(c) && c.now < c.keyNext) { SetTimer(c, T_POLL, c.keyNext); break; }
+            if (!f.addr && f.api == 0x1C && c.now < c.vaNext) { SetTimer(c, T_POLL, c.vaNext); break; }
             Rq q = f; c.reqs.pop_front(); Request(c, q); continue;
         }
         break;
@@ -2935,7 +2950,7 @@ void Process(Ctx& c)
 }
 
 // ---- savestate (section "WMNA"; layout kSaveVer) ----
-constexpr u32 kSaveVer = 4;          // (3: + nullKey, keyNext; 4: + interval kicks; 2 and 3 still load)
+constexpr u32 kSaveVer = 5;          // (3: + nullKey, keyNext; 4: + interval kicks; 2 and 3 still load)
 struct SS
 {
     Savestate* f;
@@ -2973,6 +2988,7 @@ void Visit(Ctx& c, SS& z, u32 ver)
     {
         z.B(c.nullKey); z.V(c.keyNext);
         if (ver >= 4) { z.V(c.kickAt); z.V(c.kickArg); }
+        if (ver >= 5) z.V(c.vaNext);
         z.B(c.opEx); z.V(c.opList); z.V(c.opListAll); z.V(c.opBufSize); z.V(c.opSsidLen); z.V(c.opMatch); z.V(c.opType); z.V(c.opSsid);
         z.Seq(c.opDescs, [&](std::vector<u8>& v) { z.Bytes(v); });
     }
@@ -3010,7 +3026,7 @@ void Release(Ctx& c)
     c.op = OpNone; c.opStage = 0; c.opDesc.clear();
     c.wl = 0; c.mode = 0; c.mgmtQ.clear(); c.mgmtBusy = false; c.txWindow = false; c.gameInfoPending = false;
     c.mpBusy = false; c.mpInd.clear(); c.aid = 0; c.bufBusy[0] = c.bufBusy[1] = false; c.lastCmdSeq = 0xFFFF;
-    c.nullKey = false; c.keyNext = 0; c.mpNext = 0; c.kickAt[0] = c.kickAt[1] = 0;
+    c.nullKey = false; c.keyNext = 0; c.mpNext = 0; c.kickAt[0] = c.kickAt[1] = 0; c.vaNext = 0;
     SetBuild(c, -1);
     for (Sta& t : c.sta) t = Sta{};
     c.pending.clear();
@@ -3081,7 +3097,7 @@ bool Fifo9(NDS& nds, u32 val)
             const Build* b = nds.ConsoleType == 0 && Allowed(c) ? FindBuild(c, &table) : nullptr;
             if (b && b->gen >= 50 && !TwlAllowed())
             {
-                if (g_Stats) fprintf(stderr, "A7WM inst%d: WM build %s: emulated (debug.litev.a7wmtwl not set)\n", c.inst, b->name);
+                if (g_Stats) fprintf(stderr, "A7WM inst%d: WM build %s: emulated (debug.litev.a7wmtwl=0)\n", c.inst, b->name);
                 b = nullptr;
             }
             SetBuild(c, b ? (int)(b - kBuilds) + 1 : 0);
