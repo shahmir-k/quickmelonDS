@@ -846,7 +846,8 @@ static void NetplayHarnessXfer(NetplaySetup& setup)
     };
 }
 
-int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts)
+int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts,
+           std::vector<PreparedMPConsole> prepared)
 {
     // LITEV_NETPLAY="player=P,delay=D,port=N,peer=IP:PORT[,latency=MS]": two-player Netplay (fixed
     // peer, no session setup). This process is player P's device: it emulates every console, but
@@ -921,6 +922,9 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     // LITEV_MP_PLAYERS=N: N consoles (default 2; Netplay: its player count)
     int n = players ? players : getenv("LITEV_MP_PLAYERS") ? atoi(getenv("LITEV_MP_PLAYERS")) : 2;
     if (n < 2 || n > LockstepMP::kMaxInst) { fprintf(stderr, "error: %d instances (2..%d)\n", n, LockstepMP::kMaxInst); return 1; }
+    const bool adoptPrepared = !prepared.empty();
+    if (adoptPrepared && (int)prepared.size() != n)
+    { fprintf(stderr, "error: %zu prepared consoles for %d-player trial\n", prepared.size(), n); return 1; }
     const u16 allMask = (u16)((1u << n) - 1);
 
     // Each console's ROM: --romK (default --rom). With session setup (Netplay with players=, the
@@ -986,8 +990,22 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_JIT_SHARED_CODE
         ARMJIT_Global::SetSharedCode(jitShared == 1 || (jitShared == 2 && k > 0) || (jitShared == 3 && k == 0));   // (3: console 0 only)
 #endif
-        if (!BuildAndBoot(c, std::nullopt, b[k], err)) { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
-        printf("console %d rom: %s (xxh3 %016llx)\n", k, c.rom.c_str(), (unsigned long long)b[k].romHash);
+        if (adoptPrepared)
+        {
+            if (!prepared[k].udata || !prepared[k].nds ||
+                prepared[k].nds.get() != prepared[k].identity)
+            { fprintf(stderr, "error (mp%d): prepared object identity/lifetime invalid\n", k); return 1; }
+            b[k].udata = std::move(prepared[k].udata);
+            b[k].nds = std::move(prepared[k].nds);
+            printf("handoff adopted exact prepared console%d nds=%p identity=%p clock=%llu\n",
+                   k, (void*)b[k].nds.get(), (void*)prepared[k].identity,
+                   (unsigned long long)b[k].nds->GetSysTimestamp());
+        }
+        else if (!BuildAndBoot(c, std::nullopt, b[k], err))
+        { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
+        if (adoptPrepared) printf("console %d rom: %s (prepared checkpoint)\n", k, c.rom.c_str());
+        else printf("console %d rom: %s (xxh3 %016llx)\n", k, c.rom.c_str(), (unsigned long long)b[k].romHash);
+        if (adoptPrepared) continue;
         // A live Ambient checkpoint does not contain SPI firmware. Clone the
         // source image before loading its savestate, or later firmware reads
         // could return the replica's default MAC/settings instead.
@@ -1318,7 +1336,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             printf("inst%d RAMPATCH: %d copies\n", k, hits);
         }
         // Distinct MAC per instance so they associate as different wireless players.
-        if (k && !getenv("LITEV_APP_FW") && !getenv("LITEV_MP_MACSWAP"))
+        if (k && !adoptPrepared && !getenv("LITEV_APP_FW") && !getenv("LITEV_MP_MACSWAP"))
         {
             Firmware& fw = b[k].nds->GetFirmware();
             fw.GetHeader().MacAddr[5] ^= (u8)k;

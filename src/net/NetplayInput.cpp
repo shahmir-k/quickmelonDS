@@ -349,8 +349,13 @@ bool NetplayInput::WaitForHandoffPeerInput(int timeoutMs)
                 target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
                 target.sin_port = htons((u16)HandoffStartPort);
                 sendto(stale, &bad, sizeof(bad), 0, (sockaddr*)&target, sizeof(target));
+                // A correct public token from an unrelated source port must
+                // also be rejected; token equality alone is not the gate.
+                Proof wrongEndpoint = mine;
+                wrongEndpoint.Player = (u8)Peers.front();
+                sendto(stale, &wrongEndpoint, sizeof(wrongEndpoint), 0, (sockaddr*)&target, sizeof(target));
                 close(stale);
-                fprintf(stderr, "handoff injected stale frame-0 proof\n");
+                fprintf(stderr, "handoff injected stale and wrong-endpoint frame-0 proofs\n");
             }
         }
         pollfd p{fd, POLLIN, 0};

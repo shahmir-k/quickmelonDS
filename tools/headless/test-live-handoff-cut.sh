@@ -99,11 +99,35 @@ if [[ $expect == pass || $expect == retry ]]; then
            ! grep -q 'ran_clean:       yes' "$log"; then
             echo "FAIL: $process provisional Netplay/rollback ($out_dir)" >&2; exit 1
         fi
+        local_ptr=$(sed -n 's/.*trial exact local=\([^ ]*\) peer=.*/\1/p' "$log" | tail -1)
+        peer_ptr=$(sed -n 's/.*trial exact local=[^ ]* peer=\([^ ]*\).*/\1/p' "$log" | tail -1)
+        if [[ -z $local_ptr || -z $peer_ptr || $local_ptr == 0 || $peer_ptr == 0 ]]; then
+            echo "FAIL: $process missing retained scratch object identities ($out_dir)" >&2; exit 1
+        fi
+        for console in 0 1; do
+            adopted=$(sed -n "s/.*adopted exact prepared console$console nds=\([^ ]*\) identity=\([^ ]*\).*/\1 \2/p" "$log" | tail -1)
+            expected=$peer_ptr; [[ $process == p0 && $console == 0 || $process == p1 && $console == 1 ]] && expected=$local_ptr
+            if [[ $adopted != "$expected $expected" ]]; then
+                echo "FAIL: $process console$console was not the exact PREPARED object ($out_dir)" >&2; exit 1
+            fi
+        done
+        if [[ -n $stale_input ]] &&
+           { ! grep -q 'injected stale and wrong-endpoint frame-0 proofs' "$log" ||
+             [[ $(grep -c 'rejected stale frame-0 proof' "$log") -lt 2 ]]; }; then
+            echo "FAIL: $process did not reject both stale proofs before valid peer proof ($out_dir)" >&2; exit 1
+        fi
     done
     if ! cmp -s "$out_dir/tx0/tx0.txt" "$out_dir/tx1/tx0.txt" ||
        ! cmp -s "$out_dir/tx0/tx1.txt" "$out_dir/tx1/tx1.txt"; then
         echo "FAIL: cross-process TX differs ($out_dir)" >&2; exit 1
     fi
+    for console in 0 1; do
+        host_state=$(sed -n "s/.*handoff probe inst$console: \(.*\)/\1/p" "$out_dir/p0/log.txt" | head -1)
+        guest_state=$(sed -n "s/.*handoff probe inst$console: \(.*\)/\1/p" "$out_dir/p1/log.txt" | head -1)
+        if [[ -z $host_state || $host_state != "$guest_state" ]]; then
+            echo "FAIL: prepared console$console differs before first Lockstep frame ($out_dir)" >&2; exit 1
+        fi
+    done
     if [[ $expect == retry ]]; then
         role_dir=p0; [[ ${fault%%:*} == client ]] && role_dir=p1
         if ! grep -q "injected ${fault#*:} failure" "$out_dir/$role_dir/log.txt"; then
@@ -150,8 +174,8 @@ elif [[ $expect == abort ]]; then
             echo "FAIL: a replica advanced after asymmetric live-start response ($out_dir)" >&2; exit 1
         fi
         if [[ -n $stale_input ]] &&
-           { ! grep -q 'injected stale frame-0 proof' "$out_dir/p1/log.txt" ||
-             ! grep -q 'rejected stale frame-0 proof' "$out_dir/p1/log.txt"; }; then
+           { ! grep -q 'injected stale and wrong-endpoint frame-0 proofs' "$out_dir/p1/log.txt" ||
+             [[ $(grep -c 'rejected stale frame-0 proof' "$out_dir/p1/log.txt") -lt 2 ]]; }; then
             echo "FAIL: stale frame-0 proof was not rejected ($out_dir)" >&2; exit 1
         fi
     elif grep -q 'swap trial begin' "$out_dir/p0/log.txt" "$out_dir/p1/log.txt"; then
