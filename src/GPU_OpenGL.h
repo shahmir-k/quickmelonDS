@@ -95,6 +95,10 @@ private:
     bool Synced3D = false;
     bool CapturedSince3D = false;   // LITEV_GLHI_DEFER: a display capture was recorded since the last 3D kick
     int Prev3DColor = 0;
+    // screen swap at line 0 of this frame and the last one: a game that swaps the screens every
+    // frame (dual-screen 3D: the 3D draws each screen in turn) needs this frame's own 3D
+    bool SwapLine0 = false, PrevSwapLine0 = false;
+    bool Late3D() const;
     GLuint Get3DTex();
 
     friend class GLRenderer2D;

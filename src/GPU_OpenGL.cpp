@@ -190,20 +190,29 @@ void GLRenderer::Start3DRendering()
     Synced3D = false;
 }
 
+// Default: show the 3D one frame late (the render kicked a frame earlier), so the emu thread
+// never waits for the GL thread to finish the newest one. Render-only approximation, except
+// when the game swaps the screens every frame (dual-screen 3D: Mario Kart DS's course intro,
+// Golden Sun's title): the previous frame's 3D is the OTHER screen's view, so it showed each
+// screen's picture on the other screen (and in the display capture the other screen shows).
+// debug.litev.glhilate=0: always the newest render (waits for it).
+bool GLRenderer::Late3D() const
+{
+    static const bool late = [] {
+#ifdef __ANDROID__
+        char b[92] = {}; return !(__system_property_get("debug.litev.glhilate", b) > 0 && atoi(b) == 0);
+#else
+        return OpenGL::Prop("glhilate", 1) != 0;
+#endif
+    }();
+    return late && SwapLine0 == PrevSwapLine0;
+}
+
 GLuint GLRenderer::Get3DTex()
 {
     if (Thread3D && !Synced3D)
     {
-        // Default: show the 3D one frame late (the render kicked a frame earlier), so the
-        // emu thread never waits for the GL thread to finish the newest one. Render-only
-        // approximation. debug.litev.glhilate=0: the newest render (waits for it).
-        static const bool late = [] {
-#ifdef __ANDROID__
-            char b[92] = {}; return !(__system_property_get("debug.litev.glhilate", b) > 0 && atoi(b) == 0);
-#else
-            return OpenGL::Prop("glhilate", 1) != 0;
-#endif
-        }();
+        const bool late = Late3D();
         OutputTex3D = Thread3D->SyncColor(late ? Prev3DColor : Thread3D->GL->GetCurColor());
         Synced3D = true;
         static const bool dbg = OpenGL::Prop("glhidbg", 0) != 0;
@@ -217,14 +226,7 @@ void GLRenderer::Bind3DTex()
     if (Thread3D && GLDefer::Recording())
     {
         // which colour buffer is decided now; the worker waits for its render and binds it
-        static const bool late = [] {
-#ifdef __ANDROID__
-            char b[92] = {}; return !(__system_property_get("debug.litev.glhilate", b) > 0 && atoi(b) == 0);
-#else
-            return true;
-#endif
-        }();
-        const int c = late ? Prev3DColor : Thread3D->GL->GetCurColor();
+        const int c = Late3D() ? Prev3DColor : Thread3D->GL->GetCurColor();
         GLThread3D* t = Thread3D;
         const u64 seq = t->ColorSeq[c];
         const u32 fr = GPU.NDS.NumFrames;
@@ -679,6 +681,7 @@ void GLRenderer::SetScaleFactor(int scale)
 
 void GLRenderer::DrawScanline(u32 line)
 {
+    if (line == 0) { PrevSwapLine0 = SwapLine0; SwapLine0 = GPU.ScreenSwap; }
     u32 dispcnt_a_diff = DispCntA ^ GPU.GPU2D_A.DispCnt;
     u32 dispcnt_b_diff = DispCntB ^ GPU.GPU2D_B.DispCnt;
     u32 capturecnt_diff = CaptureCnt ^ GPU.CaptureCnt;
