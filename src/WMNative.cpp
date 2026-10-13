@@ -350,6 +350,17 @@ bool Allowed(Ctx& c)
 #endif
     return v ? atoi(v) != 0 : true;
 }
+// debug.litev.a7wmtwl=1 (prop / env): also the TWL 5.x build (PB/PW/B2W2/Sims 3); off by default until its MP path is proven
+bool TwlAllowed()
+{
+#if defined(__ANDROID__)
+    char b[16] = {0};
+    const char* v = __system_property_get("debug.litev.a7wmtwl", b) > 0 ? b : nullptr;
+#else
+    const char* v = getenv("debug.litev.a7wmtwl");
+#endif
+    return v && atoi(v) != 0;
+}
 
 // ---- WM build recognition ----
 // The WMSP request dispatch table (apiid -> handler; 46+ entries into one module) is found by a scan of the ARM7's memory;
@@ -3055,6 +3066,11 @@ bool Fifo9(NDS& nds, u32 val)
         {
             u32 table = 0;
             const Build* b = nds.ConsoleType == 0 && Allowed(c) ? FindBuild(c, &table) : nullptr;
+            if (b && b->gen >= 50 && !TwlAllowed())
+            {
+                if (g_Stats) fprintf(stderr, "A7WM inst%d: WM build %s: emulated (debug.litev.a7wmtwl not set)\n", c.inst, b->name);
+                b = nullptr;
+            }
             SetBuild(c, b ? (int)(b - kBuilds) + 1 : 0);
             c.w7 = nds.ARM7Read32(a + 4); c.st = nds.ARM7Read32(a + 8); c.cbuf = nds.ARM7Read32(a + 12);
             c.camLife = 0x28;
