@@ -692,6 +692,9 @@ public:
     bool ScreenSwap = false;
 
     u16 VCount = 0;
+#ifdef LITEV_A7_NATIVE_WM
+    s32 WMLine = -1;    // the native ARM7 WM driver's next VCount alarm line (-1 none): StartScanline calls it there
+#endif
     u16 TotalScanlines = 0;
 
 #ifdef LITEV_AGGRESSIVE_SKIP
