@@ -860,6 +860,12 @@ int main(int argc, char** argv)
         }
 #endif
         nds->RunFrame();
+        if (inputScript.HasProgram())   // closed-loop script steps (@until / @repeat ... rgb) see this frame's screens
+        {
+            void* top = nullptr; void* bot = nullptr;
+            if (nds->GPU.GetFramebuffers(&top, &bot) && top && bot) inputScript.OnFrame(frame, (const u32*)top, (const u32*)bot);
+            else inputScript.OnFrame(frame, nullptr, nullptr);
+        }
         if (static const bool p2d = getenv("LITEV_PRINT_2D") != nullptr; p2d)   // display registers after the frame
             fprintf(stderr, "2D f%d A: dispcnt=%08x bldcnt=%04x eva=%d evb=%d evy=%d mb=%04x  B: dispcnt=%08x bldcnt=%04x evy=%d mb=%04x cap=%08x\n", frame,
                     nds->GPU.GPU2D_A.DispCnt, nds->GPU.GPU2D_A.BlendCnt, nds->GPU.GPU2D_A.EVA, nds->GPU.GPU2D_A.EVB, nds->GPU.GPU2D_A.EVY, nds->GPU.MasterBrightnessA,
@@ -1135,6 +1141,10 @@ int main(int argc, char** argv)
 #if defined(LITEV_A9HLE) && defined(LITEV_HLE_DIAG)
     if (getenv("LITEV_HLESIG_SCAN")) melonDS::A9HLE::SigScan(*nds);
 #endif
+    // LITEV_HEADLESS_SAVOUT=<path> (test only): the game save memory at the end (e.g. after a LAN trade)
+    if (const char* so = getenv("LITEV_HEADLESS_SAVOUT"))
+        if (const u8* sv = nds->GetNDSSave())
+            if (FILE* fp = fopen(so, "wb")) { fwrite(sv, 1, nds->GetNDSSaveLength(), fp); fclose(fp); }
     printf("=== liteDS-headless summary ===\n");
     printf("mode:        %s\n", opt.jit ? "jit" : "interp");
     printf("frames:      %d\n", opt.frames);
