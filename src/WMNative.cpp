@@ -22,14 +22,14 @@ namespace
 {
 std::mutex g_TrM;
 std::map<const NDS*, FILE*> g_Tr;
-struct TrSt { u32 status = 0; u32 last[0x7bc / 4] = {}; };
+struct TrSt { u32 status = 0; u32 last[0x7d0 / 4] = {}; };
 std::map<const NDS*, TrSt> g_TrSt;
 void StatusDiff(FILE* f, NDS& nds)
 {
     TrSt* t;
     { std::lock_guard<std::mutex> l(g_TrM); t = &g_TrSt[&nds]; }
     if (!t->status) return;
-    for (u32 i = 0; i < 0x7bc / 4; i++)
+    for (u32 i = 0; i < 0x7d0 / 4; i++)
     {
         u32 v; memcpy(&v, &nds.MainRAM[(t->status + 4 * i) & nds.MainRAMMask], 4);
         if (v != t->last[i]) { fprintf(f, "  S+%03x %08x -> %08x\n", 4 * i, t->last[i], v); t->last[i] = v; }
@@ -232,7 +232,7 @@ struct Ctx
     // VAlarm (WMSP's MP V-count alarm)
     s32 vX = -1;
     // WMSP
-    u8 rssi[16] = {}; u32 rssiIdx = 0;
+    u8 rssi[32] = {}; u32 rssiIdx = 0;          // (3.x: the first 16)
     u16 camLife = 0x28;                         // WL station lifetime (100 ms units)
     Rq opRq{0, 0, 0};
     std::deque<struct Ind> inds;                // WL -> WMSP indications not handled yet
@@ -240,9 +240,12 @@ struct Ctx
     u8 joinDesc[0x40] = {}; u16 joinTgid = 0, joinPSize = 0, joinCSize = 0; u8 joinAttr = 0, joinRssi = 0;
     u16 mpTxopOrig = 0;
     const u16* stMap = nullptr;                 // WMStatus offset map of this build (nullptr: the 3.0 layout)
-    const struct Build* bd = nullptr; bool v31 = false;
+    const struct Build* bd = nullptr; bool v31 = false, v4 = false, pw = false;
     bool nullKey = false;                       // WL NullKeyResponseMode (3.1 MP: the child's W_AIDLow stays set)
     u64 keyNext = 0;                            // child: the next key data not before this (3.1 childInterval)
+    // START_SCAN_EX (4.x): channels left / requested, the result buffer, the SSID filter, the BSS descriptors found
+    bool opEx = false; u16 opList = 0, opListAll = 0, opBufSize = 0, opSsidLen = 0, opMatch = 0, opType = 0; u8 opSsid[32] = {};
+    std::vector<std::vector<u8>> opDescs;
     u64 mpNext = 0;                             // the next MP of a sequence not before this (the guest's MP end -> CMD path)
     // late takeover: the guest's WM handles INITIALIZE and everything up to the first local-play request (scan / measure /
     // parent / connect to a DS parent), and again from END on (Nintendo WFC's DCF mode stays emulated)
@@ -270,11 +273,18 @@ u64 S64(Ctx& c, u32 o) { return S32(c, o) | (u64)S32(c, o + 4) << 32; }
 // NitroSDK 3.1 WMStatus fields with no 3.0 counterpart (3.1 offsets)
 enum : u32 { N_pSize = 0x30, N_cSize = 0x32, N_pMax = 0x34, N_cMax = 0x36, N_sendSize = 0x38, N_recvSize = 0x3a, N_maxSend = 0x3c,
              N_maxRecv = 0x3e, N_pVC = 0x40, N_cVC = 0x42, N_pInt = 0x44, N_cInt = 0x46, N_pTick = 0x48, N_cTick = 0x50, N_minFreq = 0x58,
-             N_freq = 0x5a, N_maxFreq = 0x5c, N_ignSize = 0x9c };
+             N_freq = 0x5a, N_maxFreq = 0x5c, N_ignSize = 0x9c,
+             // the persistent MP parameters (3.1 + 4.x) and 4.x's current ones (the MP engine runs on these)
+             N_minPoll = 0x92, N_single = 0x94, N_retry = 0x98, N_ignFatal = 0x9a,
+             A_minFreq = 0x7c0, A_freq = 0x7c2, A_maxFreq = 0x7c4, A_minPoll = 0x7c6, A_single = 0x7c8, A_retry = 0x7ca, A_ignFatal = 0x7cc };
 u16 N16(Ctx& c, u32 o) { return Rd16(c, c.st + o); }
 void NS16(Ctx& c, u32 o, u16 v) { Wr16(c, c.st + o, v); }
 u64 N64(Ctx& c, u32 o) { return Rd32(c, c.st + o) | (u64)Rd32(c, c.st + o + 4) << 32; }
 void NS64(Ctx& c, u32 o, u64 v) { Wr32(c, c.st + o, (u32)v); Wr32(c, c.st + o + 4, (u32)(v >> 32)); }
+// 4.x: WEP off (wep flag, mode, the 0x50 key bytes)
+void WepOff(Ctx& c) { if (!c.v4) return; Wr32(c, c.st + 0x198, 0); Wr16(c, c.st + 0x196, 0); for (u32 o = 0; o < 0x50; o += 4) Wr32(c, c.st + 0x19c + o, 0); }
+// the key-data pending flag (TwlSDK 5.x WMSP never writes it)
+void KeyPend(Ctx& c, u16 v) { if (!c.pw) SS16(c, ST_keyPend, v); }
 // 3.1 size variables (0x027e0000..0x027e0100): "parent" = my aid 0
 bool AmParent(Ctx& c) { return S16(c, ST_aid) == 0; }
 void SetPSize(Ctx& c, u16 s) { NS16(c, N_pSize, s); NS16(c, AmParent(c) ? N_sendSize : N_recvSize, s + 4); }
@@ -346,39 +356,61 @@ bool Allowed(Ctx& c)
 // the build id is an FNV-1a hash of the first 96 words of every handler, branch offsets / pc-relative load offsets /
 // pointer-like literals masked (relocation-insensitive: the same build at another address matches). Unrecognised builds
 // keep the emulated driver.
-// Per build: the WMSP / WL behaviour version (v31: NitroSDK 3.1's WMStatus layout, START_MP / SET_MP_PARAMETER, size
-// variables, null-key MP mode; spec-shrek-delta) and the guest's latencies (us) for the waits the native driver times.
+// Per build: the WMSP / WL generation and the guest's latencies (us) for the waits the native driver times.
+//  gen 30: NitroSDK 3.0 (spec-wmsp / spec-wl)
+//  gen 31: NitroSDK 3.1 - 3.1 WMStatus layout, START_MP + WMMPParam, SET_MP_PARAMETER, size variables, null-key MP mode,
+//          DISCONNECTED_FROM_MYSELF, interval alarms (spec-shrek-delta)
+//  gen 40: NitroSDK 4.x (WL 2.83) - + current MP parameters (st+0x7c0..), WMMPTmpParam, 0x204 port limits, 32-entry
+//          RSSI ring, V-alarm line 0xcb, START_SCAN_EX (spec-kirby-delta; NitroSDK 4.2 source)
+//  gen 50: TwlSDK 5.x NITRO mode (WL 2.88) - + no key-pending flag, child empty flag rxFlags 0x0400, flush before the MP
+//          clean-ups, PORT_RECV rssi (spec-pw-delta)
 struct Build
 {
-    u64 id; const char* name; bool v31; char wlVer[8];
-    u32 parentHoldUs, scanSetupUs, scanExtraUs, scanDownUs, endScanUs, measPreUs, measExtraUs, measPostUs, mpGapUs;
+    u64 id; const char* name; u8 gen; char wlVer[8];
+    u32 parentHoldUs, scanSetupUs, scanExtraUs, scanDownUs, endScanUs, measPreUs, measExtraUs, measPostUs, mpGapUs, resetUs, endParentUs;
 };
 constexpr Build kBuilds[] = {
-    {0x408040ea75491a59ull, "NitroSDK 3.0 WM (Mario Kart DS, Animal Crossing WW)", false, "2.64.00", 3000, 1500, 100, 800, 11200, 0, 0, 12600, 1100},
-    {0x29342b46397da78full, "NitroSDK 3.1 WM (Shrek SnCR, New Super Mario Bros.)", true, "2.74.00", 4500, 3800, 112, 570, 11700, 3800, 120, 12050, 900},
+    {0x408040ea75491a59ull, "NitroSDK 3.0 WM (Mario Kart DS, Animal Crossing WW)", 30, "2.64.00", 3000, 1500, 100, 800, 11200, 0, 0, 12600, 1100, 0, 0},
+    {0x29342b46397da78full, "NitroSDK 3.1 WM (Shrek SnCR, New Super Mario Bros.)", 31, "2.74.00", 4500, 3800, 112, 570, 11700, 3800, 120, 12050, 900, 0, 0},
+    {0x3e7897fa761e4bf8ull, "NitroSDK 4.x WM (Kirby SSU, Chrono Trigger, M&L BIS)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
+    {0x6d9f2d0d3ca0bd96ull, "NitroSDK 4.x WM (GTA CW, Sonic Chronicles)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
+    {0x32abc95715c0a7fdull, "NitroSDK 4.x WM (Dragon Quest IX)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
+    {0x44459275eff97ba4ull, "NitroSDK 4.x WM (Pokemon HeartGold / SoulSilver)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
+    {0x8f8c5c9ada28f3c0ull, "NitroSDK 4.x WM (Pokemon Platinum)", 40, "2.83.00", 4340, 2300, 100, 1300, 12000, 3800, 120, 12580, 1600, 12000, 12160},
+    {0x5c3f3bbdb2cacf4bull, "TwlSDK 5.x WM, NITRO mode (Pokemon Black / White / B2W2, The Sims 3)", 50, "2.88.00", 5930, 3570, 320, 180, 12580, 3800, 120, 12580, 1600, 12000, 12160},
 };
-// NitroSDK 3.1 WMStatus: 3.0 offset -> 3.1 offset (spec-shrek-delta 1.2)
-const u16* Map31()
+// NitroSDK 3.1 WMStatus: 3.0 offset -> 3.1 offset (spec-shrek-delta 1.2); 4.x: + the MP engine's current parameters
+const u16* Map31(bool v4)
 {
-    static u16 m[0x800];
+    static u16 tab[2][0x800];
     static const bool init = [] {
+      for (int g = 0; g < 2; g++)
+      {
+        u16* m = tab[g];
         for (u32 o = 0; o < 0x800; o++) m[o] = (u16)(o >= 0x9a ? o + 4 : o);
         for (u32 o = 0x30; o < 0x34; o++) m[o] = (u16)(o + 0x2e);
         m[0x34] = 0x5a; m[0x35] = 0x5b;
         for (u32 o = 0x36; o < 0x58; o++) m[o] = (u16)(o + 0x2c);
         m[0xda] = 0x9a; m[0xdb] = 0x9b;
         for (u32 o = 0x18e; o < 0x192; o++) m[o] = (u16)(o - 0x152);
+        if (g)              // ST_freq / ST_minPoll / ST_single / ST_retry / ST_ignFatal -> mp_current_* (u16)
+        {
+            const u16 cur[][2] = {{0x34, 0x7c2}, {0x92, 0x7c6}, {0x94, 0x7c8}, {0x98, 0x7ca}, {0xda, 0x7cc}};
+            for (auto& k : cur) { m[k[0]] = k[1]; m[k[0] + 1] = k[1] + 1; }
+        }
+      }
         return true;
     }();
     (void)init;
-    return m;
+    return tab[v4];
 }
 void SetBuild(Ctx& c, int b)
 {
     c.build = (s8)b;
     c.bd = b >= 1 ? &kBuilds[b - 1] : nullptr;
-    c.v31 = c.bd && c.bd->v31;
-    c.stMap = c.v31 ? Map31() : nullptr;
+    const u8 gen = c.bd ? c.bd->gen : 30;
+    c.v31 = gen >= 31; c.v4 = gen >= 40; c.pw = gen >= 50;
+    c.stMap = c.v31 ? Map31(c.v4) : nullptr;
 }
 u32 MaskWord(u32 w)
 {
@@ -506,6 +538,8 @@ void PumpCbs(Ctx& c)
 inline int Pop(u32 v) { return __builtin_popcount(v); }
 u16 Conv(u8 b) { return (b & 2) ? (b >> 2) : (b >> 2) + 25; }          // RSSI byte -> WMSP units
 u16 LinkLevel(u16 r) { return r < 8 ? 0 : r < 14 ? 1 : r < 20 ? 2 : 3; }
+// 4.x: a joined parent of platform 8 (w7 bssDesc gameInfo byte 3) uses other thresholds
+u16 LinkLevelC(Ctx& c, u16 r) { return c.v4 && Rd8(c, c.w7 + 0x53) == 8 ? (r < 0x16 ? 0 : r < 0x1C ? 1 : r < 0x22 ? 2 : 3) : LinkLevel(r); }
 void SeedUpdate(Ctx& c, u16 r)
 {
     u32 x = r ^ ((u32)Rd16(c, kEntropy) << 1);
@@ -838,7 +872,18 @@ void RxBeacon(Ctx& c, const u8* h, const u8* f, u32 len)
     {
         // passive scan: SSID matches (WMSP's scan SSID is empty) and BSSID filter (broadcast here)
         if (!(c.opBssid[0] & 1) && !MacEq(c.opBssid, f + 16)) return;
-        if (c.opDesc.empty()) ScanFound(c, BssDesc(c, h, f, len));
+        if (c.opEx)         // (every new BSSID whose SSID passes the filter)
+        {
+            for (const auto& d : c.opDescs) if (MacEq(&d[4], f + 16)) return;
+            std::vector<u8> d = BssDesc(c, h, f, len);
+            if (c.opSsidLen)
+            {
+                const u32 n = std::min<u32>(c.opType >= 2 ? c.opMatch : c.opSsidLen, 32);
+                if (memcmp(&d[0xC], c.opSsid, n)) return;
+            }
+            c.opDescs.push_back(std::move(d));
+        }
+        else if (c.opDesc.empty()) ScanFound(c, BssDesc(c, h, f, len));
         return;
     }
     if (c.mode != 2 || !MacEq(f + 16, c.bssid)) return;
@@ -1307,11 +1352,12 @@ std::vector<u8> GameInfo(Ctx& c)
     const u16 len = S16(c, ST_ppUgiLen);
     std::vector<u8> g(0x10 + ((len + 1) & ~1), 0);
     g[0] = 1;
+    if (c.v4) g[2] = 1;                         // (4.x: gameinfo version 1)
     const u32 gg = S32(c, ST_ppGgid); const u16 tg = S16(c, ST_ppTgid);
     memcpy(&g[4], &gg, 4); memcpy(&g[8], &tg, 2);
     g[0xA] = (u8)len;
     g[0xB] = (S16(c, ST_ppEntry) ? 1 : 0) | (S16(c, ST_ppMB) ? 2 : 0) | (S16(c, ST_ppKS) ? 4 : 0) | (!c.v31 && S16(c, ST_ppCS) ? 8 : 0);
-    const u16 ps = S16(c, ST_ppPSize), cs = S16(c, ST_ppCSize);
+    const u16 ps = S16(c, ST_ppPSize), cs = c.v4 && S16(c, ST_ppMB) ? std::min<u16>(S16(c, ST_ppCSize), 8) : S16(c, ST_ppCSize);
     memcpy(&g[0xC], &ps, 2); memcpy(&g[0xE], &cs, 2);
     if (len) ReadA9(c, S32(c, ST_ppUgi), &g[0x10], (len + 1) & ~1);
     g.resize(0x10 + len);
@@ -1346,7 +1392,8 @@ void PortSendCb(Ctx& c, u16 i, u16 err)
 }
 u16 PutSendQueue(Ctx& c, u16 conn, u16 prio, u16 port, u16 dest, u32 data, u16 size, u32 cb, u32 arg)
 {
-    if (!size || size + ((port & 8) ? 2 : 0) > S16(c, ST_maxSend)) return E_INVALID;
+    if (!size || size + ((port & 8) ? 2 : 0) > (c.v4 ? 0x204 : S16(c, ST_maxSend))) return E_INVALID;
+    if (c.pw && !S32(c, ST_mpFlag)) return E_SEND_FAILED;
     const u16 i = S16(c, ST_free);
     if (i == 0xFFFF) return E_QFULL;
     SS16(c, ST_free, S16(c, QE(i)));
@@ -1414,7 +1461,8 @@ int Pack(Ctx& c, u16 pollMask, u16 conn, u16 ready, u16* hdr, u16* sentDest, std
             blocked |= bit;
             const u16 d = S16(c, e + 6) & filterSet;
             if (filter && (d & ~rp)) { prev = i; i = next; continue; }
-            const bool seqf = (port & 8) != 0, destf = parent && ((d | 1) != 0xFFFF);
+            const u16 dw = c.v4 ? S16(c, e + 6) : d;    // (4.x: the dest word is the entry's rest bitmap)
+            const bool seqf = (port & 8) != 0, destf = parent && ((dw | 1) != 0xFFFF);
             u16 size = S16(c, e + 0xE);
             if (size & 1) { size++; SS16(c, e + 0xE, size); }
             const s32 need = size + (first ? 0 : 2) + (seqf ? 2 : 0) + (destf ? 2 : 0);
@@ -1440,7 +1488,7 @@ int Pack(Ctx& c, u16 pollMask, u16 conn, u16 ready, u16* hdr, u16* sentDest, std
                 out.push_back((s & 0x7FFF) & 0xFF); out.push_back((s & 0x7FFF) >> 8);
                 cap -= 2;
             }
-            if (destf) { h |= 0x1000; out.push_back(d & 0xFF); out.push_back(d >> 8); cap -= 2; }
+            if (destf) { h |= 0x1000; out.push_back(dw & 0xFF); out.push_back(dw >> 8); cap -= 2; }
             if (hp == ~(size_t)0) *hdr |= h; else { out[hp] = h & 0xFF; out[hp + 1] = h >> 8; }
             first = false;
             // unlink -> ready queue
@@ -1569,19 +1617,19 @@ void ResendMaMP(Ctx& c, u16 arg)
 void SendMaKeyData(Ctx& c)
 {
     if (S16(c, ST_conn) == 0) return;
-    SS16(c, ST_keyPend, 1);
+    KeyPend(c, 1);
     u16 hdr = 0, sd = 0;
     std::vector<u8>& body = c.mpBody;
-    if (Pack(c, 1, 1, 1, &hdr, &sd, body) == 1) { SS16(c, ST_keyPend, 0); return; }
+    if (Pack(c, 1, 1, 1, &hdr, &sd, body) == 1) { KeyPend(c, 0); return; }
     if (S32(c, ST_vsync) == 1) hdr |= 0x8000;
     const int r = MaKeyData(c, (u16)body.size(), hdr, body.data());
-    if (r != 0 && r != 8) SS16(c, ST_keyPend, 0);
+    if (r != 0 && r != 8) KeyPend(c, 0);
 }
 // ParsePortPacket (0x06006ab0)
-void ParsePortPacket(Ctx& c, u16 aid, u16 wmHeader, u32 data, s32 len, u32 rb)
+void ParsePortPacket(Ctx& c, u16 aid, u16 wmHeader, u32 data, s32 len, u32 rb, u16 rssi)
 {
     const u16 myAid = S16(c, ST_aid);
-    if (len == 0 || len > (s32)S16(c, ST_maxRecv) || aid == myAid || aid >= 16 || (len & 1)) return;
+    if (len == 0 || len > (c.v4 ? 0x204 : (s32)S16(c, ST_maxRecv)) || aid == myAid || aid >= 16 || (len & 1)) return;
     bool first = true;
     while (len > 0)
     {
@@ -1612,7 +1660,7 @@ void ParsePortPacket(Ctx& c, u16 aid, u16 wmHeader, u32 data, s32 len, u32 rb)
         if (destf && !(Rd16(c, q) & (1 << myAid))) continue;
         if (size > 0)
             Send(c, CbB(0x82, E_OK).P16(4, SC_PORT_RECV).P16(6, port).P32(8, rb).P32(0xC, p).P16(0x10, (u16)size).P16(0x12, aid)
-                     .P16(0x20, myAid).P16(0x1A, seqOut).MySz(c, 0x40));
+                     .P16(0x20, myAid).P16(0x1A, seqOut).MySz(c, 0x40).P16(c.pw ? 0x3E : 0x20, c.pw ? rssi : myAid));
     }
 }
 
@@ -1648,7 +1696,7 @@ void IndMpEnd(Ctx& c, const std::vector<u8>& B)
             Wr16(c, e, len - 2);
             SS16(c, ST_ready, S16(c, ST_ready) | (1 << aid));
             SS64(c, ST_lastRx + 8 * aid, now);
-            if (len - 2) ParsePortPacket(c, aid, G16(B, 0xA + i * size + 8), e + 0xA, len - 2, rb);
+            if (len - 2) ParsePortPacket(c, aid, G16(B, 0xA + i * size + 8), e + 0xA, len - 2, rb, Conv(B[0xA + i * size + 3]));
         }
         else if (len == 0)
         {
@@ -1694,13 +1742,15 @@ void IndMpInd(Ctx& c, const std::vector<u8>& B)
         const s64 ticks = (s64)(s32)(((u32)(u16)(Rd16(c, rb + 0xA) - Rd16(c, rb + 0xC)) + 0x80) * 16 * 0x82EA / 64 / 1024);
         SetTimer(c, T_ACKTO, c.now + (u64)std::max<s64>(ticks, 1) * 64);
     }
-    const bool a = (f & 0x2800) == 0x2800, b = (f & 0x6000) == 0x6000;
-    if (b) SS16(c, ST_keyPend, 0);
+    // (5.x: the "empty" flag is rxFlags 0x0400 - ponytail: WL 2.88 sets it for what 3.x/4.x flag as 0x0800, key data out;
+    //  the MP path of this build is from its code only, no connected trace)
+    const bool a = c.pw ? (f & 0x0800) != 0 : (f & 0x2800) == 0x2800, b = (f & 0x6000) == 0x6000;
+    if (b) KeyPend(c, 0);
     SS16(c, ST_rxA, a); SS16(c, ST_rxB, b);
     if (c.v31 && polled)        // (the child's send size follows the parent's reply slot)
     {
         s32 n = ((s32)Rd16(c, rb + 0x2C) - 0x66) / 4 - 0x20;
-        if (n >= 0) { n = std::min<s32>(n, N16(c, N_cMax)); if (n != N16(c, N_cSize)) SetCSize(c, (u16)n); }
+        if (n >= 0) { n = std::min<s32>(n, c.v4 ? 0x200 : N16(c, N_cMax)); if (n != N16(c, N_cSize)) SetCSize(c, (u16)n); }
     }
     if (pending)
     {
@@ -1714,7 +1764,7 @@ void IndMpInd(Ctx& c, const std::vector<u8>& B)
         Wr16(c, rb + 6, len - 2);
         SS16(c, ST_c030, (Rd16(c, rb + 0x30) & 0x8000) ? 1 : 0);
         Send(c, CbB(0x0E, E_OK).P16(4, SC_MP_IND).P32(8, rb));
-        if (len - 2) ParsePortPacket(c, 0, Rd16(c, rb + 0x30), rb + 0x32, len - 2, rb);
+        if (len - 2) ParsePortPacket(c, 0, Rd16(c, rb + 0x30), rb + 0x32, len - 2, rb, Conv(B[0xF]));
     }
     else
     {
@@ -1759,8 +1809,8 @@ void IndMpAck(Ctx& c, const std::vector<u8>& B, bool fake)
 }
 
 // ---- RSSI ring / link level (0.6) ----
-void AddRssi(Ctx& c, u16 r) { c.rssi[c.rssiIdx] = (u8)r; c.rssiIdx = (c.rssiIdx + 1) & 15; SeedUpdate(c, r); }
-u16 AvgLinkLevel(Ctx& c) { u32 s = 0; for (u8 v : c.rssi) s += v; return LinkLevel((u16)(s >> 4)); }
+void AddRssi(Ctx& c, u16 r) { c.rssi[c.rssiIdx] = (u8)r; c.rssiIdx = (c.rssiIdx + 1) & (c.v4 ? 31 : 15); SeedUpdate(c, r); }
+u16 AvgLinkLevel(Ctx& c) { const int n = c.v4 ? 32 : 16; u32 s = 0; for (int i = 0; i < n; i++) s += c.rssi[i]; return LinkLevelC(c, (u16)(s / n)); }
 
 // ---- V-count alarm (5.1) ----
 void PostVAlarmMP(Ctx& c)
@@ -1774,21 +1824,24 @@ u32 US32(Ctx& c) { return CR(c, R_US0) | (u32)CR(c, R_US1) << 16; }
 // the MP V-count lines (3.1: parentVCount / childVCount, defaults the 3.0 constants)
 s32 PVC(Ctx& c) { return c.v31 ? (s16)N16(c, N_pVC) : 0x104; }
 s32 CVC(Ctx& c) { return c.v31 ? (s16)N16(c, N_cVC) : 0xF0; }
+// the parent's V-sync line and the end of both adjust windows (4.x: 0xcb, [.., 0xd2))
+s32 SyncLine(Ctx& c) { return c.v4 ? 0xCB : 0xD1; }
+s32 WinEnd(Ctx& c) { return c.v4 ? 0xD2 : 0xD4; }
 void VAlarm(Ctx& c, u16 x)
 {
     const u16 vc = c.nds.GPU.VCount;
     if (S16(c, ST_mode) == 1)
     {
-        if (x == 0xD1)
+        if (x == SyncLine(c))
         {
-            if (S16(c, ST_vres) >= 0x3C) { if (vc >= 0xD1 && vc < 0xD4) { SetVCount(c, vc); SS16(c, ST_vres, 0); } }
+            if (S16(c, ST_vres) >= 0x3C) { if (vc >= SyncLine(c) && vc < WinEnd(c)) { SetVCount(c, vc); SS16(c, ST_vres, 0); } }
             else SS16(c, ST_vres, S16(c, ST_vres) + 1);
             c.vtsf = (u16)(((US32(c) << 1) - vc * 0x7F) >> 7);
             ArmVLine(c, PVC(c));
         }
         else
         {
-            if (S32(c, ST_mpFlag) == 1) { ArmVLine(c, 0xD1); PostVAlarmMP(c); }
+            if (S32(c, ST_mpFlag) == 1) { ArmVLine(c, SyncLine(c)); PostVAlarmMP(c); }
             else ArmVLine(c, -1);
         }
         return;
@@ -1818,7 +1871,7 @@ void VAlarm(Ctx& c, u16 x)
     else if (x == 0xD0)
     {
         u32 d = S32(c, ST_vofs);
-        if (vc >= 0xD0 && vc < 0xD4 && d >= 0x7F)
+        if (vc >= 0xD0 && vc < WinEnd(c) && d >= 0x7F)
         {
             u32 k = 1;
             while (k < 7 && !(d < 0x3F * k + 0x7F)) k++;
@@ -1847,7 +1900,7 @@ void VAlarm(Ctx& c, u16 x)
 }
 void StartVAlarm(Ctx& c)
 {
-    if (S16(c, ST_mode) == 1) ArmVLine(c, 0xD1);
+    if (S16(c, ST_mode) == 1) ArmVLine(c, SyncLine(c));
     else { SS32(c, ST_vsync, 0); ArmVLine(c, 0xC8); SS32(c, ST_vofs, 0); }
 }
 void VAlarmMP(Ctx& c)       // internal 0x1c (0x06006868)
@@ -1866,11 +1919,12 @@ void VAlarmMP(Ctx& c)       // internal 0x1c (0x06006868)
     if (state == S_MP_PARENT)
     {
         if (S16(c, ST_conn) == 0) { SS16(c, ST_count, 0); return; }
-        const bool idle = !((s16)S16(c, ST_count) != 0 && (s16)S16(c, ST_limit) != 0);
+        bool idle = !((s16)S16(c, ST_count) != 0 && (s16)S16(c, ST_limit) != 0);
+        if (c.v4) { idle = !((s16)S16(c, ST_count) > 0 && (s16)S16(c, ST_limit) > 0); if ((s16)S16(c, ST_count) < 0) SS16(c, ST_count, 0); }
         s32 cnt = (s16)S16(c, ST_count) + S16(c, ST_freq);
         if (cnt > 0x100) cnt = 0x100;
         SS16(c, ST_count, (u16)cnt);
-        SS16(c, ST_limit, c.v31 ? N16(c, N_maxFreq) : S16(c, ST_fixFreq) ? S16(c, ST_freq) : 6);
+        SS16(c, ST_limit, c.v4 ? N16(c, A_maxFreq) : c.v31 ? N16(c, N_maxFreq) : S16(c, ST_fixFreq) ? S16(c, ST_freq) : 6);
         if (idle && (s16)S16(c, ST_count) > 0 && (s16)S16(c, ST_limit) > 0) SendMaMP(c, 0xFFFF);
         if (S16(c, ST_minPoll) == 1) { const u16 k = S16(c, ST_keepCnt) - 1; SS16(c, ST_keepCnt, k); if (!k) { SS16(c, ST_keepAlive, 1); SS16(c, ST_keepCnt, 0x3C); } }
     }
@@ -1895,7 +1949,7 @@ int DisconnectCore(Ctx& c, u16 bitmap, bool autoMode, u16 reason, u16* disc)
             if (!autoMode) Send(c, CbB(0x0D, E_ILLEGAL).P16(4, 0).P16(6, 0).P16(8, bitmap).P16(0xA, 0));
             return 0;
         }
-        if (S32(c, ST_mpFlag)) { SS32(c, ST_mpFlag, 0); wasMP = true; CancelVAlarm(c); }
+        if (S32(c, ST_mpFlag)) { SS32(c, ST_mpFlag, 0); wasMP = true; CancelVAlarm(c); if (c.pw) SendComplete(c, false, 0); }
         if (state == S_MP_CHILD) SS16(c, ST_state, S_CHILD);
         SS16(c, ST_conn, 0); SS16(c, ST_ready, 0); SS32(c, ST_ks, 0); SS32(c, ST_dcf, 0); SS32(c, ST_vsync, 0);
     }
@@ -1947,7 +2001,7 @@ void DeauthFinish(Ctx& c)
         SS16(c, ST_state, S_IDLE);
         if (c.v31)
         {
-            SizesOff(c);
+            WepOff(c); SizesOff(c);
             u8 pm[6]; ReadA9(c, SA(c, ST_pMac), pm, 6);
             if (c.opAuto) Send(c, CbB(0x0C, E_OK).P16(8, SC_DISCONNECTED).P16(0xC, c.opReason).P16(0xA, S16(c, ST_aid)).PB(0x10, pm, 6).Sz(c, 0x16));
             else Send(c, CbB(0x0C, E_OK).P16(8, SC_DISC_MYSELF).P16(0xC, 0xF001).P16(0xA, S16(c, ST_aid)).PB(0x10, pm, 6).Sz(c, 0x16));
@@ -1966,7 +2020,7 @@ void DeauthFinish(Ctx& c)
         c.pending.clear();
         SS16(c, ST_indOn, 0); SS16(c, ST_state, S_CLASS1);
         DevIdle(c);
-        SS16(c, ST_state, S_IDLE); SizesOff(c);
+        SS16(c, ST_state, S_IDLE); WepOff(c); SizesOff(c);
         Send(c, CbB(0x09, E_OK));
     }
     else if (api == 0x01)
@@ -1976,6 +2030,7 @@ void DeauthFinish(Ctx& c)
         DevIdle(c);
         SS16(c, ST_preamble, 1);
         SS16(c, ST_state, S_IDLE);
+        if (c.v4) { WepOff(c); SizesOff(c); }
         Send(c, CbB(0x01, E_OK));
     }
     OpFinish(c);
@@ -2041,10 +2096,10 @@ void HandleInd(Ctx& c, Ind& in)
         {
             if (c.v31 && S16(c, ST_conn) == 0) break;
             bool was = false;
-            if (S32(c, ST_mpFlag)) { SS32(c, ST_mpFlag, 0); CancelVAlarm(c); was = true; }
+            if (S32(c, ST_mpFlag)) { SS32(c, ST_mpFlag, 0); CancelVAlarm(c); was = true; if (c.pw) SendComplete(c, false, 0); }
             SS16(c, ST_conn, 0); SS16(c, ST_ready, 0); SS32(c, ST_ks, 0); SS32(c, ST_dcf, 0); SS32(c, ST_vsync, 0); SS16(c, ST_indOn, 0);
             SS16(c, ST_state, S_CLASS1);
-            if (c.v31) SizesOff(c);
+            if (c.v31) { WepOff(c); SizesOff(c); }
             Send(c, CbB(0x0C, E_OK).P16(8, SC_DISCONNECTED).P16(0xC, G16(B, 6)).P16(0xA, S16(c, ST_aid)).Sz(c, 0x16)
                          .PB(0x10, &B[0], c.v31 ? 6 : 0));
             SizesOff(c);
@@ -2116,9 +2171,11 @@ void InitStatus(Ctx& c)
     SS16(c, ST_minPoll, 0); SS16(c, ST_single, 0);
     if (c.v31)
     {
-        NS16(c, N_minFreq, 1); NS16(c, N_freq, 1); NS16(c, N_maxFreq, 6); SS16(c, ST_retry, 0); SS16(c, ST_ignFatal, 0); NS16(c, N_ignSize, 0);
+        NS16(c, N_minFreq, 1); NS16(c, N_freq, 1); NS16(c, N_maxFreq, 6); NS16(c, N_retry, 0); NS16(c, N_ignFatal, 0); NS16(c, N_ignSize, 0);
+        NS16(c, N_minPoll, 0); NS16(c, N_single, 0);
         SizesOff(c);
         NS16(c, N_pVC, 0x104); NS16(c, N_cVC, 0xF0); NS16(c, N_pInt, 1000); NS16(c, N_cInt, 0); NS64(c, N_pTick, 0x20B); NS64(c, N_cTick, 0);
+        if (c.v4) { const u16 cur[] = {1, 1, 6, 0, 0, 0, 0}; for (int i = 0; i < 7; i++) NS16(c, A_minFreq + 2 * i, cur[i]); }
     }
     else { SS16(c, ST_fixFreq, 0); SizesOff(c); }
     SS16(c, ST_vaPend, 0); SS16(c, ST_indOn, 0); SS16(c, ST_pm, 0); SS16(c, ST_preamble, 1);
@@ -2142,29 +2199,45 @@ u16 SetMPParam(Ctx& c, const u8* p, u8* old)
     if (old)
     {
         const u32 all = 0x3FFF; memcpy(old, &all, 4);
-        const u16 f = N16(c, N_freq);     // (the guest reports freq for all three)
-        B16v(old, 4, f); B16v(old, 6, f); B16v(old, 8, f);
+        if (c.v4) { B16v(old, 4, N16(c, N_minFreq)); B16v(old, 6, N16(c, N_freq)); B16v(old, 8, N16(c, N_maxFreq)); }
+        else { const u16 f = N16(c, N_freq); B16v(old, 4, f); B16v(old, 6, f); B16v(old, 8, f); }     // (3.1 reports freq thrice)
         B16v(old, 0xA, N16(c, N_pSize)); B16v(old, 0xC, N16(c, N_cSize)); B16v(old, 0xE, N16(c, N_pInt)); B16v(old, 0x10, N16(c, N_cInt));
-        B16v(old, 0x12, N16(c, N_pVC)); B16v(old, 0x14, N16(c, N_cVC)); B16v(old, 0x16, S16(c, ST_retry));
-        old[0x18] = (u8)S16(c, ST_minPoll); old[0x19] = (u8)S16(c, ST_single); old[0x1A] = (u8)S16(c, ST_ignFatal); old[0x1B] = (u8)N16(c, N_ignSize);
+        B16v(old, 0x12, N16(c, N_pVC)); B16v(old, 0x14, N16(c, N_cVC)); B16v(old, 0x16, N16(c, N_retry));
+        old[0x18] = (u8)N16(c, N_minPoll); old[0x19] = (u8)N16(c, N_single); old[0x1A] = (u8)N16(c, N_ignFatal); old[0x1B] = (u8)N16(c, N_ignSize);
     }
     auto g = [&](u32 o) { return G16v(p, o); };
     auto vok = [](u16 v) { return v <= 0xBE || (v >= 0xDC && v <= 0x106); };
-    if (mask & 1) NS16(c, N_minFreq, g(4) ? g(4) : 16);
-    if (mask & 2) { const u16 f = g(6) ? g(6) : 16; NS16(c, N_freq, f); if ((s16)S16(c, ST_count) > (s16)f) SS16(c, ST_count, f); }
-    if (mask & 4) { const u16 f = g(8) ? g(8) : 16; NS16(c, N_maxFreq, f); if ((s16)S16(c, ST_count) > (s16)f) SS16(c, ST_count, f); }
+    auto both = [&](u32 o, u32 a, u16 v) { NS16(c, o, v); if (c.v4) NS16(c, a, v); };
+    if (mask & 1) both(N_minFreq, A_minFreq, g(4) ? g(4) : 16);
+    if (mask & 2) { const u16 f = g(6) ? g(6) : 16; both(N_freq, A_freq, f); if ((s16)S16(c, ST_count) > (s16)f) SS16(c, ST_count, f); }
+    if (mask & 4) { const u16 f = g(8) ? g(8) : 16; both(N_maxFreq, A_maxFreq, f); if ((s16)S16(c, ST_count) > (s16)f) SS16(c, ST_count, f); }
     if (mask & 8) { const u16 v = (g(0xA) + 1) & ~1; if (v > N16(c, N_pMax)) r = E_INVALID; else SetPSize(c, v); }
-    if (mask & 0x10) { const u16 v = (g(0xC) + 1) & ~1; if (v > N16(c, N_cMax)) r = E_INVALID; else SetCSize(c, v); }
+    if (mask & 0x10) { const u16 v = (g(0xC) + 1) & ~1; if (v > (c.v4 ? 0x200 : N16(c, N_cMax))) r = E_INVALID; else SetCSize(c, v); }
     if (mask & 0x20) { const u16 us = g(0xE); if (us > 10000) r = E_INVALID; else { NS16(c, N_pInt, us); NS64(c, N_pTick, ((u64)us * 0x82EA) >> 16); } }
     if (mask & 0x40) { const u16 us = g(0x10); if (us > 10000) r = E_INVALID; else { NS16(c, N_cInt, us); NS64(c, N_cTick, ((u64)us * 0x82EA) >> 16); } }
     if (mask & 0x80) { if (vok(g(0x12))) NS16(c, N_pVC, g(0x12)); else r = E_INVALID; }
     if (mask & 0x100) { if (vok(g(0x14))) NS16(c, N_cVC, g(0x14)); else r = E_INVALID; }
-    if (mask & 0x200) SS16(c, ST_retry, g(0x16));
-    if (mask & 0x400) SS16(c, ST_minPoll, p[0x18]);
-    if (mask & 0x800) SS16(c, ST_single, p[0x19]);
-    if (mask & 0x1000) SS16(c, ST_ignFatal, p[0x1A]);
+    if (mask & 0x200) both(N_retry, A_retry, g(0x16));
+    if (mask & 0x400) NS16(c, N_minPoll, p[0x18]);
+    if (mask & 0x800) NS16(c, N_single, p[0x19]);
+    if (mask & 0x1000) both(N_ignFatal, A_ignFatal, p[0x1A]);
     if (mask & 0x2000) NS16(c, N_ignSize, p[0x1B]);
     return r;
+}
+// 4.x WMMPTmpParam (START_MP +0x30): the current MP parameters for this MP session
+void SetMPTmpParam(Ctx& c, const u8* t)
+{
+    u32 m; memcpy(&m, t, 4);
+    auto g = [&](u32 o) { return G16v(t, o); };
+    u16 maxF = (m & 4) ? g(8) : N16(c, N_maxFreq); if (!maxF) maxF = 16;
+    u16 minF = (m & 1) ? g(4) : N16(c, N_minFreq); if (!minF) minF = 16; minF = std::min(minF, maxF);
+    u16 f = (m & 2) ? g(6) : N16(c, N_freq); if (!f) f = 16; f = std::min(f, maxF);
+    NS16(c, A_maxFreq, maxF); NS16(c, A_minFreq, minF); NS16(c, A_freq, f);
+    if ((s16)S16(c, ST_count) > (s16)maxF) SS16(c, ST_count, maxF);
+    NS16(c, A_retry, (m & 0x200) ? g(0xA) : N16(c, N_retry));
+    NS16(c, A_minPoll, (m & 0x400) ? t[0xC] : N16(c, N_minPoll));
+    NS16(c, A_single, (m & 0x800) ? t[0xD] : N16(c, N_single));
+    NS16(c, A_ignFatal, (m & 0x1000) ? t[0xE] : N16(c, N_ignFatal));
 }
 // 3.1 START_MP (0x027e51a0): recvBuf, recvBufSize, sendBuf, sendBufSize, WMMPParam
 void StartMP31(Ctx& c, const Rq& q, u16 state)
@@ -2183,9 +2256,10 @@ void StartMP31(Ctx& c, const Rq& q, u16 state)
     if (S32(c, ST_mpFlag)) { SS32(c, ST_mpFlag, 0); CleanSendQueue(c, 0xFFFF); }
     InitSendQueue(c);
     SetMPParam(c, prm, nullptr);
+    if (c.v4 && state != S_MP_PARENT && state != S_MP_CHILD) { u8 t[0x10]; ReadA9(c, q.addr + 0x30, t, 0x10); SetMPTmpParam(c, t); }
     if (state != S_PARENT && state != S_CHILD) { Send(c, CbB(0xE, E_ILLEGAL).P16(4, SC_MP_START)); return; }
     SS16(c, ST_waitAck, 0); SS16(c, ST_c030, 0); SS16(c, ST_c032, 1); SS16(c, ST_newFrame, 0); SS16(c, ST_keepAlive, 0);
-    SS16(c, ST_keepCnt, 0x3C); SS32(c, ST_inFlight, 0); SS16(c, ST_keyPend, 0); SS16(c, ST_rxB, 0); SS16(c, ST_rxA, 0);
+    SS16(c, ST_keepCnt, 0x3C); SS32(c, ST_inFlight, 0); KeyPend(c, 0); SS16(c, ST_rxB, 0); SS16(c, ST_rxA, 0);
     SS16(c, ST_polled, 0); SS16(c, ST_resend, 0);
     SS32(c, ST_rb0, rb); SS16(c, ST_rbSize, (u16)rbs); SS32(c, ST_rb1, rb + rbs); SS16(c, ST_rbSel, 0);
     SS32(c, ST_sendBuf, sb); SS16(c, ST_sendSize, (u16)sbs);
@@ -2242,11 +2316,13 @@ bool Request(Ctx& c, const Rq& q)
         break;
     case 0x01:              // RESET
     {
+        if (c.pw && S32(c, ST_mpFlag)) SendComplete(c, false, 0xFFFF);
         if (S32(c, ST_mpFlag)) { SS32(c, ST_mpFlag, 0); CancelVAlarm(c); if (state == S_MP_CHILD) SS16(c, ST_state, S_CHILD); if (state == S_MP_PARENT) SS16(c, ST_state, S_PARENT); CleanSendQueue(c, 0xFFFF); }
         if (c.v31)          // (3.1: DISCONNECTED_FROM_MYSELF for every connection, then the child MAC table is cleared)
         {
             const u16 conn = S16(c, ST_conn);
             const bool par = S16(c, ST_state) == S_PARENT;
+            if (c.v4 && par) SS16(c, ST_ppEntry, 0);
             for (u16 aid = 0; aid < 16; aid++)
             {
                 if (!(conn & (1 << aid))) continue;
@@ -2274,7 +2350,7 @@ bool Request(Ctx& c, const Rq& q)
     }
     case 0x08:              // START_PARENT
     {
-        if (state != S_IDLE) { Send(c, CbB(8, E_ILLEGAL).P16(8, 0)); break; }
+        if (state != S_IDLE || (c.v4 && (Rd32(c, c.st + 0xC8) & 1))) { Send(c, CbB(8, E_ILLEGAL).P16(8, 0)); break; }
         const u16 ch = S16(c, ST_ppChannel);
         if (!(((1u << ch) >> 1) & S16(c, ST_allowedCh))) { Send(c, CbB(8, E_INVALID).P16(8, 0)); break; }
         SS16(c, ST_mode, 1); SS16(c, ST_aid, 0); SS16(c, ST_conn, 0); SS16(c, ST_ready, 0); SS16(c, ST_preamble, 1);
@@ -2308,6 +2384,7 @@ bool Request(Ctx& c, const Rq& q)
     case 0x09:              // END_PARENT
     {
         if (state != S_PARENT) { cb0(E_ILLEGAL); break; }
+        if (c.v4) SS16(c, ST_ppEntry, 0);
         for (u16 aid = 1; aid < 16; aid++)
             if (S16(c, ST_conn) & (1 << aid))
             {
@@ -2335,8 +2412,36 @@ bool Request(Ctx& c, const Rq& q)
         if (c.wl == 0x10) { SetAllParams(c); c.wl = 0x20; SS16(c, ST_state, S_CLASS1); SS16(c, ST_pm, 1); }
         SS16(c, ST_state, S_SCAN);
         // MLME_SCAN: passive, one channel, maxChannelTime ms
-        c.op = OpScan; c.opStage = 0; c.opCh = ch; c.opTime = Rd16(c, q.addr + 8); c.opDesc.clear();
+        c.op = OpScan; c.opStage = 0; c.opCh = ch; c.opTime = Rd16(c, q.addr + 8); c.opDesc.clear(); c.opEx = false;
         SetTimer(c, T_OP, c.now + Us(c.bd ? c.bd->scanSetupUs : 1500));     // (the guest's channel / power settling before the dwell)
+        done = false;
+        break;
+    }
+    case 0x26:              // START_SCAN_EX (4.x)
+    {
+        if (!c.v4) { cb0(E_ILLEGAL); break; }
+        auto fail = [&](u16 e) { Send(c, CbB(0x26, e).P16(8, SC_NOT_FOUND)); };
+        if (state != S_IDLE && state != S_CLASS1 && state != S_SCAN) { fail(E_ILLEGAL); break; }
+        const u16 chl = Rd16(c, q.addr + 2), size = Rd16(c, q.addr + 8);
+        const u32 buf = RqArg(c, q, 4);
+        u16 type = Rd16(c, q.addr + 0x12);
+        SS32(c, ST_scanBuf, buf); SS16(c, ST_scanCh, chl);
+        for (int k = 0; k < 6; k++) c.opBssid[k] = Rd8(c, q.addr + 0xC + k);
+        if (G16(c.opBssid, 0) != 0xFFFF && (c.opBssid[0] & 1)) c.opBssid[0] &= ~1;
+        const u16 list = (u16)((chl << 1) & S16(c, ST_enableCh));
+        if (!list || ((Rd32(c, c.st + 0xC8) & 1) && (type & 1) != 1) || !buf || (buf & 3) || size < 0x40) { fail(E_INVALID); break; }
+        SS16(c, ST_mode, 2);
+        if (c.wl == 0x10) { SetAllParams(c); c.wl = 0x20; SS16(c, ST_state, S_CLASS1); SS16(c, ST_pm, 1); }
+        // (preamble: active scans long, passive short; ponytail: probe requests of an active scan are not sent)
+        if (!(type & 1) && S16(c, ST_preamble) == 1) SS16(c, ST_preamble, 0);
+        if ((type & 1) && S16(c, ST_preamble) == 0) SS16(c, ST_preamble, 1);
+        SS16(c, ST_state, S_SCAN);
+        c.op = OpScan; c.opStage = 0; c.opEx = true; c.opList = list; c.opListAll = list; c.opBufSize = size; c.opType = type;
+        c.opSsidLen = std::min<u16>(Rd16(c, q.addr + 0x14), 32); c.opMatch = Rd16(c, q.addr + 0x36);
+        ReadA9(c, q.addr + 0x16, c.opSsid, 32);
+        c.opCh = 0; while (!(list & (1u << c.opCh))) c.opCh++;
+        c.opTime = Rd16(c, q.addr + 0xA); c.opDescs.clear();
+        SetTimer(c, T_OP, c.now + Us(c.bd->scanSetupUs));
         done = false;
         break;
     }
@@ -2349,7 +2454,7 @@ bool Request(Ctx& c, const Rq& q)
         break;
     case 0x0C:              // START_CONNECT
     {
-        if (state != S_IDLE) { Send(c, CbB(0xC, E_ILLEGAL).P16(8, SC_CONNECT_START)); break; }
+        if (state != S_IDLE || (c.v4 && (Rd32(c, c.st + 0xC8) & 1))) { Send(c, CbB(0xC, E_ILLEGAL).P16(8, SC_CONNECT_START)); break; }
         u8 desc[0xC0];
         ReadA9(c, RqArg(c, q, 4), desc, 0xC0);
         WriteA9(c, c.w7 + 0x10, desc, 0xC0);
@@ -2361,7 +2466,7 @@ bool Request(Ctx& c, const Rq& q)
         c.nullKey = false;
         SS16(c, ST_rate, (G16(desc, 0x2E) & 2) ? 2 : 1);
         SS16(c, ST_preamble, (G16(desc, 0x2C) & 0x20) ? 1 : 0);
-        SS32(c, ST_wepOn, (G16(desc, 0x2C) & 0x10) ? 1 : 0);
+        if (!c.v4) SS32(c, ST_wepOn, (G16(desc, 0x2C) & 0x10) ? 1 : 0);
         SS16(c, ST_mode, gil == 0 ? 3 : 2);
         SetAllParams(c);
         c.wl = 0x20; SS16(c, ST_state, S_CLASS1);
@@ -2421,7 +2526,7 @@ bool Request(Ctx& c, const Rq& q)
         if (state != S_PARENT && state != S_CHILD) { Send(c, CbB(0xE, E_ILLEGAL).P16(4, SC_MP_START)); break; }
         const u32 rb = RqArg(c, q, 4), rbs = RqArg(c, q, 8), freq = RqArg(c, q, 0x14);
         SS16(c, ST_waitAck, 0); SS16(c, ST_c030, 0); SS16(c, ST_c032, 1); SS16(c, ST_newFrame, 0); SS16(c, ST_keepAlive, 0);
-        SS16(c, ST_keepCnt, 0x3C); SS32(c, ST_inFlight, 0); SS16(c, ST_keyPend, 0); SS16(c, ST_rxB, 0); SS16(c, ST_rxA, 0);
+        SS16(c, ST_keepCnt, 0x3C); SS32(c, ST_inFlight, 0); KeyPend(c, 0); SS16(c, ST_rxB, 0); SS16(c, ST_rxA, 0);
         SS16(c, ST_polled, 0); SS16(c, ST_resend, 0);
         SS32(c, ST_rb0, rb); SS16(c, ST_rbSize, (u16)rbs); SS32(c, ST_rb1, rb + rbs); SS16(c, ST_rbSel, 0);
         SS32(c, ST_sendBuf, RqArg(c, q, 0xC)); SS16(c, ST_sendSize, (u16)RqArg(c, q, 0x10));
@@ -2454,12 +2559,14 @@ bool Request(Ctx& c, const Rq& q)
     {
         if (state != S_MP_PARENT && state != S_MP_CHILD) { cb0(E_ILLEGAL); break; }
         const bool was = S32(c, ST_mpFlag) != 0;
+        if (c.pw && was) SendComplete(c, false, 0xFFFF);
         SS32(c, ST_mpFlag, 0);
         CancelVAlarm(c);
         SS16(c, ST_state, state == S_MP_CHILD ? S_CHILD : S_PARENT);
         c.nullKey = false;
         if (c.mode == 2) { CW(c, R_Reply1, 0); CW(c, R_AIDLow, 0); c.bufBusy[0] = c.bufBusy[1] = false; }
-        SS16(c, ST_keyPend, 0);
+        else if (c.v31) { CW(c, R_AIDLow, 0); CW(c, R_TXSlotReset, 0x00C0); CW(c, R_TXSlotReset, 2); CW(c, R_TXSlotReset, 9); }  // (WL MaClearData(7))
+        KeyPend(c, 0);
         if (was) CleanSendQueue(c, 0xFFFF);
         cb0(E_OK);
         break;
@@ -2533,7 +2640,7 @@ bool Request(Ctx& c, const Rq& q)
     // the guest's WL takes this long for these (power-up waits, channel settling): the callback and the request's
     // consumed flag come then (scan / connect / measure time themselves)
     u32 holdUs = 0;
-    if (done) holdUs = api == 0x00 ? 12700 : api == 0x0B ? c.bd->endScanUs : api == 0x08 ? c.bd->parentHoldUs : 0;
+    if (done) holdUs = api == 0x00 ? 12700 : api == 0x0B ? c.bd->endScanUs : api == 0x08 ? c.bd->parentHoldUs : api == 0x01 ? c.bd->resetUs : api == 0x09 ? c.bd->endParentUs : 0;
     if (holdUs && c.cbs.size() > cbs0)
     {
         while (c.cbs.size() > cbs0) { c.held.push_front(c.cbs.back()); c.cbs.pop_back(); }
@@ -2557,8 +2664,40 @@ void OpFinish(Ctx& c)
     StopTimer(c, T_OP);
 }
 void ScanFound(Ctx& c, std::vector<u8>&& d) { c.opDesc = std::move(d); }
+// START_SCAN_EX result (4.x): the descriptors packed into the scan buffer (4-aligned), pointers + link levels in the callback
+void ScanExDone(Ctx& c)
+{
+    const u32 sb = S32(c, ST_scanBuf);
+    CbB cb(0x26, E_OK);
+    cb.P16(0xA, c.opListAll >> 1);
+    if (c.opDescs.empty()) cb.P16(8, SC_NOT_FOUND).P16(0xE, 0);
+    else
+    {
+        for (u32 o = 0; o + 2 <= c.opBufSize; o += 2) Wr16(c, sb + o, 0);
+        u32 dest = sb, n = 0;
+        for (const auto& d : c.opDescs)
+        {
+            const u32 len = G16(d, 0) * 2u;
+            if (n == 16 || dest + len > sb + c.opBufSize) break;   // ponytail: the WL's confirm-buffer bound, approximated
+            WriteA9(c, dest, d.data(), (u32)std::min<size_t>(len, d.size()));
+            const u16 sl = G16(d, 0xA);
+            bool valid = sl && sl <= 32;
+            if (valid) { valid = false; for (u32 i = 0; i < sl; i++) valid |= d[0xC + i] != 0; }
+            if (c.opSsidLen && !valid) { Wr16(c, dest + 0xA, c.opSsidLen); WriteA9(c, dest + 0xC, c.opSsid, 32); }
+            const u16 r = Conv(d[2]);
+            cb.P32(0x10 + 4 * n, dest).P16(0x50 + 2 * n, LinkLevelC(c, r));
+            SeedUpdate(c, r);
+            dest += len; if (dest & 2) dest = (dest + 2) & ~3u;
+            n++;
+        }
+        cb.P16(8, SC_FOUND).P16(0xE, (u16)n);
+    }
+    Send(c, cb);
+    OpFinish(c);
+}
 void ScanDone(Ctx& c)
 {
+    if (c.opEx) { ScanExDone(c); return; }
     const u16 ch = c.opCh;
     if (c.opDesc.empty()) Send(c, CbB(0xA, E_OK).P16(8, SC_NOT_FOUND).P16(0x10, ch).P16(0x12, 0));
     else
@@ -2574,7 +2713,7 @@ void ScanDone(Ctx& c)
         if (gil > 0x80) cb.P16(8, SC_NOT_FOUND).P16(0x10, ch).P16(0x12, 0);
         else
         {
-            cb.P16(8, SC_FOUND).P16(0x10, G16(d, 0x36)).P16(0x12, LinkLevel(r)).P16(0x14, G16(d, 0xA)).PB(0xA, &d[4], 6).PB(0x16, &d[0xC], 32).P16(0x36, gil);
+            cb.P16(8, SC_FOUND).P16(0x10, G16(d, 0x36)).P16(0x12, LinkLevelC(c, r)).P16(0x14, G16(d, 0xA)).PB(0xA, &d[4], 6).PB(0x16, &d[0xC], 32).P16(0x36, gil);
             for (u32 o = 0x38; o < 0xB8; o++) cb.P8(o, 0);
             cb.PB(0x38, &d[0x40], std::min<u32>((gil + 1) & ~1, (u32)d.size() - 0x40));
         }
@@ -2634,7 +2773,7 @@ void ConnectStep(Ctx& c, int result, u16 status)
         SS16(c, ST_ptgid, c.joinTgid);
         FillSeqRow(c, 0);
         const u16 r = Conv(c.joinRssi);
-        SS16(c, ST_link, LinkLevel(r));
+        SS16(c, ST_link, LinkLevelC(c, r));
         for (u8& v : c.rssi) v = (u8)r;
         c.rssiIdx = 0;
         SS16(c, ST_conn, 1); SS16(c, ST_ready, 1);
@@ -2693,6 +2832,19 @@ void FireTimers(Ctx& c)
                 SetBssid(c, c.opBssid);
                 SetChannel(c, c.opCh);
                 MacStart(c, 2);
+                c.opStage = 1;
+                SetTimer(c, T_OP, c.now + Us(c.opTime * 1000u + c.bd->scanExtraUs));
+            }
+            else if (c.op == OpScan && c.opStage == 1 && c.opEx && (c.opList & ~((2u << c.opCh) - 1)))
+            {
+                // START_SCAN_EX: the next channel of the list (the guest's WL: flash checksum + channel switch, MAC kept)
+                c.opStage = 3;
+                SetTimer(c, T_OP, c.now + Us(3050));
+            }
+            else if (c.op == OpScan && c.opStage == 3)
+            {
+                do c.opCh++; while (!(c.opList & (1u << c.opCh)));
+                SetChannel(c, c.opCh);
                 c.opStage = 1;
                 SetTimer(c, T_OP, c.now + Us(c.opTime * 1000u + c.bd->scanExtraUs));
             }
@@ -2789,12 +2941,17 @@ void Visit(Ctx& c, SS& z, u32 ver)
     z.B(c.mpBusy); z.V(c.mpPoll); z.V(c.mpGot); z.V(c.mpN); z.V(c.mpStride); z.V(c.mpTxopUs); z.V(c.mpLen); z.V(c.mpHdr); z.V(c.mpTmptt);
     z.V(c.mpRemain); z.Bytes(c.mpInd); z.V(c.mpFailed); z.V(c.mpTxopOrig);
     z.V(c.aid); z.V(c.pmac); z.V(c.bufBusy); z.V(c.lastCmdSeq); z.V(c.cmdFlags); z.V(c.beaconPeriod);
-    z.V(c.vX); z.V(c.rssi); z.V(c.rssiIdx); z.V(c.camLife);
+    z.V(c.vX); z.f->VarArray(c.rssi, ver >= 3 ? 32 : 16); z.V(c.rssiIdx); z.V(c.camLife);
     z.Seq(c.inds, [&](Ind& in) { z.V(in.code); z.Bytes(in.b); });
     z.Seq(c.autoDeAuth, [&](std::vector<u8>& v) { z.Bytes(v); });
     z.V(c.build); z.V(c.lastPassed); z.B(c.guestCbSince); z.B(c.release); z.V(c.mpNext);
     z.V(c.joinDesc); z.V(c.joinTgid); z.V(c.joinPSize); z.V(c.joinCSize); z.V(c.joinAttr); z.V(c.joinRssi);
-    if (ver >= 3) { z.B(c.nullKey); z.V(c.keyNext); }
+    if (ver >= 3)
+    {
+        z.B(c.nullKey); z.V(c.keyNext);
+        z.B(c.opEx); z.V(c.opList); z.V(c.opListAll); z.V(c.opBufSize); z.V(c.opSsidLen); z.V(c.opMatch); z.V(c.opType); z.V(c.opSsid);
+        z.Seq(c.opDescs, [&](std::vector<u8>& v) { z.Bytes(v); });
+    }
     if (!z.f->Saving) SetBuild(c, c.build);
 }
 
@@ -2907,6 +3064,7 @@ bool Fifo9(NDS& nds, u32 val)
         else if (c.build >= 1 && (c.guestCbSince || !c.lastPassed || (nds.ARM7Read16(c.lastPassed) & 0x8000)))
         {
             if (api == 0x0A || api == 0x1E || api == 0x07 || api == 0x08) take = true;
+            else if (api == 0x26) take = c.v4 && nds.ARM7Read16(a + 0x14) == 0;   // (4.x scan for any DS parent; an SSID = an AP: WFC)
             else if (api == 0x0C)   // connect: to a DS parent (game info), not an access point (WFC)
             {
                 const u32 d = nds.ARM7Read32(a + 4);
