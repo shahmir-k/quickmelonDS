@@ -718,6 +718,18 @@ if (LITEV_A7HLE)
     add_compile_definitions(LITEV_A7HLE=1)
 endif()
 
+# A7_NATIVE_WM: the NitroSDK ARM7 wireless driver (WM: the WMSP request layer + the WL MAC layer under it) runs as C++
+# from WM INITIALIZE on: the ARM9's WM requests never reach the ARM7 and the Wi-Fi chip's IRQ comes to the driver, which
+# programs the emulated chip as the guest's WL does (frames on air byte-identical; interoperates with consoles running the
+# emulated driver). Per WM build: the build is recognised by a scan for the WMSP dispatch table and a relocation-masked
+# hash of its handlers (NitroSDK 3.0 WM: Mario Kart DS, Animal Crossing WW); other builds keep the emulated driver.
+# Category B (deterministic; the guest's request / MP timing modelled, not cycle-exact). Runtime: debug.litev.a7wm
+# (prop on Android, env elsewhere; unset = on, 0 = off). See src/WMNative.h.
+option(LITEV_A7_NATIVE_WM "Native ARM7 WM wireless driver per WM build (category B)" OFF)
+if (LITEV_A7_NATIVE_WM)
+    add_compile_definitions(LITEV_A7_NATIVE_WM=1)
+endif()
+
 # A9HLE: Pokemon Black/White's NitroSDK ARM9 OS: spurious OS_WaitIrq wake-ups (the IRQ handler
 # switching to the VBlank-waiting main thread and back on every HBlank, 25-50% of ARM9 guest
 # instructions) are skipped with the exact memory/register result, and OS_SetIrqFunction /
@@ -1641,6 +1653,10 @@ endif()
 option(LITEV_NP_LEAN_IO "Netplay input I/O: the emulator thread hands its sends to the receive thread (one pipe write instead of a sendto per peer); the receive thread sleeps in poll() until a packet, a send request or the next heartbeat (was a 1 ms recv timeout: 1000 wakeups/s), takes packets without a heap copy unless faults are simulated, re-sends only after 10 ms with nothing sent, recomputes only the sender's round-trip percentile and wakes Get() only for new inputs (exact)" OFF)
 if (LITEV_NP_LEAN_IO)
     add_compile_definitions(LITEV_NP_LEAN_IO=1)
+endif()
+option(LITEV_NP_QUIET_HB "Netplay input I/O (with LITEV_NP_LEAN_IO + LITEV_NP_WIRE_RUNS; plain Netplay only, Hosted keeps the 10 ms heartbeat): between frames the heartbeat goes only to a peer that is owed an acknowledgement for 20 ms, holds our unacknowledged inputs for 2 x 20 ms + its round trip, or heard nothing for 100 ms (was: every peer every 10 ms with nothing sent: ~5 packets per peer per frame at 21 fps); every frame's send still goes to every peer with all unacknowledged inputs; wire format unchanged (exact)" OFF)
+if (LITEV_NP_QUIET_HB)
+    add_compile_definitions(LITEV_NP_QUIET_HB=1)
 endif()
 option(LITEV_NP_RX_PRIO "Netplay: the input receive thread runs at nice -16 (Linux/Android), so a peer's input is taken off the socket while the emulator and render threads keep every core busy" OFF)
 if (LITEV_NP_RX_PRIO)

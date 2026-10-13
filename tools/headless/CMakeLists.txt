@@ -61,5 +61,13 @@ if (NOT WIN32)
     target_link_libraries(liteDS-headless PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
+# --renderer hybrid|glhires on macOS: offscreen CGL context + glad (ENABLE_OGLRENDERER=ON)
+if (ENABLE_OGLRENDERER AND APPLE)
+    target_sources(liteDS-headless PRIVATE MacGL.cpp "${CMAKE_SOURCE_DIR}/src/frontend/glad/glad.c")
+    target_link_libraries(liteDS-headless PRIVATE "-framework OpenGL")
+    target_compile_definitions(liteDS-headless PRIVATE LITEV_HEADLESS_GL=1)
+    target_compile_definitions(core PUBLIC MELONDS_GL_HEADER="frontend/glad/glad.h")
+endif()
+
 set_target_properties(liteDS-headless PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")

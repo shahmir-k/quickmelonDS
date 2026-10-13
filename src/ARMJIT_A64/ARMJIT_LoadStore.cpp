@@ -33,6 +33,9 @@
 #endif
 
 using namespace Arm64Gen;
+#ifdef LITEV_JIT_PERFMAP
+namespace melonDS { void LitevPerfmapAdd(const char* name, void* a, void* b); }   // armed perf map only (ARMJIT_Compiler.cpp)
+#endif
 
 #ifdef LITEV_SLOWMEM_HIST
 namespace melonDS { void LitevSlowSiteNote(const void* ret, u32 info); }
@@ -1448,6 +1451,9 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         RET();
 
         FlushIcacheSection(patchFunc, (u8*)GetRXPtr());
+#ifdef LITEV_JIT_PERFMAP
+        LitevPerfmapAdd(Num == 0 ? "jit_far_a9" : "jit_far_a7", patchFunc, (void*)GetRXPtr());   // armed only: LDM/STM slow path (far region)
+#endif
         SwapCodeRegion();
     }
 

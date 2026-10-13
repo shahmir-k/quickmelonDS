@@ -34,6 +34,13 @@
 #include "NDSCart.h"
 #include "GPU.h"
 #include "GPU_Soft.h"
+#ifdef LITEV_HEADLESS_GL
+#include "GPU_OpenGL.h"
+#include "GPU_Hybrid.h"
+void* MacGLProc(const char* name);
+bool MacGLCreate();
+void MacGLShims();
+#endif
 #include "Platform.h"
 #include "Savestate.h"
 #include "SPI_Firmware.h"
@@ -128,6 +135,8 @@ struct Options
     AudioInterpolation interp = AudioInterpolation::None;
     int frameskip = 0;                  // LITEV_AGGRESSIVE_SKIP target (0 = off)
     bool accurate3d = false;            // --soft3d accurate: SoftRenderer3D instead of the tile renderer
+    std::string renderer = "soft";      // --renderer soft|hybrid|glhires (GL ones: macOS, ENABLE_OGLRENDERER)
+    int glScale = 1;                    // --scale N: GL internal resolution
 
     std::string inputScript;            // --input-script: scripted button input
     std::string lanJoin;                // --lan-join <host>: join a LAN session (LITEV_HEADLESS_LAN)
@@ -170,6 +179,9 @@ struct Options
         "  --audio-interp <mode>     SPU interpolation: none|linear|cosine|cubic|gaussian (default none)\n"
         "  --frameskip N             skip N of every N+1 frames' rasterization (LITEV_AGGRESSIVE_SKIP build)\n"
         "  --soft3d fast|accurate    software 3D backend: tile renderer (default when built in) or SoftRenderer3D\n"
+        "  --renderer soft|hybrid|glhires  renderer (GL ones: macOS build with ENABLE_OGLRENDERER; --fb-dump-ppm\n"
+        "                            then writes the GL output at 256N x 384N). Env debug.litev.* = GL A/B props\n"
+        "  --scale N                 GL internal resolution (default 1)\n"
         "  --bench-window <s>:<e>    report avg FPS over frames [s,e] inclusive only (still runs all frames)\n"
         "  --profile-json <path>     write per-run totals as JSON\n"
         "  --data-dir <path>         local firmware/save directory (default ./headless-data)\n"
@@ -268,6 +280,8 @@ bool ParseArgs(int argc, char** argv, Options& o)
             else { fprintf(stderr, "error: --audio-interp must be none|linear|cosine|cubic|gaussian\n"); return false; }
         }
         else if (a == "--frameskip") o.frameskip = std::atoi(next("--frameskip").c_str());
+        else if (a == "--renderer") o.renderer = next("--renderer");
+        else if (a == "--scale") o.glScale = std::max(1, std::atoi(next("--scale").c_str()));
         else if (a == "--soft3d")
         {
             std::string m = next("--soft3d");
@@ -349,6 +363,26 @@ std::unique_ptr<u8[]> ReadFile(const std::string& path, u32& lenOut)
 
 // Dump both framebuffers as a single side-by-side binary PPM (P6, 24-bit).
 // The software renderer stores pixels as BGRA/ABGR u32; we extract RGB.
+#ifdef LITEV_HEADLESS_GL
+// The GL renderers' output: a 2-layer RGBA array texture (0 = top, 1 = bottom), 256N x 192N.
+// Dumped at full scale, top over bottom (a hybrid GetFramebuffers merges into it first).
+bool DumpGLArray(const std::string& path, GLuint tex, int n)
+{
+    const int W = 256 * n, H = 192 * n;
+    std::vector<u8> px((size_t)W * H * 2 * 4);
+    glFinish();
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glGetTexImage(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    fprintf(f, "P6\n%d %d\n255\n", W, H * 2);
+    for (size_t i = 0; i < px.size(); i += 4) fwrite(&px[i], 1, 3, f);
+    fclose(f);
+    return true;
+}
+#endif
+
 bool DumpPPM(const std::string& path, const u32* top, const u32* bottom)
 {
     FILE* f = fopen(path.c_str(), "wb");
@@ -516,6 +550,22 @@ int main(int argc, char** argv)
         rs.HiresCoordinates = false;
         rs.BetterPolygons = false;
         rs.Accurate3D = opt.accurate3d;
+#ifdef LITEV_HEADLESS_GL
+        if (opt.renderer != "soft")
+        {
+            if (!MacGLCreate() || !gladLoadGLLoader((GLADloadproc)MacGLProc))
+            { fprintf(stderr, "error: no OpenGL 4.1 core context\n"); return 1; }
+            MacGLShims();
+            if (opt.renderer == "hybrid") nds->GPU.SetRenderer(std::make_unique<HybridRenderer>(*nds));
+            else if (opt.renderer == "glhires") nds->GPU.SetRenderer(std::make_unique<GLRenderer>(*nds, false));
+            else { fprintf(stderr, "error: --renderer soft|hybrid|glhires\n"); return 1; }
+            auto& r = nds->GPU.GetRenderer();
+            while (r.NeedsShaderCompile()) { int cur = 0, cnt = 0; r.ShaderCompileStep(cur, cnt); }
+            rs.ScaleFactor = opt.glScale;
+        }
+#else
+        if (opt.renderer != "soft") { fprintf(stderr, "error: build has no GL renderers (macOS + ENABLE_OGLRENDERER)\n"); return 1; }
+#endif
         nds->GPU.GetRenderer().SetRenderSettings(rs);
     }
     nds->SetNDSCart(std::move(cart));
@@ -810,6 +860,10 @@ int main(int argc, char** argv)
         }
 #endif
         nds->RunFrame();
+        if (static const bool p2d = getenv("LITEV_PRINT_2D") != nullptr; p2d)   // display registers after the frame
+            fprintf(stderr, "2D f%d A: dispcnt=%08x bldcnt=%04x eva=%d evb=%d evy=%d mb=%04x  B: dispcnt=%08x bldcnt=%04x evy=%d mb=%04x cap=%08x\n", frame,
+                    nds->GPU.GPU2D_A.DispCnt, nds->GPU.GPU2D_A.BlendCnt, nds->GPU.GPU2D_A.EVA, nds->GPU.GPU2D_A.EVB, nds->GPU.GPU2D_A.EVY, nds->GPU.MasterBrightnessA,
+                    nds->GPU.GPU2D_B.DispCnt, nds->GPU.GPU2D_B.BlendCnt, nds->GPU.GPU2D_B.EVY, nds->GPU.MasterBrightnessB, nds->GPU.CaptureCnt);
 #ifdef __APPLE__
         {
             uint64_t tc1[2] = {};
@@ -983,6 +1037,19 @@ int main(int argc, char** argv)
 
         void* top = nullptr;
         void* bot = nullptr;
+#ifdef LITEV_HEADLESS_GL
+        if (opt.renderer != "soft")
+        {
+            for (const auto& d : opt.fbDumps)
+                if (d.first == frame && !d.second.empty())
+                {
+                    nds->GPU.GetFramebuffers(&top, &bot);
+                    if (DumpGLArray(d.second, *(GLuint*)top, opt.glScale))
+                        fprintf(stderr, "dumped frame %d to %s\n", frame, d.second.c_str());
+                }
+            continue;
+        }
+#endif
         bool haveFb = nds->GPU.GetFramebuffers(&top, &bot);
 
         if (haveFb && top && bot)
