@@ -2606,6 +2606,9 @@ void Wifi::ChangeChannel()
             break;
         }
     }
+#ifdef LITEV_AMBIENT_LAN
+    WifiChannel = CurChannel;
+#endif
 
     if (CurChannel > 0)
         Log(LogLevel::Debug, "wifi: switching to channel %d\n", CurChannel);

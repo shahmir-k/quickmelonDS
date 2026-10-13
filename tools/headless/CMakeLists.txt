@@ -11,7 +11,7 @@ set(LITEV_ENET_SOURCE_DIR "${CMAKE_SOURCE_DIR}/../melonDS-android-app-clean/app/
     CACHE PATH "ENet source tree for LITEV_HEADLESS_LAN")
 
 if (LITEV_HEADLESS_LAN)
-    set(LITEV_HEADLESS_MP_SOURCES "${CMAKE_SOURCE_DIR}/src/net/MPInterface.cpp" "${CMAKE_SOURCE_DIR}/src/net/LAN.cpp")
+    set(LITEV_HEADLESS_MP_SOURCES "${CMAKE_SOURCE_DIR}/src/net/MPInterface.cpp" "${CMAKE_SOURCE_DIR}/src/net/LAN.cpp" "${CMAKE_SOURCE_DIR}/src/net/AmbientLAN.cpp")
 else()
     set(LITEV_HEADLESS_MP_SOURCES MPLocal.cpp)
 endif()
