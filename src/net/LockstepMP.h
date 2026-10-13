@@ -88,6 +88,14 @@ public:
 
     // How to read instance `inst`'s emulated clock (NDS::GetSysTimestamp), from any thread.
     void SetClock(int inst, std::function<u64()> clock) { Clock[inst] = std::move(clock); Members |= (1 << inst); }
+    // A live wireless hand-off loads consoles that booted on different devices and therefore have
+    // unrelated NDS system-clock epochs. Map each raw clock to one shared link epoch. Call before
+    // the console threads run; ordinary Netplay keeps both values at zero.
+    void SetClockOrigin(int inst, u64 rawOrigin, u64 linkEpoch)
+    {
+        ClockOrigin[inst] = rawOrigin;
+        ClockEpoch[inst] = linkEpoch;
+    }
 #ifdef LITEV_MP_FASTPOLL
     // the clock as a plain read of the console's timestamp (Now() runs several times per poll)
     void SetClockSource(int inst, const u64* src) { ClockSrc[inst] = src; Clock[inst] = [src] { return *src; }; Members |= (1 << inst); }
@@ -161,7 +169,12 @@ public:
     u64 TxHash(int inst) const { return TxH[inst]; }
     u32 TxCount(int inst) const { return TxN[inst]; }
     u64 TxDataHash(int inst) const { return TxD[inst]; }   // contents only (not when)
+    // Test-only, low-overhead in-memory capture: dump after the console threads have joined.
+    void DumpTxMemory(const char* dir) const;
 private:
+    struct TxMemoryRecord { u32 Type, Length; u64 Time, Timestamp, DataHash; };
+    std::vector<TxMemoryRecord> TxMemory[kMaxInst];
+    std::vector<std::vector<u8>> TxWifiMemory[kMaxInst];
     u64 TxH[kMaxInst] {};
     u32 TxN[kMaxInst] {};
     u64 TxD[kMaxInst] {};
@@ -244,10 +257,24 @@ private:
     void Broadcast(int inst, u32 type, u8* data, int len, u64 timestamp, std::deque<Packet>* queues);
 #ifdef LITEV_MP_FASTPOLL
     const u64* ClockSrc[kMaxInst] {};
-    u64 Now(int inst) const { return ClockSrc[inst] ? __atomic_load_n(ClockSrc[inst], __ATOMIC_RELAXED) : Clock[inst] ? Clock[inst]() : 0; }
+    u64 RawNow(int inst) const { return ClockSrc[inst] ? __atomic_load_n(ClockSrc[inst], __ATOMIC_RELAXED) : Clock[inst] ? Clock[inst]() : 0; }
 #else
-    u64 Now(int inst) const { return Clock[inst] ? Clock[inst]() : 0; }
+    u64 RawNow(int inst) const { return Clock[inst] ? Clock[inst]() : 0; }
 #endif
+    u64 ClockOrigin[kMaxInst] {};
+    u64 ClockEpoch[kMaxInst] {};
+    u64 Now(int inst) const { return RawNow(inst) - ClockOrigin[inst] + ClockEpoch[inst]; }
+    u64 RawWake(int inst, u64 linkTime) const
+    {
+        // A wake threshold belongs to NDS::RunSystem's raw clock, not this link's normalized one.
+        if (linkTime >= ClockEpoch[inst])
+        {
+            const u64 elapsed = linkTime - ClockEpoch[inst];
+            return elapsed > UINT64_MAX - ClockOrigin[inst] ? UINT64_MAX : ClockOrigin[inst] + elapsed;
+        }
+        const u64 before = ClockEpoch[inst] - linkTime;
+        return before > ClockOrigin[inst] ? 0 : ClockOrigin[inst] - before;
+    }
     bool PeersReached(int inst, u64 time) const;
     // waits (lock held) until pred(); peers' clocks advance without notifying, so also re-check
     // every 100 us
@@ -292,6 +319,7 @@ private:
     void NeedClock(int waiter, int peer, u64 t)
     {
 #ifdef LITEV_MP_CLOCKWAKE
+        t = RawWake(peer, t);
 #ifdef LITEV_MP_FUTEX
         WaitersOn[peer].fetch_or((u16)(1 << waiter), std::memory_order_relaxed);
 #else
@@ -305,7 +333,7 @@ private:
     void WakeOwn(int inst)
     {
 #ifdef LITEV_MP_CLOCKWAKE
-        if (Now(inst) >= WakeAt[inst].load(std::memory_order_relaxed)) WakeLocked(inst);
+        if (RawNow(inst) >= WakeAt[inst].load(std::memory_order_relaxed)) WakeLocked(inst);
 #endif
     }
 #ifdef LITEV_MP_CLOCKWAKE

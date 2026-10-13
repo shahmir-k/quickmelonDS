@@ -20,6 +20,7 @@
 #define NETPLAYINPUT_H
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -160,6 +161,10 @@ public:
 
     // The local player's input sampled at `frame` (applied at frame + Delay everywhere).
     void SubmitLocal(int frame, const NetplayFrameInput& input);
+    // Startup fence for a live handoff: after SubmitLocal(0), wait until every
+    // peer has also submitted its real frame-0 input. Never consumes that input.
+    // No emulated frame may run until this succeeds.
+    bool WaitForHandoffPeerInput(int timeoutMs);
 
     // The input of `player` for emulated frame `frame`; blocks until known (or Abort(), or the
     // player is dropped).
@@ -354,6 +359,46 @@ struct NetplaySetup
     std::string Log;            // what happened (errors included), one line per event
 };
 bool NetplayHandshake(NetplaySetup& s);
+
+// A fenced, already-running Ambient session contributes one exact console
+// savestate per player. This exchange is deliberately separate from the
+// start-from-ROM Netplay handshake: callers keep both original emulators and
+// their Ambient links alive until replica load and a later commit succeed.
+struct NetplayLiveCheckpoint
+{
+    u64 Epoch = 0;
+    u64 Build = 0;                 // exact native-core/protocol compatibility id
+    u64 RawClock = 0;
+    u32 Frame = 0;
+    u8 Player = 0;
+    std::array<u8, 16> FenceToken{};
+    NetplayRom Rom;
+    std::vector<u8> Firmware;          // source console's complete SPI firmware (not in NDS savestate)
+    std::vector<u8> State;
+};
+
+// player 0 listens on tcpPort; player 1 connects to hostAddress (ip:tcpPort).
+// The expected peer ROM comes from the already-validated Netplay roster.
+// Synchronous: call on a worker while the emulator thread keeps Ambient
+// Process() serviced. preparePeer must verify/load the remote state into an
+// isolated scratch replica; neither side reports success until both vote ready.
+using NetplayLivePrepare = std::function<bool(const NetplayLiveCheckpoint&, std::string&)>;
+bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
+                                    const std::string& expectedPeerIPv4,
+                                    const NetplayLiveCheckpoint& local, const NetplayRom& expectedPeerRom,
+                                    NetplayLivePrepare preparePeer, std::atomic<bool>& cancel,
+                                    NetplayLiveCheckpoint& peer, std::string& error);
+
+// A second, bounded rendezvous after both peers have voted GO. Neither caller
+// may run the first Netplay frame until this confirms that the *same* pair of
+// checkpoints is present on both sides. A lost GO leaves the other peer here
+// (still on its frozen Ambient source) rather than running predicted inputs.
+// This is a startup gate, not a distributed durable-commit guarantee: a peer
+// disappearing after the response remains an in-doubt recovery case.
+bool NetplayAwaitLiveStart(u16 tcpPort, const std::string& hostAddress,
+                           const std::string& expectedPeerIPv4,
+                           const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
+                           std::atomic<bool>& cancel, std::string& error);
 
 }
 
