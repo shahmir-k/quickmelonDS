@@ -278,9 +278,9 @@ public:
     // the shared counterpart of CompileBlock: same code for the same captured inputs, emitted once.
     // Sets NumLinkExits/LinkExits like CompileBlock; id = the code object (0: no link guard).
     JitBlockEntry SharedCompile(JitEmitJob& job, u32& id);
-    u32 LinkEntryOff(u32 entryOff, u32 id) const { return id ? entryOff - LinkGuardBytes : entryOff; }
-    static constexpr u32 LinkGuardBytes = 16;   // the link entry's guard, right before the block entry
-    static constexpr u32 ValidSize = 1u << 22;  // code objects with a link guard (ARM::JitValid bytes)
+    static constexpr u32 LinkSites = 1u << 22;  // link exits in shared code (per-console ARM::JitLinks entries)
+    static constexpr u32 SharedUnlinked = ~0u;  // PatchLinkSite target: unlink (shared code)
+    u64* SharedLinks = nullptr;                 // this console's link table (set by ARMJIT)
     u32 CurSharedId = 0;                        // the code object being emitted (0: none)
     void SharedSetCpuFields();
 #endif
@@ -696,6 +696,9 @@ public:
     // EXIT_PROTO (it stores the PC / site register first), else the dispatcher.
     u32 UnlinkedSiteTarget(u32 num, u32 rxOffset)
     {
+#ifdef LITEV_JIT_SHARED_CODE
+        if (Shared) return SharedUnlinked;   // (rxOffset is the site's link table index)
+#endif
 #ifdef LITEV_JIT_EXIT_PROTO
         (void)num;
         return rxOffset + 4;
@@ -942,7 +945,7 @@ struct SharedArena
     bool Dispatchers = false;
     void* DispatcherEntry[2] = {};
     ptrdiff_t Near = 0, Far = 0;
-    u32 NextId = 1, NextSite = 1;
+    u32 NextId = 1, NextSite = 1, NextLinkSite = 1;
     Compiler::PatchMap Patches;
     std::unordered_map<std::string, SharedObj> Objs;
     u64 Hits = 0, Misses = 0;
