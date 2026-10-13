@@ -662,6 +662,22 @@ if (LITEV_JIT_REFILL_FAST)
     endif()
 endif()
 
+# LITEV_JIT_SHARED_CODE: consoles of one process (Netplay's 8 consoles) share one JIT code arena.
+# A block's code is a function of its captured compile inputs (LITEV_JIT_BGEMIT's capture), so a
+# console reuses another console's code for the same inputs instead of emitting its own copy: the
+# remotes then fetch one copy of the game's code from the shared L3 instead of eight. Per-console
+# state is reached through RCPU, every console keeps its own blocks, lookup tables, invalidation and
+# cache-reset accounting. Exact (category A). Runtime: ARMJIT_Global::SetSharedCode before the
+# consoles are built (headless --mp-test: LITEV_JIT_SHARED=1).
+option(LITEV_JIT_SHARED_CODE "One JIT code arena shared by the consoles of a process (exact)" OFF)
+if (LITEV_JIT_SHARED_CODE)
+    if (ENABLE_JIT AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+        add_compile_definitions(LITEV_JIT_SHARED_CODE=1)
+    else()
+        message(FATAL_ERROR "LITEV_JIT_SHARED_CODE requires ENABLE_JIT and an AArch64 target.")
+    endif()
+endif()
+
 option(LITEV_JIT_ICACHE "Per-site 2-way block inline cache in the dispatcher (guest-PC->host-ptr), epoch-guarded" OFF)
 if (LITEV_JIT_ICACHE)
     if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")

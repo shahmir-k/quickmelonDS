@@ -17,6 +17,9 @@
 */
 
 #include "ARMJIT.h"
+#ifdef LITEV_JIT_SHARED_CODE
+#include <sys/mman.h>
+#endif
 #if defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
@@ -414,6 +417,14 @@ ARMJIT::~ARMJIT() noexcept
 #endif
     JitEnableWrite();
     ResetBlockCache();
+#ifdef LITEV_JIT_SHARED_CODE
+    if (JitValid)
+    {
+        NDS.ARM9.JitValid = NDS.ARM7.JitValid = nullptr;
+        munmap(JitValid, Compiler::ValidSize);
+        JitValid = nullptr;
+    }
+#endif
 }
 
 void ARMJIT::Reset() noexcept
@@ -807,6 +818,14 @@ ARMJIT::ARMJIT(melonDS::NDS& nds, std::optional<JITArgs> jit) noexcept :
 #ifdef LITEV_JIT_SILENT_STORE
     SilentStoreOn = !getenv("LITEV_JIT_SILENT_STORE_OFF");
 #endif
+#ifdef LITEV_JIT_SHARED_CODE
+    if (JITCompiler.Shared)
+    {
+        void* m = mmap(nullptr, Compiler::ValidSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (m == MAP_FAILED) { fprintf(stderr, "LITEV_JIT_SHARED_CODE: no valid map\n"); abort(); }
+        JitValid = (u8*)m;
+    }
+#endif
 #ifdef LITEV_JIT_BGEMIT
     BgMode = JITCompiler.BgLayout ? JitBgMode() : 0;
     if (BgMode)
@@ -1120,10 +1139,14 @@ void ARMJIT::LinkBlockOutgoing(JitBlock* block) noexcept
     {
         const OutgoingLink& link = block->Outgoing[i];
         auto it = blocks.find(link.TargetAddr);
-        if (it != blocks.end() && it->second->EntryPoint)   // (none yet: loaded from a savestate)
+        if (it != blocks.end() && it->second->EntryPoint   // (none yet: loaded from a savestate)
+#ifdef LITEV_JIT_SHARED_CODE
+            && (!JITCompiler.Shared || it->second->SharedId)   // (shared code links only through a guard)
+#endif
+            )
         {
             JitBlock* target = it->second;
-            u32 targetOff = EntryOff(target);
+            u32 targetOff = LinkTargetOff(target, EntryOff(target));
             JITCompiler.PatchLinkSite(link.PatchOffset, targetOff);
             target->Incoming.Add(LinkSite{block->StartAddr, link.PatchOffset});
             LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
@@ -1165,7 +1188,7 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
         if (it != blocks.end() && it->second->EntryPoint)
         {
             JitBlock* target = it->second;
-            u32 targetOff = JITCompiler.SubEntryOffset(target->EntryPoint);
+            u32 targetOff = LinkTargetOff(target, JITCompiler.SubEntryOffset(target->EntryPoint));
             JITCompiler.PatchLinkSite(link.PatchOffset, targetOff);
             target->Incoming.Add(LinkSite{block->StartAddr, link.PatchOffset});
             LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LinksPatched);
@@ -1183,9 +1206,16 @@ void ARMJIT::LinkBlock(JitBlock* block) noexcept
 
     // (b) drain pending links waiting on THIS block's start address.
 #ifdef LITEV_JIT_BGEMIT
-    u32 entryOff = EntryOff(block);
+    u32 entryOff = LinkTargetOff(block, EntryOff(block));
 #else
-    u32 entryOff = JITCompiler.SubEntryOffset(block->EntryPoint);
+    u32 entryOff = LinkTargetOff(block, JITCompiler.SubEntryOffset(block->EntryPoint));
+#endif
+#ifdef LITEV_JIT_SHARED_CODE
+    if (JITCompiler.Shared && !block->SharedId)
+    {
+        JitEnableExecute();   // (no guard: its waiting sites stay unlinked)
+        return;
+    }
 #endif
 #ifdef LITEV_JIT_FLATMAPS
     pending.drain(block->StartAddr, [&](const LinkSite& site)
@@ -1227,6 +1257,9 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
     for (int i = 0; i < block->Incoming.Length; i++)
     {
         LinkSite site = block->Incoming[i];
+#ifdef LITEV_JIT_SHARED_CODE
+        if (!JITCompiler.Shared)   // (shared: the target's guard turns the stale link away)
+#endif
         JITCompiler.PatchLinkSite(site.PatchOffset, JITCompiler.UnlinkedSiteTarget(block->Num, site.PatchOffset));
 #ifdef LITEV_JIT_FLATMAPS
         pending.insert(block->StartAddr, site);
@@ -1281,6 +1314,9 @@ void ARMJIT::UnlinkBlock(JitBlock* block) noexcept
 
         // Reset our own slot: our RX is preserved until ResetBlockCache, but a stale
         // B->dead-target must never survive a restore (LinkBlock re-drives it).
+#ifdef LITEV_JIT_SHARED_CODE
+        if (!JITCompiler.Shared)
+#endif
         JITCompiler.PatchLinkSite(link.PatchOffset, JITCompiler.UnlinkedSiteTarget(block->Num, link.PatchOffset));
     }
 
@@ -1482,6 +1518,9 @@ JitBlock* ARMJIT::ReviveParked(ARM* cpu, u32 blockAddr, u32 localAddr, bool thum
         range->Blocks.Add(b);
     }
     if (cpu->Num == 0) JitBlocks9[blockAddr] = b; else JitBlocks7[blockAddr] = b;
+#ifdef LITEV_JIT_SHARED_CODE
+    SetValid(b, 1);
+#endif
     u64* entry = &FastBlockLookupRegions[(localAddr >> 27)][(localAddr & 0x7FFFFFF) / 2];
     *entry = ((u64)blockAddr | cpu->Num) << 32;
 #ifdef LITEV_JIT_BGEMIT
@@ -1552,6 +1591,9 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
 #else
             *entry |= JITCompiler.SubEntryOffset(block->EntryPoint);
 #endif
+#ifdef LITEV_JIT_SHARED_CODE
+            SetValid(block, 1);
+#endif
 #ifdef LITEV_JIT_LINK
             if (fromState)
                 LinkBlock(block);
@@ -1564,6 +1606,9 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
         // This block dies here without passing through InvalidateByAddr; unlink it
         // before it leaves JitBlocks so no stale link points into its recycled code.
         UnlinkBlock(existingBlockIt->second);
+#endif
+#ifdef LITEV_JIT_SHARED_CODE
+        SetValid(existingBlockIt->second, 0);
 #endif
         RetireJitBlock(existingBlockIt->second);
         map.erase(existingBlockIt);
@@ -2227,9 +2272,16 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
         else
 #endif
         {
+#ifdef LITEV_JIT_SHARED_CODE
+        if (JITCompiler.Shared)
+            block->EntryPoint = SharedEmit(cpu, block, thumb, instrs, i, hasMemoryInstr);
+        else
+#endif
+        {
         JitEnableWrite();
         block->EntryPoint = JITCompiler.CompileBlock(cpu, thumb, instrs, i, hasMemoryInstr);
         JitEnableExecute();
+        }
         JIT_PHASE(JitPhase_Emit);
 
 #ifdef LITEV_JIT_LINK
@@ -2295,6 +2347,9 @@ JitBlockEntry ARMJIT::CompileBlock(ARM* cpu) noexcept
     *entry |= JITCompiler.SubEntryOffset(block->EntryPoint);
 #endif
 
+#ifdef LITEV_JIT_SHARED_CODE
+    SetValid(block, 1);
+#endif
     JIT_PHASE(JitPhase_Insert);
 #ifdef LITEV_JIT_LINK
     // Block is now in JitBlocks + FastBlockLookup: resolve its outgoing links and
@@ -2417,6 +2472,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
         if (dpN[block->Num] < 32) dpDead[block->Num][dpN[block->Num]] = block->StartAddr;
         dpN[block->Num]++;
 #endif
+#endif
+#ifdef LITEV_JIT_SHARED_CODE
+        SetValid(block, 0);
 #endif
         if (block->Num == 0)
             JitBlocks9.erase(block->StartAddr);
@@ -2631,6 +2689,12 @@ void ARMJIT::ResetBlockCache() noexcept
 #ifdef LITEV_JIT_REVIVE
     ParkedByAddr.clear();
 #endif
+#ifdef LITEV_JIT_SHARED_CODE
+    for (auto it : JitBlocks9) SetValid(it.second, 0);
+    for (auto it : JitBlocks7) SetValid(it.second, 0);
+    if (JitValid)
+        NDS.ARM9.JitValid = NDS.ARM7.JitValid = JitValid;
+#endif
     for (auto it : JitBlocks9)
     {
         JitBlock* block = it.second;
@@ -2726,6 +2790,26 @@ bool ARMJIT::HasBlock(u32 num, u32 addr) noexcept
     return it != map.end() && it->second->StartAddrLocal == LocaliseCodeAddress(num, addr);
 }
 
+#ifdef LITEV_JIT_SHARED_CODE
+// LITEV_JIT_SHARED_CODE: capture what the emission reads (making its CPU-field changes now, as an
+// inline emission does), then take the shared code for those inputs or emit it.
+JitBlockEntry ARMJIT::SharedEmit(ARM* cpu, JitBlock* block, bool thumb, FetchedInstr* instrs, int n, bool hasMem) noexcept
+{
+    static thread_local std::unique_ptr<JitEmitJob> jp;
+    if (!jp) jp.reset(new JitEmitJob);
+    JitEmitJob& job = *jp;
+    job.Thumb = thumb;
+    job.HasMem = hasMem;
+    job.Count = n;
+    memcpy(job.Instrs, instrs, n * sizeof(FetchedInstr));
+    JITCompiler.CaptureEmitInputs(cpu, job);
+    u32 id = 0;
+    JitBlockEntry entry = JITCompiler.SharedCompile(job, id);
+    block->SharedId = id;
+    return entry;
+}
+#endif
+
 void ARMJIT::CompileFromProfile(JitBlock* block) noexcept
 {
     ARM* cpu = block->Num == 0 ? (ARM*)&NDS.ARM9 : (ARM*)&NDS.ARM7;
@@ -2762,9 +2846,16 @@ void ARMJIT::CompileFromProfile(JitBlock* block) noexcept
         while (EmitFront(false)) {}
     }
 #endif
+#ifdef LITEV_JIT_SHARED_CODE
+    if (JITCompiler.Shared)
+        block->EntryPoint = SharedEmit(cpu, block, block->Thumb, instrs, n, block->HasMemInstr);
+    else
+#endif
+    {
     JitEnableWrite();
     block->EntryPoint = JITCompiler.CompileBlock(cpu, block->Thumb, instrs, n, block->HasMemInstr);
     JitEnableExecute();
+    }
 #ifdef LITEV_JIT_BGEMIT
     if (BgMode)
     {

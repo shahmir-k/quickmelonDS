@@ -475,11 +475,19 @@ void* Compiler::Gen_JumpTo7(int kind)
     LSR(W1, W0, 15);
     STR(INDEX_UNSIGNED, W1, RCPU, offsetof(ARM, CodeCycles));
 
-#ifdef LITEV_JIT_REFILL_FAST
+#if defined(LITEV_JIT_REFILL_FAST) || defined(LITEV_JIT_SHARED_CODE)
     // ARM7 blocks run with RCPU == &NDS.ARM7, and the table is a member of the same NDS object:
     // address it from RCPU (ADD+ADD) instead of a 64-bit pointer constant (MOVZ+MOVK+MOVK).
+    // (LITEV_JIT_SHARED_CODE: the stub serves every console, so never the constant.)
     const s64 a7mt = (s64)((u8*)NDS.ARM7MemTimings - (u8*)&NDS.ARM7);
-    if (a7mt > -0x1000000 && a7mt < 0x1000000)
+    bool viaCpu = false;
+#ifdef LITEV_JIT_REFILL_FAST
+    viaCpu = true;
+#endif
+#ifdef LITEV_JIT_SHARED_CODE
+    if (Shared) { assert(a7mt > -0x1000000 && a7mt < 0x1000000); viaCpu = true; }
+#endif
+    if (viaCpu && a7mt > -0x1000000 && a7mt < 0x1000000)
         ADDI2R(X2, RCPU, (u64)a7mt);
     else
 #endif

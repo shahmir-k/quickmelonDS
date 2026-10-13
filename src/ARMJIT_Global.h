@@ -49,6 +49,14 @@ void AcquireFaultHandler();
 void ReleaseFaultHandler();
 
 void* AllocateCodeMem();
+#ifdef LITEV_JIT_SHARED_CODE
+// LITEV_JIT_SHARED_CODE: consoles built while this is on share one code arena (headless --mp-test,
+// Netplay). Set before building them; a console keeps the mode it was built with.
+void SetSharedCode(bool on);
+bool SharedCode();
+void* AllocateSharedCodeMem(size_t size);
+void FreeSharedCodeMem(void* mem, size_t size);
+#endif
 void FreeCodeMem(void* codeMem);
 
 }
