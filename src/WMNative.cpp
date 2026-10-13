@@ -3,6 +3,7 @@
 #include "WMNative.h"
 #include "NDS.h"
 #include "Savestate.h"
+#include "Platform.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -3031,7 +3032,7 @@ void Visit(Ctx& c, SS& z, u32 ver)
 }
 
 // the guest's WMSP / WL are idle (its last request called back); the native driver goes on from the WMStatus state it left
-bool Activate(Ctx& c)
+bool Activate(Ctx& c, u16 api)
 {
     NDS& nds = c.nds;
     const u16 state = S16(c, ST_state);
@@ -3044,6 +3045,8 @@ bool Activate(Ctx& c)
     for (int k = 0; k < 6; k++) c.mac[k] = Rd8(c, SA(c, ST_mac + k));
     for (Sta& t : c.sta) { t = Sta{}; t.lifeReload = c.camLife; }
     c.pending.clear();
+    Platform::Log(Platform::LogLevel::Info, "A7_NATIVE_WM: takeover inst %d frame %u build=%016llx (%s) on request %02x, WM state %u\n",
+                  c.inst, nds.NumFrames, (unsigned long long)c.bd->id, c.bd->name, api, state);
     if (g_Stats) fprintf(stderr, "A7WM inst%d f%u: native WM driver takes over (state %u; WM7 %08x status %08x cb %08x)\n", c.inst, nds.NumFrames, state, c.w7, c.st, c.cbuf);
     return true;
 }
@@ -3062,6 +3065,8 @@ void Release(Ctx& c)
     c.wl = 0; c.mode = 0; c.mgmtQ.clear(); c.mgmtBusy = false; c.txWindow = false; c.gameInfoPending = false;
     c.mpBusy = false; c.mpInd.clear(); c.aid = 0; c.bufBusy[0] = c.bufBusy[1] = false; c.lastCmdSeq = 0xFFFF;
     c.nullKey = false; c.keyNext = 0; c.mpNext = 0; c.kickAt[0] = c.kickAt[1] = 0; c.vaNext = 0; c.reqAt = 0;
+    Platform::Log(Platform::LogLevel::Info, "A7_NATIVE_WM: hand-back inst %d frame %u build=%016llx: WM END done, the emulated driver has the next session\n",
+                  c.inst, nds.NumFrames, c.bd ? (unsigned long long)c.bd->id : 0ull);
     SetBuild(c, -1);
     for (Sta& t : c.sta) t = Sta{};
     c.pending.clear();
@@ -3139,6 +3144,7 @@ bool Fifo9(NDS& nds, u32 val)
             c.w7 = nds.ARM7Read32(a + 4); c.st = nds.ARM7Read32(a + 8); c.cbuf = nds.ARM7Read32(a + 12);
             c.camLife = 0x28;
             if (b && g_Stats) fprintf(stderr, "A7WM inst%d: WM build %s (table %08x): native from the first local-play request\n", c.inst, b->name, table);
+            Platform::Log(Platform::LogLevel::Info, "A7_NATIVE_WM: WM INITIALIZE inst %d: %s\n", c.inst, b ? b->name : !Allowed(c) ? "native WM off (debug.litev.a7wm=0): emulated" : "WM build not recognised (or TWL native off): emulated");
         }
         else if (api == 0x1D) c.camLife = (u16)nds.ARM7Read32(a + 8);
         else if (c.build >= 1 && (c.guestCbSince || !c.lastPassed || (nds.ARM7Read16(c.lastPassed) & 0x8000)))
@@ -3151,7 +3157,7 @@ bool Fifo9(NDS& nds, u32 val)
                 take = (d >> 24) == 2 && nds.ARM7Read16(d + 0x3C) >= 0x10;
             }
         }
-        if (!take || !Activate(c)) { c.lastPassed = a; c.guestCbSince = false; return false; }
+        if (!take || !Activate(c, api)) { c.lastPassed = a; c.guestCbSince = false; return false; }
         p = &c;
     }
 #ifdef LITEV_HLE_DIAG
