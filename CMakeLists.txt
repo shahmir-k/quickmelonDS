@@ -1765,6 +1765,16 @@ if (LITEV_GX_DMA_ZEROCOPY)
     add_compile_definitions(LITEV_GX_DMA_ZEROCOPY=1)
 endif()
 
+option(LITEV_SPU_MIX_HOIST "SPU batch: idle channels' columns cleared in one store, pans read once per batch (exact)" OFF)
+if (LITEV_SPU_MIX_HOIST)
+    add_compile_definitions(LITEV_SPU_MIX_HOIST=1)
+endif()
+
+option(LITEV_SPU_RUNN_LOCAL "SPU: a PCM/ADPCM channel's batch of output samples in one call with its state in locals (exact; debug.litev.spurunn)" OFF)
+if (LITEV_SPU_RUNN_LOCAL)
+    add_compile_definitions(LITEV_SPU_RUNN_LOCAL=1)
+endif()
+
 option(LITEV_SPU_MIX_NEON "Vectorize the SPU 16-channel pan-accumulate with integer NEON (bit-exact)" OFF)
 if (LITEV_SPU_MIX_NEON)
     add_compile_definitions(LITEV_SPU_MIX_NEON=1)

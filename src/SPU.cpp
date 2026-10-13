@@ -1160,6 +1160,218 @@ s32 SPUChannel::Run(u32 cycles, bool out)
     return val;
 }
 
+#ifdef LITEV_SPU_RUNN_LOCAL
+// LITEV_SPU_RUNN_LOCAL: n output samples of a PCM8/PCM16/ADPCM channel in one call, exactly as n calls
+// of Run<type>(cycles, true): the timer, the interpolation history and the volume stay in registers
+// (Run keeps them in the channel and returns per sample; ~9% of a Netplay remote's time in MKDS,
+// whose sound capture needs every channel's output). Runtime off: LITEV_SPURUNN=0 /
+// debug.litev.spurunn=0.
+static bool SPURunNOn()
+{
+    static const bool on = SPUProp("debug.litev.spurunn", "LITEV_SPURUNN", 1) != 0;
+    return on;
+}
+
+template<u32 type>
+bool SPUChannel::RunNLocal(u32 cycles, s32 (*dst)[16], int col, int n)
+{
+    if (!SPURunNOn()) return false;
+    int b = 0;
+    if (!(Cnt & (1u<<31)) || ((Length+LoopPos) < 16))
+    {
+        for (; b < n; b++) dst[b][col] = 0;
+        return true;
+    }
+    if (KeyOn)
+    {
+        Start();
+        KeyOn = false;
+    }
+    const bool interp = InterpType != AudioInterpolation::None;
+    const u32 reload = TimerReload;
+    const s32 vol = Volume, vshift = VolumeShift;
+    u32 timer = Timer;
+    s16 p0 = PrevSample[0], p1 = PrevSample[1], p2 = PrevSample[2];
+    // ADPCM: the decoder state in locals too (NextSample_ADPCM below, step for step; FIFO_BufferData
+    // touches none of it)
+    s32 pos = Pos, aval = ADPCMVal, aidx = ADPCMIndex;
+    u8 cbyte = ADPCMCurByte;
+    s16 cur = CurSample;
+#ifdef LITEV_SPU_SILENT_LAZY
+    u32 steps = Steps; u8 restarts = Restarts;
+#endif
+    const u32 total = LoopPos + Length;
+    bool ended = false;
+    for (; b < n && !ended; b++)
+    {
+        timer += cycles;
+        while (timer >> 16)
+        {
+            timer = reload + (timer - 0x10000);
+            if constexpr (type == 2)
+            {
+                if (interp) { p2 = p1; p1 = p0; p0 = cur; }
+                const s32 oldPos = pos;
+                pos++;
+                if (pos < 8)
+                {
+                    if (pos == 0)
+                    {
+                        u32 header = FIFO_ReadData<u32>();
+                        aval = (s32)(s16)(header & 0xFFFF);
+                        aidx = (header >> 16) & 0x7F;
+                        if (aidx > 88) aidx = 88;
+                        ADPCMValLoop = aval;
+                        ADPCMIndexLoop = aidx;
+                    }
+                }
+                else
+                {
+                    bool stop = false;
+                    if ((u32)(pos>>1) >= total)
+                    {
+                        u32 repeat = (Cnt >> 27) & 0x3;
+                        if (repeat & 1)
+                        {
+                            pos = LoopPos<<1;
+                            aval = ADPCMValLoop;
+                            aidx = ADPCMIndexLoop;
+                            cbyte = FIFO_ReadData<u8>();
+                        }
+                        else if (repeat & 2)
+                        {
+                            cur = 0;
+                            Cnt &= ~(1u<<31);
+                            stop = true;
+                        }
+                    }
+                    else
+                    {
+                        if (!(pos & 0x1))
+                            cbyte = FIFO_ReadData<u8>();
+                        else
+                            cbyte >>= 4;
+#ifdef LITEV_SPU_ADPCM_TABLE
+                        const u32 nib = cbyte & 0x7;
+                        const s32 diff = ADPCMTabs.Diff[aidx][nib];
+                        if (cbyte & 0x8)
+                        {
+                            aval -= diff;
+                            if (aval < -0x7FFF) aval = -0x7FFF;
+                        }
+                        else
+                        {
+                            aval += diff;
+                            if (aval > 0x7FFF) aval = 0x7FFF;
+                        }
+                        aidx = ADPCMTabs.Next[aidx][nib];
+#else
+                        u16 tv = ADPCMTable[aidx];
+                        u16 diff = tv >> 3;
+                        if (cbyte & 0x1) diff += (tv >> 2);
+                        if (cbyte & 0x2) diff += (tv >> 1);
+                        if (cbyte & 0x4) diff += tv;
+                        if (cbyte & 0x8)
+                        {
+                            aval -= diff;
+                            if (aval < -0x7FFF) aval = -0x7FFF;
+                        }
+                        else
+                        {
+                            aval += diff;
+                            if (aval > 0x7FFF) aval = 0x7FFF;
+                        }
+                        aidx += ADPCMIndexTable[cbyte & 0x7];
+                        if      (aidx < 0)  aidx = 0;
+                        else if (aidx > 88) aidx = 88;
+#endif
+                        if (pos == (s32)(LoopPos<<1))
+                        {
+                            ADPCMValLoop = aval;
+                            ADPCMIndexLoop = aidx;
+                        }
+                    }
+                    if (!stop) cur = (s16)aval;
+                }
+#ifdef LITEV_SPU_SILENT_LAZY
+                if (pos == oldPos + 1) steps++;
+                else { steps = 0; if (restarts < 6) restarts++; }
+#endif
+            }
+            else
+            {
+                if (interp) { p2 = p1; p1 = p0; p0 = CurSample; }
+#ifdef LITEV_SPU_SILENT_LAZY
+                const s32 oldPos = Pos;
+#endif
+                switch (type)
+                {
+                case 0: NextSample_PCM8(); break;
+                case 1: NextSample_PCM16(); break;
+                }
+#ifdef LITEV_SPU_SILENT_LAZY
+                CountStep(oldPos);
+#endif
+            }
+            if (!(Cnt & (1u<<31))) { ended = true; break; }
+        }
+        if (vol == 0) { dst[b][col] = 0; continue; }
+        s32 val = (type == 2) ? (s32)cur : (s32)CurSample;
+        if (interp)
+        {
+#ifdef LITEV_SPU_FAST_INTERP
+            s32 frac = (timer >> 8) & 0xFF;
+            val = ((val * frac) + ((s32)p0 * (0xFF - frac))) >> 8;
+#else
+            const u32 Timer = timer;
+            const u16 TimerReload = (u16)reload;
+            s32 samplepos = ((Timer - TimerReload) * 0x100) / (0x10000 - TimerReload);
+            if (samplepos > 0xFF) samplepos = 0xFF;
+            switch (InterpType)
+            {
+            case AudioInterpolation::Linear:
+                val = ((val * samplepos) + (p0 * (0xFF-samplepos))) >> 8;
+                break;
+            case AudioInterpolation::Cosine:
+                val = ((val * InterpCos[samplepos]) + (p0 * InterpCos[0xFF-samplepos])) >> 14;
+                break;
+            case AudioInterpolation::Cubic:
+                val = ((p2 * InterpCubic[samplepos][0]) + (p1 * InterpCubic[samplepos][1]) +
+                       (p0 * InterpCubic[samplepos][2]) + (val * InterpCubic[samplepos][3])) >> 14;
+                break;
+            case AudioInterpolation::SNESGaussian: {
+#define CLAMP(s) (std::clamp((s) >> 1, -0x3FFA, 0x3FF8))
+                s32 out =    (InterpSNESGauss[0x0FF - samplepos] * CLAMP(p2) >> 10);
+                out = out + ((InterpSNESGauss[0x1FF - samplepos] * CLAMP(p1)) >> 10);
+                out = out + ((InterpSNESGauss[0x100 + samplepos] * CLAMP(p0)) >> 10);
+                out = out + ((InterpSNESGauss[0x000 + samplepos] * CLAMP(val)) >> 10);
+                val = std::clamp(out, -0x8000, 0x7FFF);
+#undef CLAMP
+                break;
+            }
+            default:
+                break;
+            }
+#endif
+        }
+        val <<= vshift;
+        val *= vol;
+        dst[b][col] = val;
+    }
+    Timer = timer;
+    PrevSample[0] = p0; PrevSample[1] = p1; PrevSample[2] = p2;
+    if constexpr (type == 2)
+    {
+        Pos = pos; ADPCMVal = aval; ADPCMIndex = aidx; ADPCMCurByte = cbyte; CurSample = cur;
+#ifdef LITEV_SPU_SILENT_LAZY
+        Steps = steps; Restarts = restarts;
+#endif
+    }
+    for (; b < n; b++) dst[b][col] = 0;   // (ended: Run returns 0 from then on)
+    return true;
+}
+#endif
+
 #ifdef LITEV_SPU_FIFO_TRACK
 // FIFO_BufferData without reading the sample: the same offsets, slots and level
 void SPUChannel::FIFO_BufferTiming()
@@ -1792,12 +2004,17 @@ void SPU::MixSamples(u32 spucycles)
 #endif
     if (chMajor || capMajor)
     {
+#ifdef LITEV_SPU_MIX_HOIST
+        memset(chmajor, 0, sizeof(chmajor[0]) * nticks);   // (one block store, not 16 strided per idle channel)
+#endif
         for (int i = 0; i < 16; i++)
         {
             SPUChannel& ch = Channels[i];
             if (!(ch.Cnt & (1u<<31)) || (capLate & (1u << i)))
             {
+#ifndef LITEV_SPU_MIX_HOIST
                 for (u32 b = 0; b < nticks; b++) chmajor[b][i] = 0;
+#endif
                 continue;
             }
             ch.DoRunN(mixcyc, chmajor, i, nticks, !capMajor);
@@ -1810,6 +2027,11 @@ void SPU::MixSamples(u32 spucycles)
 #ifndef LITEV_SPU_CHMAJOR
     const u32 nticks = (u32)(LITEV_SPU_BATCH_N);
     const u32 mixcyc = spucycles;
+#endif
+#if defined(LITEV_SPU_MIX_HOIST) && defined(LITEV_SPU_MIX_NEON)
+    // the pans for the whole batch (no guest code runs inside it)
+    s32 pnBatch[16];
+    for (int i = 0; i < 16; i++) pnBatch[i] = Channels[i].Pan;
 #endif
     for (u32 _spubatch = 0; _spubatch < nticks; _spubatch++)
     {
@@ -1865,8 +2087,12 @@ void SPU::MixSamples(u32 spucycles)
         // Integer NEON, BIT-EXACT: widen s32*s32->s64 (vmull_s32), shift each term >>10, sum. DS
         // channel values (|in| < ~7e7) and 16-term sums stay < 2^31, so s64 accumulation narrowed
         // once == the scalar per-term s32 accumulation (no overflow, no wrap).
+#if defined(LITEV_SPU_MIX_HOIST) && defined(LITEV_SPU_BATCH)
+        const s32* pn = pnBatch;
+#else
         s32 pn[16];
         for (int i = 0; i < 16; i++) pn[i] = Channels[i].Pan;
+#endif
         int64x2_t lacc = vdupq_n_s64(0), racc = vdupq_n_s64(0);
         for (int i = 0; i < 16; i += 4)
         {
