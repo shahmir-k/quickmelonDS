@@ -91,6 +91,9 @@ public:
     LinkDiag GetDiag();
     // true once per session (links up until all are down) when the slowdown held 5 s: ask the player
     bool TakePrompt() { return PromptPending.exchange(false); }
+    // the frames the player saw a second (the app: frameskip / dropped presents hide frames that were emulated); the
+    // detector uses the lower of that and the emulated rate. Headless: not set = the emulated rate.
+    void SetShownFps(float fps) { ShownFps = fps; }
 
     void Process() override;
     void Begin(int inst) override;
@@ -202,6 +205,7 @@ private:
     u32 SlowSeconds = 0, DiagLogN = 0, WinHostWaits = 0, WinHostTimeouts = 0, WinStale = 0;
     LinkDiag Diag;
     std::atomic<bool> PromptPending{false};
+    std::atomic<float> ShownFps{0};
     void Detect(u32 nowMs);
     // tests: LITEV_AMBIENT_DELAY_MS
     u64 DelayUs = 0;

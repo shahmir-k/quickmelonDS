@@ -838,6 +838,7 @@ void AmbientLAN::Detect(u32 nowMs)
     const double sec = (now - Win.T0) / 1e6;
     d.Linked = linked;
     d.Fps = (float)(Win.Frames / sec);
+    if (const float shown = ShownFps; shown > 0 && shown < d.Fps) d.Fps = shown;     // (frames hidden by frameskip)
     d.WaitMs = Win.Frames ? (float)(Win.BlockedUs / 1000.0 / Win.Frames) : 0;
     d.ExchPerFrame = Win.Frames ? (float)Win.Exch / Win.Frames : 0;
     d.RttMs = (LinkRttUs + 2 * DelayUs) / 1000.0f;   // (presence ping; + the injected delay both ways in tests)
