@@ -175,7 +175,7 @@ AmbientLAN::~AmbientLAN()
     {
         for (int s = 0; s < 16; s++) if (Links[s].P) enet_peer_disconnect(Links[s].P, 0);
         enet_host_flush(Host);
-        while (!RX.empty()) { enet_packet_destroy(RX.front()); RX.pop_front(); }
+        while (!RX.empty()) { enet_packet_destroy(RX.front().Packet); RX.pop_front(); }
         enet_host_destroy(Host);
         enet_deinitialize();
     }
@@ -516,7 +516,7 @@ int AmbientLAN::OpenLink(const Peer& p)
     if (!e) return -1;
     Link& l = Links[s];
     l = Link();
-    l.ID = p.ID; l.P = e; memcpy(l.MAC, p.MAC, 6); l.ActiveMs = NowMs();
+    l.ID = p.ID; l.Generation = ++NextLinkGeneration; l.P = e; memcpy(l.MAC, p.MAC, 6); l.ActiveMs = NowMs();
     e->data = &l;
     enet_peer_timeout(e, 0, 5000, 5000);
     StOpened++;
@@ -529,6 +529,7 @@ void AmbientLAN::CloseLink(int s, const char* why)
 {
     Link& l = Links[s];
     if (!l.P) return;
+    DropQueuedForSlot(s);
     l.P->data = nullptr;
     enet_peer_disconnect(l.P, 0);
     Platform::Log(Platform::LogLevel::Info, "Ambient: link %d to %016llx closed (%s)\n", s, (unsigned long long)l.ID, why);
@@ -638,7 +639,7 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         }
         Link& n = Links[s];
         n = Link();
-        n.ID = p->ID; n.P = ev.peer; n.Up = true; memcpy(n.MAC, p->MAC, 6); n.ActiveMs = NowMs();
+        n.ID = p->ID; n.Generation = ++NextLinkGeneration; n.P = ev.peer; n.Up = true; memcpy(n.MAC, p->MAC, 6); n.ActiveMs = NowMs();
         ev.peer->data = &n;
         enet_peer_timeout(ev.peer, 0, 5000, 5000);
         LinksChanged();
@@ -653,6 +654,7 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         Platform::Log(Platform::LogLevel::Info, "Ambient: link %d to %016llx lost: rtt %u ms, last receive %u ms ago, last send %u ms ago\n", s,
                       (unsigned long long)l->ID, ev.peer->roundTripTime, enet_time_get() - ev.peer->lastReceiveTime, enet_time_get() - ev.peer->lastSendTime);
         if (ParentSlot == s) ParentSlot = -1;
+        DropQueuedForSlot(s);
         *l = Link();
         LinksChanged();
         break;
@@ -665,6 +667,27 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
     }
 }
 
+bool AmbientLAN::QueueCurrent(const QueuedPacket& q) const
+{
+    if (!q.Packet || q.Slot < 0 || q.Slot >= 16) return false;
+    const Link& l = Links[q.Slot];
+    // A slot can be reused even by the same peer before a deferred RX frame is consumed.
+    return l.P && l.ID == q.ID && l.Generation == q.Generation;
+}
+
+void AmbientLAN::DropQueuedForSlot(int slot)
+{
+    for (auto it = RX.begin(); it != RX.end(); )
+    {
+        if (it->Slot == slot)
+        {
+            enet_packet_destroy(it->Packet);
+            it = RX.erase(it);
+        }
+        else ++it;
+    }
+}
+
 // as LAN::ProcessLAN: 0 = per frame, 1 = a regular frame wanted, 2 = waiting for an MP frame, 3 = 2 without blocking
 void AmbientLAN::Pump(int type)
 {
@@ -672,7 +695,9 @@ void AmbientLAN::Pump(int type)
     u32 now = NowMs();
     while (!RX.empty())
     {
-        ENetPacket* p = RX.front();
+        const QueuedPacket q = RX.front();
+        ENetPacket* p = q.Packet;
+        if (!QueueCurrent(q)) { RX.pop_front(); enet_packet_destroy(p); continue; }
         MPPacketHeader* h = (MPPacketHeader*)p->data;
         // stale after a frame (LAN.cpp), but a management frame (auth / assoc / deauth) waits for the chip up to 1 s: a
         // parent's chip only listens around its beacons, and a child here does not send right after a real beacon
@@ -698,8 +723,8 @@ void AmbientLAN::Pump(int type)
             if (Admit(ev))
             {
                 ((MPPacketHeader*)ev.packet->data)->Magic = NowMs();
-                ev.packet->userData = ev.peer->data;
-                RX.push_back(ev.packet);
+                const Link* l = (const Link*)ev.peer->data;
+                RX.push_back({ev.packet, l->ID, l->Generation, (int)(l - Links)});
                 return;
             }
             enet_packet_destroy(ev.packet);
@@ -717,15 +742,22 @@ void AmbientLAN::Pump(int type)
 
 int AmbientLAN::Pop(u8* data, u64* timestamp)
 {
+    while (!RX.empty() && !QueueCurrent(RX.front()))
+    {
+        enet_packet_destroy(RX.front().Packet);
+        RX.pop_front();
+    }
     if (RX.empty()) return 0;
-    ENetPacket* p = RX.front();
+    const QueuedPacket q = RX.front();
+    ENetPacket* p = q.Packet;
     RX.pop_front();
     const MPPacketHeader* h = (const MPPacketHeader*)p->data;
     u32 len = std::min<u32>(h->Length, 2048);
     memcpy(data, p->data + sizeof(MPPacketHeader), len);
     if (h->Type == 1)
     {
-        if (const Link* l = (const Link*)p->userData; l && l->P) { LastHostID = l->ID; LastHostSet = true; }
+        LastHostID = q.ID;
+        LastHostSet = true;
         FrameExchanges++;
     }
     if (timestamp) *timestamp = h->Timestamp;
@@ -767,7 +799,7 @@ void AmbientLAN::End(int inst)
 {
     WifiOn = false;
     for (int s = 0; s < 16; s++) CloseLink(s, "Wi-Fi off");
-    while (!RX.empty()) { enet_packet_destroy(RX.front()); RX.pop_front(); }
+    while (!RX.empty()) { enet_packet_destroy(RX.front().Packet); RX.pop_front(); }
     if (Host) enet_host_flush(Host);
     ParentSlot = -1;
     std::lock_guard<std::mutex> g(Mu);
@@ -890,15 +922,17 @@ u16 AmbientLAN::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
     const u64 t0 = NowUs();
     u16 ret = 0;
     u32 replied = 0;
-    std::deque<ENetPacket*> later;      // regular frames meanwhile (a joining child's auth): for RecvPacket
+    std::deque<QueuedPacket> later;      // regular frames meanwhile (a joining child's auth): for RecvPacket
     for (;;)
     {
         Pump(2);
         if (RX.empty()) break;
-        ENetPacket* p = RX.front();
+        const QueuedPacket q = RX.front();
+        ENetPacket* p = q.Packet;
         RX.pop_front();
+        if (!QueueCurrent(q)) { enet_packet_destroy(p); continue; }
         const MPPacketHeader* h = (const MPPacketHeader*)p->data;
-        if (h->Type == 0) { later.push_back(p); continue; }
+        if (h->Type == 0) { later.push_back(q); continue; }
         if ((h->Type & 0xFFFF) == 2 && h->Timestamp >= timestamp - 32)
         {
             const u32 len = std::min<u32>(h->Length, 1024);
@@ -908,7 +942,7 @@ u16 AmbientLAN::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
                 memcpy(&data[(aid - 1) * 1024], p->data + sizeof(MPPacketHeader), len);
                 ret |= 1 << aid;
             }
-            if (const Link* l = (const Link*)p->userData) replied |= 1u << (l - Links);
+            replied |= 1u << q.Slot;
             if ((replied & up) == up || (ret & aidmask) == aidmask) { enet_packet_destroy(p); break; }
         }
         enet_packet_destroy(p);

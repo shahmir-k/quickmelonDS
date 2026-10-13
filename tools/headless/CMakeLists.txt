@@ -42,6 +42,12 @@ if (LITEV_HEADLESS_LAN)
     target_link_libraries(liteDS-headless PRIVATE enet)
     target_include_directories(liteDS-headless PRIVATE "${LITEV_ENET_SOURCE_DIR}/include")
     target_compile_definitions(liteDS-headless PRIVATE LITEV_HEADLESS_LAN=1)
+    if (LITEV_AMBIENT_LAN)
+        add_executable(ambient-queue-test AmbientQueueTest.cpp "${CMAKE_SOURCE_DIR}/src/net/AmbientLAN.cpp")
+        target_include_directories(ambient-queue-test PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/net" "${LITEV_ENET_SOURCE_DIR}/include")
+        target_link_libraries(ambient-queue-test PRIVATE enet)
+        set_target_properties(ambient-queue-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    endif()
 endif()
 
 # core's INTERFACE include dir already points at src/, so "types.h",
