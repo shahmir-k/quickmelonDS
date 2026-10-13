@@ -15,6 +15,7 @@ add_library(core STATIC
     CP15.cpp
     ARM7HLE.cpp
     ARM7Native.cpp
+    WMNative.cpp
     HLESig.cpp
     ARM9HLE.cpp
     HLELeaf.cpp

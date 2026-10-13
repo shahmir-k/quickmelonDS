@@ -19,6 +19,9 @@
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
+#ifdef LITEV_A7_NATIVE_WM
+#include "WMNative.h"
+#endif
 
 #include "ARMJIT.h"
 
@@ -1633,6 +1636,16 @@ void GPU::StartScanline(u32 line) noexcept
         VCountOverride = false;
     }
 
+#ifdef LITEV_A7_NATIVE_WM
+    if ((s32)VCount == WMLine) {
+#ifdef LITEV_LCD_EVT
+        const u64 ts = LcdEvt ? LcdCurTs : NDS.SchedList[Event_LCD].Timestamp;
+#else
+        const u64 ts = NDS.SchedList[Event_LCD].Timestamp;
+#endif
+        WMNative::VLine(NDS, VCount, ts);
+    }
+#endif
     // check for VCount match
 
     if (VCount == VMatch[0])
@@ -1697,6 +1710,9 @@ void GPU::LcdPlan() noexcept
             if (k == LCD_StartScanline)
             {
                 const u16 nv = p == 0 ? 0 : ((v + 1) & 0x1FF);
+#ifdef LITEV_A7_NATIVE_WM
+                if ((s32)nv == WMLine) break;
+#endif
                 if (p == 0 || nv == 192 || nv == 262 || (dma3 && nv >= 2 && nv <= 194) || nv == vm0 || nv == vm1)
                     break;
                 v = nv; k = LCD_StartHBlank; ts += HBLANK_CYCLES;

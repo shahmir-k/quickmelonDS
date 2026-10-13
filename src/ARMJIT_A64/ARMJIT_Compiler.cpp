@@ -214,6 +214,7 @@ namespace litev_perfmap
         fflush(g_file);
     }
 }
+void LitevPerfmapAdd(const char* name, void* a, void* b) { litev_perfmap::Add(name, a, b); }   // (in namespace melonDS)
 #endif  // LITEV_JIT_PERFMAP
 
 // liteDS-v2 Unit 2: prove the hand-maintained ARMJIT_Offsets.h values against the
@@ -2637,6 +2638,10 @@ void Compiler::DirectPatchPromote(u32 num, u32 site, u32 guestTarget, u64 hostEn
 
     assert(GetCodeOffset() - (ptrdiff_t)stubOff <= (ptrdiff_t)kStubBytes);
     FlushIcacheSection(GetRXBase() + stubOff, GetRXBase() + stubOff + kStubBytes);
+#ifdef LITEV_JIT_PERFMAP
+    if (litev_perfmap::g_state == 1)   // armed: DirectPatch guard stubs (outside the block's range)
+        litev_perfmap::Add(num == 0 ? "jit_dpstub_a9" : "jit_dpstub_a7", GetRXBase() + stubOff, GetRXPtr());
+#endif
 #ifdef LITEV_JIT_BGEMIT
     if (BgLayout && !reuse)
         DPCursor = (ptrdiff_t)stubOff + kStubBytes;

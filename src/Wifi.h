@@ -20,6 +20,7 @@
 #define WIFI_H
 
 #include "Savestate.h"
+#include <memory>
 
 namespace melonDS
 {
@@ -173,6 +174,14 @@ public:
 
     const u8* GetMAC() const;
     const u8* GetBSSID() const;
+
+#ifdef LITEV_A7_NATIVE_WM
+    // the native ARM7 WM driver's per-console state (WMNative.cpp), created on demand; it drives this chip through the
+    // public Read / Write, and CheckIRQ hands the chip's IRQ to it while it owns the chip
+    std::unique_ptr<void, void (*)(void*)> WMN{nullptr, nullptr};
+    bool WMNOwns = false;
+    u8* RAMPtr() { return RAM; }
+#endif
 
 private:
     melonDS::NDS& NDS;

@@ -35,7 +35,8 @@ static int GLProp(const char* name, int def)
     char b[92] = {};
     return __system_property_get(name, b) > 0 ? atoi(b) : def;
 #else
-    return def;
+    const char* e = getenv(name);   // desktop (Mac headless): environment variable
+    return e && *e ? atoi(e) : def;
 #endif
 }
 static bool CompFast() { static const bool v = GLProp("debug.litev.glcomp", 1) != 0; return v; }
