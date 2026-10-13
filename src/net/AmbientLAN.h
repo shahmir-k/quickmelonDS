@@ -79,6 +79,7 @@ public:
     // nearby devices: "id \t name \t game \t ip:port \t ggid \t build \t linked"
     std::vector<std::string> NearbyRows();
     Stats GetStats();
+    bool HasLinks() const { return StLinks.load(std::memory_order_relaxed) != 0; }
 
     // Step 2: link-caused slowdown, measured over the last second (Process = one emulated frame)
     struct LinkDiag
