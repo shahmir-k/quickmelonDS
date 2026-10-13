@@ -192,7 +192,7 @@ struct Ctx
     bool active = false;
     u32 w7 = 0, st = 0, cbuf = 0;               // ARM9 structures (from INITIALIZE)
     std::deque<Rq> reqs;                        // requests not processed yet (ARM9's and internal)
-    struct Cb { u8 d[0x100]; u8 m[0x100]; u16 n = 0; };
+    struct Cb { u8 d[0x100] = {}; u8 m[0x100] = {}; u16 n = 0; };
     std::deque<Cb> cbs;                         // callbacks waiting for the slot (only the written bytes are stored)
     u64 wake = ~0ull, now = 0;                  // the scheduled event (sys cycles), the time of this entry
     u64 tm[kTimers] = {};                       // WL / WMSP timers (0 off)
@@ -2499,12 +2499,10 @@ void DoSavestate(NDS& nds, Savestate* f)
         nds.RegisterEventFuncs(Event_WMN, &d, {[](void* that, u32 p) { OnEvent(that, p); }});
         nds.Wifi.WMNOwns = true;
         nds.GPU.WMLine = d.vX;
-        d.wake = (nds.SchedListMask & (1 << Event_WMN)) ? nds.SchedList[Event_WMN].Timestamp : ~0ull;
     }
 }
 
 void Reset(NDS& nds)
-{(NDS& nds)
 {
     Ctx* p = Get(nds);
     if (!p) return;
