@@ -339,6 +339,9 @@ u8* ARMv5::Idle2EnableByte(u32 site)
     {
         Idle2 = new Idle2State();
         memset(Idle2->Enable, 1, sizeof(Idle2->Enable));
+#ifdef LITEV_JIT_SHARED_CODE
+        JitIdle2Enable = Idle2->Enable;
+#endif
     }
     auto it = Idle2->Index.find(site);
     if (it == Idle2->Index.end())

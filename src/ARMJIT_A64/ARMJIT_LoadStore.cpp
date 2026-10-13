@@ -70,10 +70,14 @@ void Compiler::NoteProtectFault(u8* pc)
 #ifdef LITEV_JIT_BGEMIT
     std::lock_guard<std::recursive_mutex> lk(EmitLock);
 #endif
-    if (!StoreRepromoteOn())
+    if (!StoreRepromoteOn()
+#ifdef LITEV_JIT_SHARED_CODE
+        || Shared   // (shared code is patched once, for good)
+#endif
+        )
         return;
-    auto it = LoadStorePatches.find(pc - GetRXBase());
-    if (it == LoadStorePatches.end())
+    auto it = Patches().find(pc - GetRXBase());
+    if (it == Patches().end())
         return;   // RewriteMemAccess reports the JIT bug
     ptrdiff_t start = (pc - GetRXBase()) + it->second.PatchOffset;
     u32 frame = NDS.NumFrames;
@@ -142,6 +146,41 @@ u8* Compiler::RewriteMemAccess(u8* pc)
 #endif
     ptrdiff_t pcOffset = pc - GetRXBase();
 
+#ifdef LITEV_JIT_SHARED_CODE
+    if (Shared)
+    {
+        // Other cores may be running this very sequence: change one instruction only. The first
+        // one of the fast path becomes a branch to a stub with the slow call; a core already past
+        // it finishes the old fast path (or faults here too and resumes at the branch).
+        SharedArena& a = JitArena();
+        std::lock_guard<std::recursive_mutex> lk(a.Lock);
+        auto sit = a.Patches.find(pcOffset);
+        if (sit == a.Patches.end())
+        {
+            Log(LogLevel::Error, "this is a JIT bug! %08x\n", __builtin_bswap32(*(u32*)pc));
+            abort();
+        }
+        LoadStorePatch& patch = sit->second;
+        const ptrdiff_t start = pcOffset + patch.PatchOffset;
+        if (!patch.Stub)
+        {
+            const ptrdiff_t cur = GetCodeOffset();
+            NDS.JIT.JitEnableWrite();
+            SetCodePtrUnsafe(a.Near);
+            patch.Stub = (u32)a.Near;
+            BL(patch.PatchFunc);
+            B(GetRXBase() + start + patch.PatchSize);
+            FlushIcacheSection(GetRXBase() + patch.Stub, (u8*)GetRXPtr());
+            a.Near = GetCodeOffset();
+            SetCodePtrUnsafe(start);
+            B(GetRXBase() + patch.Stub);
+            FlushIcacheSection(GetRXBase() + start, GetRXBase() + start + 4);
+            SetCodePtrUnsafe(cur);
+            NDS.JIT.JitEnableExecute();
+        }
+        return GetRXBase() + start;
+    }
+#endif
     auto it = LoadStorePatches.find(pcOffset);
 
     if (it != LoadStorePatches.end())
@@ -459,7 +498,7 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
             LDRGeneric(size, flags & memop_SignExtend, rdMapped, X0, RMemBase);
             patch.PatchOffset = memopStart - loadPosition;
             patch.PatchSize = GetCodeOffset() - memopStart;
-            LoadStorePatches[loadPosition] = patch;
+            Patches()[loadPosition] = patch;
             TailStub t{};
             t.Kind = 1;
             t.A = misaligned;
@@ -491,7 +530,7 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
 
         patch.PatchOffset = memopStart - loadStorePosition;
         patch.PatchSize = GetCodeOffset() - memopStart;
-        LoadStorePatches[loadStorePosition] = patch;
+        Patches()[loadStorePosition] = patch;
         }
     }
     else
@@ -536,6 +575,11 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
             mrMiss[1] = B(CC_NEQ);
             // hit: rd = MainRAM[(addr&~3) & MainRAMMask], then ROR by (addr&3)*8.
             ANDI2R(W4, W4, NDS.MainRAMMask);
+#ifdef LITEV_JIT_SHARED_CODE
+            if (Shared)
+                LDR(INDEX_UNSIGNED, X7, RCPU, offsetof(ARM, JitMainRAM));
+            else
+#endif
             MOVP2R(X7, NDS.MainRAM);
             LDRGeneric(32, false, rdMapped, X4, X7);
             UBFIZ(W0, W0, 3, 2);
@@ -563,6 +607,11 @@ void Compiler::Comp_MemAccess(int rd, int rn, Op2 offset, int size, int flags)
             CMP(W1, W2);
             vwMiss[0] = B(CC_NEQ);
             UBFX(W1, W0, 17, 1);
+#ifdef LITEV_JIT_SHARED_CODE
+            if (Shared)
+                LDR(INDEX_UNSIGNED, X2, RCPU, offsetof(ARM, JitVRAMPtr7));
+            else
+#endif
             MOVP2R(X2, &NDS.GPU.VRAMPtr_ARM7[0]);
             LDR(X2, X2, ArithOption(X1, true));
             vwMiss[1] = CBZ(X2);
@@ -1039,7 +1088,7 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         for (i = 0; i < numLoadStores; i++)
         {
             patch.PatchOffset = fastPathStart - loadStoreOffsets[i];
-            LoadStorePatches[loadStoreOffsets[i]] = patch;
+            Patches()[loadStoreOffsets[i]] = patch;
         }
 
         ABI_PushRegisters({30});
@@ -1293,6 +1342,11 @@ s32 Compiler::Comp_MemAccessBlock(int rn, BitSet16 regs, bool store, bool preinc
         mrbMiss[nMiss++] = B(CC_HI);
 
         // hit: X4 = MainRAM base + physical index (W5, zero-extended by the AND).
+#ifdef LITEV_JIT_SHARED_CODE
+        if (Shared)
+            LDR(INDEX_UNSIGNED, X7, RCPU, offsetof(ARM, JitMainRAM));
+        else
+#endif
         MOVP2R(X7, NDS.MainRAM);
         ADD(X4, X7, EncodeRegTo64(W5));
 

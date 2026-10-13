@@ -301,6 +301,17 @@ public:
     u64* JitTsPtr = nullptr;
 #endif
 
+#ifdef LITEV_JIT_SHARED_CODE
+    // LITEV_JIT_SHARED_CODE: what code shared by several consoles reaches through RCPU instead of
+    // baking this console's addresses (set by Compiler::Reset / ARMv5::Idle2EnableByte). Transient.
+    void* JitICacheTable = nullptr;     // this CPU's ICACHE table
+    void* JitNDS = nullptr;             // &NDS (native slice loop)
+    u8* JitValid = nullptr;             // per shared code object: 1 = this console's live block for its address
+    u8* JitMainRAM = nullptr;           // NDS::MainRAM
+    u8** JitVRAMPtr7 = nullptr;         // &GPU::VRAMPtr_ARM7[0]
+    u8* JitIdle2Enable = nullptr;       // ARMv5: the IDLE2 per-site enable bytes
+#endif
+
 #ifdef LITEV_JIT_REGION_CACHE
     // Last executable code regions (LITEV_JIT_REGION_CACHE), read by the emitted
     // dispatcher on a FastBlockLookup window miss. Size 0 = empty. Only windows for

@@ -9,6 +9,9 @@ extern "C" int thread_selfcounts(int type, void* buf, size_t nbytes);   // libsy
 #endif
 #include <cstdlib>
 #include "VerifyTrace.h"
+#ifdef LITEV_JIT_SHARED_CODE
+#include "ARMJIT_Global.h"
+#endif
 #include "LockstepMP.h"
 #include "NetplayInput.h"
 #ifdef LITEV_HOSTED_NETPLAY
@@ -938,6 +941,13 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             if (p < n) romPaths[p] = path;
     }
 
+#ifdef LITEV_JIT_SHARED_CODE
+    // LITEV_JIT_SHARED=1: the consoles share one JIT code arena; =2: every console but 0 (the app:
+    // Netplay's remote consoles share, the local one keeps its own)
+    const int jitShared = getenv("LITEV_JIT_SHARED") ? atoi(getenv("LITEV_JIT_SHARED")) : 0;
+    if (jitShared)
+        printf("jit: shared code (%s)\n", jitShared == 2 ? "consoles 1.." : "every console");
+#endif
     std::vector<BuiltNDS> b(n);
     std::vector<std::string> instScripts(n);
     for (int k = 0; k < n; k++)
@@ -949,9 +959,15 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         c.inputScript = (k < (int)scripts.size() && !scripts[k].empty()) ? scripts[k] : cfg.inputScript;
         instScripts[k] = c.inputScript;
         std::string err;
+#ifdef LITEV_JIT_SHARED_CODE
+        ARMJIT_Global::SetSharedCode(jitShared == 1 || (jitShared == 2 && k > 0));
+#endif
         if (!BuildAndBoot(c, std::nullopt, b[k], err)) { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
         printf("console %d rom: %s (xxh3 %016llx)\n", k, c.rom.c_str(), (unsigned long long)b[k].romHash);
     }
+#ifdef LITEV_JIT_SHARED_CODE
+    ARMJIT_Global::SetSharedCode(false);
+#endif
     // Instance 0 knobs act on instance 0; the "1" knobs on every other instance (with two
     // instances: instance 1, as before).
     // LITEV_MP_NORENDER1: instance 1 draws nothing; LITEV_MP_NORENDER0: instance 0 too

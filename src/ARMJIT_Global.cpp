@@ -78,6 +78,32 @@ void* AllocateCodeMem()
 #endif
 }
 
+#ifdef LITEV_JIT_SHARED_CODE
+static bool SharedCodeOn = false;
+void SetSharedCode(bool on) { SharedCodeOn = on; }
+bool SharedCode() { return SharedCodeOn; }
+
+void* AllocateSharedCodeMem(size_t size)
+{
+#ifdef _WIN32
+    return VirtualAlloc(nullptr, size, MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+#elif defined(APPLE_AARCH64)
+    return mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+#else
+    return mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+#endif
+}
+
+void FreeSharedCodeMem(void* mem, size_t size)
+{
+#ifdef _WIN32
+    VirtualFree(mem, 0, MEM_RELEASE);
+#else
+    munmap(mem, size);
+#endif
+}
+#endif
+
 void FreeCodeMem(void* codeMem)
 {
     std::lock_guard guard(globalMutex);

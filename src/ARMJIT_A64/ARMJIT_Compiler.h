@@ -30,6 +30,7 @@
 #include "../ARMJIT_RegisterCache.h"
 
 #include <unordered_map>
+#include <string>
 #include <atomic>
 #include <mutex>
 #include <cassert>
@@ -101,6 +102,9 @@ struct LoadStorePatch
     void* PatchFunc;
     s32 PatchOffset;
     u32 PatchSize;
+#ifdef LITEV_JIT_SHARED_CODE
+    u32 Stub = 0;   // shared code: RX offset of the slow-path stub its first instruction now branches to
+#endif
 };
 
 #ifdef LITEV_JIT_PATCHLOG
@@ -266,6 +270,20 @@ public:
 
     explicit Compiler(melonDS::NDS& nds);
     ~Compiler() override;
+
+#ifdef LITEV_JIT_SHARED_CODE
+    // LITEV_JIT_SHARED_CODE: this compiler emits into the process's shared arena (see SharedArena in
+    // ARMJIT_Compiler.cpp). Its code reaches per-console state through RCPU only.
+    bool Shared = false;
+    // the shared counterpart of CompileBlock: same code for the same captured inputs, emitted once.
+    // Sets NumLinkExits/LinkExits like CompileBlock; id = the code object (0: no link guard).
+    JitBlockEntry SharedCompile(JitEmitJob& job, u32& id);
+    u32 LinkEntryOff(u32 entryOff, u32 id) const { return id ? entryOff - LinkGuardBytes : entryOff; }
+    static constexpr u32 LinkGuardBytes = 16;   // the link entry's guard, right before the block entry
+    static constexpr u32 ValidSize = 1u << 22;  // code objects with a link guard (ARM::JitValid bytes)
+    u32 CurSharedId = 0;                        // the code object being emitted (0: none)
+    void SharedSetCpuFields();
+#endif
 
     // Code size of the blocks compiled since the last ResetBlockCache, as every console running
     // the same guest code counts it (ARMJIT::CompileBlock adds it when it decides a compile): an
@@ -568,6 +586,7 @@ public:
     // liteDS-v2 Unit 3: emitted per-CPU dispatcher stub (num=0 ARM9, num=1 ARM7).
     // Generated in Reset() so GetRXBase() is the stable rebased block-cache base.
     void* Gen_Dispatcher(u32 num);
+    void LoadICacheTable(u32 num);   // X2 = the CPU's ICACHE table (shared code: from RCPU)
 #ifdef LITEV_JIT_BUDGET_REG
     void QuickCallFunction(Arm64Gen::ARM64Reg scratchreg, const void* func);
     template <typename T>
@@ -613,7 +632,13 @@ public:
     void ICacheAllocOnce();                     // allocate the per-CPU tables (idempotent)
     void ICacheReset();                         // zero tables + reset counter (on ResetBlockCache)
     // Assign the next compile-time site index for a dynamic exit (0 on overflow).
+#ifdef LITEV_JIT_SHARED_CODE
+    u32 ICacheAssignSite();
+    static constexpr u32 SharedICacheSites = 1u << 18;   // site ids are process-wide when shared
+    u32 ICacheTableSites() const { return Shared ? SharedICacheSites : ICacheSites; }
+#else
     u32 ICacheAssignSite() { return (ICacheNextSite < ICacheSites) ? ICacheNextSite++ : 0; }
+#endif
 #endif
 
 #ifdef LITEV_JIT_RAS
@@ -866,11 +891,17 @@ public:
     u32 JitMemMainSize;
 
 #if defined(LITEV_JIT_PATCHLOG)
-    PatchLog LoadStorePatches;
+    using PatchMap = PatchLog;
 #elif defined(LITEV_JIT_PATCHMAP_FLAT)
-    FlatPatchMap LoadStorePatches;
+    using PatchMap = FlatPatchMap;
 #else
-    std::unordered_map<ptrdiff_t, LoadStorePatch> LoadStorePatches;
+    using PatchMap = std::unordered_map<ptrdiff_t, LoadStorePatch>;
+#endif
+    PatchMap LoadStorePatches;
+#ifdef LITEV_JIT_SHARED_CODE
+    PatchMap& Patches();   // shared code: the arena's (a fault may hit code another console emitted)
+#else
+    PatchMap& Patches() { return LoadStorePatches; }
 #endif
 
     RegisterCache<Compiler, Arm64Gen::ARM64Reg> RegCache;
@@ -895,6 +926,35 @@ public:
     void* PatchedLoadFuncs[2][2][3][2][32];
     void* PatchedStoreFuncs[2][2][3][32];
 };
+
+#ifdef LITEV_JIT_SHARED_CODE
+struct SharedObj
+{
+    u32 Off, Id;
+    u8 NumLinkExits;
+    OutgoingLink LinkExits[MaxOutgoingLinks];
+};
+struct SharedArena
+{
+    std::recursive_mutex Lock;
+    void* Mem = nullptr;
+    int Users = 0;
+    bool Dispatchers = false;
+    void* DispatcherEntry[2] = {};
+    ptrdiff_t Near = 0, Far = 0;
+    u32 NextId = 1, NextSite = 1;
+    Compiler::PatchMap Patches;
+    std::unordered_map<std::string, SharedObj> Objs;
+    u64 Hits = 0, Misses = 0;
+    // the static stubs, built once by the first sharing compiler
+    u8* Base = nullptr;
+    u32 MainSize = 0, SecondarySize = 0;
+    void* JumpTo9[3], *JumpTo7[3], *ReadBanked, *WriteBanked;
+    void* PLoad[2][2][3][2][32];
+    void* PStore[2][2][3][32];
+};
+SharedArena& JitArena();
+#endif
 
 }
 
