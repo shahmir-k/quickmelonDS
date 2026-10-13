@@ -1471,6 +1471,13 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                     }
                     if (net->ShownSpeed() != lastShown) { lastShown = net->ShownSpeed(); printf("inst%d npspeed shown frame %d: %s\n", inst, f, SpeedName(lastShown).c_str()); }
                     hostedSpeed = (u32)code | who << 8;
+                    static u32 seenDropped = 0;   // a guest who left: the session speed must not change with it
+                    for (int p = 1; p < n; p++)
+                        if (net->Dropped(p) && !(seenDropped >> p & 1))
+                        {
+                            seenDropped |= 1u << p;
+                            printf("inst%d npspeed dropped player %d at frame %d: session speed %s\n", inst, p, f, SpeedName(code).c_str());
+                        }
                 }
 #endif
                 if (record && f < frames)
