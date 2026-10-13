@@ -168,8 +168,16 @@ public:
     // n samples of this channel into dst[0..n)[col], the type switch hoisted out of the loop
     template<u32 type> void RunN(u32 cycles, s32 (*dst)[16], int col, int n)
     {
+#ifdef LITEV_SPU_RUNN_LOCAL
+        if (type < 3 && RunNLocal<type>(cycles, dst, col, n)) return;
+#endif
         for (int b = 0; b < n; b++) dst[b][col] = Run<type>(cycles, true);
     }
+#ifdef LITEV_SPU_RUNN_LOCAL
+    // RunN for PCM8/PCM16/ADPCM with the timer, interpolation history and output scaling in locals
+    // (exact; false = runtime off)
+    template<u32 type> bool RunNLocal(u32 cycles, s32 (*dst)[16], int col, int n);
+#endif
     void DoRunN(u32 cycles, s32 (*dst)[16], int col, int n, bool fast = true)
     {
         switch ((Cnt >> 29) & 0x3)

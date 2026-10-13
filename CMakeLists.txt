@@ -678,6 +678,22 @@ if (LITEV_JIT_SHARED_CODE)
     endif()
 endif()
 
+option(LITEV_JIT_SHARED_IC16 "Shared JIT code: 16-byte ICACHE entries without an epoch (exact, host-only)" OFF)
+if (LITEV_JIT_SHARED_IC16)
+    if (NOT LITEV_JIT_SHARED_CODE)
+        message(FATAL_ERROR "LITEV_JIT_SHARED_IC16 requires LITEV_JIT_SHARED_CODE.")
+    endif()
+    add_compile_definitions(LITEV_JIT_SHARED_IC16=1)
+endif()
+
+option(LITEV_JIT_SHARED_IC32 "Shared JIT code: 32-byte ICACHE entries (exact, host-only)" OFF)
+if (LITEV_JIT_SHARED_IC32)
+    if (NOT LITEV_JIT_SHARED_CODE)
+        message(FATAL_ERROR "LITEV_JIT_SHARED_IC32 requires LITEV_JIT_SHARED_CODE.")
+    endif()
+    add_compile_definitions(LITEV_JIT_SHARED_IC32=1)
+endif()
+
 option(LITEV_JIT_ICACHE "Per-site 2-way block inline cache in the dispatcher (guest-PC->host-ptr), epoch-guarded" OFF)
 if (LITEV_JIT_ICACHE)
     if (LITEV_JIT_DISPATCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
@@ -1744,6 +1760,21 @@ endif()
 # narrow == the scalar per-term s32 accumulation with no overflow for ANY DS game.
 # Emu-core lever (does NOT move work off-core -> unaffected by the 4-core wall).
 # Default OFF -> byte-identical scalar behaviour. ARM64-only (guarded by include).
+option(LITEV_GX_DMA_ZEROCOPY "Geometry DMA: a chunk contiguous in main RAM goes to GPU3D::BulkWords in place (exact; debug.litev.gxzerocopy)" OFF)
+if (LITEV_GX_DMA_ZEROCOPY)
+    add_compile_definitions(LITEV_GX_DMA_ZEROCOPY=1)
+endif()
+
+option(LITEV_SPU_MIX_HOIST "SPU batch: idle channels' columns cleared in one store, pans read once per batch (exact)" OFF)
+if (LITEV_SPU_MIX_HOIST)
+    add_compile_definitions(LITEV_SPU_MIX_HOIST=1)
+endif()
+
+option(LITEV_SPU_RUNN_LOCAL "SPU: a PCM/ADPCM channel's batch of output samples in one call with its state in locals (exact; debug.litev.spurunn)" OFF)
+if (LITEV_SPU_RUNN_LOCAL)
+    add_compile_definitions(LITEV_SPU_RUNN_LOCAL=1)
+endif()
+
 option(LITEV_SPU_MIX_NEON "Vectorize the SPU 16-channel pan-accumulate with integer NEON (bit-exact)" OFF)
 if (LITEV_SPU_MIX_NEON)
     add_compile_definitions(LITEV_SPU_MIX_NEON=1)

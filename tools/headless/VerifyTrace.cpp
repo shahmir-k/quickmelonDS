@@ -1048,6 +1048,8 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             nds.GPU.SetRenderer(std::make_unique<NullRenderer>(nds.GPU));
             printf("instance %d: renderer off\n", k);
         }
+        if (const char* ip = getenv("LITEV_MP_INTERP"))   // (test only) every console's SPU interpolation (0-4)
+            nds.SPU.SetInterpolation((AudioInterpolation)atoi(ip));
         if (getenv("LITEV_MP_SILENT1"))
         {
             nds.SPU.Silent = true;  // what Netplay does to the other players' consoles

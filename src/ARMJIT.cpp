@@ -2348,6 +2348,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
     u32 mask = 1 << ((localAddr & 0x1FF) / 16);
 
     range->Code = 0;
+#ifdef LITEV_JIT_SHARED_IC16
+    bool icDead = false;
+#endif
 #ifdef LITEV_JIT_DIRECTPATCH
     bool dpAnyInval = false;
 #ifdef LITEV_JIT_DP_TARGETED
@@ -2437,6 +2440,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
         // whole-cache invalidation (single-block invalidations are ~4/3400f in steady state).
         NDS.ARM9.ICacheEpoch++;
         NDS.ARM7.ICacheEpoch++;
+#ifdef LITEV_JIT_SHARED_IC16
+        icDead = true;   // (LITEV_JIT_SHARED_IC16 entries carry no epoch: cleared after the loop)
+#endif
 #endif
 #ifdef LITEV_JIT_DIRECTPATCH
         // A block just left FastBlockLookup. Its RX is preserved until ResetBlockCache,
@@ -2468,6 +2474,9 @@ void ARMJIT::InvalidateByAddr(u32 localAddr) noexcept
             delete block;
         }
     }
+#ifdef LITEV_JIT_SHARED_IC16
+    if (icDead) JITCompiler.ICacheClearShared();   // before any JIT code of this console runs again
+#endif
 
 #ifdef LITEV_JIT_DIRECTPATCH
     // Neutralise every live promotion once, after all block removals for this address.
