@@ -36,6 +36,10 @@ constexpr u8 kPresVersion = 1;
 enum : u8 { P_Live = 1, P_Full = 2, P_Req = 3, P_Bye = 4 };
 constexpr u32 kNifi = 0x4946494E;           // MPPacketHeader magic (LAN.cpp)
 enum { Chan_Ctl = 0, Chan_MP = 1 };
+constexpr u32 kHandoffCtl = 0x46444E48;     // "HNDF", Ambient-only reliable control
+enum : u32 { HandoffFence = 1, HandoffReady = 2, HandoffAbort = 3,
+             HandoffPrepared = 4, HandoffArmed = 5, HandoffGo = 6,
+             HandoffResetDone = 7 };
 constexpr u32 kLiveMs = 2000, kFullMinMs = 500, kExpireMs = 6000, kIdleMs = 10000, kOwnBeaconStaleMs = 3000;
 
 u64 NowUs() { return (u64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -176,7 +180,7 @@ AmbientLAN::~AmbientLAN()
     {
         for (int s = 0; s < 16; s++) if (Links[s].P) enet_peer_disconnect(Links[s].P, 0);
         enet_host_flush(Host);
-        while (!RX.empty()) { enet_packet_destroy(RX.front().Packet); RX.pop_front(); }
+        while (!RX.empty()) { DestroyRX(RX.front()); RX.pop_front(); }
         enet_host_destroy(Host);
         enet_deinitialize();
     }
@@ -560,37 +564,271 @@ void AmbientLAN::NoteBeacon(const u8* data, int len)
 void AmbientLAN::SendTo(u32 slots, u32 type, const u8* data, int len, u64 timestamp)
 {
     if (!Host || !slots) return;
-    ENetPacket* pkt = nullptr;
     bool sent = false;
     for (int s = 0; s < 16; s++)
     {
         if (!(slots & (1u << s)) || !Links[s].P) continue;
         Link& l = Links[s];
+        if (l.LocalFence) l.FenceAbort = true; // watermark cannot omit a post-fence MP send
         if (!l.Up)
         {
             if (type == 0 && l.Pending.size() < 64)
             {
                 std::vector<u8> f(sizeof(MPPacketHeader) + len);
-                MPPacketHeader h = {kNifi, 0, type, (u32)len, timestamp};
+                MPPacketHeader h = {kNifi, ++l.TxSeq, type, (u32)len, timestamp};
                 memcpy(f.data(), &h, sizeof(h)); memcpy(f.data() + sizeof(h), data, len);
                 l.Pending.push_back(std::move(f));
             }
             continue;
         }
-        if (!pkt)
-        {
-            pkt = enet_packet_create(nullptr, sizeof(MPPacketHeader) + len, ENET_PACKET_FLAG_UNSEQUENCED);
-            MPPacketHeader h = {kNifi, 0, type, (u32)len, timestamp};
-            memcpy(pkt->data, &h, sizeof(h));
-            memcpy(pkt->data + sizeof(h), data, len);
-        }
-        enet_peer_send(l.P, Chan_MP, pkt);
+        // SenderID is unused by Ambient (manual LAN uses it for player id).
+        // A separate packet per recipient gives each link a contiguous watermark.
+        ENetPacket* pkt = enet_packet_create(nullptr, sizeof(MPPacketHeader) + len, ENET_PACKET_FLAG_UNSEQUENCED);
+        if (!pkt) continue;
+        MPPacketHeader h = {kNifi, ++l.TxSeq, type, (u32)len, timestamp};
+        memcpy(pkt->data, &h, sizeof(h));
+        memcpy(pkt->data + sizeof(h), data, len);
+        if (enet_peer_send(l.P, Chan_MP, pkt) != 0) { enet_packet_destroy(pkt); l.SequenceOverflow = true; continue; }
         StLinkTx++;
         if (kTrace) Trace("tx", s, type, data, len, timestamp);
         sent = true;
     }
-    if (pkt && !pkt->referenceCount) enet_packet_destroy(pkt);
     if (sent) enet_host_flush(Host);
+}
+
+AmbientLAN::Link* AmbientLAN::HandoffLink()
+{
+    Link* one = nullptr;
+    for (Link& l : Links)
+        if (l.P) { if (one) return nullptr; one = &l; }
+    return one && one->Up ? one : nullptr;
+}
+
+const AmbientLAN::Link* AmbientLAN::HandoffLink() const
+{
+    return const_cast<AmbientLAN*>(this)->HandoffLink();
+}
+
+AmbientLAN::Link* AmbientLAN::PacketLink(const QueuedPacket& q) const
+{
+    return QueueCurrent(q) ? const_cast<Link*>(&Links[q.Slot]) : nullptr;
+}
+
+void AmbientLAN::DestroyRX(const QueuedPacket& q)
+{
+    enet_packet_destroy(q.Packet);
+}
+
+void AmbientLAN::RetireMP(const QueuedPacket& q)
+{
+    ENetPacket* p = q.Packet;
+    if (!p || p->dataLength < sizeof(MPPacketHeader)) return;
+    Link* l = PacketLink(q);
+    if (!l || !((MPPacketHeader*)p->data)->SenderID) return;
+    const u32 seq = ((MPPacketHeader*)p->data)->SenderID;
+    if (seq <= l->RetiredThrough) return;
+    if (seq == l->RetiredThrough + 1)
+    {
+        l->RetiredThrough = seq;
+        while (l->RetiredBeyond.erase(l->RetiredThrough + 1)) l->RetiredThrough++;
+    }
+    else if (seq - l->RetiredThrough <= 1024)
+        l->RetiredBeyond.insert(seq);
+    else
+        l->SequenceOverflow = true;   // no silent handoff after a large missing range
+}
+
+void AmbientLAN::SendFenceControl(Link& l, u32 type, u64 epoch, u32 mark)
+{
+    if (!Host || !l.P || !l.Up) return;
+    std::vector<u8> v;
+    P32(v, kHandoffCtl); P32(v, type); P64(v, epoch); P32(v, mark);
+    v.insert(v.end(), l.FenceToken.begin(), l.FenceToken.end());
+    ENetPacket* p = enet_packet_create(v.data(), v.size(), ENET_PACKET_FLAG_RELIABLE);
+    if (!p) { l.FenceAbort = true; return; }
+    if (enet_peer_send(l.P, Chan_Ctl, p) != 0) { enet_packet_destroy(p); l.FenceAbort = true; return; }
+    enet_host_flush(Host);
+}
+
+bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
+{
+    Link* l = HandoffLink();
+    if (!l || !epoch || l->FenceAbort || l->SequenceOverflow) return false;
+    if (epoch <= l->LastClosedFenceEpoch) return false;
+    if (l->FenceEpoch && l->FenceEpoch != epoch) return false;
+    if (l->LocalFence) return false;
+    if (l->PeerFence)
+    {
+        if (token != std::array<u8, 16>{} && token != l->FenceToken) return false;
+    }
+    else
+    {
+        if (token == std::array<u8, 16>{}) return false;
+        l->FenceToken = token;
+    }
+    l->FenceEpoch = epoch;
+    l->FenceLastSent = l->TxSeq;
+    l->LocalFence = true;
+    SendFenceControl(*l, HandoffFence, epoch, l->FenceLastSent);
+    return !l->FenceAbort;
+}
+
+bool AmbientLAN::GetHandoffFenceToken(std::array<u8, 16>& token) const
+{
+    const Link* l = HandoffLink();
+    if (!l || !l->FenceEpoch || l->FenceToken == std::array<u8, 16>{}) return false;
+    token = l->FenceToken;
+    return true;
+}
+
+bool AmbientLAN::HasPeerHandoffFence() const
+{
+    const Link* l = HandoffLink();
+    return l && l->PeerFence && !l->FenceAbort;
+}
+
+u64 AmbientLAN::PeerHandoffEpoch() const
+{
+    const Link* l = HandoffLink();
+    return l && l->PeerFence ? l->FenceEpoch : 0;
+}
+
+bool AmbientLAN::CanAcknowledgeHandoffFence() const
+{
+    const Link* l = HandoffLink();
+    return l && l->LocalFence && l->PeerFence && !l->FenceAbort && !l->SequenceOverflow &&
+           l->RetiredThrough >= l->PeerLastSent && HandoffQueuedFrames() == 0;
+}
+
+bool AmbientLAN::AcknowledgeHandoffFence()
+{
+    Link* l = HandoffLink();
+    if (!CanAcknowledgeHandoffFence() || l->LocalReady) return false;
+    l->LocalReady = true;
+    SendFenceControl(*l, HandoffReady, l->FenceEpoch, l->RetiredThrough);
+    return !l->FenceAbort;
+}
+
+bool AmbientLAN::HandoffFenceComplete() const
+{
+    const Link* l = HandoffLink();
+    return l && CanAcknowledgeHandoffFence() && l->LocalReady && l->PeerReady &&
+           l->PeerRetiredThrough >= l->FenceLastSent;
+}
+
+bool AmbientLAN::HandoffFenceAborted() const
+{
+    const Link* l = HandoffLink();
+    return !l || l->FenceAbort || l->SequenceOverflow;
+}
+
+bool AmbientLAN::AcknowledgeHandoffPrepared()
+{
+    Link* l = HandoffLink();
+    if (!l || !HandoffFenceComplete() || l->FenceAbort || l->LocalPrepared) return false;
+    l->LocalPrepared = true;
+    SendFenceControl(*l, HandoffPrepared, l->FenceEpoch, 0);
+    return !l->FenceAbort;
+}
+
+bool AmbientLAN::HandoffPreparedComplete() const
+{
+    const Link* l = HandoffLink();
+    return l && HandoffFenceComplete() && l->LocalPrepared && l->PeerPrepared && !l->FenceAbort;
+}
+
+bool AmbientLAN::AcknowledgeHandoffArmed()
+{
+    Link* l = HandoffLink();
+    if (!l || !HandoffPreparedComplete() || l->FenceAbort || l->LocalArmed) return false;
+    l->LocalArmed = true;
+    SendFenceControl(*l, HandoffArmed, l->FenceEpoch, 0);
+    return !l->FenceAbort;
+}
+
+bool AmbientLAN::HandoffArmedComplete() const
+{
+    const Link* l = HandoffLink();
+    return l && HandoffPreparedComplete() && l->LocalArmed && l->PeerArmed && !l->FenceAbort;
+}
+
+bool AmbientLAN::AcknowledgeHandoffGo()
+{
+    Link* l = HandoffLink();
+    if (!l || !HandoffArmedComplete() || l->FenceAbort || l->LocalGo) return false;
+    l->LocalGo = true;
+    SendFenceControl(*l, HandoffGo, l->FenceEpoch, 0);
+    return !l->FenceAbort;
+}
+
+bool AmbientLAN::HandoffGoComplete() const
+{
+    const Link* l = HandoffLink();
+    return l && HandoffArmedComplete() && l->LocalGo && l->PeerGo && !l->FenceAbort;
+}
+
+void AmbientLAN::AbortHandoffFence()
+{
+    Link* l = HandoffLink();
+    if (!l) return;
+    if (!l->AbortSent && l->FenceEpoch) { l->AbortSent = true; SendFenceControl(*l, HandoffAbort, l->FenceEpoch, 0); }
+    l->FenceAbort = true;
+}
+
+bool AmbientLAN::ResetHandoffFenceAfterAbort()
+{
+    Link* l = HandoffLink();
+    if (!l) return false;
+    if (l->ResetCompleted) { l->ResetCompleted = false; return true; }
+    if (!l->FenceAbort || !l->AbortSent || !l->PeerAbort) return false;
+    if (!l->LocalResetDone)
+    {
+        l->LocalResetDone = true;
+        SendFenceControl(*l, HandoffResetDone, l->FenceEpoch, 0);
+    }
+    if (!l->PeerResetDone) return false;
+    CompleteHandoffReset(*l);
+    l->ResetCompleted = false;
+    return true;
+}
+
+void AmbientLAN::CompleteHandoffReset(Link& l)
+{
+    if (l.FenceEpoch)
+    {
+        l.LastClosedFenceEpoch = std::max(l.LastClosedFenceEpoch, l.FenceEpoch);
+        l.LastClosedFenceToken = l.FenceToken;
+    }
+    l.FenceEpoch = 0;
+    l.FenceToken = {};
+    l.FenceLastSent = l.PeerLastSent = l.PeerRetiredThrough = 0;
+    l.LocalFence = l.PeerFence = l.LocalReady = l.PeerReady = false;
+    l.LocalPrepared = l.PeerPrepared = l.LocalArmed = l.PeerArmed = l.LocalGo = l.PeerGo = false;
+    l.FenceAbort = l.AbortSent = l.PeerAbort = l.LocalResetDone = l.PeerResetDone = false;
+    l.ResetCompleted = true;
+}
+
+bool AmbientLAN::InjectClosedHandoffFenceForTest()
+{
+    Link* l = HandoffLink();
+    if (!Host || !l || !l->P || !l->LastClosedFenceEpoch || l->LocalFence ||
+        l->LastClosedFenceToken == std::array<u8, 16>{}) return false;
+    std::vector<u8> v;
+    P32(v, kHandoffCtl); P32(v, HandoffFence); P64(v, l->LastClosedFenceEpoch); P32(v, l->TxSeq);
+    v.insert(v.end(), l->LastClosedFenceToken.begin(), l->LastClosedFenceToken.end());
+    ENetPacket* p = enet_packet_create(v.data(), v.size(), ENET_PACKET_FLAG_RELIABLE);
+    if (!p) return false;
+    if (enet_peer_send(l->P, Chan_Ctl, p) != 0) { enet_packet_destroy(p); return false; }
+    enet_host_flush(Host);
+    return true;
+}
+
+AmbientLAN::HandoffFenceStats AmbientLAN::GetHandoffFenceStats() const
+{
+    const Link* l = HandoffLink();
+    if (!l) return {0, 0, 0, 0, 0, false, false, true};
+    return {l->FenceEpoch, l->FenceLastSent, l->PeerLastSent, l->RetiredThrough,
+            l->PeerRetiredThrough, l->LocalReady, l->PeerReady, l->FenceAbort || l->SequenceOverflow};
 }
 
 // a received MP frame: from a link of this session? (a child takes frames from its parent only)
@@ -666,8 +904,57 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         break;
     }
     case ENET_EVENT_TYPE_RECEIVE:
-        enet_packet_destroy(ev.packet);     // (control channel: unused)
+    {
+        Link* l = (Link*)ev.peer->data;
+        if (l && ev.channelID == Chan_Ctl && ev.packet->dataLength == 36)
+        {
+            const u8* d = ev.packet->data;
+            if (G32(d) == kHandoffCtl)
+            {
+                const u32 type = G32(d + 4);
+                const u64 epoch = (u64)G32(d + 8) | ((u64)G32(d + 12) << 32);
+                const u32 mark = G32(d + 16);
+                std::array<u8, 16> token{};
+                memcpy(token.data(), d + 20, token.size());
+                if (epoch && epoch <= l->LastClosedFenceEpoch)
+                {
+                    if (getenv("LITEV_AMBIENT_CUT_STALE_REPLAY") &&
+                        *getenv("LITEV_AMBIENT_CUT_STALE_REPLAY"))
+                        fprintf(stderr, "CUTFENCE ignored stale closed epoch %llx\n", (unsigned long long)epoch);
+                }
+                else if (!epoch || token == std::array<u8, 16>{} ||
+                    (l->FenceEpoch && (l->FenceEpoch != epoch || l->FenceToken != token))) l->FenceAbort = true;
+                else if (type == HandoffFence)
+                {
+                    l->FenceEpoch = epoch;
+                    l->FenceToken = token;
+                    l->PeerFence = true;
+                    l->PeerLastSent = mark;
+                }
+                else if (type == HandoffReady && l->FenceEpoch == epoch)
+                {
+                    l->PeerReady = true;
+                    l->PeerRetiredThrough = mark;
+                }
+                else if (type == HandoffPrepared && l->FenceEpoch == epoch && mark == 0)
+                    l->PeerPrepared = true;
+                else if (type == HandoffArmed && l->FenceEpoch == epoch && mark == 0 && l->PeerPrepared)
+                    l->PeerArmed = true;
+                else if (type == HandoffGo && l->FenceEpoch == epoch && mark == 0 && l->PeerArmed)
+                    l->PeerGo = true;
+                else if (type == HandoffAbort && l->FenceEpoch == epoch)
+                { l->PeerAbort = true; l->FenceAbort = true; }
+                else if (type == HandoffResetDone && l->FenceEpoch == epoch && mark == 0 &&
+                         l->FenceAbort && l->PeerAbort)
+                {
+                    l->PeerResetDone = true;
+                    if (l->LocalResetDone) CompleteHandoffReset(*l);
+                }
+            }
+        }
+        enet_packet_destroy(ev.packet);
         break;
+    }
     default:
         break;
     }
@@ -703,7 +990,7 @@ void AmbientLAN::Pump(int type)
     {
         const QueuedPacket q = RX.front();
         ENetPacket* p = q.Packet;
-        if (!QueueCurrent(q)) { RX.pop_front(); enet_packet_destroy(p); continue; }
+        if (!QueueCurrent(q)) { RX.pop_front(); DestroyRX(q); continue; }
         MPPacketHeader* h = (MPPacketHeader*)p->data;
         // stale after a frame (LAN.cpp), but a management frame (auth / assoc / deauth) waits for the chip up to 1 s: a
         // parent's chip only listens around its beacons, and a child here does not send right after a real beacon
@@ -716,13 +1003,13 @@ void AmbientLAN::Pump(int type)
                 Platform::Log(Platform::LogLevel::Info,
                               "AMBWAIT stale frame type=%04x age_ms=%u keep_ms=%u slot=%d\n",
                               h->Type, h->Magic > now ? 0u : now - h->Magic, keep, q.Slot);
-            RX.pop_front(); enet_packet_destroy(p); continue;
+            RX.pop_front(); RetireMP(q); DestroyRX(q); continue;
         }
         if (type >= 2) return;
         if (type == 1)
         {
             if (h->Type == 0) return;
-            RX.pop_front(); enet_packet_destroy(p);
+            RX.pop_front(); RetireMP(q); DestroyRX(q);
         }
         break;
     }
@@ -764,6 +1051,8 @@ int AmbientLAN::Pop(u8* data, u64* timestamp)
     const QueuedPacket q = RX.front();
     ENetPacket* p = q.Packet;
     RX.pop_front();
+    if (!PacketLink(q)) { DestroyRX(q); return Pop(data, timestamp); }
+    RetireMP(q);
     const MPPacketHeader* h = (const MPPacketHeader*)p->data;
     u32 len = std::min<u32>(h->Length, 2048);
     memcpy(data, p->data + sizeof(MPPacketHeader), len);
@@ -774,7 +1063,7 @@ int AmbientLAN::Pop(u8* data, u64* timestamp)
         FrameExchanges++;
     }
     if (timestamp) *timestamp = h->Timestamp;
-    enet_packet_destroy(p);
+    DestroyRX(q);
     return (int)len;
 }
 
@@ -807,6 +1096,13 @@ void AmbientLAN::Process()
     StSlowPending = slow.Pending;
 }
 
+size_t AmbientLAN::HandoffQueuedFrames() const
+{
+    size_t count = RX.size();
+    for (const Link& link : Links) count += link.Pending.size();
+    return count;
+}
+
 void AmbientLAN::Begin(int inst)
 {
     WifiOn = true;
@@ -819,7 +1115,7 @@ void AmbientLAN::End(int inst)
 {
     WifiOn = false;
     for (int s = 0; s < 16; s++) CloseLink(s, "Wi-Fi off");
-    while (!RX.empty()) { enet_packet_destroy(RX.front().Packet); RX.pop_front(); }
+    while (!RX.empty()) { DestroyRX(RX.front()); RX.pop_front(); }
     if (Host) enet_host_flush(Host);
     ParentSlot = -1;
     std::lock_guard<std::mutex> g(Mu);
@@ -929,7 +1225,11 @@ int AmbientLAN::RecvHostPacket(int inst, u8* data, u64* timestamp)
         while (RX.empty() && NowUs() < end);
     }
 #endif
-    Pump(2);
+    // After the peer has announced a cut, it may intentionally send no more
+    // host CMDs. Do not amplify each virtual receive poll into a 50 ms wall
+    // wait while this console finishes its current emulated frame. The final
+    // checkpoint still requires a zero busy mask and a fully retired fence.
+    Pump(HasPeerHandoffFence() ? 3 : 2);
     const int r = Pop(data, timestamp);
     const u64 waited = NowUs() - t0;
     FrameBlockedUs += (u32)waited;
@@ -954,7 +1254,7 @@ u16 AmbientLAN::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
         const QueuedPacket q = RX.front();
         ENetPacket* p = q.Packet;
         RX.pop_front();
-        if (!QueueCurrent(q)) { enet_packet_destroy(p); continue; }
+        if (!QueueCurrent(q)) { DestroyRX(q); continue; }
         const MPPacketHeader* h = (const MPPacketHeader*)p->data;
         if (h->Type == 0) { later.push_back(q); continue; }
         if ((h->Type & 0xFFFF) == 2 && h->Timestamp >= timestamp - 32)
@@ -967,13 +1267,14 @@ u16 AmbientLAN::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
                 ret |= 1 << aid;
             }
             replied |= 1u << q.Slot;
-            if ((replied & up) == up || (ret & aidmask) == aidmask) { enet_packet_destroy(p); break; }
+            if ((replied & up) == up || (ret & aidmask) == aidmask) { RetireMP(q); DestroyRX(q); break; }
         }
         else if (kWaitTrace && (h->Type & 0xFFFF) == 2)
             Platform::Log(Platform::LogLevel::Info,
                           "AMBWAIT old reply slot=%d reply_ts=%llu want_ts=%llu\n",
                           q.Slot, (unsigned long long)h->Timestamp, (unsigned long long)timestamp);
-        enet_packet_destroy(p);
+        RetireMP(q);
+        DestroyRX(q);
     }
     RX.insert(RX.begin(), later.begin(), later.end());
     const u64 waited = NowUs() - t0;

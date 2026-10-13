@@ -162,8 +162,8 @@ std::string Basename(const std::string& path)
 // The userdata must outlive the NDS, so they are bundled together.
 struct BuiltNDS
 {
-    std::unique_ptr<NDS> nds;
     std::unique_ptr<HeadlessHost::InstanceUserData> udata;
+    std::unique_ptr<NDS> nds;
     u64 romHash = 0;
     u32 romSize = 0;
     InputScript inputScript;   // optional scripted input (empty => none)
@@ -231,7 +231,9 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
     out.romHash = h->second;
     out.romSize = romlen;
 
-    auto cart = NDSCart::ParseROM(std::move(romdata), romlen, nullptr, std::nullopt);
+    out.udata = std::make_unique<HeadlessHost::InstanceUserData>();
+    out.udata->savePrefix = cfg.instanceTag;
+    auto cart = NDSCart::ParseROM(std::move(romdata), romlen, out.udata.get(), std::nullopt);
     if (!cart) { err = "failed to parse DS ROM '" + cfg.rom + "'"; return false; }
 
     bool jit = jitOverride.value_or(cfg.jit);
@@ -268,9 +270,6 @@ bool BuildAndBoot(const TraceRunConfig& cfg, std::optional<bool> jitOverride,
         }
         args.Firmware.UpdateChecksums();
     }
-
-    out.udata = std::make_unique<HeadlessHost::InstanceUserData>();
-    out.udata->savePrefix = cfg.instanceTag;
 
     out.nds = std::make_unique<NDS>(std::move(args), out.udata.get());
     out.nds->SetRenderer(std::make_unique<SoftRenderer>(*out.nds));
@@ -989,6 +988,22 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #endif
         if (!BuildAndBoot(c, std::nullopt, b[k], err)) { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
         printf("console %d rom: %s (xxh3 %016llx)\n", k, c.rom.c_str(), (unsigned long long)b[k].romHash);
+        // A live Ambient checkpoint does not contain SPI firmware. Clone the
+        // source image before loading its savestate, or later firmware reads
+        // could return the replica's default MAC/settings instead.
+        if (const char* fw = getenv(("LITEV_MP_FW" + std::to_string(k)).c_str()))
+        {
+            u32 len = 0; auto bytes = ReadFile(fw, len);
+            if (!bytes || !len || len > (1u << 20))
+            { fprintf(stderr, "error (mp%d): cannot load firmware '%s'\n", k, fw); return 1; }
+            Firmware clone(bytes.get(), len);
+            if (clone.Length() != len)
+            { fprintf(stderr, "error (mp%d): firmware size changed\n", k); return 1; }
+            b[k].nds->SetFirmware(std::move(clone));
+            const auto& mac = b[k].nds->GetFirmware().GetHeader().MacAddr;
+            printf("console %d firmware: %s (%u bytes), MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   k, fw, len, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        }
         // LITEV_MP_SAV<k>=<file> (test only): console k's game save (.sav), read-only (the harness saves to its data dir)
         if (const char* sv = getenv(("LITEV_MP_SAV" + std::to_string(k)).c_str()))
         {
@@ -1180,28 +1195,64 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_NP_QUIET_HB
     if (net && np) net->QuietHeartbeat = !getenv("LITEV_NP_QUIET_HB") || atoi(getenv("LITEV_NP_QUIET_HB")) != 0;   // plain Netplay; =0 off
 #endif
+    const bool handoffProbe = getenv("LITEV_MP_HANDOFF_PROBE") != nullptr;
+    const bool handoffStartupGate = getenv("LITEV_MP_HANDOFF_STARTUP_GATE") && net && np && players == 0;
+    if (handoffStartupGate)
+    {
+        // The source consoles are still frozen outside this function. Publish
+        // the actual first local input, then require the remote's frame-0 input
+        // before allowing *any* replica console to execute a frame. This
+        // prevents an asymmetric final control response from using the first
+        // DelayFrames frames of predicted/no-input Netplay time unilaterally.
+        net->SubmitLocal(0, ScriptInput(b[player], 0));
+        if (!net->WaitForHandoffPeerInput(5000))
+        { fprintf(stderr, "handoff startup peer input unavailable; zero Netplay frames run\n"); return 2; }
+        printf("handoff startup peer input confirmed before frame 0\n");
+    }
+    std::vector<u64> handoffOrigin(n);
+    if (handoffProbe)
+        for (int k = 0; k < n; k++)
+        {
+            handoffOrigin[k] = b[k].nds->GetSysTimestamp();
+            Savestate checkpoint;
+            b[k].nds->DoSavestate(&checkpoint);
+            printf("handoff probe inst%d: raw clock=%llu wifiOn=%d mp=%d busy=%02x state=%016llx ram=%016llx\n", k,
+                   (unsigned long long)handoffOrigin[k], b[k].nds->Wifi.IsPoweredOn(), b[k].nds->Wifi.IsMultiplayer(),
+                   b[k].nds->Wifi.HandoffBusyMask(),
+                   (unsigned long long)XXH3_64bits(checkpoint.Buffer(), checkpoint.Length()),
+                   (unsigned long long)XXH3_64bits(b[k].nds->MainRAM, b[k].nds->MainRAMMask + 1));
+        }
     for (int k = 0; k < n; k++)
     {
         if (lockstepMP)
         {
             NDS* nd = b[k].nds.get();
 #ifdef LITEV_HOSTED_NETPLAY
-            if (record) record->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
+            if (record)
+            {
+                if (handoffProbe) lockstepMP->SetClockOrigin(k, handoffOrigin[k], 1000000000ull);
+                record->SetClock(k, [nd] { return nd->GetSysTimestamp(); });
+            }
             else
 #endif
             {
                 // diagnostic LITEV_MP_CLOCKSKEW=<console>:<cycles>: that console's link clock runs ahead
                 u64 sk = 0; const char* e = getenv("LITEV_MP_CLOCKSKEW");
                 if (e && atoi(e) == k) sk = strtoull(strchr(e, ':') + 1, nullptr, 0);
+                if (handoffProbe) lockstepMP->SetClockOrigin(k, handoffOrigin[k], 1000000000ull);
 #ifdef LITEV_MP_FASTPOLL
                 if (!sk) lockstepMP->SetClockSource(k, nd->SysTimestampPtr());
                 else
 #endif
                 lockstepMP->SetClock(k, [nd, sk] { return nd->GetSysTimestamp() + sk; });
             }
-            lockstepMP->SetWake(k, *nd);
+            if (!getenv("LITEV_MP_NO_WAKE")) lockstepMP->SetWake(k, *nd);
+            if (getenv("LITEV_MP_NO_INLINE_POLL")) nd->MPHostPoll = nullptr;
+            if (getenv("LITEV_MP_NO_HOST_QUIET")) nd->MPHostQuiet = nullptr;
         }
         b[k].udata->instanceID = k;
+        if (handoffProbe && lockstepMP && b[k].nds->Wifi.IsPoweredOn())
+            lockstepMP->Begin(k);
 #ifdef LITEV_A7_NATIVE_WM
         // LITEV_A7WM_INST=<mask>: console k runs the native ARM7 WM driver iff bit k (unset: debug.litev.a7wm decides)
         if (const char* wm = getenv("LITEV_A7WM_INST")) WMNative::SetInstance(*b[k].nds, k, (strtoul(wm, nullptr, 0) >> k) & 1);
@@ -1362,7 +1413,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_NP_SPEED
                         FfPress(*net, ffPlan, inst, f, local);
 #endif
-                        net->SubmitLocal(f, local);
+                        if (!handoffStartupGate || f != 0) net->SubmitLocal(f, local);
                     }
                     NetplayFrameInput in = net->Get(inst, f);
                     bi.nds->SetKeyMask(in.Keys);
@@ -1505,6 +1556,9 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                            (unsigned long long)XXH3_64bits(bi.nds->MainRAM, bi.nds->MainRAMMask + 1));
                     if (lockstepMP)   // what the other consoles see of this one: its sent frames
                         printf("inst%d tx %d: %016llx n=%u data=%016llx\n", inst, f + 1, (unsigned long long)lockstepMP->TxHash(inst), lockstepMP->TxCount(inst), (unsigned long long)lockstepMP->TxDataHash(inst));
+                    if (handoffProbe)
+                        printf("handoff probe inst%d frame%d: wifiOn=%d mp=%d\n", inst, f + 1,
+                               bi.nds->Wifi.IsPoweredOn(), bi.nds->Wifi.IsMultiplayer());
                     if (getenv("LITEV_MP_STATE"))
                     {
                         // diagnostics: more of the console's state, to find what diverges first
@@ -1682,6 +1736,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     for (std::thread& t : threads) t.join();
+    if (lockstepMP && getenv("LITEV_MP_TXMEM")) lockstepMP->DumpTxMemory(getenv("LITEV_MP_TXMEM"));
     {
         double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall0).count();
         printf("perf: %d frames, wall %.2f ms/frame, process CPU %.2f ms/frame (%d consoles)\n", frames, wall / frames, (CpuMs() - cpu0) / frames, n);
@@ -1769,6 +1824,26 @@ int ReplayConsole(const TraceRunConfig& cfg, int frames, const std::vector<std::
         Firmware& fw = b.nds->GetFirmware();
         fw.GetHeader().MacAddr[5] ^= (u8)k;
         fw.UpdateChecksums();
+    }
+    // A Hosted handoff replica must start from its owner's live firmware and
+    // checkpoint, exactly as the server's corresponding console does.
+    if (const char* fw = getenv(("LITEV_MP_FW" + std::to_string(k)).c_str()))
+    {
+        u32 len = 0; auto bytes = ReadFile(fw, len);
+        if (!bytes || !len || len > (1u << 20))
+        { fprintf(stderr, "error (replay%d): cannot load firmware '%s'\n", k, fw); return 1; }
+        Firmware clone(bytes.get(), len);
+        if (clone.Length() != len)
+        { fprintf(stderr, "error (replay%d): firmware size changed\n", k); return 1; }
+        b.nds->SetFirmware(std::move(clone));
+    }
+    if (const char* ss = getenv(("LITEV_MP_SS" + std::to_string(k)).c_str()))
+    {
+        u32 len = 0; auto bytes = ReadFile(ss, len);
+        Savestate state(bytes ? bytes.get() : nullptr, len, false);
+        if (!bytes || state.Error || !b.nds->DoSavestate(&state) || state.Error)
+        { fprintf(stderr, "error (replay%d): cannot load savestate '%s'\n", k, ss); return 1; }
+        printf("replay console %d savestate: %s\n", k, ss);
     }
     if (getenv("LITEV_MP_NORENDER0")) b.nds->GPU.SetRenderer(std::make_unique<NullRenderer>(b.nds->GPU));
 
