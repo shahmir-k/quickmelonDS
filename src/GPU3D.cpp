@@ -859,11 +859,25 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 
     CmdStallQueue.DoSavestate(file);
 
+#ifdef LITEV_GX_UNTIMED
+    if (file->Saving && GXUntimedOn)
+    {
+        // untimed, the pipeline counters reach no guest-visible state (only the timed engine's
+        // pre-delays read them), and the engines that skip work (a Netplay sink, LITEV_GX_ASYNC_LOCAL's
+        // emulator side, the bulk sink pass) leave them differently: save them as ZeroTiming leaves
+        // them, so equal guest states save equal bytes
+        u32 z = 0, one = 1;
+        file->Var32(&z); file->Var32(&z); file->Var32(&z); file->Var32(&z); file->Var32(&one);
+    }
+    else
+#endif
+    {
     file->Var32((u32*)&VertexPipeline);
     file->Var32((u32*)&NormalPipeline);
     file->Var32((u32*)&PolygonPipeline);
     file->Var32((u32*)&VertexSlotCounter);
     file->Var32(&VertexSlotsFree);
+    }
 
     if (!file->Saving)
     {
