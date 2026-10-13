@@ -715,7 +715,7 @@ void AmbientLAN::Pump(int type)
         // (it heard a synthesized one), so its auth request arrives while the parent dozes
         const u8 fc = p->data[sizeof(MPPacketHeader) + 12];
         const u32 keep = (h->Type == 0 && (fc & 0x0C) == 0 && fc != 0x80) ? 1000 : 16;
-        if (h->Magic > now || now - h->Magic > keep) { RX.pop_front(); enet_packet_destroy(p); continue; }
+        if (h->Magic > now || now - h->Magic > keep) { RX.pop_front(); enet_packet_destroy(p); WinStale++; continue; }
         if (type >= 2) return;
         if (type == 1)
         {
@@ -866,6 +866,14 @@ void AmbientLAN::Detect(u32 nowMs)
         std::lock_guard<std::mutex> g(Mu);
         Diag = d;
     }
+    // while linked, a line a few seconds in the log (the device side of a session, where the app shows only the overlay)
+    if (linked && ++DiagLogN >= 5)
+    {
+        DiagLogN = 0;
+        Platform::Log(Platform::LogLevel::Info, "Ambient: diag %.1f fps, link wait %.1f ms/frame, %.2f exch/frame, rtt %.1f ms, ceiling %.0f fps, slow %us | host waits %u timeouts %u, stale drops %u\n",
+                      d.Fps, d.WaitMs, d.ExchPerFrame, d.RttMs, d.CeilingFps, d.SlowSeconds, WinHostWaits, WinHostTimeouts, WinStale);
+    }
+    WinHostWaits = WinHostTimeouts = WinStale = 0;
     Win = {};
     Win.T0 = now;
 }
@@ -974,6 +982,7 @@ int AmbientLAN::RecvHostPacket(int inst, u8* data, u64* timestamp)
     }
     if (!Host || !NumLinks) return 0;
     const u64 t0 = NowUs();
+    WinHostWaits++;
 #ifdef LITEV_LAN_RX_SPIN
     // as LAN (LITEV_LAN_RX_SPIN): poll the socket without sleeping for a while first (waking a sleeping core costs a
     // scheduler round trip); debug.litev.lanspin / LITEV_LAN_RX_SPIN_US us, default 2000, 0 = off
@@ -1000,6 +1009,7 @@ int AmbientLAN::RecvHostPacket(int inst, u8* data, u64* timestamp)
 #endif
     Pump(2);
     const int r = Pop(data, timestamp);
+    if (r <= 0) WinHostTimeouts++;
     FrameBlockedUs += (u32)(NowUs() - t0);
     return r;
 }

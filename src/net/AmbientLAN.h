@@ -199,7 +199,7 @@ private:
     struct Window { u64 T0 = 0, BlockedUs = 0; u32 Frames = 0, Exch = 0; } Win;
     bool WasLinked = false, SessionPrompted = false;
     u64 LinkedSinceUs = 0;
-    u32 SlowSeconds = 0;
+    u32 SlowSeconds = 0, DiagLogN = 0, WinHostWaits = 0, WinHostTimeouts = 0, WinStale = 0;
     LinkDiag Diag;
     std::atomic<bool> PromptPending{false};
     void Detect(u32 nowMs);
