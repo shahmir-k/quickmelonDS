@@ -1542,6 +1542,27 @@ static s32 LiteV_NativeSlice9(melonDS::NDS* nds)
     return nds->NativeSliceNext();
 }
 #endif
+#ifdef LITEV_JIT_SHARED_IC32
+// LITEV_JIT_SHARED_IC32: shared code (no DIRECTPATCH) needs only the first 32 bytes of an ICACHE
+// entry (keys, epoch, pointers), so its per-console tables are indexed 32-byte: half the lines and
+// pages the dispatcher touches for the process-wide site ids. Exact (host-only).
+// Headless A/B: LITEV_JIT_SHARED_IC32=0; Android: debug.litev.jitic32=0.
+static bool IC32On()
+{
+    static const bool on = [] {
+#if defined(__ANDROID__)
+        char b[8] = {0};
+        return !(__system_property_get("debug.litev.jitic32", b) > 0 && atoi(b) == 0);
+#else
+        const char* e = getenv("LITEV_JIT_SHARED_IC32");
+        return !(e && atoi(e) == 0);
+#endif
+    }();
+    return on;
+}
+int Compiler::ICShift() const { return Shared && IC32On() ? 5 : ICacheEntryShift; }
+#endif
+
 void Compiler::LoadICacheTable(u32 num)
 {
 #ifdef LITEV_JIT_SHARED_CODE
@@ -1647,7 +1668,7 @@ void* Compiler::Gen_Dispatcher(u32 num)
     // done and the CPSR store is byte-identical to step (g), so a hit is timing-exact.
     FixupBranch icNoCache = CBZ(W9);
     LoadICacheTable(num);
-    ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICacheEntryShift)); // &ICacheTable[num][W9]
+    ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICShift())); // &ICacheTable[num][W9]
     LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
     LDR(INDEX_UNSIGNED, W4, RCPU, offsetof(ARM, ICacheEpoch));
     CMP(W3, W4);
@@ -1670,7 +1691,7 @@ void* Compiler::Gen_Dispatcher(u32 num)
     {
         FixupBranch rasNone = CBZ(W10);
         LoadICacheTable(num);
-        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICacheEntryShift));
+        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICShift()));
         LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
         LDR(INDEX_UNSIGNED, W4, RCPU, offsetof(ARM, ICacheEpoch));
         CMP(W3, W4);
@@ -1764,7 +1785,7 @@ void* Compiler::Gen_Dispatcher(u32 num)
     {
         FixupBranch wbSkip = CBZ(W9);
         LoadICacheTable(num);
-        ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICacheEntryShift));
+        ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICShift()));
         // The epoch covers both ways: demote slot0 only if it is from the live epoch. A stale
         // slot0 (its block may be invalidated since) would otherwise come back to life under
         // the new stamp, and the guest would run a dead block's code (another JIT state than
@@ -1788,7 +1809,7 @@ void* Compiler::Gen_Dispatcher(u32 num)
     {
         FixupBranch rasSkip = CBZ(W10);
         LoadICacheTable(num);
-        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICacheEntryShift));
+        ADD(X2, X2, X10, ArithOption(X10, ST_LSL, ICShift()));
         // (same rule: re-stamping a stale entry must not revive its slot1)
         LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, epoch));
         LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, ICacheEpoch));
@@ -1819,7 +1840,7 @@ void* Compiler::Gen_Dispatcher(u32 num)
     {
         FixupBranch dpNoCache = CBZ(W9);
         LoadICacheTable(num);
-        ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICacheEntryShift));
+        ADD(X2, X2, X9, ArithOption(X9, ST_LSL, ICShift()));
         STR(INDEX_UNSIGNED, WZR, X2, offsetof(ICacheEntry, hitCount));   // streak reset
         LDR(INDEX_UNSIGNED, W3, X2, offsetof(ICacheEntry, promoted));
         FixupBranch dpNotPromoted = CBZ(W3);
@@ -1926,6 +1947,9 @@ void* Compiler::Gen_Dispatcher(u32 num)
   #endif
 #ifdef LITEV_JIT_DIRECTPATCH
     // A slot1 hit breaks the consecutive-slot0 streak (site is bimodal, not monomorphic).
+#ifdef LITEV_JIT_SHARED_CODE
+    if (!Shared)   // (shared code: no DIRECTPATCH, and LITEV_JIT_SHARED_IC32 entries have no such field)
+#endif
     STR(INDEX_UNSIGNED, WZR, X2, offsetof(ICacheEntry, hitCount));
 #endif
     BR(X5);
@@ -3855,7 +3879,7 @@ void Compiler::ICacheReset()
 #endif
     for (int c = 0; c < 2; c++)
     {
-        if (ICacheTable[c]) memset(ICacheTable[c], 0, icSites * sizeof(ICacheEntry));
+        if (ICacheTable[c]) memset(ICacheTable[c], 0, icSites << ICShift());
 #if defined(LITEV_JIT_DIRECTPATCH) && defined(LITEV_JIT_DP_REVERTLIST)
         DirectPatchListed[c].clear();
 #endif
@@ -3978,6 +4002,8 @@ void Compiler::Reset()
 #endif
             FlushIcache();
             NDS.JIT.JitEnableExecute();
+            if (const char* dd = getenv("LITEV_JIT_DUMPDISP"))   // measurement: the dispatchers' code (raw A64)
+                if (FILE* f = fopen(dd, "wb")) { fwrite(a.DispatcherEntry[0], 1, (u8*)GetRXPtr() - (u8*)a.DispatcherEntry[0], f); fclose(f); }
             a.Near = GetCodeOffset();
             a.Far = JitMemMainSize;
             a.Dispatchers = true;
