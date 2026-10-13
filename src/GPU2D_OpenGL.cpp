@@ -1549,6 +1549,7 @@ void GLRenderer2D::UpdateOAM(int ystart, int yend)
 
                 if (capblock != -1)
                 {
+                    SpriteAffine = true;   // a display-capture bitmap sprite: hi-res content (glhi1x)
                     if (!is256)
                     {
                         sprcfg.Type = 3;
@@ -2080,8 +2081,19 @@ void GLRenderer2D::Check1x(int ystart, int yend)
     glReadPixels(0, y0, ScreenW, h, GL_RGBA, GL_UNSIGNED_BYTE, r.data());
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+    static int logged = 0;
     for (size_t i = 0; i < a.size(); i += 4)
-        if (memcmp(&a[i], &r[i], 3)) bad++;
+        if (memcmp(&a[i], &r[i], 3))
+        {
+            if (!bad && logged < 30)
+            {
+                logged++;
+                const int p = (int)(i / 4);
+                Platform::Log(Platform::Info, "LITEV_HI1XCHECK diff at x %d y %d (screen %d, %s): got %d %d %d want %d %d %d\n",
+                              p % ScreenW, y0 + p / ScreenW, GPU2D.Num, CompSF == 1 ? "1x" : "split", a[i], a[i+1], a[i+2], r[i], r[i+1], r[i+2]);
+            }
+            bad++;
+        }
     px += a.size() / 4;
     if (++checks % 20 == 0)
     {

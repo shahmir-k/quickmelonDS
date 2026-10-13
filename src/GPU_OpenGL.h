@@ -93,6 +93,7 @@ private:
     // 3D output the current frame shows, waiting (GPU-side) for its render on first use.
     GLThread3D* Thread3D = nullptr;
     bool Synced3D = false;
+    bool CapturedSince3D = false;   // LITEV_GLHI_DEFER: a display capture was recorded since the last 3D kick
     int Prev3DColor = 0;
     GLuint Get3DTex();
 

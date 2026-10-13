@@ -159,7 +159,7 @@ private:
     int NumSprites;
     bool SpriteUseMosaic;
     bool SpriteMosaicAttr = true;   // some sprite has the mosaic attribute (debug.litev.glhimos)
-    bool SpriteAffine = true;       // some listed sprite is rotscaled (debug.litev.glhi1x)
+    bool SpriteAffine = true;       // some listed sprite is rotscaled or a display-capture bitmap: hi-res content (debug.litev.glhi1x)
     bool AffineUncomposited = true; // ... or was, in an OAM list used since the last composite
     GLuint LowFB = 0, LowTex = 0;   // native-resolution compositor target (debug.litev.glhi1x)
     // LITEV_GLHI_SPLIT3D: a screen whose only hi-res layer is the 3D one composites the rest

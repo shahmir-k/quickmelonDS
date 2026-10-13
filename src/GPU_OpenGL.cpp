@@ -163,6 +163,16 @@ void GLRenderer::WaitPresent()
 
 void GLRenderer::Start3DRendering()
 {
+    // the 3D job may texture from this frame's display captures: with LITEV_GLHI_DEFER they are
+    // written on the worker, so it waits on the worker's fence after them (the 3D kick's own
+    // fence would only cover this thread's context)
+    if (Defer && CapturedSince3D && Thread3D && GLDefer::Recording())
+    {
+        GLsync f = nullptr;
+        Defer->RunSync([&f] { f = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0); glFlush(); });
+        Thread3D->ExtInFence = f;
+    }
+    CapturedSince3D = false;
     if (Thread3D) Prev3DColor = Thread3D->GL->GetCurColor();
     Rend3D->RenderFrame();
     Synced3D = false;
@@ -912,6 +922,7 @@ void GLRenderer::VBlankEnd()
 
 void GLRenderer::DoCapture(int ystart, int yend)
 {
+    CapturedSince3D = true;
     u32 dispcnt = DispCntA;
     u32 capcnt = CaptureCnt;
     u32 dispmode = (dispcnt >> 16) & 0x3;

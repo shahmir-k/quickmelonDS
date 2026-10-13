@@ -89,7 +89,11 @@ public:
         ColorSeq[c] = seq;   // (unchanged colour if the frame is skipped: still waits right)
         // GLRenderer: its capture textures were written on the caller's context this frame
         GLsync inFence = nullptr;
-        if (Parent && Threaded) { inFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0); glFlush(); }
+        if (Parent && Threaded)
+        {
+            if (ExtInFence) { inFence = ExtInFence; ExtInFence = nullptr; }   // the parent's GL worker (LITEV_GLHI_DEFER)
+            else { inFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0); glFlush(); }
+        }
         const double tq = NowMs();
         const u32 frame = GPU3D.NDS.NumFrames; (void)frame;
         Run([this, tq, seq, c, slot, inFence, frame] {
@@ -154,6 +158,7 @@ public:
     std::unique_ptr<GLRenderer3D> GL;
     GLsync Fence[GLRenderer3D::MaxColorRing] {};
     u64 Seq = 0, ColorSeq[GLRenderer3D::MaxColorRing] {};
+    GLsync ExtInFence = nullptr;   // set by the parent: the next job waits on this fence instead
     int Slot = 0;
     std::atomic<u64> DoneSeq { 0 };
     // LITEV_GL_NOSNAPCOPY: last job reading polygon/vertex bank b in place (emu thread only)
