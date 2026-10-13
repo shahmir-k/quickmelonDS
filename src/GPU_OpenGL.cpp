@@ -17,6 +17,7 @@
 */
 
 #include <string.h>
+#include <vector>
 #include "NDS.h"
 #include "GPU_OpenGL.h"
 #include "GLThread3D.h"
@@ -173,6 +174,11 @@ void GLRenderer::Start3DRendering()
         Thread3D->ExtInFence = f;
     }
     CapturedSince3D = false;
+    // an identical 3D frame keeps its colour buffer and its job may write it again while the
+    // worker still samples it for the frame before: let the worker finish first
+    static const bool skipSync = OpenGL::Prop("glhiskipsync", 1) != 0;
+    if (Defer && Thread3D && GLDefer::Recording() && GPU.GPU3D.RenderFrameIdentical && skipSync)
+        Defer->Drain();
     if (Thread3D) Prev3DColor = Thread3D->GL->GetCurColor();
     Rend3D->RenderFrame();
     Synced3D = false;
@@ -921,6 +927,32 @@ void GLRenderer::VBlank()
 
     LastLine = 0;
     LastCapLine = 0;
+
+    // debug.litev.glhihash=1: hash both screens of every frame's final output (LITEV_GLHIHASH),
+    // in the GL order (on the worker with LITEV_GLHI_DEFER): an exact per-frame output check
+    static const bool hashOn = OpenGL::Prop("glhihash", 0) != 0;
+    if (hashOn)
+    {
+        const int buf = BackBuffer; const u32 fr = GPU.NDS.NumFrames;
+        GLDefer::Exec([this, buf, fr] {
+            static GLuint fb = 0;
+            if (!fb) glGenFramebuffers(1, &fb);
+            static std::vector<u8> px;
+            px.resize((size_t)ScreenW * ScreenH * 4);
+            u64 h[2];
+            for (int l = 0; l < 2; l++)
+            {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+                glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, FPOutputTex[buf], 0, l);
+                glReadPixels(0, 0, ScreenW, ScreenH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                u64 x = 1469598103934665603ULL;
+                for (u8 b : px) { x ^= b; x *= 1099511628211ULL; }
+                h[l] = x;
+            }
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+            Log(LogLevel::Info, "LITEV_FBHASH frame=%u top=0x%016llx bot=0x%016llx\n", fr, (unsigned long long)h[0], (unsigned long long)h[1]);
+        });
+    }
 
     if (GLDefer::Recording())
     {
