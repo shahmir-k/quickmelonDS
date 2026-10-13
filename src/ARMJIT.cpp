@@ -2806,6 +2806,36 @@ JitBlockEntry ARMJIT::SharedEmit(ARM* cpu, JitBlock* block, bool thumb, FetchedI
     u32 id = 0;
     JitBlockEntry entry = JITCompiler.SharedCompile(job, id);
     block->SharedId = id;
+#ifdef LITEV_JIT_REVIVE
+    // LITEV_JITSHARE_VERIFY=1: the code this console takes was made for the bytes in its own memory
+    // (every instruction word of the key == this console's code memory now). Checks counted at exit.
+    static const bool verify = getenv("LITEV_JITSHARE_VERIFY") != nullptr;
+    if (verify)
+    {
+        static std::atomic<u64> checks {0};
+        static bool reg = (atexit([] { fprintf(stderr, "JITSHARE verify: %llu instructions checked against console memory\n", (unsigned long long)checks.load()); }), true);
+        (void)reg;
+        for (int k = 0; k < n; k++)
+        {
+            const u32 w = instrs[k].Instr;
+            const bool merged = thumb && instrs[k].Info.Kind == ARMInstrInfo::tk_BL_LONG;
+            for (int h = 0; h < (merged ? 2 : 1); h++)
+            {
+                const u8* p = HostCodePtr(LocaliseCodeAddress(cpu->Num, instrs[k].Addr + 2 * h));
+                if (!p) continue;   // (BIOS etc.: not RAM-backed here)
+                u32 mem; memcpy(&mem, p, thumb ? 2 : 4);
+                const u32 want = thumb ? ((w >> (16 * h)) & 0xFFFF) : w;
+                if ((thumb ? (mem & 0xFFFF) : mem) != want)
+                {
+                    fprintf(stderr, "JITSHARE verify FAIL: console %p cpu %d block %08x instr %08x: key %08x memory %08x\n",
+                            (void*)&NDS, cpu->Num, instrs[0].Addr, instrs[k].Addr + 2 * h, want, mem);
+                    abort();
+                }
+                checks++;
+            }
+        }
+    }
+#endif
     return entry;
 }
 #endif

@@ -317,6 +317,17 @@ static constexpr u16 GlobalRegPinnedMask =
 // code lives until the last sharing compiler is gone. ponytail: one 120 MB arena, abort when it is
 // full; chain more arenas (one reservation, a common base for the 32-bit lookup offsets) if a
 // session ever gets there.
+//
+// Different ROMs / diverged consoles (cross-game Netplay, e.g. Pokemon Black trading with White;
+// overlays, self-modifying code, save-driven paths): sharing is keyed by the block's guest bytes,
+// never by ROM or address alone. SharedKey holds every instruction word the console itself fetched
+// for the block (with its addresses, literal values, compile-time profile and memory map), so a
+// console only ever reuses code emitted for exactly the bytes in its own memory; blocks of two
+// different games share code only where the bytes are identical (common SDK functions), which is
+// the same code either would emit. Each console keeps its own block maps and invalidation (a write
+// to its code drops its block, the shared code stays for the others), and a link patched by
+// another console is entered only through the target's ARM::JitValid guard, i.e. only if that
+// block is this console's own live block for the address.
 SharedArena& JitArena() { static SharedArena a; return a; }
 namespace
 {
