@@ -1036,7 +1036,7 @@ void GLRenderer::DownscaleCapture(int width, int height, int layer)
 // reads 5_5_5_1, which is either rejected (VRAM keeps stale data) or comes back with R in the high
 // bits; both leave the wrong picture in VRAM, e.g. the white background behind Pokemon White's
 // trainer battle "VS" screen in hi-res 2D. Each 8-bit channel is the exact expansion of the stored
-// 5-bit value, so the round trip is lossless.
+// 5-bit value (round(v * 255 / 31)), whose top 5 bits are v again: lossless.
 static void ReadCapture1555(int y, int w, int h, u8* dst)
 {
     static std::vector<u8> rgba;
@@ -1051,8 +1051,7 @@ static void ReadCapture1555(int y, int w, int h, u8* dst)
     for (size_t i = 0, n = (size_t)w * h; i < n; i++)
     {
         const u8* c = &rgba[i * 4];
-        out[i] = (u16)(((c[r] * 31 + 127) / 255) | (((c[1] * 31 + 127) / 255) << 5) |
-                       (((c[b] * 31 + 127) / 255) << 10) | ((c[3] >> 7) << 15));
+        out[i] = (u16)((c[r] >> 3) | ((c[1] >> 3) << 5) | ((c[b] >> 3) << 10) | ((c[3] >> 7) << 15));
     }
 }
 
