@@ -239,6 +239,12 @@ struct Ctx
     u8 joinDesc[0x40] = {}; u16 joinTgid = 0, joinPSize = 0, joinCSize = 0; u8 joinAttr = 0, joinRssi = 0;
     u16 mpTxopOrig = 0;
     u64 mpNext = 0;                             // the next MP of a sequence not before this (the guest's MP end -> CMD path)
+    // late takeover: the guest's WM handles INITIALIZE and everything up to the first local-play request (scan / measure /
+    // parent / connect to a DS parent), and again from END on (Nintendo WFC's DCF mode stays emulated)
+    s8 build = -1;                              // this WM session: -1 not checked, 0 emulated, 1 the native driver may take over
+    u32 lastPassed = 0;                         // the last request left to the guest
+    bool guestCbSince = true;                   // a guest callback went to the ARM9 since then
+    bool release = false;                       // END done: give the WM back once its callback is out
     std::deque<Cb> held;                        // a request's callbacks held until the guest would have finished it
     ~Ctx();
 };
@@ -348,6 +354,7 @@ const Build* FindBuild(Ctx& c, u32* tableOut)
 
 // ---- scheduling ----
 void Process(Ctx& c);
+void Release(Ctx& c);
 void OnEvent(void* that, u32)
 {
     Ctx& c = *(Ctx*)that;
@@ -2008,6 +2015,7 @@ bool Request(Ctx& c, const Rq& q)
         PowerDown(c); c.wl = 0;
         SS16(c, ST_state, S_READY); SS16(c, ST_state, S_STOP);
         cb0(E_OK);
+        c.release = true;
         break;
     case 0x01:              // RESET
     {
@@ -2468,6 +2476,7 @@ void Process(Ctx& c)
         break;
     }
     PumpCbs(c);
+    if (c.release && c.cbs.empty() && c.op == OpNone && c.inds.empty() && c.reqs.empty()) { Release(c); c.inside = false; return; }
     u64 next = ~0ull;
     for (u64 t : c.tm) if (t && t < next) next = t;
     if (c.irqPending || c.lineDue) next = c.now + 1;
@@ -2476,7 +2485,7 @@ void Process(Ctx& c)
 }
 
 // ---- savestate (section "WMNA"; layout kSaveVer) ----
-constexpr u32 kSaveVer = 1;
+constexpr u32 kSaveVer = 2;
 struct SS
 {
     Savestate* f;
@@ -2503,27 +2512,49 @@ void Visit(Ctx& c, SS& z)
     z.Seq(c.mgmtQ, mg); z.B(c.mgmtBusy); mg(c.mgmtCur); z.B(c.txWindow);
     z.V(c.beaconLen); z.V(c.gameInfoOff); z.Bytes(c.pendingGameInfo); z.B(c.gameInfoPending);
     z.B(c.mpBusy); z.V(c.mpPoll); z.V(c.mpGot); z.V(c.mpN); z.V(c.mpStride); z.V(c.mpTxopUs); z.V(c.mpLen); z.V(c.mpHdr); z.V(c.mpTmptt);
-    z.V(c.mpRemain); z.Bytes(c.mpInd); z.V(c.mpFailed); z.V(c.mpTxopOrig); z.V(c.mpNext);
+    z.V(c.mpRemain); z.Bytes(c.mpInd); z.V(c.mpFailed); z.V(c.mpTxopOrig);
     z.V(c.aid); z.V(c.pmac); z.V(c.bufBusy); z.V(c.lastCmdSeq); z.V(c.cmdFlags); z.V(c.beaconPeriod);
     z.V(c.vX); z.V(c.rssi); z.V(c.rssiIdx); z.V(c.camLife);
     z.Seq(c.inds, [&](Ind& in) { z.V(in.code); z.Bytes(in.b); });
     z.Seq(c.autoDeAuth, [&](std::vector<u8>& v) { z.Bytes(v); });
+    z.V(c.build); z.V(c.lastPassed); z.B(c.guestCbSince); z.B(c.release); z.V(c.mpNext);
     z.V(c.joinDesc); z.V(c.joinTgid); z.V(c.joinPSize); z.V(c.joinCSize); z.V(c.joinAttr); z.V(c.joinRssi);
 }
 
-bool Activate(Ctx& c, u32 req)
+// the guest's WMSP / WL are idle (its last request called back); the native driver goes on from the WMStatus state it left
+bool Activate(Ctx& c)
 {
     NDS& nds = c.nds;
-    if (nds.ConsoleType != 0 || !Allowed(c)) return false;
-    u32 table = 0;
-    const Build* b = FindBuild(c, &table);
-    if (!b) return false;
-    c.w7 = Rd32(c, req + 4); c.st = Rd32(c, req + 8); c.cbuf = Rd32(c, req + 12);
+    const u16 state = S16(c, ST_state);
+    if (state != S_IDLE && state != S_CLASS1 && state != S_SCAN) return false;
     nds.RegisterEventFuncs(Event_WMN, &c, {[](void* that, u32 p) { OnEvent(that, p); }});
     c.active = true;
     nds.Wifi.WMNOwns = true;
-    if (g_Stats) fprintf(stderr, "A7WM inst%d: native WM driver active: %s (table %08x; WM7 %08x status %08x cb %08x)\n", c.inst, b->name, table, c.w7, c.st, c.cbuf);
+    c.wl = state == S_IDLE ? 0x10 : 0x20;
+    c.mode = 0;
+    for (int k = 0; k < 6; k++) c.mac[k] = Rd8(c, c.st + ST_mac + k);
+    for (Sta& t : c.sta) { t = Sta{}; t.lifeReload = c.camLife; }
+    c.pending.clear();
+    if (g_Stats) fprintf(stderr, "A7WM inst%d f%u: native WM driver takes over (state %u; WM7 %08x status %08x cb %08x)\n", c.inst, nds.NumFrames, state, c.w7, c.st, c.cbuf);
     return true;
+}
+// END done: the guest's WM gets the next session (its WMSP / WL are where they were at the takeover: idle)
+void Release(Ctx& c)
+{
+    NDS& nds = c.nds;
+    nds.CancelEvent(Event_WMN);
+    nds.GPU.WMLine = -1;
+    nds.Wifi.WMNOwns = false;
+    c.active = false; c.release = false; c.build = -1; c.lastPassed = 0; c.guestCbSince = true;
+    c.reqs.clear(); c.cbs.clear(); c.held.clear(); c.inds.clear(); c.autoDeAuth.clear();
+    for (u64& t : c.tm) t = 0;
+    c.wake = ~0ull; c.irqPending = false; c.lineDue = false; c.vX = -1;
+    c.op = OpNone; c.opStage = 0; c.opDesc.clear();
+    c.wl = 0; c.mode = 0; c.mgmtQ.clear(); c.mgmtBusy = false; c.txWindow = false; c.gameInfoPending = false;
+    c.mpBusy = false; c.mpInd.clear(); c.aid = 0; c.bufBusy[0] = c.bufBusy[1] = false; c.lastCmdSeq = 0xFFFF;
+    for (Sta& t : c.sta) t = Sta{};
+    c.pending.clear();
+    if (g_Stats) fprintf(stderr, "A7WM inst%d f%u: WM back to the emulated driver\n", c.inst, nds.NumFrames);
 }
 }
 
@@ -2575,14 +2606,36 @@ void SetInstance(NDS& nds, int inst, int allow)
 
 bool Fifo9(NDS& nds, u32 val)
 {
-    Ctx* p = Get(nds);
     const u32 a = val >> 6;
+    if ((a >> 24) != 2) return false;
+    Ctx* p = Get(nds);
     if (!p || !p->active)
     {
-        // WM INITIALIZE (apiid 0) is where the native driver takes the WM over
-        if ((a >> 24) != 2 || (nds.ARM7Read16(a) & 0x7FFF) != 0) return false;
-        if (!Activate(GetOrMake(nds), a)) return false;
-        p = Get(nds);
+        Ctx& c = GetOrMake(nds);
+        if ((val >> 5) & 1) return false;
+        const u16 api = nds.ARM7Read16(a) & 0x7FFF;
+        bool take = false;
+        if (api == 0x00)            // the guest's INITIALIZE: is this WM build ours (for this session)?
+        {
+            u32 table = 0;
+            const Build* b = nds.ConsoleType == 0 && Allowed(c) ? FindBuild(c, &table) : nullptr;
+            c.build = b ? 1 : 0;
+            c.w7 = nds.ARM7Read32(a + 4); c.st = nds.ARM7Read32(a + 8); c.cbuf = nds.ARM7Read32(a + 12);
+            c.camLife = 0x28;
+            if (b && g_Stats) fprintf(stderr, "A7WM inst%d: WM build %s (table %08x): native from the first local-play request\n", c.inst, b->name, table);
+        }
+        else if (api == 0x1D) c.camLife = (u16)nds.ARM7Read32(a + 8);
+        else if (c.build == 1 && (c.guestCbSince || !c.lastPassed || (nds.ARM7Read16(c.lastPassed) & 0x8000)))
+        {
+            if (api == 0x0A || api == 0x1E || api == 0x07 || api == 0x08) take = true;
+            else if (api == 0x0C)   // connect: to a DS parent (game info), not an access point (WFC)
+            {
+                const u32 d = nds.ARM7Read32(a + 4);
+                take = (d >> 24) == 2 && nds.ARM7Read16(d + 0x3C) >= 0x10;
+            }
+        }
+        if (!take || !Activate(c)) { c.lastPassed = a; c.guestCbSince = false; return false; }
+        p = &c;
     }
 #ifdef LITEV_HLE_DIAG
     TraceFifo(nds, 0, val);
@@ -2593,6 +2646,12 @@ bool Fifo9(NDS& nds, u32 val)
     else c.reqs.push_back({a, (u16)(nds.ARM7Read16(a) & 0x7FFF), 0});
     WakeAt(c, CpuNow(nds) + 64);                // (the ARM7 takes the request in its PXI IRQ)
     return true;
+}
+
+void Fifo7(NDS& nds, u32 val)
+{
+    Ctx* p = Get(nds);
+    if (p && !p->active && (val & 31) == kTagWM) p->guestCbSince = true;
 }
 
 void ChipIRQ(NDS& nds)

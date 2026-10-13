@@ -26,6 +26,8 @@ void SetInstance(melonDS::NDS& nds, int inst, int allow);
 bool Fifo9(melonDS::NDS& nds, u32 val);
 // GPU::StartScanline at the line the driver asked for (GPU::WMLine); ts = that line's start
 void VLine(melonDS::NDS& nds, u16 vcount, u64 ts);
+// NDS: an ARM7 word to the ARM9 IPC FIFO (the guest's WM callbacks, while the native driver does not own the WM)
+void Fifo7(melonDS::NDS& nds, u32 val);
 // Wifi::CheckIRQ while the native driver owns the chip: IF & IE nonzero
 void ChipIRQ(melonDS::NDS& nds);
 #ifdef LITEV_HLE_DIAG

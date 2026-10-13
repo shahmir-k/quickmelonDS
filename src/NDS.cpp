@@ -5183,6 +5183,9 @@ void NDS::ARM7IOWrite32(u32 addr, u32 val)
             {
                 bool wasempty = IPCFIFO7.IsEmpty();
                 IPCFIFO7.Write(val);
+#ifdef LITEV_A7_NATIVE_WM
+                if ((val & 31) == 10) WMNative::Fifo7(*this, val);
+#endif
 #if defined(LITEV_A7_NATIVE_WM) && defined(LITEV_HLE_DIAG)
                 WMNative::TraceFifo(*this, 1, val);
 #endif
