@@ -1760,6 +1760,11 @@ endif()
 # narrow == the scalar per-term s32 accumulation with no overflow for ANY DS game.
 # Emu-core lever (does NOT move work off-core -> unaffected by the 4-core wall).
 # Default OFF -> byte-identical scalar behaviour. ARM64-only (guarded by include).
+option(LITEV_GX_DMA_ZEROCOPY "Geometry DMA: a chunk contiguous in main RAM goes to GPU3D::BulkWords in place (exact; debug.litev.gxzerocopy)" OFF)
+if (LITEV_GX_DMA_ZEROCOPY)
+    add_compile_definitions(LITEV_GX_DMA_ZEROCOPY=1)
+endif()
+
 option(LITEV_SPU_MIX_NEON "Vectorize the SPU 16-channel pan-accumulate with integer NEON (bit-exact)" OFF)
 if (LITEV_SPU_MIX_NEON)
     add_compile_definitions(LITEV_SPU_MIX_NEON=1)

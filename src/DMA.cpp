@@ -760,6 +760,20 @@ bool DMA::Bulk9(bool burststart)
 }
 #endif
 
+#ifdef LITEV_GX_DMA_ZEROCOPY
+// LITEV_GX_DMA_ZEROCOPY: a geometry DMA chunk contiguous in main RAM goes to GPU3D::BulkWords in place
+// (no copy to the stack first). Exact. Runtime off: LITEV_GXZEROCOPY=0 / debug.litev.gxzerocopy=0.
+static bool GXZeroCopyOn()
+{
+#if defined(__ANDROID__)
+    static const bool on = litevDmaPropDefaultOn("debug.litev.gxzerocopy");
+#else
+    static const bool on = !(getenv("LITEV_GXZEROCOPY") && atoi(getenv("LITEV_GXZEROCOPY")) == 0);
+#endif
+    return on;
+}
+#endif
+
 void DMA::Run9()
 {
     if (NDS.ARM9Timestamp >= NDS.ARM9Target) return;
@@ -848,6 +862,7 @@ void DMA::Run9()
                 u32 words[64];
                 const u32 n = IterCount < 64 ? IterCount : 64;
                 u32 cycles = 0;
+                const u32* bulkSrc = words;
 #ifdef LITEV_GX_DMA_PREFETCH
                 // Same words and cycles; the loop state lives in registers (the MainRAM byte loads
                 // otherwise force member reloads) and the display list is prefetched one chunk
@@ -859,6 +874,13 @@ void DMA::Run9()
                     const u8* bt = MRAMBurstTable.data();
                     const u8* reloaded = nullptr;
                     for (u32 o = 0; o < 512; o += 64) __builtin_prefetch(ram + ((src + o) & mask));
+#ifdef LITEV_GX_DMA_ZEROCOPY
+                    // the chunk is contiguous in main RAM (no mirror wrap): BulkWords reads it in place
+                    // instead of from a copy (nothing writes main RAM in between: exact)
+                    const u32 so = src & mask;
+                    if (inc == 4 && so + 4 * n <= mask + 1 && GXZeroCopyOn())
+                        bulkSrc = (const u32*)&ram[so];
+#endif
                     for (u32 i = 0; i < n; i++)
                     {
                         if (burststart || bt[bc] == 0)
@@ -869,6 +891,9 @@ void DMA::Run9()
                         }
                         cycles += bt[bc++];
                         burststart = false;
+#ifdef LITEV_GX_DMA_ZEROCOPY
+                        if (bulkSrc == words)
+#endif
                         words[i] = *(const u32*)&ram[src & mask];
                         src += inc;
                     }
@@ -894,7 +919,7 @@ void DMA::Run9()
                 NDS.ARM9Timestamp += (u64)cycles << NDS.ARM9ClockShift;
                 IterCount -= n;
                 RemCount -= n;
-                gpu3d.BulkWords(words, n);
+                gpu3d.BulkWords(bulkSrc, n);
 
                 if (NDS.ARM9Timestamp >= NDS.ARM9Target) goto gxfifo_done;
             }
