@@ -718,9 +718,13 @@ if (LITEV_A7HLE)
     add_compile_definitions(LITEV_A7HLE=1)
 endif()
 
-# A7_NATIVE_WM: the NitroSDK ARM7 wireless driver (WM: WMSP + the MAC layer under it) natively, per WM build found by
-# signature (unrecognised builds keep the emulated driver). Runtime: debug.litev.a7wm (prop on Android, env elsewhere).
-# See src/WMNative.h.
+# A7_NATIVE_WM: the NitroSDK ARM7 wireless driver (WM: the WMSP request layer + the WL MAC layer under it) runs as C++
+# from WM INITIALIZE on: the ARM9's WM requests never reach the ARM7 and the Wi-Fi chip's IRQ comes to the driver, which
+# programs the emulated chip as the guest's WL does (frames on air byte-identical; interoperates with consoles running the
+# emulated driver). Per WM build: the build is recognised by a scan for the WMSP dispatch table and a relocation-masked
+# hash of its handlers (NitroSDK 3.0 WM: Mario Kart DS, Animal Crossing WW); other builds keep the emulated driver.
+# Category B (deterministic; the guest's request / MP timing modelled, not cycle-exact). Runtime: debug.litev.a7wm
+# (prop on Android, env elsewhere; unset = on, 0 = off). See src/WMNative.h.
 option(LITEV_A7_NATIVE_WM "Native ARM7 WM wireless driver per WM build (category B)" OFF)
 if (LITEV_A7_NATIVE_WM)
     add_compile_definitions(LITEV_A7_NATIVE_WM=1)

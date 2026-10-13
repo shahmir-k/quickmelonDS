@@ -285,7 +285,7 @@ Ctx::~Ctx()
                                    (unsigned long long)stCb, (unsigned long long)stIrq, (unsigned long long)stEv, (unsigned long long)stMp, (unsigned long long)stRx);
 }
 
-// debug.litev.a7wm (prop on Android, env elsewhere): 0 off, 1 on; unset: the build default
+// debug.litev.a7wm (prop on Android, env elsewhere): 0 off; unset / 1: on (compiled in = on)
 bool Allowed(Ctx& c)
 {
     if (c.allow >= 0) return c.allow == 1;
@@ -295,7 +295,7 @@ bool Allowed(Ctx& c)
 #else
     const char* v = getenv("debug.litev.a7wm");
 #endif
-    return v ? atoi(v) == 1 : false;        // ponytail: default off until the gates pass
+    return v ? atoi(v) != 0 : true;
 }
 
 // ---- WM build recognition ----

@@ -1,4 +1,15 @@
-// LITEV_A7_NATIVE_WM: the NitroSDK ARM7 wireless driver (WM) natively, per WM build. See WMNative.cpp.
+// LITEV_A7_NATIVE_WM: the NitroSDK ARM7 wireless driver (WM) natively, per WM build.
+//
+// From WM INITIALIZE on (a recognised WM build: the WMSP request dispatch table found by a scan of the ARM7's memory,
+// the build id = a relocation-masked hash of its handlers), the ARM9's WM requests (PXI tag 10) are taken here instead
+// of reaching the ARM7, and the Wi-Fi chip's IRQ comes here instead of the ARM7: the guest's WM / WL threads, IRQ
+// handler and alarms never run. Two layers, as the guest's: WMSP (request handlers, WMStatus in ARM9 RAM, the callbacks
+// to the ARM9 through the shared slot, the MP send queue and port packets, the V-count MP alarms incl. the child's
+// V-count sync) and WL (chip bring-up, passive scan, beacon, auth / assoc on both sides, the MP CMD / reply / ACK
+// exchange, lifetimes). Frames on air are the guest's byte for byte; mixed sessions (native and emulated drivers) work.
+// Category B: deterministic; the guest's request latencies and MP cadence are modelled, not cycle-exact.
+// Runtime: debug.litev.a7wm (prop on Android, env elsewhere; unset = on, 0 = off); headless LITEV_A7WM_INST=<mask>.
+// Diagnostics (LITEV_HLE_DIAG): LITEV_WMTRACE=<prefix> (+ _A7W / _CHIP / _MEM) protocol traces; LITEV_A7WM_STATS=1.
 #pragma once
 #ifdef LITEV_A7_NATIVE_WM
 #include "types.h"
