@@ -19,6 +19,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#ifdef LITEV_GX_ASYNC_LOCAL
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <pthread.h>
+#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER) && defined(LITEV_TOPO_PIN)
+#include "LitevCores.h"
+#endif
+#if !defined(LITEV_REMOTE_GX_FASTSINK) || !defined(LITEV_GX_BULK_LEAN) || !defined(LITEV_GX_UNTIMED) || defined(LITEV_REMOTE_GX_MODEL) || defined(LITEV_GX_LAZY)
+#error "LITEV_GX_ASYNC_LOCAL needs LITEV_REMOTE_GX_FASTSINK, LITEV_GX_BULK_LEAN, LITEV_GX_UNTIMED, not LITEV_REMOTE_GX_MODEL / LITEV_GX_LAZY"
+#endif
+#endif
 #include "NDS.h"
 #include "GPU.h"
 #include "FIFO.h"
@@ -271,6 +283,199 @@ const u8 CmdNumParams[256] =
 
 void MatrixLoadIdentity(s32* m);
 
+#ifdef LITEV_GX_ASYNC_LOCAL
+// Runtime switch: debug.litev.gxasync (headless: env LITEV_GXASYNC), default on.
+static const bool GXAsyncOn = [] {
+#if defined(__ANDROID__)
+    return litevGxPropDefault("debug.litev.gxasync", 1) != 0;
+#else
+    const char* e = getenv("LITEV_GXASYNC");
+    return e ? atoi(e) != 0 : true;
+#endif
+}();
+
+struct GPU3D::AsyncGeo
+{
+    std::unique_ptr<GPU3D> Sh;                      // the full engine, run by the worker
+    static constexpr u32 Cap = 1u << 16;            // logged entries in flight
+    std::unique_ptr<CmdFIFOEntry[]> Buf { new CmdFIFOEntry[Cap] };
+    std::atomic<u32> Head {0};                      // entries published to the worker (emulator thread)
+    u32 Pend = 0;                                   // entries logged (emulator thread only; >= Head)
+    std::atomic<u32> Tail {0};                      // entries run (worker)
+    std::atomic<bool> Stop {false}, Sleeping {false};
+    std::mutex M;
+    std::condition_variable CV;
+    std::thread T;
+
+    void Run() noexcept
+    {
+#if defined(__ANDROID__) && defined(LITEV_PIN_RENDER) && defined(LITEV_TOPO_PIN)
+        LitevTopo::PinSelf(LitevTopo::CoreRole::RenderCritical);   // (with the render coordinator: off the emulator's core)
+#endif
+#if defined(__linux__) || defined(__ANDROID__)
+        pthread_setname_np(pthread_self(), "gx-async");
+#elif defined(__APPLE__)
+        pthread_setname_np("gx-async");
+#endif
+        for (;;)
+        {
+            u32 t = Tail.load(std::memory_order_relaxed);
+            u32 h = Head.load(std::memory_order_acquire);
+            if (t == h)
+            {
+                for (int i = 0; i < 4000 && h == t; i++)   // a display list comes in bursts
+                {
+#if defined(__aarch64__)
+                    __asm__ volatile("yield");
+#endif
+                    h = Head.load(std::memory_order_acquire);
+                }
+                if (h == t)
+                {
+                    std::unique_lock<std::mutex> lk(M);
+                    Sleeping.store(true, std::memory_order_seq_cst);
+                    CV.wait(lk, [&] { return Stop.load(std::memory_order_relaxed) || Head.load(std::memory_order_seq_cst) != t; });
+                    Sleeping.store(false, std::memory_order_relaxed);
+                    if (Stop.load(std::memory_order_relaxed) && Head.load(std::memory_order_acquire) == t) return;
+                    continue;
+                }
+            }
+            while (t != h)
+            {
+                const u32 i = t & (Cap - 1), n = std::min(h - t, Cap - i);
+                const CmdFIFOEntry* p = &Buf[i];
+                // the entries in order through the bulk executor; a SWAP_BUFFERS only flags the
+                // swap (the emulator thread hands the bank to the renderer at VBlank)
+                for (u32 j = 0; j < n;)
+                {
+                    u32 k = j;
+                    while (k < n && p[k].Command != 0x50) k++;
+                    if (k > j)
+                    {
+                        Sh->BulkPtr = p + j; Sh->BulkEnd = p + k;
+                        Sh->ExecuteCommandT<true>();
+                        Sh->BulkPtr = Sh->BulkEnd = nullptr;
+                    }
+                    if (k < n) Sh->FlushAttributes = p[k].Param & 0x3;   // (SubmitPolygon reads the W-buffer bit)
+                    j = k < n ? k + 1 : k;
+                }
+                t += n;
+                Tail.store(t, std::memory_order_release);
+            }
+        }
+    }
+};
+
+GPU3D::~GPU3D() noexcept { AsyncStop(false); }
+
+void GPU3D::AsyncPublish() noexcept
+{
+    AsyncGeo& a = *Async;
+    if (a.Pend == a.Head.load(std::memory_order_relaxed)) return;
+    a.Head.store(a.Pend, std::memory_order_seq_cst);
+    if (a.Sleeping.load(std::memory_order_seq_cst))
+    {
+        std::lock_guard<std::mutex> lk(a.M);
+        a.CV.notify_one();
+    }
+}
+
+void GPU3D::AsyncPush(const CmdFIFOEntry& e) noexcept
+{
+    AsyncGeo& a = *Async;
+    const u32 h = a.Pend;
+    if (__builtin_expect(h - a.Tail.load(std::memory_order_acquire) >= AsyncGeo::Cap, 0))
+    {
+        AsyncPublish();
+        while (h - a.Tail.load(std::memory_order_acquire) >= AsyncGeo::Cap) std::this_thread::yield();
+    }
+    a.Buf[h & (AsyncGeo::Cap - 1)] = e;
+    a.Pend = h + 1;
+    if ((a.Pend & 63) == 0) AsyncPublish();   // (and at the end of each batch: AsyncFlush)
+}
+
+void GPU3D::AsyncSync() noexcept
+{
+    if (!Async) return;
+    AsyncPublish();
+    AsyncGeo& a = *Async;
+    const u32 h = a.Head.load(std::memory_order_relaxed);
+    while (a.Tail.load(std::memory_order_acquire) != h)
+    {
+#if defined(__aarch64__)
+        __asm__ volatile("yield");
+#endif
+    }
+}
+
+// the state the geometry engine computes (shared vertex/polygon RAM: the pointers carry over)
+void GPU3D::CopyGeoFrom(const GPU3D& s) noexcept
+{
+    memcpy(ExecParams, s.ExecParams, sizeof(ExecParams)); ExecParamCount = s.ExecParamCount;
+    MatrixMode = s.MatrixMode;
+    memcpy(ProjMatrix, s.ProjMatrix, sizeof(ProjMatrix)); memcpy(PosMatrix, s.PosMatrix, sizeof(PosMatrix));
+    memcpy(VecMatrix, s.VecMatrix, sizeof(VecMatrix)); memcpy(TexMatrix, s.TexMatrix, sizeof(TexMatrix));
+    memcpy(ClipMatrix, s.ClipMatrix, sizeof(ClipMatrix)); ClipMatrixDirty = s.ClipMatrixDirty;
+    memcpy(Viewport, s.Viewport, sizeof(Viewport));
+    memcpy(ProjMatrixStack, s.ProjMatrixStack, sizeof(ProjMatrixStack));
+    memcpy(PosMatrixStack, s.PosMatrixStack, sizeof(PosMatrixStack));
+    memcpy(VecMatrixStack, s.VecMatrixStack, sizeof(VecMatrixStack));
+    memcpy(TexMatrixStack, s.TexMatrixStack, sizeof(TexMatrixStack));
+    ProjMatrixStackPointer = s.ProjMatrixStackPointer; PosMatrixStackPointer = s.PosMatrixStackPointer;
+    TexMatrixStackPointer = s.TexMatrixStackPointer;
+    PolygonMode = s.PolygonMode;
+    memcpy(CurVertex, s.CurVertex, sizeof(CurVertex)); memcpy(VertexColor, s.VertexColor, sizeof(VertexColor));
+    memcpy(TexCoords, s.TexCoords, sizeof(TexCoords)); memcpy(RawTexCoords, s.RawTexCoords, sizeof(RawTexCoords));
+    memcpy(Normal, s.Normal, sizeof(Normal));
+    memcpy(LightDirection, s.LightDirection, sizeof(LightDirection)); memcpy(SpecRecip, s.SpecRecip, sizeof(SpecRecip));
+    memcpy(LightColor, s.LightColor, sizeof(LightColor));
+    memcpy(MatDiffuse, s.MatDiffuse, sizeof(MatDiffuse)); memcpy(MatAmbient, s.MatAmbient, sizeof(MatAmbient));
+    memcpy(MatSpecular, s.MatSpecular, sizeof(MatSpecular)); memcpy(MatEmission, s.MatEmission, sizeof(MatEmission));
+    UseShininessTable = s.UseShininessTable; memcpy(ShininessTable, s.ShininessTable, sizeof(ShininessTable));
+    PolygonAttr = s.PolygonAttr; CurPolygonAttr = s.CurPolygonAttr; TexParam = s.TexParam; TexPalette = s.TexPalette;
+    memcpy(PosTestResult, s.PosTestResult, sizeof(PosTestResult)); memcpy(VecTestResult, s.VecTestResult, sizeof(VecTestResult));
+    for (int i = 0; i < 4; i++) TempVertexBuffer[i] = s.TempVertexBuffer[i];
+    VertexNum = s.VertexNum; VertexNumInPoly = s.VertexNumInPoly; NumConsecutivePolygons = s.NumConsecutivePolygons;
+    LastStripPolygon = s.LastStripPolygon;
+    CurVertexRAM = s.CurVertexRAM; CurPolygonRAM = s.CurPolygonRAM; CurRAMBank = s.CurRAMBank;
+    NumVertices = s.NumVertices; NumPolygons = s.NumPolygons; NumOpaquePolygons = s.NumOpaquePolygons;
+}
+
+void GPU3D::AsyncMaybeStart() noexcept
+{
+    if (Async || IsShadow || !GXAsyncOn || !GXUntimedOn || LITEV_HEADLESS(Headless) || Sink || !GeometryEnabled
+        || SinkVeto.load(std::memory_order_relaxed)) return;
+    auto a = std::make_unique<AsyncGeo>();
+    a->Sh = std::make_unique<GPU3D>(GPU);
+    GPU3D& sh = *a->Sh;
+    sh.IsShadow = true;
+    sh.CopyGeoFrom(*this);
+    sh.GeometryEnabled = true; sh.RenderingEnabled = RenderingEnabled;
+    sh.ZeroDotWLimit = ZeroDotWLimit; sh.DispCnt = DispCnt; sh.FlushAttributes = FlushAttributes;
+    sh.TimingFixed = true;
+    TimingFixed = true;   // as every console of a Netplay session: the timing a sink keeps
+    Sink = true;
+    AsyncGeo* ap = a.get();
+    a->T = std::thread([ap] { ap->Run(); });
+    Async = std::move(a);
+    Log(LogLevel::Info, "GX async: the geometry engine runs on a worker thread\n");
+}
+
+void GPU3D::AsyncStop(bool copyBack) noexcept
+{
+    if (!Async) return;
+    AsyncSync();
+    if (copyBack) CopyGeoFrom(*Async->Sh);
+    {
+        std::lock_guard<std::mutex> lk(Async->M);
+        Async->Stop.store(true);
+        Async->CV.notify_one();
+    }
+    Async->T.join();
+    Async.reset();
+}
+#endif
+
 GPU3D::GPU3D(melonDS::GPU& gpu) noexcept :
     NDS(gpu.NDS),
     GPU(gpu)
@@ -313,6 +518,9 @@ void GPU3D::Reset() noexcept
 {
 #ifdef LITEV_GX_LAZY
     LazyN = 0;
+#endif
+#ifdef LITEV_GX_ASYNC_LOCAL
+    if (Async) { AsyncStop(false); Sink = false; }   // (restarts at a VBlank)
 #endif
 #ifdef LITEV_GXFIFO_UNIFIED
     CmdQHead = PipeN = FifoN = 0;
@@ -441,6 +649,9 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
 {
 #ifdef LITEV_GX_LAZY
     if (file->Saving) LazySync(); else LazyN = 0;
+#endif
+#ifdef LITEV_GX_ASYNC_LOCAL
+    if (Async) { AsyncSync(); if (file->Saving) CopyGeoFrom(*Async->Sh); }   // (loading: the worker restarts below)
 #endif
     file->Section("GP3D");
 
@@ -704,6 +915,15 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     file->Var32(&TexPalette);
 
     RenderFrameIdentical = false;
+#ifdef LITEV_GX_ASYNC_LOCAL
+    if (Async && !file->Saving)
+    {
+        GPU3D& sh = *Async->Sh;
+        sh.CopyGeoFrom(*this);
+        sh.RenderingEnabled = RenderingEnabled; sh.ZeroDotWLimit = ZeroDotWLimit; sh.DispCnt = DispCnt;
+        sh.FlushAttributes = FlushAttributes;
+    }
+#endif
 }
 
 
@@ -934,12 +1154,25 @@ void GPU3D::UpdateClipMatrix() noexcept
 std::atomic<bool> GPU3D::SinkVeto{false};
 void GPU3D::SinkOff(const char* why) noexcept
 {
+#ifdef LITEV_GX_ASYNC_LOCAL
+    if (IsShadow) return;
+    if (Async)
+    {
+        AsyncStop(true);   // the full engine's state, as of every entry run so far
+        Sink = false;
+        Log(LogLevel::Info, "GX async off (%s): the geometry engine runs here again\n", why);
+        return;
+    }
+#endif
     Sink = false;
     Log(LogLevel::Warn, "GX sink off (%s): this remote copy's geometry results are stale until resynced\n", why);
 }
 // the game uses geometry results (any console of the process): no sinks from now on
 void GPU3D::SinkUse(const char* what, u32 addr) noexcept
 {
+#ifdef LITEV_GX_ASYNC_LOCAL
+    if (IsShadow) return;   // (the worker's engine: its test commands)
+#endif
     if (!SinkVeto.exchange(true, std::memory_order_relaxed))
         Log(LogLevel::Info, "GX sink veto: the game uses geometry results (%s %08X)\n", what, addr);
     if (Sink) SinkOff(what);
@@ -2164,10 +2397,14 @@ void GPU3D::CalculateLighting() noexcept
     LITE_PROFILE_ADD(melonDS::LiteProfile::g_Frame.LightingCalls);
 
 #ifdef LITEV_FF_HEADLESS3D
-    if (LITEV_HEADLESS(Headless) && !FFHeadlessNow)
+    if ((LITEV_HEADLESS(Headless) && !FFHeadlessNow)
 #else
-    if (LITEV_HEADLESS(Headless))
+    if (LITEV_HEADLESS(Headless)
 #endif
+#ifdef LITEV_GX_ASYNC_LOCAL
+        || Async   // (the worker lights the vertices)
+#endif
+        )
     {
         s32 c = __builtin_popcount(CurPolygonAttr & 0xF);
         NormalPipeline = 7;
@@ -2686,6 +2923,9 @@ gxfifo_threaded_top:
     else entry = CmdFIFORead();
 #else
     CmdFIFOEntry entry = CmdFIFORead();
+#endif
+#ifdef LITEV_GX_ASYNC_LOCAL
+    if (Async) AsyncPush(entry);   // (the worker's engine runs every entry this one runs)
 #endif
 
     //printf("FIFO: processing %02X %08X. Levels: FIFO=%d, PIPE=%d\n", entry.Command, entry.Param, CmdFIFO->Level(), CmdPIPE->Level());
@@ -4472,9 +4712,12 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
         [0x29] = 3, [0x40] = 3, [0x50] = 4, [0x70] = 4, [0x71] = 4, [0x72] = 4,
     };
 #ifdef LITEV_FF_HEADLESS3D
-    const bool lightCycles = LITEV_HEADLESS(Headless) && !FFHeadlessNow;
+    bool lightCycles = LITEV_HEADLESS(Headless) && !FFHeadlessNow;
 #else
-    const bool lightCycles = LITEV_HEADLESS(Headless);
+    bool lightCycles = LITEV_HEADLESS(Headless);
+#endif
+#ifdef LITEV_GX_ASYNC_LOCAL
+    if (Async) lightCycles = true;   // (the worker lights the vertices)
 #endif
     u32 numCmds = NumCommands, cur = CurCommand, pc = ParamCount, tp = TotalParams;
     // the current command (mid-way from an earlier call) must be one this pass runs, and
@@ -4491,6 +4734,14 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
         if (pc + 1 < tp && numCmds && GXSinkSkipOn)
         {
             const u32 t = std::min(tp - 1 - pc, n - i);
+#ifdef LITEV_GX_ASYNC_LOCAL
+            if (Async)
+                for (u32 j = 0; j < t; j++)
+                {
+                    CmdFIFOEntry e; e._contents = 0; e.Command = cur & 0xFF; e.Param = words[i + j];
+                    AsyncPush(e);
+                }
+#endif
             ran = true;
             pc += t;
             i += t - 1;
@@ -4515,6 +4766,9 @@ u32 GPU3D::SinkWords(const u32* words, u32 n, bool& ran) noexcept
             if ((cur & 0xFF) || (numCmds == 4 && cur == 0))
             {
                 ran = true;   // an entry {cur & 0xFF, val}; the command runs on its last one
+#ifdef LITEV_GX_ASYNC_LOCAL
+                if (Async) { CmdFIFOEntry e; e._contents = 0; e.Command = cur & 0xFF; e.Param = val; AsyncPush(e); }
+#endif
                 if (pc >= tp) switch (kKind[cur & 0xFF])
                 {
                 case 1: // vertex: SubmitVertex's sink counting; AddCycles(3) (the pipeline counters aside)
@@ -4626,6 +4880,9 @@ u32 GPU3D::SinkMemo(const u32* words, u32 n, bool& ran) noexcept
 
 void GPU3D::BulkWords(const u32* words, u32 n) noexcept
 {
+#ifdef LITEV_GX_ASYNC_LOCAL
+    struct AsyncFlushAtEnd { GPU3D* g; ~AsyncFlushAtEnd() { g->AsyncFlush(); } } asyncFlush {this};
+#endif
     // contract: n <= 64 (the decode buffer below; after a SWAP_BUFFERS the rest goes to the 260-entry FIFO). A larger
     // call is a caller bug: split it so it can never overrun the stack (as consecutive calls: the decoder state carries)
     for (; n > 64; words += 64, n -= 64) BulkWords(words, 64);
@@ -4899,6 +5156,9 @@ void GPU3D::ZeroTiming() noexcept
 // A SWAP_BUFFERS still holds the engine until VBlank and keeps its 325-cycle busy window after.
 void GPU3D::RunUntimed() noexcept
 {
+#ifdef LITEV_GX_ASYNC_LOCAL
+    struct AsyncFlushAtEnd { GPU3D* g; ~AsyncFlushAtEnd() { g->AsyncFlush(); } } asyncFlush {this};
+#endif
     const u64 now = NDS.ARM9Timestamp >> NDS.ARM9ClockShift;
     const s32 elapsed = (s32)(now - Timestamp);
     Timestamp = now;
@@ -5028,6 +5288,15 @@ void GPU3D::VBlank() noexcept
 {
 #ifdef LITEV_GX_LAZY
     LazySync();
+#endif
+#ifdef LITEV_GX_ASYNC_LOCAL
+    if (Async)
+    {
+        // the bank the worker built (in this console's vertex/polygon RAM)
+        AsyncSync();
+        const GPU3D& sh = *Async->Sh;
+        NumVertices = sh.NumVertices; NumPolygons = sh.NumPolygons; NumOpaquePolygons = sh.NumOpaquePolygons;
+    }
 #endif
 #ifdef LITEV_REMOTE_GX_SINK
     if (Sink && SinkVeto.load(std::memory_order_relaxed)) SinkOff("another console used geometry results");
@@ -5163,8 +5432,19 @@ void GPU3D::VBlank() noexcept
 #endif
 
             FlushRequest = 0;
+#ifdef LITEV_GX_ASYNC_LOCAL
+            if (Async)
+            {
+                GPU3D& sh = *Async->Sh;
+                sh.CurRAMBank = CurRAMBank; sh.CurVertexRAM = CurVertexRAM; sh.CurPolygonRAM = CurPolygonRAM;
+                sh.NumVertices = sh.NumPolygons = sh.NumOpaquePolygons = 0;
+            }
+#endif
         }
     }
+#ifdef LITEV_GX_ASYNC_LOCAL
+    AsyncMaybeStart();
+#endif
 }
 
 
@@ -5478,6 +5758,9 @@ void GPU3D::Write16(u32 addr, u16 val) noexcept
     case 0x04000610:
         val &= 0x7FFF;
         ZeroDotWLimit = (val * 0x200) + 0x1FF;
+#ifdef LITEV_GX_ASYNC_LOCAL
+        if (Async) { AsyncSync(); Async->Sh->ZeroDotWLimit = ZeroDotWLimit; }
+#endif
         return;
     }
 
@@ -5560,6 +5843,9 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
     case 0x04000610:
         val &= 0x7FFF;
         ZeroDotWLimit = (val * 0x200) + 0x1FF;
+#ifdef LITEV_GX_ASYNC_LOCAL
+        if (Async) { AsyncSync(); Async->Sh->ZeroDotWLimit = ZeroDotWLimit; }
+#endif
         return;
     }
 

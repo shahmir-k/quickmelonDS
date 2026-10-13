@@ -97,7 +97,7 @@ class GPU3D
 {
 public:
     GPU3D(melonDS::GPU& gpu) noexcept;
-    ~GPU3D() noexcept = default;
+    ~GPU3D() noexcept;
     void Reset() noexcept;
 
     void DoSavestate(Savestate* file) noexcept;
@@ -176,6 +176,24 @@ private:
     template<bool Bulk> void ExecuteCommandT() noexcept;
     const CmdFIFOEntry* BulkPtr = nullptr;
     const CmdFIFOEntry* BulkEnd = nullptr;
+#endif
+#ifdef LITEV_GX_ASYNC_LOCAL
+    // LITEV_GX_ASYNC_LOCAL (category B): the local console's geometry engine runs as a Netplay remote's
+    // (Sink + TimingFixed: the guest-visible state only) on the emulator thread, and every command
+    // entry it runs is logged for a worker thread that runs the full engine on a shadow GPU3D
+    // (Async->Sh) into this console's vertex/polygon RAM, which the renderer reads as before. Synced
+    // (AsyncSync) at VBlank, savestates and ZeroDotWLimit writes; the first geometry result the game
+    // reads (SinkUse) copies the shadow's state back (AsyncStop) and the console runs full from then.
+    struct AsyncGeo;
+    std::unique_ptr<AsyncGeo> Async;
+    bool IsShadow = false;
+    void AsyncMaybeStart() noexcept;
+    void AsyncStop(bool copyBack) noexcept;
+    void AsyncSync() noexcept;
+    void AsyncPush(const CmdFIFOEntry& e) noexcept;
+    void AsyncPublish() noexcept;   // hand the logged entries to the worker
+    void AsyncFlush() noexcept { if (Async) AsyncPublish(); }
+    void CopyGeoFrom(const GPU3D& s) noexcept;
 #endif
 #ifdef LITEV_GX_LAZY
     // LITEV_GX_LAZY (inspired by DSperate's geometry command log, https://github.com/beebono/DSperate,
