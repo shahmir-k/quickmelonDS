@@ -1490,7 +1490,7 @@ int main(int argc, char** argv)
                 if (cutXferPort && eligible)
                 {
                     melonDS::AmbientLAN::HandoffOfferStatus offer{};
-                    if (ambient->GetHandoffOfferStatus(offer) && offer.Accepted && offer.Epoch == nextEpoch)
+                    if (ambient->GetHandoffOfferStatus(offer) && offer.Accepted && (!host || offer.Epoch == nextEpoch))
                     {
                         if (!ambient->PublishHandoffRom(cutOwnRom))
                         { fprintf(stderr, "CUTFENCE local ROM manifest failed\n"); return 2; }
@@ -1512,12 +1512,20 @@ int main(int argc, char** argv)
                 if (eligible && offerReady && romReady && (frame % 120) == 0)
                     printf("CUTFENCE %s waiting f%d busy=%02x queued=%zu peerFence=%d\n", cutRole, frame,
                            nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames(), ambient->HasPeerHandoffFence());
-                if (eligible && offerReady && romReady &&
-                    (host || ambient->HasPeerHandoffFence()) &&
+                // Who freezes first is the game's MP role, not the handoff role: an MP client is
+                // inside an exchange at nearly every frame boundary while its host keeps issuing
+                // commands, so it waits for the peer's fence and then runs on to its own idle cut
+                // (the host's last ACK retires). Anyone else may start the fence when idle.
+                const bool mayStartFence = ambient->HasPeerHandoffFence() ||
+                    (cutXferPort ? !nds->Wifi.IsMPClientMode() : host);
+                if (eligible && offerReady && romReady && mayStartFence &&
                     nds->Wifi.HandoffBusyMask() == 0 && ambient->HandoffQueuedFrames() == 0)
                 {
                     ++cutAttempt;
-                    const u64 epoch = host ? epochBase + (u64)cutAttempt : ambient->PeerHandoffEpoch();
+                    melonDS::AmbientLAN::HandoffOfferStatus accepted{};
+                    const u64 epoch = ambient->HasPeerHandoffFence() ? ambient->PeerHandoffEpoch() :
+                        host ? epochBase + (u64)cutAttempt :
+                        ambient->GetHandoffOfferStatus(accepted) ? accepted.Epoch : 0;
                     printf("CUTFENCE %s attempt=%d holding f%d clock=%llu epoch=%llx\n", cutRole, cutAttempt,
                            frame, (unsigned long long)nds->GetSysTimestamp(), (unsigned long long)epoch);
                     fflush(stdout);

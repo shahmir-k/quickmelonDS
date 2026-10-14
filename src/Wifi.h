@@ -176,6 +176,7 @@ public:
     const u8* GetBSSID() const;
     bool IsPoweredOn() const { return PowerOn; }
     bool IsMultiplayer() const { return IsMP; }
+    bool IsMPClientMode() const { return IsMP && IsMPClient; }   // (live handoff: who may freeze first)
     // Live-link migration may snapshot only after all chip-side transfers have completed.
     // A nonzero mask is a reason to defer the checkpoint to a later emulated boundary.
     u32 HandoffBusyMask() const

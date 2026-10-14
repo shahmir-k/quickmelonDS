@@ -901,7 +901,8 @@ bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
 {
     Link* l = HandoffLink();
     if (!l || !HandoffBuildCompatible() || !epoch || l->FenceAbort || l->SequenceOverflow) return false;
-    const auto& effectiveToken = token == std::array<u8, 16>{} && l->PeerFence ? l->FenceToken : token;
+    // no token: the peer's fence token, else the accepted offer's (either side may fence first)
+    const auto& effectiveToken = token != std::array<u8, 16>{} ? token : l->PeerFence ? l->FenceToken : l->OfferToken;
     if (Cfg.RequireHandoffOffer &&
         !HandoffOfferReady(epoch, effectiveToken, static_cast<HandoffMode>(l->OfferMode))) return false;
     if (epoch <= l->LastClosedFenceEpoch) return false;
@@ -913,8 +914,8 @@ bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
     }
     else
     {
-        if (token == std::array<u8, 16>{}) return false;
-        l->FenceToken = token;
+        if (effectiveToken == std::array<u8, 16>{}) return false;
+        l->FenceToken = effectiveToken;
     }
     l->FenceEpoch = epoch;
     l->ActiveMs = NowMs();
