@@ -846,6 +846,8 @@ static void NetplayHarnessXfer(NetplaySetup& setup)
     };
 }
 
+static int net_local_for_stamp(NetplayInput* n) { return n ? n->LocalPlayer() : 0; }
+
 int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts,
            std::vector<PreparedMPConsole> prepared, LiveExitResult* ended)
 {
@@ -1501,6 +1503,13 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                 }
                 // the frame's scanlines: the app paces by them (a game that rewinds VCOUNT, as the Wi-Fi
                 // client of a DS multiplayer session does to follow the host, runs longer frames)
+                if (f == 0 && inst == net_local_for_stamp(net.get()) && getenv("LITEV_CUT_T0_US"))
+                {
+                    const long long t0 = atoll(getenv("LITEV_CUT_T0_US"));
+                    const long long now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    printf("CUTFENCE t=%lldms first Netplay frame (inst%d)\n", (now - t0) / 1000, inst);
+                    fflush(stdout);
+                }
                 const u32 lines = bi.nds->RunFrame();
                 const double lineScale = lines ? lines / 263.0 : 1.0;
 #ifdef LITEV_NP_SPEED

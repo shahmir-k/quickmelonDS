@@ -1940,6 +1940,23 @@ void NetplayLiveExit::Cancel()
     Changed.notify_all();
 }
 
+// tests: LITEV_HANDOFF_SIM_RTT_MS models a slow link on the handoff's TCP messages (sender side):
+// a message of n bytes arrives half a round trip later, after the TCP slow-start rounds its size
+// needs (initial window 10 x 1460 B, doubling per round trip, per connection) and n / 10 MB/s.
+struct SimTcp
+{
+    double HalfRttMs = getenv("LITEV_HANDOFF_SIM_RTT_MS") ? atof(getenv("LITEV_HANDOFF_SIM_RTT_MS")) / 2 : 0;
+    double Window = 14600;
+    void Connect() const { if (HalfRttMs) usleep((useconds_t)(HalfRttMs * 2000)); }   // SYN, SYN-ACK
+    void Send(size_t n)
+    {
+        if (!HalfRttMs) return;
+        int rounds = 0;
+        for (double sent = Window; sent < n; sent += Window) { Window *= 2; rounds++; }
+        usleep((useconds_t)((HalfRttMs + rounds * HalfRttMs * 2 + n / 10000.0) * 1000));
+    }
+};
+
 u64 NetplayHandoffCompat()
 {
     return LITEV_HANDOFF_COMPAT;
@@ -2041,8 +2058,10 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
         Sha256 firmwareSha; firmwareSha.Add(local.Firmware.data(), local.Firmware.size()); firmwareSha.Get(h.FirmwareSha);
         return h;
     };
+    SimTcp sim;
     auto sendState = [&](int fd) {
         const Header h = makeHeader();
+        sim.Send(sizeof(h) + local.Firmware.size() + packed.size());
         if (!sendBytes(fd, &h, sizeof(h))) return false;
         if (!sendBytes(fd, local.Firmware.data(), local.Firmware.size())) return false;
         const u64 cut = getenv("LITEV_HANDOFF_XFER_CUT") ? strtoull(getenv("LITEV_HANDOFF_XFER_CUT"), nullptr, 10) : 0;
@@ -2121,7 +2140,8 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
         if (!mine.Ok && reason.empty()) reason = "unspecified";
         mine.Length = (u8)std::min(reason.size(), sizeof(mine.Reason));
         memcpy(mine.Reason, reason.data(), mine.Length);
-        const bool exchanged = host ? recvBytes(fd, &theirs, sizeof(theirs)) && sendBytes(fd, &mine, sizeof(mine))
+        if (!host) sim.Send(sizeof(mine));
+        const bool exchanged = host ? recvBytes(fd, &theirs, sizeof(theirs)) && (sim.Send(sizeof(mine)), sendBytes(fd, &mine, sizeof(mine)))
                                     : sendBytes(fd, &mine, sizeof(mine)) && recvBytes(fd, &theirs, sizeof(theirs));
         const char* who = host ? "guest" : "host";
         if (!mine.Ok) error = "this device rejected the peer checkpoint: " + reason;
@@ -2181,6 +2201,7 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
         }
         if (fd < 0) { error = "checkpoint host connect timeout"; return false; }
     }
+    if (local.Player == 1) sim.Connect();
     SetupSocket(fd, timeoutS);
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     bool ok;
@@ -2312,9 +2333,11 @@ bool NetplayAwaitLiveStart(u16 tcpPort, const std::string& hostAddress,
     if (fd < 0) { error = "live-start peer unavailable or cancelled"; return false; }
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
     Start other{};
+    SimTcp sim;
+    if (local.Player == 1) sim.Connect();
     const bool exchanged = local.Player == 0 ?
-        io(fd, &other, sizeof(other), false) && io(fd, &mine, sizeof(mine), true) :
-        io(fd, &mine, sizeof(mine), true) && io(fd, &other, sizeof(other), false);
+        io(fd, &other, sizeof(other), false) && (sim.Send(sizeof(mine)), io(fd, &mine, sizeof(mine), true)) :
+        (sim.Send(sizeof(mine)), io(fd, &mine, sizeof(mine), true)) && io(fd, &other, sizeof(other), false);
     close(fd);
     if (!exchanged) { error = "live-start rendezvous interrupted"; return false; }
     if (local.Player == 0 && getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE") &&

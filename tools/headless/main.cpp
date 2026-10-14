@@ -1447,7 +1447,7 @@ int main(int argc, char** argv)
                 lanNext += std::chrono::microseconds(16667);
                 std::this_thread::sleep_until(lanNext);
             }
-            if (ambient && cutDir && cutRole && frame >= cutMinFrame && ambient->GetStats().Links)
+            if (ambient && cutDir && cutRole && (frame >= cutMinFrame || ambient->HasPeerHandoffFence()) && ambient->GetStats().Links)
             {
                 const bool host = strcmp(cutRole, "host") == 0;
                 const std::string abort = std::string(cutDir) + "/abort";
@@ -1557,6 +1557,18 @@ int main(int argc, char** argv)
                         // transient queued packet races the peer's fence response.
                         if (nds->Wifi.HandoffBusyMask() || !ambient->GetStats().Links)
                         { ambient->AbortHandoffFence(); break; }
+                        if (getenv("LITEV_AMBIENT_FENCE_TRACE"))
+                        {
+                            static auto lastTrace = std::chrono::steady_clock::now();
+                            if (std::chrono::steady_clock::now() - lastTrace > std::chrono::milliseconds(200))
+                            {
+                                lastTrace = std::chrono::steady_clock::now();
+                                const auto fs = ambient->GetHandoffFenceStats();
+                                printf("CUTFENCE %s t=%ldms fencing: local=%u retired=%u peer=%u peerRetired=%u ready=%d/%d queued=%zu peerFence=%d\n",
+                                       cutRole, frozenMs(), fs.LastSent, fs.RetiredThrough, fs.PeerLastSent, fs.PeerRetiredThrough,
+                                       fs.LocalReady, fs.PeerReady, ambient->HandoffQueuedFrames(), ambient->HasPeerHandoffFence());
+                            }
+                        }
                         if (ambient->CanAcknowledgeHandoffFence())
                         {
                             if (const char* fail = getenv("LITEV_AMBIENT_CUT_INJECT_FAIL"); fail && strcmp(fail, cutRole) == 0)
@@ -1934,6 +1946,10 @@ int main(int argc, char** argv)
                             // LITEV_AMBIENT_CUT_TRIAL_SCRIPT: this player's input script for the trial
                             std::vector<std::string> trialScripts(2);
                             if (const char* ts = getenv("LITEV_AMBIENT_CUT_TRIAL_SCRIPT")) trialScripts[host ? 0 : 1] = ts;
+                            {   // (MPTest stamps the first Netplay frame against the freeze)
+                                const auto t0 = std::chrono::duration_cast<std::chrono::microseconds>(cutFreezeStart.time_since_epoch()).count();
+                                setenv("LITEV_CUT_T0_US", std::to_string(t0).c_str(), 1);
+                            }
                             liteds::LiveExitResult ended;
                             const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, trialScripts, std::move(replicas),
                                                                    liveLocal ? &ended : nullptr);

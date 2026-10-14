@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <chrono>
+#include <thread>
 #include <algorithm>
 
 #ifdef __WIN32__
@@ -154,6 +155,7 @@ AmbientLAN::AmbientLAN(const Config& cfg) : Cfg(cfg), Vis(cfg.Vis)
     Snap = std::make_shared<const std::vector<Peer>>();
     View = Snap;
 
+    if (const char* rtt = getenv("LITEV_HANDOFF_SIM_RTT_MS")) SimHalfRttUs = (u64)(atof(rtt) * 500);
     if (enet_initialize() != 0) { Platform::Log(Platform::LogLevel::Error, "Ambient: enet init failed\n"); return; }
     for (int i = 0; i < 64 && !Host; i++)
     {
@@ -859,15 +861,27 @@ void AmbientLAN::SettleMPGaps(Link& l, u32 now)
 void AmbientLAN::SettleHandoffMP(Link& l, u32 now)
 {
     if (!l.LocalFence || !l.PeerFence || l.FenceAbort || l.SequenceOverflow ||
-        l.RetiredThrough >= l.PeerLastSent || HandoffQueuedFrames()) return;
-    const u32 quietSince = std::max({l.LocalFenceMs, l.PeerFenceMs, l.LastMPMs});
-    if (now - quietSince < kHandoffMPDrainMs) return;
-    // The source game is frozen and its RX queue is empty. Packets not seen
-    // during this drain interval were lost on the unsequenced channel, not
-    // pending game work. Keep the peer-fence sequence as a drop cutoff across
-    // rollback so a very late pre-cut packet cannot enter resumed gameplay.
+        l.RetiredThrough >= l.PeerLastSent) return;
+    // Both fences are known and this side's game is frozen at its cut: it consumes nothing more,
+    // so every packet of the peer's up to its fence mark not consumed by now - queued, still in
+    // flight or lost - is lost to both checkpoints alike. Retire them now: waiting 1 s for the
+    // unreliable channel to go quiet (as this did) froze both games 1-2.5 s longer at every cut.
+    // Late arrivals are dropped at admission (DropThroughSeq), also across a rollback.
+    (void)now;
     if (l.PeerLastSent - l.RetiredThrough > 4096)
     { l.SequenceOverflow = true; return; }
+    const int slot = (int)(&l - Links);
+    for (auto it = RX.begin(); it != RX.end(); )
+    {
+        const auto* h = (const MPPacketHeader*)it->Packet->data;
+        if (it->Slot == slot && h->SenderID && h->SenderID <= l.PeerLastSent)
+        {
+            const QueuedPacket q = *it;
+            it = RX.erase(it);
+            DestroyRX(q);
+        }
+        else ++it;
+    }
     if (kFenceTrace)
         fprintf(stderr, "AMBFENCE drained lost MP %u..%u\n", l.RetiredThrough + 1, l.PeerLastSent);
     l.RetiredThrough = l.PeerLastSent;
@@ -1257,26 +1271,42 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
     case ENET_EVENT_TYPE_RECEIVE:
     {
         Link* l = (Link*)ev.peer->data;
-        if (l && ev.channelID == Chan_Ctl && ev.packet->dataLength == kHandoffRomBytes)
-            ReceiveHandoffRom(*l, ev.packet->data, ev.packet->dataLength);
-        else if (l && ev.channelID == Chan_Ctl && ev.packet->dataLength == 36)
+        if (l && ev.channelID == Chan_Ctl)
         {
-            const u8* d = ev.packet->data;
-            if (G32(d) == kHandoffCtl)
-            {
-                const u32 type = G32(d + 4);
-                const u64 epoch = (u64)G32(d + 8) | ((u64)G32(d + 12) << 32);
-                const u32 mark = G32(d + 16);
-                std::array<u8, 16> token{};
-                memcpy(token.data(), d + 20, token.size());
-                ReceiveHandoffControl(*l, type, epoch, mark, token);
-            }
+            if (SimHalfRttUs)   // (in order, as the reliable channel delivers them)
+                DelayedControls.push_back({NowUs() + SimHalfRttUs, (int)(l - Links), l->ID,
+                                           std::vector<u8>(ev.packet->data, ev.packet->data + ev.packet->dataLength)});
+            else ReceiveControl(*l, ev.packet->data, ev.packet->dataLength);
         }
         enet_packet_destroy(ev.packet);
         break;
     }
     default:
         break;
+    }
+}
+
+void AmbientLAN::DeliverDelayedControls()
+{
+    while (!DelayedControls.empty() && DelayedControls.front().DueUs <= NowUs())
+    {
+        const DelayedControl d = std::move(DelayedControls.front());
+        DelayedControls.erase(DelayedControls.begin());
+        if (Links[d.Slot].P && Links[d.Slot].ID == d.ID) ReceiveControl(Links[d.Slot], d.Bytes.data(), d.Bytes.size());
+    }
+}
+
+void AmbientLAN::ReceiveControl(Link& l, const u8* d, size_t length)
+{
+    if (length == kHandoffRomBytes) ReceiveHandoffRom(l, d, length);
+    else if (length == 36 && G32(d) == kHandoffCtl)
+    {
+        const u32 type = G32(d + 4);
+        const u64 epoch = (u64)G32(d + 8) | ((u64)G32(d + 12) << 32);
+        const u32 mark = G32(d + 16);
+        std::array<u8, 16> token{};
+        memcpy(token.data(), d + 20, token.size());
+        ReceiveHandoffControl(l, type, epoch, mark, token);
     }
 }
 
@@ -1336,7 +1366,18 @@ void AmbientLAN::Pump(int type)
     int timeout = type == 2 ? RecvTimeout : 0;
     u32 last = NowMs();
     ENetEvent ev;
-    while (enet_host_service(Host, &ev, timeout) > 0)
+    // (tests, LITEV_HANDOFF_SIM_RTT_MS: delayed control messages arrive during the wait, as real ones do)
+    auto service = [&] {
+        if (!SimHalfRttUs) return enet_host_service(Host, &ev, timeout);
+        for (int waited = 0;; waited++)
+        {
+            DeliverDelayedControls();
+            const int r = enet_host_service(Host, &ev, 0);
+            if (r != 0 || waited >= timeout) return r;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+    while (service() > 0)
     {
         if (ev.type == ENET_EVENT_TYPE_RECEIVE && ev.channelID == Chan_MP)
         {
@@ -1389,6 +1430,7 @@ int AmbientLAN::Pop(u8* data, u64* timestamp)
 
 void AmbientLAN::Process()
 {
+    DeliverDelayedControls();
     const u32 frameBlocked = FrameBlockedUs, frameExchanges = FrameExchanges;
     StFrames++;
     StLastBlocked = FrameBlockedUs; StLastExch = FrameExchanges;

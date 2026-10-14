@@ -175,7 +175,14 @@ public:
     };
 
 private:
-    mutable u32 LoggedBuildMismatch = 0;   // (HandoffBuildCompatible: the peer BuildID last reported)
+    mutable u32 LoggedBuildMismatch = 0;
+    // tests: LITEV_HANDOFF_SIM_RTT_MS delivers handoff control messages half that later
+    struct Link;
+    struct DelayedControl { u64 DueUs; int Slot; u64 ID; std::vector<u8> Bytes; };
+    void ReceiveControl(Link& l, const u8* d, size_t length);
+    void DeliverDelayedControls();
+    std::vector<DelayedControl> DelayedControls;
+    u64 SimHalfRttUs = 0;   // (HandoffBuildCompatible: the peer BuildID last reported)
     struct Link
     {
         u64 ID = 0;
