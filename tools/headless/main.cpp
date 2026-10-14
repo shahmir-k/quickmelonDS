@@ -756,6 +756,8 @@ int main(int argc, char** argv)
     int cutAttempt = 0;
     bool cutRetryReady = false;
     bool cutResetDelayed = false;
+    bool cutOfferSent = false;
+    std::array<u8, 16> cutOfferToken{};
     NetplayRom cutOwnRom, cutPeerRom;
     if (cutXferPort)
     {
@@ -773,6 +775,7 @@ int main(int argc, char** argv)
         c.DeviceID = getenv("LITEV_AMBIENT_ID") ? strtoull(getenv("LITEV_AMBIENT_ID"), nullptr, 16)
                                                 : std::hash<std::string>()(opt.ambient) ^ ((u64)getpid() << 32);
         c.Name = opt.ambient;
+        c.RequireHandoffOffer = cutXferPort != 0;
         memcpy(c.GameCode, nds->NDSCartSlot.GetCart()->GetHeader().GameCode, 4);
         if (getenv("LITEV_AMBIENT_UPORT")) c.UnicastPort = (u16)atoi(getenv("LITEV_AMBIENT_UPORT"));
         if (getenv("LITEV_AMBIENT_PPORT")) c.PresencePort = (u16)atoi(getenv("LITEV_AMBIENT_PPORT"));   // (tests: a router that drops broadcast)
@@ -1064,6 +1067,8 @@ int main(int argc, char** argv)
                 if (cutRetryAfterAbort && cutAttempt == 1 && cutDir && cutRole)
                 {
                     cutRetryReady = true;
+                    cutOfferSent = false;
+                    cutOfferToken = {};
                     if (strcmp(cutRole, "host") == 0 &&
                         getenv("LITEV_AMBIENT_CUT_STALE_REPLAY") &&
                         *getenv("LITEV_AMBIENT_CUT_STALE_REPLAY"))
@@ -1118,7 +1123,39 @@ int main(int argc, char** argv)
                 auto exists = [](const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (!f) return false; fclose(f); return true; };
                 auto mark = [](const std::string& p) { FILE* f = fopen(p.c_str(), "wb"); if (!f) return false; fclose(f); return true; };
                 const bool retryOpen = cutRetryAfterAbort && cutAttempt == 1 && cutRetryReady;
-                if (((cutAttempt == 0 && !exists(abort)) || retryOpen) &&
+                const bool eligible = (cutAttempt == 0 && !exists(abort)) || retryOpen;
+                const u64 nextEpoch = 0x48414e444f464630ull + (u64)cutAttempt + 1;
+                if (cutXferPort && eligible)
+                {
+                    if (host && !cutOfferSent)
+                    {
+                        std::random_device random;
+                        for (u8& byte : cutOfferToken) byte = (u8)random();
+                        if (ambient->ProposeHandoff(nextEpoch, cutOfferToken,
+                                                    melonDS::AmbientLAN::HandoffPlainNetplay))
+                        {
+                            cutOfferSent = true;
+                            printf("CUTFENCE host offered epoch=%llx\n", (unsigned long long)nextEpoch);
+                            fflush(stdout);
+                        }
+                    }
+                    else if (!host)
+                    {
+                        u64 offeredEpoch = 0;
+                        melonDS::AmbientLAN::HandoffMode offeredMode;
+                        if (ambient->IncomingHandoffOffer(offeredEpoch, offeredMode) &&
+                            offeredMode == melonDS::AmbientLAN::HandoffPlainNetplay &&
+                            ambient->RespondToHandoffOffer(offeredEpoch, true))
+                        {
+                            printf("CUTFENCE client accepted epoch=%llx\n", (unsigned long long)offeredEpoch);
+                            fflush(stdout);
+                        }
+                    }
+                }
+                const bool offerReady = !cutXferPort || !host ||
+                    ambient->HandoffOfferReady(nextEpoch, cutOfferToken,
+                                               melonDS::AmbientLAN::HandoffPlainNetplay);
+                if (eligible && offerReady &&
                     (host || ambient->HasPeerHandoffFence()) &&
                     nds->Wifi.HandoffBusyMask() == 0 && ambient->HandoffQueuedFrames() == 0)
                 {
@@ -1128,7 +1165,8 @@ int main(int argc, char** argv)
                            frame, (unsigned long long)nds->GetSysTimestamp(), (unsigned long long)epoch);
                     fflush(stdout);
                     std::array<u8, 16> token{};
-                    if (host) { std::random_device random; for (u8& byte : token) byte = (u8)random(); }
+                    if (host && cutXferPort) token = cutOfferToken;
+                    else if (host) { std::random_device random; for (u8& byte : token) byte = (u8)random(); }
                     if (!ambient->StartHandoffFence(epoch, token)) { mark(abort); fprintf(stderr, "CUTFENCE start failed\n"); return 2; }
                     if (const char* inject = getenv("LITEV_AMBIENT_CUT_POSTFENCE_SEND"); inject && strcmp(inject, cutRole) == 0)
                     {

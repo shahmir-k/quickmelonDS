@@ -51,6 +51,7 @@ public:
         char GameCode[4] = {};
         u32 BuildID = 0;
         bool AllowHandoff = true;  // Android disables it for an unversioned/dirty native build
+        bool RequireHandoffOffer = false; // Android requires explicit peer consent before any cut fence
         int Vis = Vis_Everyone;
         u16 PresencePort = 7065;    // subnet broadcast (shared, SO_REUSEPORT)
         u16 UnicastPort = 0;        // this device's presence socket (0 = any; the app advertises it over NSD)
@@ -93,6 +94,15 @@ public:
     // Compatibility gate only: presence is unauthenticated. The checkpoint
     // exchange must still verify its full native build identity and peer.
     bool HandoffBuildCompatible() const;
+    enum HandoffMode { HandoffPlainNetplay = 1, HandoffHostedNetplay = 2 };
+    // Two-player, reliable peer consent before the first frozen frame. All methods
+    // are emulator-thread-only, just like the fence API below. The offer epoch
+    // increases for every new attempt on this live link; the token is random.
+    bool ProposeHandoff(u64 epoch, const std::array<u8, 16>& token, HandoffMode mode);
+    bool IncomingHandoffOffer(u64& epoch, HandoffMode& mode) const;
+    bool RespondToHandoffOffer(u64 epoch, bool accept);
+    bool HandoffOfferReady(u64 epoch, const std::array<u8, 16>& token, HandoffMode mode) const;
+    void CancelHandoffOffer();
     // Emulator-thread-only, two-peer cut fence. Call after the host stops issuing
     // MP commands; the client may keep running until it reaches its own idle cut.
     // A received FENCE is not READY: unsequenced MP packets must first retire.
@@ -171,6 +181,10 @@ private:
         // prior failed offer is then rejected without a bounded replay cache.
         u64 LastClosedFenceEpoch = 0;
         std::array<u8, 16> LastClosedFenceToken{}; // test replay only
+        u64 OfferEpoch = 0, LastClosedOfferEpoch = 0;
+        std::array<u8, 16> OfferToken{};
+        u32 OfferMode = 0;
+        bool LocalOffered = false, PeerOffered = false, LocalOfferAccepted = false, PeerOfferAccepted = false;
         std::array<u8, 16> FenceToken{};
         u32 FenceLastSent = 0, PeerLastSent = 0, PeerRetiredThrough = 0;
         bool LocalFence = false, PeerFence = false, LocalReady = false, PeerReady = false;
@@ -222,6 +236,11 @@ private:
     void DestroyRX(const QueuedPacket& q);
     void RetireMP(const QueuedPacket& q);
     void SendFenceControl(Link& link, u32 type, u64 epoch, u32 mark);
+    bool SendOfferControl(Link& link, u32 type, u64 epoch, u32 mark,
+                          const std::array<u8, 16>& token);
+    void ReceiveHandoffControl(Link& link, u32 type, u64 epoch, u32 mark,
+                               const std::array<u8, 16>& token);
+    void CloseHandoffOffer(Link& link);
     void CompleteHandoffReset(Link& link);
     Link* HandoffLink();
     const Link* HandoffLink() const;
@@ -259,6 +278,7 @@ private:
     void DropQueuedForSlot(int slot);
     u32 UpMask() const;
     friend struct AmbientLANQueueTestAccess;
+    friend struct AmbientLANOfferTestAccess;
 };
 
 }

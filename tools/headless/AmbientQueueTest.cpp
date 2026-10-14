@@ -134,11 +134,75 @@ struct AmbientLANQueueTestAccess
         armBeacon();
         assert(ambient.RecvPacket(0, frame, &timestamp) == 64 && frame[40] == 0xD1);
     }
+
+    static void RunOfferGate()
+    {
+        AmbientLAN::Config cfg;
+        cfg.DeviceID = 0x401;
+        cfg.BuildID = 0x1234;
+        cfg.Name = "offer-test";
+        cfg.RequireHandoffOffer = true;
+        cfg.PresencePort = 0;
+        cfg.LinkPort = 18067;
+        AmbientLAN ambient(cfg);
+        assert(ambient.Ok());
+        AmbientLAN::Peer peer;
+        peer.ID = 0x402;
+        peer.IP = inet_addr("127.0.0.1");
+        peer.LinkPort = ambient.GetLinkPort();
+        const int slot = ambient.OpenLink(peer);
+        assert(slot >= 0);
+        auto& link = ambient.Links[slot];
+        link.Up = true;
+        auto view = std::make_shared<std::vector<AmbientLAN::Peer>>(1, peer);
+        (*view)[0].BuildID = cfg.BuildID;
+        ambient.View = view;
+        assert(ambient.HandoffBuildCompatible());
+
+        std::array<u8, 16> token{};
+        token[0] = 0xA5;
+        // Wire types 1=FENCE, 8=OFFER, 9=ACCEPT, 11=CANCEL.
+        ambient.ReceiveHandoffControl(link, 1, 100, 0, token);
+        assert(!link.PeerFence && link.FenceEpoch == 0); // no consent: ignore a peer cut
+        ambient.ReceiveHandoffControl(link, 8, 100, AmbientLAN::HandoffPlainNetplay, token);
+        u64 epoch = 0;
+        AmbientLAN::HandoffMode mode = AmbientLAN::HandoffHostedNetplay;
+        assert(ambient.IncomingHandoffOffer(epoch, mode));
+        assert(epoch == 100 && mode == AmbientLAN::HandoffPlainNetplay);
+        assert(!ambient.HandoffOfferReady(epoch, token, mode));
+        link.LocalOfferAccepted = true; // the response send is exercised by the integration gate
+        assert(ambient.HandoffOfferReady(epoch, token, mode));
+        std::array<u8, 16> wrong = token;
+        wrong[0] ^= 1;
+        ambient.ReceiveHandoffControl(link, 1, 100, 0, wrong);
+        assert(!link.PeerFence && link.FenceEpoch == 0);
+        ambient.ReceiveHandoffControl(link, 1, 100, 0, token);
+        assert(link.PeerFence && link.FenceEpoch == 100);
+        link.FenceEpoch = 0;
+        link.PeerFence = false;
+        ambient.CloseHandoffOffer(link);
+        ambient.ReceiveHandoffControl(link, 8, 100, AmbientLAN::HandoffPlainNetplay, token);
+        assert(!link.PeerOffered); // replay of a closed offer
+
+        link.OfferEpoch = 101;
+        link.OfferToken = token;
+        link.OfferMode = AmbientLAN::HandoffHostedNetplay;
+        link.LocalOffered = true;
+        ambient.ReceiveHandoffControl(link, 9, 101, AmbientLAN::HandoffHostedNetplay, wrong);
+        assert(!link.PeerOfferAccepted);
+        ambient.ReceiveHandoffControl(link, 9, 101, AmbientLAN::HandoffHostedNetplay, token);
+        assert(link.PeerOfferAccepted);
+        assert(ambient.HandoffOfferReady(101, token, AmbientLAN::HandoffHostedNetplay));
+        ambient.ReceiveHandoffControl(link, 11, 101, 0, token);
+        assert(!ambient.HandoffOfferReady(101, token, AmbientLAN::HandoffHostedNetplay));
+        assert(link.LastClosedOfferEpoch == 101);
+    }
 };
 }
 
 int main()
 {
     melonDS::AmbientLANQueueTestAccess::Run();
+    melonDS::AmbientLANQueueTestAccess::RunOfferGate();
     std::puts("ambient-queue-test: PASS");
 }
