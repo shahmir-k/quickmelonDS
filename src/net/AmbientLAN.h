@@ -90,9 +90,9 @@ public:
     // Group fast-forward: ONE speed for the LAN session (the linked players), in NetplaySpeed codes (0 = normal). Any
     // member's key asks for it; the parent decides and relays it (a child links only to its parent) and every member
     // switches at the same emulated time (the parent's chip clock + kSpeedLagUs: a child's clock follows its parent's),
-    // so a host never runs faster than its children (it would time out their replies). Any change of the links (one
-    // opens or closes) is normal speed again; no links = no group (the frontend's own fast-forward, which a player
-    // leaving the session starts from off).
+    // so a host never runs faster than its children (it would time out their replies). A link opening is normal speed
+    // for the whole group (the join runs at 1x); a player leaving runs 1x (its last link closed), the others keep the
+    // group's speed. No links = no group (the frontend's own fast-forward, off for a player who just left).
     static constexpr u64 kSpeedLagUs = 250000;
     int ToggleSpeed(int onCode);                // any thread: the key; returns the code it shows
     int SpeedShown() const { return StShown.load(); }
@@ -210,7 +210,7 @@ private:
     int SlotByMAC(const u8* mac);
     int OpenLink(const Peer& p);
     void CloseLink(int s, const char* why);
-    void LinksChanged();
+    void LinksChanged(bool opened);
     void NoteBeacon(const u8* data, int len);
     void SendTo(u32 slots, u32 type, const u8* data, int len, u64 timestamp);
     void Pump(int type, int waitMs = -1);

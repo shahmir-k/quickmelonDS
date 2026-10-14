@@ -524,18 +524,22 @@ u32 AmbientLAN::UpMask() const
     return m;
 }
 
-void AmbientLAN::LinksChanged()
+void AmbientLAN::LinksChanged(bool opened)
 {
-    // a change of the group: normal speed (a parent tells its other children)
-    const bool fast = StSpeed || PendCode > 0;
-    PendCode = -1;
-    StSpeed = StShown = 0;
-    StSpeedWho = 0;
-    SpeedReq = -1;
-    if (fast && ParentSlot < 0 && UpMask()) SpeedDecide(0, 0, 0);
     std::vector<u64> ids;
     NumLinks = 0;
     for (int s = 0; s < 16; s++) if (Links[s].P) { NumLinks++; ids.push_back(Links[s].ID); }
+    // a player joining: the whole group to normal speed (the join runs at 1x on both ends; a parent tells its other
+    // children); one leaving: only the leaver (its last link closed), the others keep the group's speed
+    if (opened || !NumLinks)
+    {
+        const bool fast = StSpeed || PendCode > 0;
+        PendCode = -1;
+        StSpeed = StShown = 0;
+        StSpeedWho = 0;
+        SpeedReq = -1;
+        if (fast && ParentSlot < 0 && UpMask()) SpeedDecide(0, 0, 0);
+    }
     StLinks = NumLinks;
     std::lock_guard<std::mutex> g(Mu);
     LinkedIDs.swap(ids);
@@ -556,7 +560,7 @@ int AmbientLAN::OpenLink(const Peer& p)
     e->data = &l;
     enet_peer_timeout(e, 0, 5000, 5000);
     StOpened++;
-    LinksChanged();
+    LinksChanged(true);
     Platform::Log(Platform::LogLevel::Info, "Ambient: link %d -> %016llx (%s)\n", s, (unsigned long long)p.ID, p.Name.c_str());
     return s;
 }
@@ -571,7 +575,7 @@ void AmbientLAN::CloseLink(int s, const char* why)
     Platform::Log(Platform::LogLevel::Info, "Ambient: link %d to %016llx closed (%s)\n", s, (unsigned long long)l.ID, why);
     if (ParentSlot == s) ParentSlot = -1;
     l = Link();
-    LinksChanged();
+    LinksChanged(false);
 }
 
 void AmbientLAN::NoteBeacon(const u8* data, int len)
@@ -678,7 +682,7 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         n.ID = p->ID; n.Generation = ++NextLinkGeneration; n.P = ev.peer; n.Up = true; memcpy(n.MAC, p->MAC, 6); n.ActiveMs = NowMs();
         ev.peer->data = &n;
         enet_peer_timeout(ev.peer, 0, 5000, 5000);
-        LinksChanged();
+        LinksChanged(true);
         Platform::Log(Platform::LogLevel::Info, "Ambient: link %d <- %016llx (%s)\n", s, (unsigned long long)p->ID, p->Name.c_str());
         break;
     }
@@ -692,7 +696,7 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         if (ParentSlot == s) ParentSlot = -1;
         DropQueuedForSlot(s);
         *l = Link();
-        LinksChanged();
+        LinksChanged(false);
         break;
     }
     case ENET_EVENT_TYPE_RECEIVE:

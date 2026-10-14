@@ -1079,7 +1079,9 @@ int main(int argc, char** argv)
             if (!getenv("LITEV_LAN_NOPACE"))
             {
                 lanNext += std::chrono::microseconds(period);
-                if (!period) lanNext = std::chrono::steady_clock::now();
+                // time lost (a link wait, a slow start, uncapped) is not made up in a burst: at most 100 ms behind
+                const auto now = std::chrono::steady_clock::now();
+                if (!period || now - lanNext > std::chrono::milliseconds(100)) lanNext = now;
                 std::this_thread::sleep_until(lanNext);
             }
         }
@@ -1255,6 +1257,11 @@ int main(int argc, char** argv)
 
     u64 audioHash = XXH3_64bits_digest(audioHashState);
     XXH3_freeState(audioHashState);
+#ifdef LITEV_AMBIENT_LAN
+    // leave the LAN session at the last frame (as the app does on stop): the others see the links close now, not
+    // after the exit's summary work
+    if (ambient) { melonDS::MPInterface::Set(melonDS::MPInterface_Dummy); ambient = nullptr; }
+#endif
 
 #if defined(LITEV_A9HLE) && defined(LITEV_HLE_DIAG)
     if (getenv("LITEV_HLESIG_SCAN")) melonDS::A9HLE::SigScan(*nds);
