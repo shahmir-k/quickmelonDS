@@ -1005,7 +1005,14 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         { fprintf(stderr, "error (mp%d): %s\n", k, err.c_str()); return 1; }
         if (adoptPrepared) printf("console %d rom: %s (prepared checkpoint)\n", k, c.rom.c_str());
         else printf("console %d rom: %s (xxh3 %016llx)\n", k, c.rom.c_str(), (unsigned long long)b[k].romHash);
-        if (adoptPrepared) continue;
+        if (adoptPrepared)
+        {
+            // (a prepared console skipped BuildAndBoot, where scripts load)
+            std::string serr;
+            if (!c.inputScript.empty() && !b[k].inputScript.LoadFile(c.inputScript, serr))
+            { fprintf(stderr, "error (mp%d): input script: %s\n", k, serr.c_str()); return 1; }
+            continue;
+        }
         // A live Ambient checkpoint does not contain SPI firmware. Clone the
         // source image before loading its savestate, or later firmware reads
         // could return the replica's default MAC/settings instead.

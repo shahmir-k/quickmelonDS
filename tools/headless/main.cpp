@@ -434,11 +434,11 @@ bool DumpPPM(const std::string& path, const u32* top, const u32* bottom)
 
 // Write a full core savestate to `path` using the same in-memory Savestate API
 // as the Qt frontend (default 32 MB save buffer -> DoSavestate -> flush bytes).
-bool SaveSavestate(NDS& nds, const std::string& path, std::vector<u8>* captured = nullptr, bool coldJit = false)
+bool SaveSavestate(NDS& nds, const std::string& path, std::vector<u8>* captured = nullptr, bool coldCaches = false)
 {
     Savestate state; // default ctor: save mode, DEFAULT_SIZE buffer
     if (state.Error) { fprintf(stderr, "error: savestate alloc failed\n"); return false; }
-    state.ColdJit = coldJit;
+    state.ColdCaches = coldCaches;
     if (!nds.DoSavestate(&state) || state.Error)
     {
         fprintf(stderr, "error: DoSavestate failed while dumping\n");
@@ -496,6 +496,41 @@ bool LoadSavestate(NDS& nds, const std::string& path)
 
 } // namespace
 
+// A live handoff checkpoint loaded into a fresh scratch console (its own userdata and save files)
+static bool PrepareScratch(const NetplayLiveCheckpoint& candidate, const std::string& romPath, bool jit,
+                           std::unique_ptr<HeadlessHost::InstanceUserData>& user,
+                           std::unique_ptr<NDS>& instance, std::string& reason)
+{
+    auto scratch = std::make_unique<HeadlessHost::InstanceUserData>();
+    scratch->savePrefix = candidate.Player == 0 ? "handoff-scratch-host" : "handoff-scratch-client";
+    u32 romLength = 0;
+    auto romData = ReadFile(romPath, romLength);
+    if (!romData) { reason = "scratch replica ROM unavailable"; return false; }
+    auto cart = NDSCart::ParseROM(std::move(romData), romLength, scratch.get(), std::nullopt);
+    if (!cart) { reason = "scratch replica ROM parse failed"; return false; }
+    NDSArgs replicaArgs;
+    replicaArgs.Firmware = Firmware(candidate.Firmware.data(), (u32)candidate.Firmware.size());
+#ifdef JIT_ENABLED
+    replicaArgs.JIT = jit ? std::optional<JITArgs>(JITArgs{}) : std::nullopt;
+#endif
+    auto replica = std::make_unique<NDS>(std::move(replicaArgs), scratch.get());
+    replica->SetRenderer(std::make_unique<SoftRenderer>(*replica));
+    replica->SetNDSCart(std::move(cart));
+    replica->Reset();
+    replica->SetupDirectBoot("headless.nds");
+    replica->Start();
+    Savestate parsed((void*)candidate.State.data(), (u32)candidate.State.size(), false);
+    if (parsed.Error || !replica->DoSavestate(&parsed) || parsed.Error)
+    { reason = "scratch replica savestate load failed"; return false; }
+    const Firmware& loaded = replica->GetFirmware();
+    if (loaded.Length() != candidate.Firmware.size() ||
+        memcmp(loaded.Buffer(), candidate.Firmware.data(), loaded.Length()) != 0)
+    { reason = "scratch replica firmware mismatch"; return false; }
+    user = std::move(scratch);
+    instance = std::move(replica);
+    return true;
+}
+
 int main(int argc, char** argv)
 {
 #ifdef LITEV_ACCESS_STATS
@@ -508,6 +543,40 @@ int main(int argc, char** argv)
     HeadlessHost::SetDataDir(opt.dataDir);
 
 #ifdef LITEV_AMBIENT_LAN
+    // LITEV_TEST_PROOF_STATES=state0|fw0|rom0|state1|fw1|rom1: the reversible proof on two
+    // checkpoint files (a cut's host.mln/host.fw and client.mln/client.fw); prints its hashes.
+    if (const char* spec = getenv("LITEV_TEST_PROOF_STATES"))
+    {
+        std::vector<std::string> f(1);
+        for (const char* q = spec; *q; q++) if (*q == '|') f.emplace_back(); else f.back() += *q;
+        if (f.size() != 6) { fprintf(stderr, "LITEV_TEST_PROOF_STATES needs 6 paths\n"); return 2; }
+        std::unique_ptr<HeadlessHost::InstanceUserData> user[2];
+        std::unique_ptr<NDS> console[2];
+        std::array<u64, 2> clocks{};
+        std::string error;
+        for (int p = 0; p < 2; p++)
+        {
+            NetplayLiveCheckpoint c;
+            c.Player = (u8)p;
+            u32 len = 0;
+            auto st = ReadFile(f[p * 3], len);
+            if (!st) { fprintf(stderr, "cannot read %s\n", f[p * 3].c_str()); return 2; }
+            c.State.assign(st.get(), st.get() + len);
+            auto fw = ReadFile(f[p * 3 + 1], len);
+            if (!fw) { fprintf(stderr, "cannot read %s\n", f[p * 3 + 1].c_str()); return 2; }
+            c.Firmware.assign(fw.get(), fw.get() + len);
+            if (!PrepareScratch(c, f[p * 3 + 2], opt.jit, user[p], console[p], error)) { fprintf(stderr, "prepare %d: %s\n", p, error.c_str()); return 2; }
+            user[p]->instanceID = p;
+            clocks[p] = console[p]->GetSysTimestamp();
+        }
+        std::array<u64, 4> hashes{};
+        const bool ok = NetplayRunLiveProof({console[0].get(), console[1].get()}, clocks,
+                                            [&](int p) { console[p]->RunFrame(); }, hashes, error);
+        printf("PROOF %s p0=%016llx/%016llx p1=%016llx/%016llx %s\n", ok ? "ok" : "FAIL",
+               (unsigned long long)hashes[0], (unsigned long long)hashes[2],
+               (unsigned long long)hashes[1], (unsigned long long)hashes[3], error.c_str());
+        return ok ? 0 : 2;
+    }
     if (getenv("LITEV_TEST_LIVE_PROOF"))
     {
         NetplayLiveCheckpoint p0, p1;
@@ -1546,34 +1615,7 @@ int main(int argc, char** argv)
                                                   std::unique_ptr<HeadlessHost::InstanceUserData>& user,
                                                   std::unique_ptr<NDS>& instance,
                                                   std::string& reason) {
-                            auto scratch = std::make_unique<HeadlessHost::InstanceUserData>();
-                            scratch->savePrefix = candidate.Player == 0 ? "handoff-scratch-host" : "handoff-scratch-client";
-                            u32 romLength = 0;
-                            auto romData = ReadFile(romPath, romLength);
-                            if (!romData) { reason = "scratch replica ROM unavailable"; return false; }
-                            auto cart = NDSCart::ParseROM(std::move(romData), romLength, scratch.get(), std::nullopt);
-                            if (!cart) { reason = "scratch replica ROM parse failed"; return false; }
-                            NDSArgs replicaArgs;
-                            replicaArgs.Firmware = Firmware(candidate.Firmware.data(), (u32)candidate.Firmware.size());
-#ifdef JIT_ENABLED
-                            replicaArgs.JIT = opt.jit ? std::optional<JITArgs>(JITArgs{}) : std::nullopt;
-#endif
-                            auto replica = std::make_unique<NDS>(std::move(replicaArgs), scratch.get());
-                            replica->SetRenderer(std::make_unique<SoftRenderer>(*replica));
-                            replica->SetNDSCart(std::move(cart));
-                            replica->Reset();
-                            replica->SetupDirectBoot("headless.nds");
-                            replica->Start();
-                            Savestate parsed((void*)candidate.State.data(), (u32)candidate.State.size(), false);
-                            if (parsed.Error || !replica->DoSavestate(&parsed) || parsed.Error)
-                            { reason = "scratch replica savestate load failed"; return false; }
-                            const Firmware& loaded = replica->GetFirmware();
-                            if (loaded.Length() != candidate.Firmware.size() ||
-                                memcmp(loaded.Buffer(), candidate.Firmware.data(), loaded.Length()) != 0)
-                            { reason = "scratch replica firmware mismatch"; return false; }
-                            user = std::move(scratch);
-                            instance = std::move(replica);
-                            return true;
+                            return PrepareScratch(candidate, romPath, opt.jit, user, instance, reason);
                         };
                         if (cutXferPort)
                         {
@@ -1684,9 +1726,14 @@ int main(int argc, char** argv)
                             bool proven = prepareScratch(local, opt.rom, proofUser[me], proofNds[me], proofError) &&
                                           prepareScratch(remote, peerRomPath, proofUser[1 - me], proofNds[1 - me], proofError);
                             if (proven)
+                            {
+                                // (headless MP callbacks route by the userdata's instance id)
+                                proofUser[0]->instanceID = 0;
+                                proofUser[1]->instanceID = 1;
                                 proven = NetplayRunLiveProof({proofNds[0].get(), proofNds[1].get()},
                                     {me == 0 ? local.RawClock : remote.RawClock, me == 1 ? local.RawClock : remote.RawClock},
                                     [&](int p) { proofNds[p]->RunFrame(); }, proof, proofError);
+                            }
                             for (int p = 0; p < 2; p++) { proofNds[p].reset(); proofUser[p].reset(); }
                             nds->JIT.JitEnableExecute();   // (macOS: scratch JIT teardown left this thread writing)
                             if (!proven)
@@ -1864,7 +1911,10 @@ int main(int argc, char** argv)
                             printf("CUTFENCE %s trial exact local=%p peer=%p\n", cutRole,
                                    (void*)own.identity, (void*)other.identity);
                             fflush(stdout);
-                            const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, {}, std::move(replicas));
+                            // LITEV_AMBIENT_CUT_TRIAL_SCRIPT: this player's input script for the trial
+                            std::vector<std::string> trialScripts(2);
+                            if (const char* ts = getenv("LITEV_AMBIENT_CUT_TRIAL_SCRIPT")) trialScripts[host ? 0 : 1] = ts;
+                            const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, trialScripts, std::move(replicas));
                             keepAmbient.store(false, std::memory_order_release);
                             ambientService.join();
                             if (cutExternalPeer || liveLocal)

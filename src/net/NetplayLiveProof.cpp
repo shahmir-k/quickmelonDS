@@ -83,6 +83,22 @@ bool NetplayRunLiveProof(const std::array<NDS*, 2>& consoles, const std::array<u
         for (int p = 0; p < 2; ++p)
             if (consoles[p]->Wifi.IsPoweredOn()) link->Begin(p);
         std::atomic<bool> finished{false}, expired{false}, workerFailed{false};
+        std::atomic<int> done[2] {{0}, {0}};
+        // A console keeps running after its two hashed frames until the other has its two too: the
+        // other may still wait for its link frames (a client polls its host up to its own time).
+        auto run = [&](int p) {
+            for (int f = 0; (f < 2 || done[1 - p].load(std::memory_order_acquire) < 2) &&
+                            !expired.load(std::memory_order_acquire); f++)
+            {
+                runFrame(p);
+                if (f < 2) hashes[f * 2 + p] = NetplayLiveProofHash(*consoles[p]);
+                done[p].store(f + 1, std::memory_order_release);
+            }
+            // leave the link: the other console's extra frame must not wait on this clock forever
+            // (both hashed frame pairs are complete by now)
+            link->End(p);
+            link->Stop();
+        };
         std::thread worker, watchdog;
         try
         {
@@ -94,15 +110,10 @@ bool NetplayRunLiveProof(const std::array<NDS*, 2>& consoles, const std::array<u
                 { expired.store(true, std::memory_order_release); link->Stop(); }
             });
             worker = std::thread([&] {
-                try
-                {
-                    for (int f = 0; f < 2; ++f)
-                    { runFrame(1); hashes[f * 2 + 1] = NetplayLiveProofHash(*consoles[1]); }
-                }
+                try { run(1); }
                 catch (...) { workerFailed.store(true, std::memory_order_release); link->Stop(); }
             });
-            for (int f = 0; f < 2; ++f)
-            { runFrame(0); hashes[f * 2] = NetplayLiveProofHash(*consoles[0]); }
+            run(0);
         }
         catch (const std::exception& exception)
         {

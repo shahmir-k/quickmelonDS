@@ -1606,16 +1606,17 @@ void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
     Console& c = Con(nds);
     State& s = c.s;
     SeqState& q = c.q;
-    if (!f->Saving)
+    const bool cold = f->Saving && f->ColdCaches;   // (Savestate::ColdCaches: reset here as a loader does, save none)
+    if (!f->Saving || cold)
     {
         s = State{};                // as a new console (stats start empty), then what the saving one had
         q = SeqState{};
-        if (!f->HasSection("A7HL")) return;
+        if (!f->Saving && !f->HasSection("A7HL")) return;
     }
     f->Section("A7HL");
-    // (only this build's layout and hooks: another build's state loads as a new console)
+    // (only this build's layout and hooks: another build's state loads as a new console; 0: saved cold)
     static const u64 build = [] { u64 h = 0xcbf29ce484222325ull; for (char ch : __DATE__ " " __TIME__) h = (h ^ (u8)ch) * 0x100000001b3ull; return h; }();
-    u64 b = build;
+    u64 b = cold ? 0 : build;
     f->Var64(&b);
     if (b != build) return;
     auto idx = [&](auto* p, auto& tab) -> s32 { for (size_t i = 0; i < std::size(tab); i++) if (p == &tab[i]) return (s32)i; return -1; };

@@ -430,7 +430,7 @@ private:
 
 // The live handoff compatibility id: the same handoff protocol and emulation-affecting LITEV
 // options (CMakeLists.txt, LITEV_HANDOFF_COMPAT), not the same binary: checkpoints carry an empty
-// JIT cache (Savestate::ColdJit). Use it for NetplayLiveCheckpoint::Build and Ambient's BuildID.
+// JIT and HLE caches (Savestate::ColdCaches). Use it for NetplayLiveCheckpoint::Build and Ambient's BuildID.
 u64 NetplayHandoffCompat();
 
 // The reversible pre-commit proof: the two consoles freshly loaded from the checkpoint pair run

@@ -51,7 +51,7 @@ public:
         std::string Name;           // shown to others (<= 32 bytes)
         char GameCode[4] = {};
         u32 BuildID = 0;
-        bool AllowHandoff = true;  // Android disables it for an unversioned/dirty native build
+        bool AllowHandoff = true;
         bool RequireHandoffOffer = false; // Android requires explicit peer consent before any cut fence
         int Vis = Vis_Everyone;
         u16 PresencePort = 7065;    // subnet broadcast (shared, SO_REUSEPORT)

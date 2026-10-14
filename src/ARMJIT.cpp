@@ -2905,10 +2905,10 @@ void ARMJIT::DoSavestate(Savestate* file) noexcept
     const u32 config = sizeof(JitProfileInstr) | (MaxBlockSize << 8) | (LiteralOptimizations << 16)
         | (BranchOptimizations << 17) | (FastMemory << 18);
 
-    // ColdJit: the profile part is empty, so it is tagged build-independent (build 0) with only
+    // ColdCaches: the profile part is empty, so it is tagged build-independent (build 0) with only
     // the runtime JIT settings that shape blocks (MaxBlockSize, literal/branch optimizations).
     // FastMemory is left out: Apple hosts never have it and it does not change guest timing.
-    const bool cold = file->Saving && file->ColdJit && NDS.IsJITEnabled();
+    const bool cold = file->Saving && file->ColdCaches && NDS.IsJITEnabled();
     const u32 coldConfig = config & ~0xFFu & ~(1u << 18);
 
     if (!file->Saving || cold)
