@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "NetplayInput.h"
+#include <zlib.h>
 #include "../Platform.h"
 #include "../teakra/src/makedsp1/sha256.h"
 #if defined(__aarch64__)
@@ -1904,7 +1905,7 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
     error.clear();
     peer = NetplayLiveCheckpoint{};
     constexpr u32 magic = 0x32434C4E; // "NLC2": live console checkpoint + SPI firmware
-    constexpr u16 kVersion = 3;        // 3: cold-JIT checkpoints, compatibility id, prepare reasons
+    constexpr u16 kVersion = 4;        // 3: cold-JIT checkpoints, compatibility id, prepare reasons; 4: zlib body
     constexpr u32 maxState = 64u << 20;
     constexpr u32 maxFirmware = 1u << 20;
     constexpr int timeoutS = 15;
@@ -1916,7 +1917,7 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
         u16 Version;
         u8 Player, Reserved;
         u64 Epoch, Build, RawClock, RomSize;
-        u32 Frame, StateSize, FirmwareSize;
+        u32 Frame, StateSize, FirmwareSize, PackedSize;   // PackedSize: the zlib-compressed state sent
         u8 FenceToken[16];
         u8 RomSha[32], StateSha[32], FirmwareSha[32];
     };
@@ -1969,12 +1970,22 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
         }
         return true;
     };
+    // The state crosses zlib-compressed (level 1: a 19.8 MB Pokémon B/W checkpoint is 2.2 MB, 0.05 s on
+    // a Mac): the transfer was the largest part of the RG DS cut freeze. The SHA-256 is of the state.
+    std::vector<u8> packed(compressBound((uLong)local.State.size()));
+    {
+        uLongf packedLength = (uLongf)packed.size();
+        if (compress2(packed.data(), &packedLength, local.State.data(), (uLong)local.State.size(), 1) != Z_OK)
+        { error = "checkpoint compression failed"; return false; }
+        packed.resize(packedLength);
+    }
     auto makeHeader = [&] {
         Header h{};
         h.Magic = magic; h.Version = kVersion; h.Player = local.Player;
         h.Epoch = local.Epoch; h.Build = local.Build; h.RawClock = local.RawClock;
         h.RomSize = local.Rom.Size; h.Frame = local.Frame; h.StateSize = (u32)local.State.size();
         h.FirmwareSize = (u32)local.Firmware.size();
+        h.PackedSize = (u32)packed.size();
         memcpy(h.FenceToken, local.FenceToken.data(), local.FenceToken.size());
         memcpy(h.RomSha, local.Rom.Sha, 32);
         Sha256 sha; sha.Add(local.State.data(), local.State.size()); sha.Get(h.StateSha);
@@ -1987,17 +1998,17 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
         if (!sendBytes(fd, local.Firmware.data(), local.Firmware.size())) return false;
         const u64 cut = getenv("LITEV_HANDOFF_XFER_CUT") ? strtoull(getenv("LITEV_HANDOFF_XFER_CUT"), nullptr, 10) : 0;
         const bool corrupt = getenv("LITEV_HANDOFF_XFER_CORRUPT") != nullptr;
-        for (size_t off = 0; off < local.State.size(); off += kChunk)
+        for (size_t off = 0; off < packed.size(); off += kChunk)
         {
-            const size_t n = std::min<size_t>(kChunk, local.State.size() - off);
+            const size_t n = std::min<size_t>(kChunk, packed.size() - off);
             if (cut && off >= cut) return false; // test-only interrupted transfer
             if (corrupt && off == 0)
             {
-                std::vector<u8> bad(local.State.begin(), local.State.begin() + n);
-                bad[0] ^= 1;
+                std::vector<u8> bad(packed.begin(), packed.begin() + n);
+                bad[n / 2] ^= 1;
                 if (!sendBytes(fd, bad.data(), n)) return false;
             }
-            else if (!sendBytes(fd, local.State.data() + off, n)) return false;
+            else if (!sendBytes(fd, packed.data() + off, n)) return false;
         }
         return true;
     };
@@ -2014,7 +2025,8 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
         else if (h.Epoch != local.Epoch) snprintf(why, sizeof(why), "peer cut epoch differs");
         else if (memcmp(h.FenceToken, local.FenceToken.data(), local.FenceToken.size())) snprintf(why, sizeof(why), "peer cut token differs");
         else if (h.RomSize != expectedPeerRom.Size || memcmp(h.RomSha, expectedPeerRom.Sha, 32)) snprintf(why, sizeof(why), "peer ROM differs from its roster entry");
-        else if (!h.StateSize || h.StateSize > maxState || !h.FirmwareSize || h.FirmwareSize > maxFirmware)
+        else if (!h.StateSize || h.StateSize > maxState || !h.FirmwareSize || h.FirmwareSize > maxFirmware ||
+                 !h.PackedSize || h.PackedSize > compressBound(h.StateSize))
             snprintf(why, sizeof(why), "peer checkpoint size invalid (state %u, firmware %u)", h.StateSize, h.FirmwareSize);
         if (why[0])
         {
@@ -2028,14 +2040,18 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
         u8 firmwareDigest[32]; firmwareSha.Get(firmwareDigest);
         if (memcmp(firmwareDigest, h.FirmwareSha, 32))
         { error = "checkpoint firmware SHA-256 mismatch"; return false; }
-        std::vector<u8> bytes(h.StateSize);
-        Sha256 sha;
-        for (size_t off = 0; off < bytes.size(); off += kChunk)
+        std::vector<u8> body(h.PackedSize);
+        for (size_t off = 0; off < body.size(); off += kChunk)
         {
-            const size_t n = std::min<size_t>(kChunk, bytes.size() - off);
-            if (!recvBytes(fd, bytes.data() + off, n)) { error = "checkpoint body interrupted"; return false; }
-            sha.Add(bytes.data() + off, n);
+            const size_t n = std::min<size_t>(kChunk, body.size() - off);
+            if (!recvBytes(fd, body.data() + off, n)) { error = "checkpoint body interrupted"; return false; }
         }
+        std::vector<u8> bytes(h.StateSize);
+        uLongf unpacked = (uLongf)bytes.size();
+        if (uncompress(bytes.data(), &unpacked, body.data(), (uLong)body.size()) != Z_OK || unpacked != bytes.size())
+        { error = "checkpoint body does not decompress"; return false; }
+        Sha256 sha;
+        sha.Add(bytes.data(), bytes.size());
         u8 digest[32]; sha.Get(digest);
         if (memcmp(digest, h.StateSha, 32)) { error = "checkpoint SHA-256 mismatch"; return false; }
         peer.Epoch = h.Epoch; peer.Build = h.Build; peer.RawClock = h.RawClock;

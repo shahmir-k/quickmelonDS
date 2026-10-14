@@ -947,11 +947,17 @@ ARMJIT_Memory::ARMJIT_Memory(melonDS::NDS& nds, bool fastmem) : NDS(nds)
         Log(LogLevel::Error, "Failed to open memory using shm_open! (%s)", strerror(errno));
     }
     shm_unlink(fastmemPidName);
-#endif
+    // (Android: the ashmem region above already has its size; ftruncate on it fails with EINVAL,
+    // which was logged as an error for every console created)
     if (ftruncate(MemoryFile, MemoryTotalSize) < 0)
     {
         Log(LogLevel::Error, "Failed to allocate memory using ftruncate! (%s)", strerror(errno));
     }
+#endif
+#if defined(__ANDROID__)
+    if (MemoryFile < 0)
+        Log(LogLevel::Error, "Failed to create the fastmem shared memory region\n");
+#endif
 
     mmap(MemoryBase, MemoryTotalSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, MemoryFile, 0);
 #endif

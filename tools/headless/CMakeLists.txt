@@ -36,7 +36,7 @@ if (LITEV_HOSTED_NETPLAY)
     target_sources(liteDS-headless PRIVATE "${CMAKE_SOURCE_DIR}/src/net/HostedMP.cpp")
 endif()
 
-target_link_libraries(liteDS-headless PRIVATE core)
+target_link_libraries(liteDS-headless PRIVATE core z)   # (z: live handoff checkpoint compression)
 
 add_executable(packet-dispatcher-test PacketDispatcherTest.cpp "${CMAKE_SOURCE_DIR}/src/net/PacketDispatcher.cpp")
 target_include_directories(packet-dispatcher-test PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/net")

@@ -1079,6 +1079,9 @@ int main(int argc, char** argv)
     const bool cutRetryAfterAbort = getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT") &&
                                     *getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT");
     int cutAttempt = 0;
+    // milliseconds since this console froze for the cut (the CUTFENCE lines' t= field)
+    auto cutFreezeStart = std::chrono::steady_clock::now();
+    auto frozenMs = [&] { return (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - cutFreezeStart).count(); };
     bool cutRetryReady = false;
     bool cutResetDelayed = false;
     bool cutOfferSent = false;
@@ -1526,6 +1529,7 @@ int main(int argc, char** argv)
                     const u64 epoch = ambient->HasPeerHandoffFence() ? ambient->PeerHandoffEpoch() :
                         host ? epochBase + (u64)cutAttempt :
                         ambient->GetHandoffOfferStatus(accepted) ? accepted.Epoch : 0;
+                    cutFreezeStart = std::chrono::steady_clock::now();   // (the game is frozen from here)
                     printf("CUTFENCE %s attempt=%d holding f%d clock=%llu epoch=%llx\n", cutRole, cutAttempt,
                            frame, (unsigned long long)nds->GetSysTimestamp(), (unsigned long long)epoch);
                     fflush(stdout);
@@ -1608,7 +1612,7 @@ int main(int argc, char** argv)
                         // (LITEV_HANDOFF_WARM_CHECKPOINT=1: the old warm-JIT checkpoint, negative control)
                         const bool coldCheckpoint = cutXferPort && !getenv("LITEV_HANDOFF_WARM_CHECKPOINT");
                         if (!SaveSavestate(*nds, path, cutXferPort ? &liveState : nullptr, coldCheckpoint)) { mark(abort); return 2; }
-                        printf("CUTFENCE %s saved f%d busy=%02x queued=%zu\n", cutRole, frame,
+                        printf("CUTFENCE %s t=%ldms saved f%d busy=%02x queued=%zu\n", cutRole, frozenMs(), frame,
                                nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames());
                         printf("CUTFENCE watermark local=%u retired=%u peer=%u peerRetired=%u ready=%d/%d aborted=%d\n",
                                fs.LastSent, fs.RetiredThrough, fs.PeerLastSent, fs.PeerRetiredThrough,
@@ -1717,8 +1721,8 @@ int main(int argc, char** argv)
                                 }
                                 Firmware peerFirmware(remote.Firmware.data(), (u32)remote.Firmware.size());
                                 const auto& peerMac = peerFirmware.GetHeader().MacAddr;
-                                printf("CUTFENCE %s transfer verified peer=%u frame=%u clock=%llu bytes=%zu\n",
-                                       cutRole, remote.Player, remote.Frame,
+                                printf("CUTFENCE %s t=%ldms transfer verified peer=%u frame=%u clock=%llu bytes=%zu\n",
+                                       cutRole, frozenMs(), remote.Player, remote.Frame,
                                        (unsigned long long)remote.RawClock, remote.State.size());
                                 printf("CUTFENCE %s peer firmware=%zu MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
                                        cutRole, remote.Firmware.size(), peerMac[0], peerMac[1], peerMac[2],
@@ -1758,7 +1762,7 @@ int main(int argc, char** argv)
                                 printf("CUTFENCE %s proof abort: %s\n", cutRole, proofError.c_str());
                             }
                             else
-                                printf("CUTFENCE %s proof p0=%016llx/%016llx p1=%016llx/%016llx\n", cutRole,
+                                printf("CUTFENCE %s t=%ldms proof p0=%016llx/%016llx p1=%016llx/%016llx\n", cutRole, frozenMs(),
                                        (unsigned long long)proof[0], (unsigned long long)proof[2],
                                        (unsigned long long)proof[1], (unsigned long long)proof[3]);
                             fflush(stdout);
@@ -1800,7 +1804,7 @@ int main(int argc, char** argv)
                                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                                 }
                                 if (!complete()) { ambient->AbortHandoffFence(); return false; }
-                                printf("CUTFENCE %s %s agreed\n", cutRole, name);
+                                printf("CUTFENCE %s t=%ldms %s agreed\n", cutRole, frozenMs(), name);
                                 fflush(stdout);
                                 return true;
                             };
@@ -1854,7 +1858,7 @@ int main(int argc, char** argv)
                                 transferFailed = true;
                                 printf("CUTFENCE %s live-start abort: %s\n", cutRole, startError.c_str());
                             }
-                            else printf("CUTFENCE %s live-start rendezvous agreed\n", cutRole);
+                            else printf("CUTFENCE %s t=%ldms live-start rendezvous agreed\n", cutRole, frozenMs());
                             fflush(stdout);
                         }
                         if (!transferFailed && cutSwapTrialFrames > 0)
@@ -1891,7 +1895,7 @@ int main(int argc, char** argv)
                             trialCfg.jit = opt.jit;
                             trialCfg.fixedRtcEpoch = opt.fixedRtc;
                             auto savedAmbient = melonDS::MPInterface::Take();
-                            printf("CUTFENCE %s swap trial begin %d frames\n", cutRole, cutSwapTrialFrames);
+                            printf("CUTFENCE %s t=%ldms swap trial begin %d frames\n", cutRole, frozenMs(), cutSwapTrialFrames);
                             fflush(stdout);
                             std::atomic<bool> keepAmbient{true};
                             std::thread ambientService([&] {
