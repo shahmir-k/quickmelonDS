@@ -102,6 +102,16 @@ struct WireHash
     u64 Hash;
 };
 
+// Ordinary lobby Netplay keeps its established wire format. A live handoff
+// appends this to every input/hash packet, so a delayed packet from an older
+// session at the same endpoint cannot enter the new timeline.
+struct HandoffWireAuth
+{
+    u64 Epoch;
+    u8 Token[16];
+};
+static_assert(sizeof(HandoffWireAuth) == 24);
+
 u64 NowUs()
 {
     return (u64)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -278,6 +288,8 @@ bool NetplayInput::ArmHandoffSession(u64 epoch, const std::array<u8, 16>& token,
     for (int peer : Peers)
     {
         Inputs[peer].clear();
+        PeerHashes[peer].clear();
+        LastPeerUs[peer] = 0;
         RemoteUpTo[peer] = PeerAck[peer] = DelayFrames - 1;
     }
     return true;
@@ -377,6 +389,7 @@ bool NetplayInput::WaitForHandoffPeerInput(int timeoutMs)
                 if (valid)
                 {
                     const int peer = incoming.Player;
+                    LastPeerUs[peer] = NowUs();
                     if (!proven[peer])
                     {
                         std::lock_guard<std::mutex> lk(Lock);
@@ -475,6 +488,14 @@ void NetplayInput::Send(bool all)
                 memcpy(p, &e, sizeof(e));
             }
 #endif
+            if (HandoffEpoch)
+            {
+                HandoffWireAuth auth {HandoffEpoch, {}};
+                memcpy(auth.Token, HandoffToken.data(), sizeof(auth.Token));
+                const size_t at = packet.size();
+                packet.resize(at + sizeof(auth));
+                memcpy(packet.data() + at, &auth, sizeof(auth));
+            }
         }
         sendto(Socket, packet.data(), packet.size(), 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
     }
@@ -568,8 +589,21 @@ int NetplayInput::SpeedAt(int frame, u32* requesters, int* inputFrame)
 void NetplayInput::SendHash(int frame, u64 hash)
 {
     WireHash h {kHashMagic, (u8)Local, frame, hash};
+    u8 packet[sizeof(h) + sizeof(HandoffWireAuth)];
+    memcpy(packet, &h, sizeof(h));
+    size_t length = sizeof(h);
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        if (HandoffEpoch)
+        {
+            HandoffWireAuth auth {HandoffEpoch, {}};
+            memcpy(auth.Token, HandoffToken.data(), sizeof(auth.Token));
+            memcpy(packet + length, &auth, sizeof(auth));
+            length += sizeof(auth);
+        }
+    }
     for (int peer : Peers)
-        sendto(Socket, &h, sizeof(h), 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
+        sendto(Socket, packet, length, 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
 }
 
 bool NetplayInput::PeerHash(int player, int frame, u64& hash)
@@ -683,7 +717,6 @@ void NetplayInput::ReceiveLoop()
         for (ssize_t len; (len = recv(Socket, buf, sizeof(buf), MSG_DONTWAIT)) > 0;)
         {
             now = NowUs();
-            if (len > 4 && IsPeer(buf[4])) LastPeerUs[buf[4]] = now; // both packet kinds: magic, player
             u64 due;
             if (len < (ssize_t)sizeof(WireHeader)) continue;
             if (!faults) Receive(buf, len, now);    // no copy
@@ -709,7 +742,6 @@ void NetplayInput::ReceiveLoop()
 
         ssize_t len = recv(Socket, buf, sizeof(buf), 0);
         u64 now = NowUs();
-        if (len > 4 && IsPeer(buf[4])) LastPeerUs[buf[4]] = now; // both packet kinds: magic, player
         u64 due;
         if (len >= (ssize_t)sizeof(WireHeader) && Faults.Deliver(now, due))
             pending.emplace(due, std::vector<u8>(buf, buf + len));
@@ -728,14 +760,24 @@ void NetplayInput::ReceiveLoop()
 void NetplayInput::Receive(const u8* data, size_t size, u64 now)
 {
     WireHash wh;
-    if (size == sizeof(WireHash) && (memcpy(&wh, data, sizeof(wh)), wh.Magic == kHashMagic))
+    if (size >= sizeof(WireHash) && (memcpy(&wh, data, sizeof(wh)), wh.Magic == kHashMagic))
     {
         if (IsPeer(wh.Player))
         {
             std::lock_guard<std::mutex> lk(Lock);
+            if (HandoffEpoch)
+            {
+                HandoffWireAuth auth{};
+                if (size != sizeof(wh) + sizeof(auth)) return;
+                memcpy(&auth, data + sizeof(wh), sizeof(auth));
+                if (auth.Epoch != HandoffEpoch ||
+                    memcmp(auth.Token, HandoffToken.data(), sizeof(auth.Token))) return;
+            }
+            else if (size != sizeof(wh)) return;
             auto& hashes = PeerHashes[wh.Player];
             hashes[wh.Frame] = wh.Hash;
             while (hashes.size() > 64) hashes.erase(hashes.begin());
+            LastPeerUs[wh.Player] = now;
         }
         return;
     }
@@ -745,7 +787,17 @@ void NetplayInput::Receive(const u8* data, size_t size, u64 now)
         size >= sizeof(header) + header.Count * sizeof(WireEntry))
     {
         std::lock_guard<std::mutex> lk(Lock);
+        if (HandoffEpoch)
+        {
+            HandoffWireAuth auth{};
+            const size_t payload = sizeof(header) + header.Count * sizeof(WireEntry);
+            if (size != payload + sizeof(auth)) return;
+            memcpy(&auth, data + payload, sizeof(auth));
+            if (auth.Epoch != HandoffEpoch ||
+                memcmp(auth.Token, HandoffToken.data(), sizeof(auth.Token))) return;
+        }
         int from = header.Player;
+        LastPeerUs[from] = now;
         auto& inputs = Inputs[from];
         const size_t had = inputs.size();
         const u8* p = data + sizeof(header);

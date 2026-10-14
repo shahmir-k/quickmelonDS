@@ -161,8 +161,9 @@ public:
 
     // The local player's input sampled at `frame` (applied at frame + Delay everywhere).
     void SubmitLocal(int frame, const NetplayFrameInput& input);
-    // Handoff-only frame-zero proof over a separate UDP startup port. This
-    // rejects stale/wrong-endpoint first inputs, not active-LAN impersonation.
+    // Handoff-only frame-zero proof over a separate UDP startup port. Later
+    // input/hash packets carry the epoch+token too, rejecting old-session
+    // datagrams at a reused endpoint. This is not active-LAN authentication.
     bool ArmHandoffSession(u64 epoch, const std::array<u8, 16>& token,
                            int localStartupPort,
                            const std::vector<std::pair<int, std::string>>& startupPeers);

@@ -574,6 +574,67 @@ int main(int argc, char** argv)
         printf("PREPARE_BRIDGE %s\n", ok ? "PASS" : "FAIL");
         return ok ? 0 : 2;
     }
+    if (getenv("LITEV_TEST_HANDOFF_WIRE_AUTH"))
+    {
+        // An old Netplay sender can reuse the same player index and target IP.
+        // Its untagged input and hash must not enter a newly armed live cut.
+        const int base = 22000 + (getpid() % 4000) * 5;
+        const auto address = [](int port) { return "127.0.0.1:" + std::to_string(port); };
+        NetplayInput host(0, 3, base, {{1, address(base + 1)}});
+        NetplayInput peer(1, 3, base + 1, {{0, address(base)}});
+        NetplayInput stale(1, 3, base + 2, {{0, address(base)}});
+        NetplayInput wrongToken(1, 3, base + 5, {{0, address(base)}});
+        std::array<u8, 16> token{};
+        for (int i = 0; i < 16; i++) token[i] = (u8)(i + 1);
+        std::array<u8, 16> wrong = token;
+        wrong[0] ^= 1;
+        if (!host.Ok() || !peer.Ok() || !stale.Ok() || !wrongToken.Ok() ||
+            !host.ArmHandoffSession(42, token, base + 3, {{1, address(base + 4)}}) ||
+            !peer.ArmHandoffSession(42, token, base + 4, {{0, address(base + 3)}}) ||
+            !wrongToken.ArmHandoffSession(42, wrong, base + 6, {{0, address(base + 3)}}))
+        { printf("HANDOFF_WIRE_AUTH FAIL: sockets\n"); return 2; }
+        host.SubmitLocal(0, NetplayFrameInput{0xFFE, -1, -1});
+        peer.SubmitLocal(0, NetplayFrameInput{0xFFD, -1, -1});
+        bool hostProof = false, peerProof = false;
+        std::thread hostStart([&] { hostProof = host.WaitForHandoffPeerInput(3000); });
+        std::thread peerStart([&] { peerProof = peer.WaitForHandoffPeerInput(3000); });
+        hostStart.join();
+        peerStart.join();
+        if (!hostProof || !peerProof)
+        { printf("HANDOFF_WIRE_AUTH FAIL: startup proof\n"); return 2; }
+
+        stale.SendHash(60, 0xBAD);
+        stale.SubmitLocal(1, NetplayFrameInput{0xFF7, -1, -1});
+        wrongToken.SendHash(60, 0xBAD);
+        wrongToken.SubmitLocal(1, NetplayFrameInput{0xFF7, -1, -1});
+        std::atomic<bool> gotInput{false};
+        NetplayFrameInput received;
+        std::thread getter([&] {
+            received = host.Get(1, 4);
+            gotInput.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        u64 hash = 0;
+        const bool staleRejected = !gotInput.load(std::memory_order_acquire) &&
+                                   !host.PeerHash(1, 60, hash);
+        peer.SendHash(60, 0xA55A);
+        peer.SubmitLocal(1, NetplayFrameInput{0xFFB, -1, -1});
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!gotInput.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!gotInput.load(std::memory_order_acquire)) host.Abort();
+        getter.join();
+        bool validHash = false;
+        const auto hashUntil = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!(validHash = host.PeerHash(1, 60, hash)) &&
+               std::chrono::steady_clock::now() < hashUntil)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool ok = staleRejected && gotInput && received.Keys == 0xFFB &&
+                        validHash && hash == 0xA55A;
+        printf("HANDOFF_WIRE_AUTH %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 2;
+    }
     if (getenv("LITEV_TEST_ROM_REHASH"))
     {
         // Same-size replacement: ordinary setup may reuse a hash, but a live
