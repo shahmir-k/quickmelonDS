@@ -25,6 +25,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <set>
 #include <string>
 #include <thread>
@@ -117,6 +118,7 @@ public:
     // The offering host must choose a nonzero epoch strictly greater than
     // every earlier offer on this live link (reconnect resets the counter).
     bool StartHandoffFence(u64 epoch, const std::array<u8, 16>& token = {});
+    const char* FenceStartFailure = "";   // why the last StartHandoffFence failed
     bool GetHandoffFenceToken(std::array<u8, 16>& token) const;
     // After a committed handoff's Netplay session ended (every device leaves at the same frame):
     // the link's fence and offer are over on both sides, with no message needed.
@@ -193,7 +195,7 @@ private:
         u32 ActiveMs = 0, CloseAtMs = 0;
         std::vector<std::vector<u8>> Pending;   // frames sent while connecting
         u32 TxSeq = 0, RetiredThrough = 0;
-        std::set<u32> RetiredBeyond;
+        std::map<u32, u32> RetiredBeyond;   // retired out of order: seq -> when (ms)
         u32 GapSinceMs = 0, LastMPMs = 0;
         u32 LocalFenceMs = 0, PeerFenceMs = 0, DropThroughSeq = 0;
         bool SequenceOverflow = false;

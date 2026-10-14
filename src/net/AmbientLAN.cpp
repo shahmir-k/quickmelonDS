@@ -835,7 +835,7 @@ void AmbientLAN::RetireMP(const QueuedPacket& q)
     }
     else if (seq - l->RetiredThrough <= 1024)
     {
-        l->RetiredBeyond.insert(seq);
+        l->RetiredBeyond.emplace(seq, NowMs());
         if (!l->GapSinceMs) l->GapSinceMs = NowMs();
     }
     else
@@ -845,15 +845,17 @@ void AmbientLAN::RetireMP(const QueuedPacket& q)
 void AmbientLAN::SettleMPGaps(Link& l, u32 now)
 {
     if (l.RetiredBeyond.empty()) { l.GapSinceMs = 0; return; }
-    if (!l.GapSinceMs) { l.GapSinceMs = now; return; }
-    if (now - l.GapSinceMs < kMPGapExpireMs) return;
-    const u32 first = *l.RetiredBeyond.begin();
-    if (first > l.RetiredThrough + 1)
-    {
-        if (kFenceTrace)
-            fprintf(stderr, "AMBFENCE expired MP gap %u..%u\n", l.RetiredThrough + 1, first - 1);
-        l.RetiredThrough = first - 1;
-    }
+    // A sequence number missing for kMPGapExpireMs while a later one was retired is lost. Every
+    // such gap expires at once: expiring only the oldest per period (as this did) let RetiredThrough
+    // fall ~1000 packets behind on Wi-Fi with a loss every second, and a fence mark more than 1024
+    // ahead then tripped SequenceOverflow ("cannot start Ambient cut fence", r8b-mac).
+    u32 through = 0;
+    for (const auto& [seq, ms] : l.RetiredBeyond) if (now - ms >= kMPGapExpireMs) through = seq;
+    if (!through) return;
+    if (kFenceTrace)
+        fprintf(stderr, "AMBFENCE expired MP gaps %u..%u\n", l.RetiredThrough + 1, through);
+    l.RetiredThrough = through;
+    l.RetiredBeyond.erase(l.RetiredBeyond.begin(), l.RetiredBeyond.upper_bound(through));
     while (l.RetiredBeyond.erase(l.RetiredThrough + 1)) l.RetiredThrough++;
     l.GapSinceMs = l.RetiredBeyond.empty() ? 0 : now;
 }
@@ -914,21 +916,28 @@ static void FencedLinkTimeout(ENetPeer* p, bool fenced)
 bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
 {
     Link* l = HandoffLink();
-    if (!l || !HandoffBuildCompatible() || !epoch || l->FenceAbort || l->SequenceOverflow) return false;
+    auto no = [&](const char* why) { FenceStartFailure = why; return false; };
+    if (!l) return no("no single live Ambient link");
+    if (!HandoffBuildCompatible()) return no("peer not in the presence view or handoff build differs");
+    if (!epoch) return no("no epoch");
+    if (l->FenceAbort) return no(l->PeerAbort ? "peer aborted the fence" : "fence already aborted");
+    if (l->SequenceOverflow) return no("sequence overflow");
     // no token: the peer's fence token, else the accepted offer's (either side may fence first)
     const auto& effectiveToken = token != std::array<u8, 16>{} ? token : l->PeerFence ? l->FenceToken : l->OfferToken;
     if (Cfg.RequireHandoffOffer &&
-        !HandoffOfferReady(epoch, effectiveToken, static_cast<HandoffMode>(l->OfferMode))) return false;
-    if (epoch <= l->LastClosedFenceEpoch) return false;
-    if (l->FenceEpoch && l->FenceEpoch != epoch) return false;
-    if (l->LocalFence) return false;
+        !HandoffOfferReady(epoch, effectiveToken, static_cast<HandoffMode>(l->OfferMode)))
+        return no(l->OfferEpoch != epoch ? "offer epoch differs" : l->OfferToken != effectiveToken ? "offer token differs" :
+                  "offer not accepted on both sides");
+    if (epoch <= l->LastClosedFenceEpoch) return no("epoch already closed");
+    if (l->FenceEpoch && l->FenceEpoch != epoch) return no("another fence epoch is open");
+    if (l->LocalFence) return no("already fenced");
     if (l->PeerFence)
     {
-        if (token != std::array<u8, 16>{} && token != l->FenceToken) return false;
+        if (token != std::array<u8, 16>{} && token != l->FenceToken) return no("peer fence token differs");
     }
     else
     {
-        if (effectiveToken == std::array<u8, 16>{}) return false;
+        if (effectiveToken == std::array<u8, 16>{}) return no("no token");
         l->FenceToken = effectiveToken;
     }
     l->FenceEpoch = epoch;
