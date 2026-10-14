@@ -47,6 +47,7 @@ struct AmbientLANQueueTestAccess
     {
         AmbientLAN::Config cfg;
         cfg.DeviceID = 0x101;
+        cfg.BuildID = 0x1234;
         cfg.Name = "rx-test";
         cfg.PresencePort = 0;
         cfg.LinkPort = 18066;
@@ -69,6 +70,20 @@ struct AmbientLANQueueTestAccess
         const u64 newGen = ambient.Links[slot].Generation;
         assert(newGen != oldGen);
         ambient.Links[slot].Up = true;
+
+        auto buildPeer = std::make_shared<std::vector<AmbientLAN::Peer>>(1);
+        (*buildPeer)[0].ID = peer.ID;
+        (*buildPeer)[0].BuildID = 0x9876;
+        ambient.View = buildPeer;
+        assert(!ambient.HandoffBuildCompatible());
+        std::array<u8, 16> token{};
+        token[0] = 1;
+        assert(!ambient.StartHandoffFence(1, token));
+        (*buildPeer)[0].BuildID = cfg.BuildID;
+        assert(ambient.HandoffBuildCompatible());
+        ambient.Cfg.AllowHandoff = false;
+        assert(!ambient.HandoffBuildCompatible());
+        ambient.Cfg.AllowHandoff = true;
 
         // Simulate a frame that was set aside by RecvReplies before the close and reinserted later.
         ambient.RX.push_back(Make(slot, 0x201, oldGen, 0, 0xB1));

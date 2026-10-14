@@ -609,6 +609,16 @@ const AmbientLAN::Link* AmbientLAN::HandoffLink() const
     return const_cast<AmbientLAN*>(this)->HandoffLink();
 }
 
+bool AmbientLAN::HandoffBuildCompatible() const
+{
+    const Link* link = HandoffLink();
+    if (!Cfg.AllowHandoff || !link || !View) return false;
+    for (const Peer& peer : *View)
+        if (peer.ID == link->ID)
+            return peer.BuildID == Cfg.BuildID;
+    return false;
+}
+
 AmbientLAN::Link* AmbientLAN::PacketLink(const QueuedPacket& q) const
 {
     return QueueCurrent(q) ? const_cast<Link*>(&Links[q.Slot]) : nullptr;
@@ -653,7 +663,7 @@ void AmbientLAN::SendFenceControl(Link& l, u32 type, u64 epoch, u32 mark)
 bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
 {
     Link* l = HandoffLink();
-    if (!l || !epoch || l->FenceAbort || l->SequenceOverflow) return false;
+    if (!l || !HandoffBuildCompatible() || !epoch || l->FenceAbort || l->SequenceOverflow) return false;
     if (epoch <= l->LastClosedFenceEpoch) return false;
     if (l->FenceEpoch && l->FenceEpoch != epoch) return false;
     if (l->LocalFence) return false;
@@ -684,7 +694,7 @@ bool AmbientLAN::GetHandoffFenceToken(std::array<u8, 16>& token) const
 bool AmbientLAN::HasPeerHandoffFence() const
 {
     const Link* l = HandoffLink();
-    return l && l->PeerFence && !l->FenceAbort;
+    return l && HandoffBuildCompatible() && l->PeerFence && !l->FenceAbort;
 }
 
 u64 AmbientLAN::PeerHandoffEpoch() const
@@ -696,7 +706,7 @@ u64 AmbientLAN::PeerHandoffEpoch() const
 bool AmbientLAN::CanAcknowledgeHandoffFence() const
 {
     const Link* l = HandoffLink();
-    return l && l->LocalFence && l->PeerFence && !l->FenceAbort && !l->SequenceOverflow &&
+    return l && HandoffBuildCompatible() && l->LocalFence && l->PeerFence && !l->FenceAbort && !l->SequenceOverflow &&
            l->RetiredThrough >= l->PeerLastSent && HandoffQueuedFrames() == 0;
 }
 

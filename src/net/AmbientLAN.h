@@ -50,6 +50,7 @@ public:
         std::string Name;           // shown to others (<= 32 bytes)
         char GameCode[4] = {};
         u32 BuildID = 0;
+        bool AllowHandoff = true;  // Android disables it for an unversioned/dirty native build
         int Vis = Vis_Everyone;
         u16 PresencePort = 7065;    // subnet broadcast (shared, SO_REUSEPORT)
         u16 UnicastPort = 0;        // this device's presence socket (0 = any; the app advertises it over NSD)
@@ -89,6 +90,9 @@ public:
     bool HasLinks() const { return StLinks.load(std::memory_order_relaxed) != 0; }
     // Emulator-thread-only diagnostic: MP frames already admitted locally or buffered while a link opens.
     size_t HandoffQueuedFrames() const;
+    // Compatibility gate only: presence is unauthenticated. The checkpoint
+    // exchange must still verify its full native build identity and peer.
+    bool HandoffBuildCompatible() const;
     // Emulator-thread-only, two-peer cut fence. Call after the host stops issuing
     // MP commands; the client may keep running until it reaches its own idle cut.
     // A received FENCE is not READY: unsequenced MP packets must first retire.
