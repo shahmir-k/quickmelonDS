@@ -254,7 +254,8 @@ u8 AmbientLAN::HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, boo
     auto it = std::find_if(Peers.begin(), Peers.end(), [&](const Peer& x) { return x.ID == id; });
     if (kind == P_Bye) { if (it != Peers.end()) Peers.erase(it); return 0; }
     if (kind == P_Req && it == Peers.end()) return 0;     // (a request alone does not make a device nearby)
-    if (it == Peers.end()) { Peers.emplace_back(); it = Peers.end() - 1; it->ID = id; }
+    const bool fresh = it == Peers.end();
+    if (fresh) { Peers.emplace_back(); it = Peers.end() - 1; it->ID = id; }
     Peer& e = *it;
     e.IP = ip; e.UniPort = port; e.LinkPort = G16(p + 6); e.BuildID = G32(p + 16); e.SeenMs = now;
     if (bcast) e.BcastMs = now;
@@ -283,6 +284,9 @@ u8 AmbientLAN::HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, boo
         // stale details: ask that device (unicast), at most once a second
         if (now - e.ReqMs >= 1000 || !e.ReqMs) { e.ReqMs = now; return P_Req; }
     }
+    // a device new here gets our details at once (else it waits up to kLiveMs for our liveness: a game run in
+    // fast-forward can finish its scan before that)
+    if (fresh && Announcing) { e.ReqMs = now; return P_Full; }
     return 0;
 }
 
@@ -446,9 +450,12 @@ void AmbientLAN::RebuildCands()
         u32 tu = G16(&p.Beacon[12 + 24 + 8]);
         const u32 iv = std::clamp<u32>(tu * 1024u, 20000u, 1000000u);
         u64 due = now + (p.ID % iv);    // (a new one: spread the phases)
-        u64 base = now - (wall - p.BeaconUs);       // (its age on arrival in real time, then the chip's)
-        for (const auto& o : Cands) if (o.ID == p.ID) { due = o.DueUs; if (o.SrcUs == p.BeaconUs) base = o.BaseUs; }
-        c.push_back({i, p.ID, due, iv, base, p.BeaconUs});
+        // its TSF: as received, aged by the real time since, then the chip's time only (monotonic, one beacon interval
+        // per interval, also when that device's beacon changes)
+        u64 tsf; memcpy(&tsf, &p.Beacon[12 + 24], 8);
+        u64 off = tsf + (wall - p.BeaconUs) - now;
+        for (const auto& o : Cands) if (o.ID == p.ID) { due = o.DueUs; off = o.TsfOff; }
+        c.push_back({i, p.ID, due, iv, off});
     }
     Cands.swap(c);
     NextInjectUs = ~0ull;
@@ -470,8 +477,7 @@ int AmbientLAN::Inject(u8* data, u64* timestamp)
         const Peer& p = (*View)[best->Idx];
         len = (int)p.Beacon.size();
         memcpy(data, p.Beacon.data(), len);
-        u64 tsf; memcpy(&tsf, &data[12 + 24], 8);
-        tsf += now - best->BaseUs;
+        const u64 tsf = now + best->TsfOff;
         memcpy(&data[12 + 24], &tsf, 8);
         best->DueUs = std::max(best->DueUs + best->IntervalUs, now);
         StInjected++;
@@ -484,14 +490,14 @@ int AmbientLAN::Inject(u8* data, u64* timestamp)
 }
 
 // the chip's clock (beacons keep their pace per emulated second in fast-forward / slow motion); when it goes back (a
-// savestate, a reset) the schedule goes back with it
+// savestate, a reset) the schedule goes back with it, the TSF does not
 u64 AmbientLAN::EmuNow()
 {
     const u64 now = WifiUs;
     if (now < EmuUs)
     {
         const u64 d = EmuUs - now;
-        for (auto& c : Cands) { c.DueUs = c.DueUs > d ? c.DueUs - d : 0; c.BaseUs -= d; }
+        for (auto& c : Cands) { c.DueUs = c.DueUs > d ? c.DueUs - d : 0; c.TsfOff += d; }
         if (NextInjectUs != ~0ull) NextInjectUs = NextInjectUs > d ? NextInjectUs - d : 0;
     }
     return EmuUs = now;
@@ -520,6 +526,13 @@ u32 AmbientLAN::UpMask() const
 
 void AmbientLAN::LinksChanged()
 {
+    // a change of the group: normal speed (a parent tells its other children)
+    const bool fast = StSpeed || PendCode > 0;
+    PendCode = -1;
+    StSpeed = StShown = 0;
+    StSpeedWho = 0;
+    SpeedReq = -1;
+    if (fast && ParentSlot < 0 && UpMask()) SpeedDecide(0, 0, 0);
     std::vector<u64> ids;
     NumLinks = 0;
     for (int s = 0; s < 16; s++) if (Links[s].P) { NumLinks++; ids.push_back(Links[s].ID); }
@@ -683,8 +696,12 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         break;
     }
     case ENET_EVENT_TYPE_RECEIVE:
-        enet_packet_destroy(ev.packet);     // (control channel: unused)
+    {
+        const Link* l = (const Link*)ev.peer->data;
+        if (l && ev.channelID == Chan_Ctl) SpeedControl((int)(l - Links), ev.packet->data, ev.packet->dataLength);
+        enet_packet_destroy(ev.packet);
         break;
+    }
     default:
         break;
     }
@@ -772,6 +789,81 @@ void AmbientLAN::Pump(int type, int waitMs)
     }
 }
 
+// ---- group fast-forward (AmbientLAN.h) ----
+// control channel: {1, code, seq u32, at u64, who u64} parent -> children: the group speed from the chip time `at`;
+// {2, code} child -> parent: its key asks for `code`
+
+int AmbientLAN::ToggleSpeed(int onCode)
+{
+    const int c = StShown ? 0 : onCode;
+    StShown = c;
+    SpeedReq = c;
+    return c;
+}
+
+std::string AmbientLAN::SpeedWho()
+{
+    const u64 id = StSpeedWho;
+    if (id == Cfg.DeviceID) return Cfg.Name;
+    std::lock_guard<std::mutex> g(Mu);
+    for (const auto& p : *Snap) if (p.ID == id) return p.Name;
+    return "";
+}
+
+void AmbientLAN::SendCtl(u32 slots, const u8* m, int n)
+{
+    if (!Host || !slots) return;
+    ENetPacket* pkt = enet_packet_create(m, n, ENET_PACKET_FLAG_RELIABLE);
+    for (int s = 0; s < 16; s++) if ((slots >> s & 1) && Links[s].Up) enet_peer_send(Links[s].P, Chan_Ctl, pkt);
+    if (!pkt->referenceCount) enet_packet_destroy(pkt);
+    enet_host_flush(Host);
+}
+
+// parent: the group speed from chip time atUs, for every member
+void AmbientLAN::SpeedDecide(int code, u64 who, u64 atUs)
+{
+    SpeedSeq++;
+    PendCode = code; PendWho = who; PendAtUs = atUs; PendWallUs = NowUs();
+    StShown = code;
+    u8 m[22] = {1, (u8)code};
+    memcpy(m + 2, &SpeedSeq, 4); memcpy(m + 6, &atUs, 8); memcpy(m + 14, &who, 8);
+    SendCtl(UpMask(), m, sizeof(m));
+}
+
+void AmbientLAN::SpeedControl(int slot, const u8* p, size_t n)
+{
+    if (n >= 2 && p[0] == 2 && ParentSlot < 0) SpeedDecide(p[1] & 63, Links[slot].ID, WifiUs + kSpeedLagUs);
+    else if (n >= 22 && p[0] == 1 && slot == ParentSlot)
+    {
+        u32 seq;
+        memcpy(&seq, p + 2, 4);
+        if (seq == SpeedSeq) return;
+        SpeedSeq = seq;
+        PendCode = p[1] & 63; memcpy(&PendAtUs, p + 6, 8); memcpy(&PendWho, p + 14, 8); PendWallUs = NowUs();
+        StShown = PendCode;
+    }
+}
+
+void AmbientLAN::SpeedTick()
+{
+    const int req = SpeedReq.exchange(-1);
+    if (req >= 0 && NumLinks)
+    {
+        if (ParentSlot >= 0 && Links[ParentSlot].Up) { const u8 m[2] = {2, (u8)req}; SendCtl(1u << ParentSlot, m, 2); }
+        else if (ParentSlot >= 0) StShown = StSpeed.load();     // (not up yet: the press is dropped)
+        else SpeedDecide(req, Cfg.DeviceID, WifiUs + kSpeedLagUs);
+    }
+    // at the agreed chip time (one far ahead: a clock not following the parent's yet, at once; a chip that stopped
+    // polling: after 2 s)
+    const u64 now = WifiUs;
+    if (PendCode < 0 || (now < PendAtUs && PendAtUs - now <= 4 * kSpeedLagUs && NowUs() - PendWallUs < 2000000)) return;
+    Platform::Log(Platform::LogLevel::Info, "Ambient: group speed %d by %016llx (chip %llu us, due %llu)\n", PendCode,
+                  (unsigned long long)PendWho, (unsigned long long)now, (unsigned long long)PendAtUs);
+    StSpeed = PendCode;
+    StSpeedWho = PendWho;
+    PendCode = -1;
+}
+
 int AmbientLAN::Pop(u8* data, u64* timestamp)
 {
     while (!RX.empty() && !QueueCurrent(RX.front()))
@@ -818,8 +910,10 @@ void AmbientLAN::Process()
         else if (now - l.ActiveMs > kIdleMs) CloseLink(s, "idle");
     }
     StMaxRtt = rtt;
+    SpeedTick();
     if (StSlowDismissRequested.exchange(false)) Slowdown.Dismiss();
-    const auto slow = Slowdown.Observe(NowUs(), UpMask() != 0, frameBlocked, frameExchanges);
+    const int sp = StSpeed;     // (NetplaySpeed codes: 63 uncapped, else x4)
+    const auto slow = Slowdown.Observe(NowUs(), UpMask() != 0, frameBlocked, frameExchanges, sp == 63 ? 0 : sp ? sp * 1500 : 6000);
     StSlowFps = slow.FpsX100;
     StSlowWait = slow.WaitUsPerFrame;
     StSlowExch = slow.ExchangesPerFrameX100;

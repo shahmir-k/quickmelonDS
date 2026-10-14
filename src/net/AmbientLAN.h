@@ -87,6 +87,17 @@ public:
     Stats GetStats();
     void DismissSlowdownPrompt() { StSlowDismissRequested = true; StSlowPending = false; }
     bool HasLinks() const { return StLinks.load(std::memory_order_relaxed) != 0; }
+    // Group fast-forward: ONE speed for the LAN session (the linked players), in NetplaySpeed codes (0 = normal). Any
+    // member's key asks for it; the parent decides and relays it (a child links only to its parent) and every member
+    // switches at the same emulated time (the parent's chip clock + kSpeedLagUs: a child's clock follows its parent's),
+    // so a host never runs faster than its children (it would time out their replies). Any change of the links (one
+    // opens or closes) is normal speed again; no links = no group (the frontend's own fast-forward, which a player
+    // leaving the session starts from off).
+    static constexpr u64 kSpeedLagUs = 250000;
+    int ToggleSpeed(int onCode);                // any thread: the key; returns the code it shows
+    int SpeedShown() const { return StShown.load(); }
+    int Speed() const { return StSpeed.load(); }
+    std::string SpeedWho();                     // the name of the player whose key set Speed()
 
     void Process() override;
     void Begin(int inst) override;
@@ -134,7 +145,7 @@ private:
         u64 ID = 0, Generation = 0;
         int Slot = -1;
     };
-    struct Cand { size_t Idx; u64 ID; u64 DueUs; u32 IntervalUs; u64 BaseUs = 0, SrcUs = 0; };    // (us: the chip's clock; BaseUs: when the beacon's TSF was taken, SrcUs: its Peer::BeaconUs)
+    struct Cand { size_t Idx; u64 ID; u64 DueUs; u32 IntervalUs; u64 TsfOff = 0; };    // (us: the chip's clock; TSF = the chip's clock + TsfOff)
 
     Config Cfg;
     u8 MyMAC[6];
@@ -176,6 +187,11 @@ private:
     u64 NextInjectUs = ~0ull;
     u64 EmuUs = 0;
     u32 FrameBlockedUs = 0, FrameExchanges = 0;
+    int PendCode = -1;              // group speed to apply at PendAtUs (chip clock), from PendWho
+    u64 PendAtUs = 0, PendWho = 0, PendWallUs = 0;
+    u32 SpeedSeq = 0;               // parent: its decisions; child: the last one applied
+    std::atomic<int> SpeedReq{-1}, StSpeed{0}, StShown{0};
+    std::atomic<u64> StSpeedWho{0};
     AmbientSlowdown Slowdown;
 
     std::atomic<u64> StFrames{0}, StPresTx{0}, StPresRx{0}, StLinkTx{0}, StLinkRx{0}, StInjected{0}, StOpened{0}, StBlockedUs{0}, StExchanges{0};
@@ -198,6 +214,10 @@ private:
     void NoteBeacon(const u8* data, int len);
     void SendTo(u32 slots, u32 type, const u8* data, int len, u64 timestamp);
     void Pump(int type, int waitMs = -1);
+    void SpeedDecide(int code, u64 who, u64 atUs);
+    void SpeedControl(int slot, const u8* p, size_t n);
+    void SpeedTick();
+    void SendCtl(u32 slots, const u8* m, int n);
     void OnEvent(ENetEvent& ev);
     bool Admit(ENetEvent& ev);
     int Pop(u8* data, u64* timestamp);

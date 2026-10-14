@@ -1037,9 +1037,49 @@ int main(int argc, char** argv)
                 printf("\n");
                 fflush(stdout);
             }
+            int period = 16667;
+#ifdef LITEV_AMBIENT_LAN
+            if (ambient)
+            {
+                // the LAN session's fast-forward (AmbientLAN::ToggleSpeed): LITEV_AMBIENT_FF=[NAME@]F:t/F:u...: at frame F
+                // this player presses the key (t: 2x, u: uncapped); NAME@: only the player named NAME
+                static std::map<int, int> ffPlan = [&] {
+                    std::map<int, int> m;
+                    std::string v = getenv("LITEV_AMBIENT_FF") ? getenv("LITEV_AMBIENT_FF") : "";
+                    const size_t at = v.find('@');
+                    if (at != std::string::npos) { if (v.substr(0, at) != opt.ambient) v.clear(); else v = v.substr(at + 1); }
+                    for (size_t i = 0; i < v.size(); )
+                    {
+                        size_t e = v.find('/', i); if (e == std::string::npos) e = v.size();
+                        const std::string t = v.substr(i, e - i);
+                        const size_t c = t.find(':');
+                        if (c != std::string::npos) m[atoi(t.c_str())] = t[c + 1] == 'u' ? 63 : 8;
+                        i = e + 1;
+                    }
+                    return m;
+                }();
+                static int lastSpeed = 0;
+                if (ffPlan.count(frame))
+                    printf("AMBIENT ff press f%d: links=%u shows %d\n", frame, (unsigned)ambient->HasLinks(), ambient->HasLinks() ? ambient->ToggleSpeed(ffPlan[frame]) : -1);
+                const int sp = ambient->HasLinks() ? ambient->Speed() : 0;
+                if (sp != lastSpeed)
+                {
+                    lastSpeed = sp;
+                    printf("AMBIENT speed f%d: %d by '%s'\n", frame, sp, ambient->SpeedWho().c_str());
+                    fflush(stdout);
+                }
+                period = sp == 63 ? 0 : sp ? 16667 * 4 / sp : 16667;
+                // LITEV_AMBIENT_SOLO_FF=<multiplier> (0: uncapped): this player's own fast-forward during discovery; a LAN
+                // session ends it (1x from the first link; leaving the session stays 1x)
+                static float soloFf = getenv("LITEV_AMBIENT_SOLO_FF") ? (float)atof(getenv("LITEV_AMBIENT_SOLO_FF")) : 1.0f;
+                if (ambient->HasLinks() && soloFf != 1.0f) { soloFf = 1.0f; printf("AMBIENT solo ff off f%d: a link opened\n", frame); }
+                if (soloFf != 1.0f) period = soloFf <= 0 ? 0 : (int)(16667 / soloFf);
+            }
+#endif
             if (!getenv("LITEV_LAN_NOPACE"))
             {
-                lanNext += std::chrono::microseconds(16667);
+                lanNext += std::chrono::microseconds(period);
+                if (!period) lanNext = std::chrono::steady_clock::now();
                 std::this_thread::sleep_until(lanNext);
             }
         }

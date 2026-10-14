@@ -94,7 +94,7 @@ struct AmbientLANQueueTestAccess
         (*beaconPeer)[0].ID = 0x303;
         (*beaconPeer)[0].Beacon.assign(64, 0);
         (*beaconPeer)[0].Beacon[9] = 6;
-        (*beaconPeer)[0].Beacon[40] = 0xD1;
+        (*beaconPeer)[0].Beacon[50] = 0xD1;
         (*beaconPeer)[0].BeaconUs = NowUs();
         ambient.View = beaconPeer;
         WifiChannel = 6;
@@ -112,35 +112,34 @@ struct AmbientLANQueueTestAccess
         ambient.Process();
         assert(ambient.NumLinks == 0 && ambient.RX.empty());
         armBeacon();
-        assert(ambient.RecvPacket(0, frame, &timestamp) == 64 && frame[40] == 0xD1);
+        assert(ambient.RecvPacket(0, frame, &timestamp) == 64 && frame[50] == 0xD1);
 
         assert(ambient.OpenLink(peer) == slot);
         ambient.Links[slot].ActiveMs = NowMs() - 10001;
         ambient.Process();
         assert(ambient.NumLinks == 0 && ambient.RX.empty());
         armBeacon();
-        assert(ambient.RecvPacket(0, frame, &timestamp) == 64 && frame[40] == 0xD1);
+        assert(ambient.RecvPacket(0, frame, &timestamp) == 64 && frame[50] == 0xD1);
 
         // Beacons and their TSF follow the chip's clock, not the wall clock (fast-forward / slow motion).
         WifiUs = 50000000;
         armBeacon();
-        ambient.Cands[0].BaseUs = WifiUs - 300;
+        ambient.Cands[0].TsfOff = 300 - WifiUs;
         ambient.RecvPacket(0, frame, &timestamp);
-        u64 tsf, tsf0;
-        memcpy(&tsf0, &(*beaconPeer)[0].Beacon[36], 8);
+        u64 tsf;
         memcpy(&tsf, frame + 36, 8);
-        assert(tsf - tsf0 == 300);
+        assert(tsf == 300);
         assert(ambient.RecvPacket(0, frame, &timestamp) == 0);       // not due again at the same emulated time
         WifiUs += 1000000;
         assert(ambient.RecvPacket(0, frame, &timestamp) == 64);      // one interval of emulated time, no wall time
         memcpy(&tsf, frame + 36, 8);
-        assert(tsf - tsf0 == 1000300);
-        WifiUs -= 30000000;                                          // a savestate from earlier: the same phase
+        assert(tsf == 1000300);
+        WifiUs -= 30000000;                                          // a savestate from earlier: the same phase, TSF on
         assert(ambient.RecvPacket(0, frame, &timestamp) == 0);
         WifiUs += 1000000;
         assert(ambient.RecvPacket(0, frame, &timestamp) == 64);
         memcpy(&tsf, frame + 36, 8);
-        assert(tsf - tsf0 == 2000300);
+        assert(tsf == 2000300);
 
         // RecvReplies: old replies streaming in do not extend its wait past RecvTimeout.
         auto linkPeer = std::make_shared<std::vector<AmbientLAN::Peer>>(1);
