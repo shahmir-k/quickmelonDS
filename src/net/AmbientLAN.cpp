@@ -544,7 +544,7 @@ AmbientLAN::Stats AmbientLAN::GetStats()
     s.ClientWaitUs = StClientWaitUs; s.ClientWaitCalls = StClientWaitCalls; s.ClientWaitMisses = StClientWaitMisses;
     for (int t = 0; t < 4; t++) s.Stale[t] = StStale[t];
     s.LinkRttUs = LinkRttUs;
-    s.EmuUs = FrameEmuUs; s.PredFpsX100 = StPredFps; s.Verdict = StVerdict;
+    s.EmuUs = EmuBaseUs; s.PredFpsX100 = StPredFps; s.Verdict = StVerdict;
     s.LastFrameBlockedUs = StLastBlocked; s.LastFrameExchanges = StLastExch; s.Links = StLinks; s.Nearby = StNearby; s.MaxRttMs = StMaxRtt;
     s.SlowFpsX100 = StSlowFps; s.SlowWaitUsPerFrame = StSlowWait;
     s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending;
@@ -692,7 +692,7 @@ int AmbientLAN::OpenLink(const Peer& p)
     StOpened++;
     LinksChanged(true);
     Platform::Log(Platform::LogLevel::Info, "Ambient: link %d -> %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p.ID, p.Name.c_str(),
-                  (int)PeerVerdict(p.ID), FrameEmuUs / 1000.0);
+                  (int)PeerVerdict(p.ID), EmuBaseUs / 1000.0);
     return s;
 }
 
@@ -815,7 +815,7 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         enet_peer_timeout(ev.peer, 0, 5000, 5000);
         LinksChanged(true);
         Platform::Log(Platform::LogLevel::Info, "Ambient: link %d <- %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p->ID, p->Name.c_str(),
-                      (int)PeerVerdict(p->ID), FrameEmuUs / 1000.0);
+                      (int)PeerVerdict(p->ID), EmuBaseUs / 1000.0);
         break;
     }
     case ENET_EVENT_TYPE_DISCONNECT:
@@ -1115,7 +1115,7 @@ AmbientLAN::Verdict AmbientLAN::PeerVerdict(u64 id)
 {
     std::lock_guard<std::mutex> g(Mu);
     for (const auto& p : Peers)
-        if (p.ID == id) return p.RttN < 3 ? Verdict_Unknown : FrameEmuUs + p.RttUs() > 1000000 / 50 ? Verdict_LanBad : Verdict_LanOk;
+        if (p.ID == id) return p.RttN < 3 ? Verdict_Unknown : EmuBaseUs + p.RttUs() > 1000000 / 58 ? Verdict_LanBad : Verdict_LanOk;
     return Verdict_Unknown;
 }
 
@@ -1123,22 +1123,34 @@ AmbientLAN::Verdict AmbientLAN::PeerVerdict(u64 id)
 void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
 {
     const u32 run = RunUs;
+    const u64 now = NowUs();
     if (run)
     {
         const u32 e = run > frameBlocked ? run - frameBlocked : 0;
-        FrameEmuUs = (FrameEmuUs * 15 + e) / 16;
+        FrameEmuUs = (FrameEmuUs * 15 + std::min<u32>(e, 2 * FrameEmuUs)) / 16;     // (a loading frame: at most 2x)
         RunUs = 0;
+        // E for the round-trip rule: the lowest half-second average of the last 2 s (a loading phase emulates more)
+        EmSum += e; EmN++;
+        if (!EmT0) EmT0 = now;
+        if (now - EmT0 >= 500000)
+        {
+            EmRing[EmPos++ % 4] = (u32)(EmSum / EmN);
+            u32 m = ~0u;
+            for (u32 x : EmRing) if (x) m = std::min(m, x);
+            EmuBaseUs = m;
+            EmT0 = now; EmSum = 0; EmN = 0;
+        }
     }
-    const u64 now = NowUs();
     if (!UpMask())
     {
         if (StVerdict) Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict cleared (no links)\n");
         StVerdict = Verdict_Unknown; StPredFps = 0;
-        FirstExchUs = VT0 = 0; VFrames = VExch = VRunN = VBad = VOk = 0; VRunUs = 0; VerdictDismissed = false;
+        FirstExchUs = VT0 = 0; VFrames = VExch = VRunN = VBad = VWeak = VOk = 0; VRunUs = 0; VerdictDismissed = false;
         return;
     }
+    const u64 stalls = StHostWaitTimeouts + StClientWaitMisses;
     if (frameExchanges && !FirstExchUs) FirstExchUs = now;
-    if (!VT0) VT0 = now;
+    if (!VT0) { VT0 = now; VStallAt = stalls; VEmuAtLink = EmuBaseUs; }
     VFrames++; VExch += frameExchanges;
     if (run) { VRunUs += run; VRunN++; }
     if (now - VT0 < 500000) return;
@@ -1146,25 +1158,29 @@ void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
     if (FirstExchUs && now - FirstExchUs >= 1000000 && rtt && VExch)
     {
         const double net = (double)VExch / VFrames * rtt;
-        const double frame = VRunN ? (double)VRunUs / VRunN : FrameEmuUs + net;
+        const double frame = VRunN ? (double)VRunUs / VRunN : EmuBaseUs + net;
         const double pred = std::min(60.0, 1e6 / frame);
         StPredFps = (u32)(pred * 100);
-        // (50: a margin, a 55-57 fps LAN is no case for Netplay; round trips taking half the frame are the network's
-        // doing even where the partner is slow too; one exchange a frame not fitting is bad whatever else waited)
-        const bool bad = (frame > 1e6 / 50 && (frame - net <= 1e6 / 58 || net >= frame / 2)) || FrameEmuUs + rtt > 1000000 / 50;
-        VBad = bad ? VBad + 1 : 0;
-        VOk = bad ? 0 : VOk + 1;
+        // strong: the round trips alone take the frames below 50 fps (50: a margin, a 55-57 fps LAN is no case for
+        // Netplay), or one exchange a frame does not fit 58; weak: they take 40% of the frame with no wait timing out
+        // (a partner slow too; a timeout = a partner loading, an MKDS race start)
+        // (E: the session's lowest, a loading phase emulates more)
+        const bool strong = (frame > 1e6 / 50 && frame - net <= 1e6 / 58) || std::min<u32>(VEmuAtLink, EmuBaseUs) + rtt > 1000000 / 58;
+        const bool weak = frame > 1e6 / 50 && net >= frame * 0.4 && stalls == VStallAt;
+        VBad = strong ? VBad + 1 : 0;
+        VWeak = strong || weak ? VWeak + 1 : 0;
+        VOk = strong || weak ? 0 : VOk + 1;
         int v = StVerdict;
-        if (VBad >= 2) v = Verdict_LanBad;
+        if (VBad >= 2 || VWeak >= 6) v = Verdict_LanBad;
         else if (VOk >= (v == Verdict_LanBad ? 4u : 2u)) v = Verdict_LanOk;
         if (v != StVerdict)
         {
-            Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict %s: %.1f fps (frame %.1f ms, of which %.2f exchanges/frame x %.1f ms round trips)\n",
-                          v == Verdict_LanBad ? "LAN_BAD" : "LAN_OK", pred, frame / 1000.0, (double)VExch / VFrames, rtt / 1000.0);
+            Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict %s: %.1f fps (frame %.1f ms, of which %.2f exchanges/frame x %.1f ms round trips; emulation %.1f ms)\n",
+                          v == Verdict_LanBad ? "LAN_BAD" : "LAN_OK", pred, frame / 1000.0, (double)VExch / VFrames, rtt / 1000.0, EmuBaseUs / 1000.0);
             StVerdict = v;
         }
     }
-    VT0 = now; VFrames = VExch = VRunN = 0; VRunUs = 0;
+    VT0 = now; VFrames = VExch = VRunN = 0; VRunUs = 0; VStallAt = stalls;
 }
 
 void AmbientLAN::Begin(int inst)
