@@ -43,6 +43,10 @@ enum : u32 { HandoffFence = 1, HandoffReady = 2, HandoffAbort = 3,
              HandoffDecline = 10, HandoffCancel = 11, HandoffRom = 12 };
 constexpr size_t kHandoffRomBytes = 88;
 constexpr u32 kLiveMs = 2000, kFullMinMs = 500, kExpireMs = 6000, kIdleMs = 10000, kOwnBeaconStaleMs = 3000;
+// The game's MP clock is frozen through checkpoint transfer and both startup
+// proofs. Keep the already-consented link alive long enough for that bounded
+// transaction; ordinary gameplay still closes after 10 seconds of inactivity.
+constexpr u32 kHandoffIdleMs = 120000;
 
 u64 NowUs() { return (u64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 u32 NowMs() { return (u32)(NowUs() / 1000); }
@@ -837,6 +841,7 @@ bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
         l->FenceToken = token;
     }
     l->FenceEpoch = epoch;
+    l->ActiveMs = NowMs();
     l->FenceLastSent = l->TxSeq;
     l->LocalFence = true;
     SendFenceControl(*l, HandoffFence, epoch, l->FenceLastSent);
@@ -970,6 +975,7 @@ void AmbientLAN::CompleteHandoffReset(Link& l)
         l.LastClosedFenceToken = l.FenceToken;
     }
     l.FenceEpoch = 0;
+    l.ActiveMs = NowMs(); // give a rolled-back source its normal idle grace period
     l.FenceToken = {};
     l.FenceLastSent = l.PeerLastSent = l.PeerRetiredThrough = 0;
     l.LocalFence = l.PeerFence = l.LocalReady = l.PeerReady = false;
@@ -1054,6 +1060,7 @@ void AmbientLAN::ReceiveHandoffControl(Link& l, u32 type, u64 epoch, u32 mark,
     else if (type == HandoffFence)
     {
         l.FenceEpoch = epoch;
+        l.ActiveMs = NowMs();
         l.FenceToken = token;
         l.PeerFence = true;
         l.PeerLastSent = mark;
@@ -1302,7 +1309,8 @@ void AmbientLAN::Process()
         if (!l.P) continue;
         if (l.Up) rtt = std::max<u32>(rtt, l.P->roundTripTime);
         if (l.CloseAtMs && (s32)(now - l.CloseAtMs) >= 0) CloseLink(s, "deauth");
-        else if (now - l.ActiveMs > kIdleMs) CloseLink(s, "idle");
+        else if (now - l.ActiveMs > (l.FenceEpoch ? kHandoffIdleMs : kIdleMs))
+            CloseLink(s, "idle");
     }
     StMaxRtt = rtt;
     if (StSlowDismissRequested.exchange(false)) Slowdown.Dismiss();

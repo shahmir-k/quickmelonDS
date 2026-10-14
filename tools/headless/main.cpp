@@ -578,20 +578,23 @@ int main(int argc, char** argv)
     {
         // An old Netplay sender can reuse the same player index and target IP.
         // Its untagged input and hash must not enter a newly armed live cut.
+        // Also run with host id 15: Hosted Netplay's record server uses that
+        // input seat rather than its visible console seat 0.
+        const int hostPlayer = getenv("LITEV_TEST_HANDOFF_WIRE_AUTH_HOSTED") ? 15 : 0;
         const int base = 22000 + (getpid() % 4000) * 5;
         const auto address = [](int port) { return "127.0.0.1:" + std::to_string(port); };
-        NetplayInput host(0, 3, base, {{1, address(base + 1)}});
-        NetplayInput peer(1, 3, base + 1, {{0, address(base)}});
-        NetplayInput stale(1, 3, base + 2, {{0, address(base)}});
-        NetplayInput wrongToken(1, 3, base + 5, {{0, address(base)}});
+        NetplayInput host(hostPlayer, 3, base, {{1, address(base + 1)}});
+        NetplayInput peer(1, 3, base + 1, {{hostPlayer, address(base)}});
+        NetplayInput stale(1, 3, base + 2, {{hostPlayer, address(base)}});
+        NetplayInput wrongToken(1, 3, base + 5, {{hostPlayer, address(base)}});
         std::array<u8, 16> token{};
         for (int i = 0; i < 16; i++) token[i] = (u8)(i + 1);
         std::array<u8, 16> wrong = token;
         wrong[0] ^= 1;
         if (!host.Ok() || !peer.Ok() || !stale.Ok() || !wrongToken.Ok() ||
             !host.ArmHandoffSession(42, token, base + 3, {{1, address(base + 4)}}) ||
-            !peer.ArmHandoffSession(42, token, base + 4, {{0, address(base + 3)}}) ||
-            !wrongToken.ArmHandoffSession(42, wrong, base + 6, {{0, address(base + 3)}}))
+            !peer.ArmHandoffSession(42, token, base + 4, {{hostPlayer, address(base + 3)}}) ||
+            !wrongToken.ArmHandoffSession(42, wrong, base + 6, {{hostPlayer, address(base + 3)}}))
         { printf("HANDOFF_WIRE_AUTH FAIL: sockets\n"); return 2; }
         // A correctly tagged packet is still premature until the separate
         // frame-zero proof completes on this receiver.
@@ -1416,6 +1419,25 @@ int main(int argc, char** argv)
                     }
                     else
                     {
+                        // A real checkpoint exchange can keep both source
+                        // games frozen for longer than ordinary Ambient's
+                        // 10-second idle timeout. Pump only control traffic
+                        // and prove the fenced link survives that interval.
+                        if (const char* hold = getenv("LITEV_AMBIENT_CUT_FROZEN_MS"))
+                        {
+                            const int ms = std::clamp(atoi(hold), 0, 60000);
+                            const auto until = std::chrono::steady_clock::now() +
+                                               std::chrono::milliseconds(ms);
+                            while (std::chrono::steady_clock::now() < until)
+                            {
+                                ambient->Process();
+                                if (!ambient->GetStats().Links || ambient->HandoffFenceAborted() ||
+                                    !ambient->HandoffFenceComplete())
+                                { fprintf(stderr, "CUTFENCE fenced link expired during frozen hold\n"); return 2; }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                            }
+                            printf("CUTFENCE %s frozen link survived %d ms\n", cutRole, ms);
+                        }
                         const auto fs = ambient->GetHandoffFenceStats();
                         const std::string path = std::string(cutDir) + (host ? "/host.mln" : "/client.mln");
                         std::vector<u8> liveState;
