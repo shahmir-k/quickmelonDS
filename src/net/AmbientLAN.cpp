@@ -40,7 +40,8 @@ constexpr u32 kHandoffCtl = 0x46444E48;     // "HNDF", Ambient-only reliable con
 enum : u32 { HandoffFence = 1, HandoffReady = 2, HandoffAbort = 3,
              HandoffPrepared = 4, HandoffArmed = 5, HandoffGo = 6,
              HandoffResetDone = 7, HandoffOffer = 8, HandoffAccept = 9,
-             HandoffDecline = 10, HandoffCancel = 11 };
+             HandoffDecline = 10, HandoffCancel = 11, HandoffRom = 12 };
+constexpr size_t kHandoffRomBytes = 88;
 constexpr u32 kLiveMs = 2000, kFullMinMs = 500, kExpireMs = 6000, kIdleMs = 10000, kOwnBeaconStaleMs = 3000;
 
 u64 NowUs() { return (u64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -620,6 +621,17 @@ bool AmbientLAN::HandoffBuildCompatible() const
     return false;
 }
 
+bool AmbientLAN::HandoffPeerIPv4(std::string& address) const
+{
+    address.clear();
+    const Link* l = HandoffLink();
+    if (!l || !l->P || !HandoffBuildCompatible()) return false;
+    char host[64]{};
+    if (enet_address_get_host_ip(&l->P->address, host, sizeof(host)) != 0 || !host[0]) return false;
+    address = host;
+    return true;
+}
+
 bool AmbientLAN::SendOfferControl(Link& l, u32 type, u64 epoch, u32 mark,
                                   const std::array<u8, 16>& token)
 {
@@ -641,6 +653,8 @@ void AmbientLAN::CloseHandoffOffer(Link& l)
     l.OfferToken = {};
     l.OfferMode = 0;
     l.LocalOffered = l.PeerOffered = l.LocalOfferAccepted = l.PeerOfferAccepted = false;
+    l.LocalOfferRom = {};
+    l.PeerOfferRom = {};
 }
 
 bool AmbientLAN::ProposeHandoff(u64 epoch, const std::array<u8, 16>& token, HandoffMode mode)
@@ -697,6 +711,60 @@ bool AmbientLAN::GetHandoffOfferStatus(HandoffOfferStatus& status) const
               l->LocalOffered, (l->LocalOffered && l->PeerOfferAccepted) ||
                                    (l->PeerOffered && l->LocalOfferAccepted)};
     return true;
+}
+
+bool AmbientLAN::PublishHandoffRom(const NetplayRom& rom)
+{
+    Link* l = HandoffLink();
+    if (!l || !rom.Size || rom.Size > (512u << 20) ||
+        !HandoffOfferReady(l->OfferEpoch, l->OfferToken, static_cast<HandoffMode>(l->OfferMode))) return false;
+    if (l->LocalOfferRom.Size) return l->LocalOfferRom == rom;
+    std::vector<u8> v;
+    P32(v, kHandoffCtl); P32(v, HandoffRom); P64(v, l->OfferEpoch);
+    v.insert(v.end(), l->OfferToken.begin(), l->OfferToken.end());
+    P64(v, rom.Size);
+    v.insert(v.end(), rom.Sha, rom.Sha + 32);
+    v.insert(v.end(), rom.GameCode, rom.GameCode + 4);
+    v.insert(v.end(), rom.Title, rom.Title + 12);
+    if (v.size() != kHandoffRomBytes) return false;
+    ENetPacket* p = enet_packet_create(v.data(), v.size(), ENET_PACKET_FLAG_RELIABLE);
+    if (!p) return false;
+    if (enet_peer_send(l->P, Chan_Ctl, p) != 0) { enet_packet_destroy(p); return false; }
+    enet_host_flush(Host);
+    l->LocalOfferRom = rom;
+    return true;
+}
+
+bool AmbientLAN::GetPeerHandoffRom(NetplayRom& rom) const
+{
+    const Link* l = HandoffLink();
+    if (!l || !l->PeerOfferRom.Size ||
+        !HandoffOfferReady(l->OfferEpoch, l->OfferToken, static_cast<HandoffMode>(l->OfferMode))) return false;
+    rom = l->PeerOfferRom;
+    return true;
+}
+
+void AmbientLAN::ReceiveHandoffRom(Link& l, const u8* bytes, size_t length)
+{
+    if (length != kHandoffRomBytes || G32(bytes) != kHandoffCtl || G32(bytes + 4) != HandoffRom)
+        return;
+    const u64 epoch = (u64)G32(bytes + 8) | ((u64)G32(bytes + 12) << 32);
+    std::array<u8, 16> token{};
+    memcpy(token.data(), bytes + 16, token.size());
+    if (!HandoffOfferReady(epoch, token, static_cast<HandoffMode>(l.OfferMode))) return;
+    NetplayRom rom;
+    rom.Size = (u64)G32(bytes + 32) | ((u64)G32(bytes + 36) << 32);
+    if (!rom.Size || rom.Size > (512u << 20)) return;
+    memcpy(rom.Sha, bytes + 40, 32);
+    memcpy(rom.GameCode, bytes + 72, 4);
+    memcpy(rom.Title, bytes + 76, 12);
+    if (l.PeerOfferRom.Size && l.PeerOfferRom != rom)
+    {
+        SendOfferControl(l, HandoffCancel, l.OfferEpoch, 0, l.OfferToken);
+        CloseHandoffOffer(l);
+        return;
+    }
+    l.PeerOfferRom = rom;
 }
 
 void AmbientLAN::CancelHandoffOffer()
@@ -1086,7 +1154,9 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
     case ENET_EVENT_TYPE_RECEIVE:
     {
         Link* l = (Link*)ev.peer->data;
-        if (l && ev.channelID == Chan_Ctl && ev.packet->dataLength == 36)
+        if (l && ev.channelID == Chan_Ctl && ev.packet->dataLength == kHandoffRomBytes)
+            ReceiveHandoffRom(*l, ev.packet->data, ev.packet->dataLength);
+        else if (l && ev.channelID == Chan_Ctl && ev.packet->dataLength == 36)
         {
             const u8* d = ev.packet->data;
             if (G32(d) == kHandoffCtl)

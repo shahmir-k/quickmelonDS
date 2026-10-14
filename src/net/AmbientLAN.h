@@ -35,6 +35,7 @@
 #include "types.h"
 #include "MPInterface.h"
 #include "AmbientSlowdown.h"
+#include "NetplayInput.h"
 
 namespace melonDS
 {
@@ -94,6 +95,9 @@ public:
     // Compatibility gate only: presence is unauthenticated. The checkpoint
     // exchange must still verify its full native build identity and peer.
     bool HandoffBuildCompatible() const;
+    // The address of the sole *connected* ENet peer, not a presence-advertised
+    // address. Bind the checkpoint and startup sockets to this IPv4 peer.
+    bool HandoffPeerIPv4(std::string& address) const;
     enum HandoffMode { HandoffPlainNetplay = 1, HandoffHostedNetplay = 2 };
     // Two-player, reliable peer consent before the first frozen frame. All methods
     // are emulator-thread-only, just like the fence API below. The offer epoch
@@ -104,6 +108,8 @@ public:
     bool HandoffOfferReady(u64 epoch, const std::array<u8, 16>& token, HandoffMode mode) const;
     struct HandoffOfferStatus { u64 Epoch; u64 PeerID; HandoffMode Mode; bool Outgoing, Accepted; };
     bool GetHandoffOfferStatus(HandoffOfferStatus& status) const;
+    bool PublishHandoffRom(const NetplayRom& rom);
+    bool GetPeerHandoffRom(NetplayRom& rom) const;
     void CancelHandoffOffer();
     // Emulator-thread-only, two-peer cut fence. Call after the host stops issuing
     // MP commands; the client may keep running until it reaches its own idle cut.
@@ -187,6 +193,7 @@ private:
         std::array<u8, 16> OfferToken{};
         u32 OfferMode = 0;
         bool LocalOffered = false, PeerOffered = false, LocalOfferAccepted = false, PeerOfferAccepted = false;
+        NetplayRom LocalOfferRom, PeerOfferRom;
         std::array<u8, 16> FenceToken{};
         u32 FenceLastSent = 0, PeerLastSent = 0, PeerRetiredThrough = 0;
         bool LocalFence = false, PeerFence = false, LocalReady = false, PeerReady = false;
@@ -242,6 +249,7 @@ private:
                           const std::array<u8, 16>& token);
     void ReceiveHandoffControl(Link& link, u32 type, u64 epoch, u32 mark,
                                const std::array<u8, 16>& token);
+    void ReceiveHandoffRom(Link& link, const u8* bytes, size_t length);
     void CloseHandoffOffer(Link& link);
     void CompleteHandoffReset(Link& link);
     Link* HandoffLink();

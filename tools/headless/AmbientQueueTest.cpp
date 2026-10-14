@@ -81,6 +81,8 @@ struct AmbientLANQueueTestAccess
         assert(!ambient.StartHandoffFence(1, token));
         (*buildPeer)[0].BuildID = cfg.BuildID;
         assert(ambient.HandoffBuildCompatible());
+        std::string peerAddress;
+        assert(ambient.HandoffPeerIPv4(peerAddress) && peerAddress == "127.0.0.1");
         ambient.Cfg.AllowHandoff = false;
         assert(!ambient.HandoffBuildCompatible());
         ambient.Cfg.AllowHandoff = true;
@@ -176,6 +178,27 @@ struct AmbientLANQueueTestAccess
         link.LocalOfferAccepted = true; // the response send is exercised by the integration gate
         assert(ambient.GetHandoffOfferStatus(status) && status.Accepted);
         assert(ambient.HandoffOfferReady(epoch, token, mode));
+        std::vector<u8> manifest(88);
+        auto put32 = [&](size_t at, u32 value) {
+            for (int i = 0; i < 4; i++) manifest[at + i] = (u8)(value >> (8 * i));
+        };
+        put32(0, 0x46444E48); // HNDF
+        put32(4, 12);         // ROM manifest
+        put32(8, 100);
+        memcpy(manifest.data() + 16, token.data(), token.size());
+        put32(32, 0x2000000);
+        memset(manifest.data() + 40, 0xA5, 32);
+        memcpy(manifest.data() + 72, "IRAO", 4);
+        memcpy(manifest.data() + 76, "POKEMON WHITE", 12);
+        NetplayRom described;
+        manifest[16] ^= 1;
+        ambient.ReceiveHandoffRom(link, manifest.data(), manifest.size());
+        assert(!ambient.GetPeerHandoffRom(described)); // wrong offer token
+        manifest[16] ^= 1;
+        ambient.ReceiveHandoffRom(link, manifest.data(), manifest.size());
+        assert(ambient.GetPeerHandoffRom(described));
+        assert(described.Size == 0x2000000 && described.Sha[0] == 0xA5 &&
+               !memcmp(described.GameCode, "IRAO", 4));
         std::array<u8, 16> wrong = token;
         wrong[0] ^= 1;
         ambient.ReceiveHandoffControl(link, 1, 100, 0, wrong);

@@ -757,6 +757,7 @@ int main(int argc, char** argv)
     bool cutRetryReady = false;
     bool cutResetDelayed = false;
     bool cutOfferSent = false;
+    bool cutRomVerified = false;
     std::array<u8, 16> cutOfferToken{};
     NetplayRom cutOwnRom, cutPeerRom;
     if (cutXferPort)
@@ -1068,6 +1069,7 @@ int main(int argc, char** argv)
                 {
                     cutRetryReady = true;
                     cutOfferSent = false;
+                    cutRomVerified = false;
                     cutOfferToken = {};
                     if (strcmp(cutRole, "host") == 0 &&
                         getenv("LITEV_AMBIENT_CUT_STALE_REPLAY") &&
@@ -1155,7 +1157,30 @@ int main(int argc, char** argv)
                 const bool offerReady = !cutXferPort || !host ||
                     ambient->HandoffOfferReady(nextEpoch, cutOfferToken,
                                                melonDS::AmbientLAN::HandoffPlainNetplay);
-                if (eligible && offerReady &&
+                bool romReady = !cutXferPort;
+                if (cutXferPort && eligible)
+                {
+                    melonDS::AmbientLAN::HandoffOfferStatus offer{};
+                    if (ambient->GetHandoffOfferStatus(offer) && offer.Accepted && offer.Epoch == nextEpoch)
+                    {
+                        if (!ambient->PublishHandoffRom(cutOwnRom))
+                        { fprintf(stderr, "CUTFENCE local ROM manifest failed\n"); return 2; }
+                        NetplayRom described;
+                        if (ambient->GetPeerHandoffRom(described))
+                        {
+                            if (described != cutPeerRom)
+                            { fprintf(stderr, "CUTFENCE peer ROM manifest differs\n"); return 2; }
+                            romReady = true;
+                            if (!cutRomVerified)
+                            {
+                                cutRomVerified = true;
+                                printf("CUTFENCE %s exact peer ROM verified before cut\n", cutRole);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                }
+                if (eligible && offerReady && romReady &&
                     (host || ambient->HasPeerHandoffFence()) &&
                     nds->Wifi.HandoffBusyMask() == 0 && ambient->HandoffQueuedFrames() == 0)
                 {
