@@ -126,6 +126,9 @@ public:
     // each); sets the program's keys for the following frames.
     bool HasProgram() const { return !steps_.empty(); }
     void OnFrame(int frame, const melonDS::u32* top, const melonDS::u32* bot);
+    // Names reached by @log in the last OnFrame call. A test runner can capture that exact
+    // frame, rather than guessing a frame number from a prior run with different link delay.
+    std::vector<std::string> TakeMilestones();
 
         // Number of parsed directives (diagnostics).
     size_t DirectiveCount() const { return directives_.size(); }
@@ -144,6 +147,7 @@ private:
     size_t pc_ = 0; int stepStart_ = -1; bool failed_ = false;
     melonDS::u32 progKeys_ = 0; int progTx_ = -1, progTy_ = -1;
     std::string path_;
+    std::vector<std::string> milestones_;
     bool Eval(const std::vector<Cond>& c, const melonDS::u32* top, const melonDS::u32* bot) const;
     bool ParseStep(const std::string& line, std::string& err);
 

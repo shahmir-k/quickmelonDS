@@ -63,6 +63,7 @@ public:
         u64 ClientWaitUs, ClientWaitCalls, ClientWaitMisses;
         u64 Stale[4];               // MP frames dropped as stale (too old for the chip), by type: regular, CMD, reply, ack
         u32 LastFrameBlockedUs, LastFrameExchanges, Links, Nearby, MaxRttMs;
+        u32 LinkRttUs;              // the slowest linked device's median presence round trip
         u32 SlowFpsX100, SlowWaitUsPerFrame, SlowExchangesPerFrameX100;
         bool SlowdownPending;
     };
@@ -82,7 +83,7 @@ public:
     void AddPeerAddress(u32 ipNetOrder, u16 port);
     void SetVisibility(int vis);
     void SetForeground(bool fg) { Foreground = fg; }
-    // nearby devices: "id \t name \t game \t ip:port \t ggid \t build \t linked"
+    // nearby devices: "id \t name \t game \t ip:port \t ggid \t build \t linked \t rtt_us \t jitter_us \t loss_%"
     std::vector<std::string> NearbyRows();
     Stats GetStats();
     void DismissSlowdownPrompt() { StSlowDismissRequested = true; StSlowPending = false; }
@@ -98,6 +99,8 @@ public:
     int SpeedShown() const { return StShown.load(); }
     int Speed() const { return StSpeed.load(); }
     std::string SpeedWho();                     // the name of the player whose key set Speed()
+    // the frontend, after each frame: its emulation wall time (RunFrame, link waits included)
+    void NoteFrameUs(u32 us) { RunUs = us; }
 
     void Process() override;
     void Begin(int inst) override;
@@ -126,6 +129,13 @@ public:
         std::string Name;
         std::vector<u8> Beacon;     // the DS TX header + beacon frame as sent (empty: not beaconing)
         u64 BeaconUs = 0;           // when it arrived (TSF aging)
+        // presence round trips (same game only): the last 8, the loss of the last 16 pings
+        u32 RttS[8] = {};
+        u8 RttN = 0, RttPos = 0, PingN = 0, LossPct = 0;
+        u16 Sent = 0, Recv = 0;
+        u32 PingMs = 0;
+        u32 RttUs() const;          // median (0: none yet)
+        u32 JitterUs() const;       // mean deviation from it
     };
 
 private:
@@ -168,6 +178,9 @@ private:
     u8 HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, bool bcast);     // (under Mu) the reply to send
     std::vector<u8> BuildPresence(u8 kind);
     void SendPresence(const std::vector<u8>& pkt, bool bcast, const std::vector<std::pair<u32, u16>>& to);
+    std::vector<u8> BuildPing(u8 kind, u64 t);
+    u64 PingEcho = 0;                                       // presence thread
+    std::atomic<u32> LinkRttUs{0};                          // the slowest linked device's median round trip
 
     // ---- links + synthesis (emulator thread) ----
     ENetHost* Host = nullptr;
@@ -187,6 +200,7 @@ private:
     u64 NextInjectUs = ~0ull;
     u64 EmuUs = 0;
     u32 FrameBlockedUs = 0, FrameExchanges = 0;
+    u32 RunUs = 0;                  // NoteFrameUs
     int PendCode = -1;              // group speed to apply at PendAtUs (chip clock), from PendWho
     u64 PendAtUs = 0, PendWho = 0, PendWallUs = 0;
     u32 SpeedSeq = 0;               // parent: its decisions; child: the last one applied
@@ -218,6 +232,8 @@ private:
     void SpeedControl(int slot, const u8* p, size_t n);
     void SpeedTick();
     void SendCtl(u32 slots, const u8* m, int n);
+    std::vector<std::pair<u64, QueuedPacket>> Delayed;      // tests (NetSim): received MP frames held until then (us)
+    bool ReleaseDelayed();
     void OnEvent(ENetEvent& ev);
     bool Admit(ENetEvent& ev);
     int Pop(u8* data, u64* timestamp);

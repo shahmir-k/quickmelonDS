@@ -124,6 +124,7 @@ struct Options
     // frame:path pairs to dump as PPM. Multiple frames in ONE run (comma-separated in a single
     // --fb-dump-ppm, or the flag repeated) so a visual A/B needs one replay, not one-per-frame.
     std::vector<std::pair<int, std::string>> fbDumps;
+    std::string scriptShotDir;          // capture both screens on each reactive @log milestone
     std::string videoMp4;               // --video-mp4: every frame, through ffmpeg
     std::string checkRecording;         // --check-recording: an app recording's frames.csv
     int reloadAt = -1;                  // --reload-at: load --savestate again after this many frames
@@ -182,6 +183,7 @@ struct Options
         "  --fastmem on|off          JIT fast-memory path (default on; no-op where unsupported)\n"
         "  --fb-hash-every N         print xxhash of both framebuffers every N frames\n"
         "  --fb-dump-ppm <f>:<path>[,<f>:<path>...]  dump both framebuffers at each frame as PPM\n"
+        "  --script-shot-dir <dir>   dump both screens at each @log milestone (directory must exist)\n"
         "                            (multiple frames in ONE run; flag may also repeat)\n"
         "  --audio-interp <mode>     SPU interpolation: none|linear|cosine|cubic|gaussian (default none)\n"
         "  --frameskip N             skip N of every N+1 frames' rasterization (LITEV_AGGRESSIVE_SKIP build)\n"
@@ -266,6 +268,7 @@ bool ParseArgs(int argc, char** argv, Options& o)
         else if (a == "--video-mp4") o.videoMp4 = next("--video-mp4");
         else if (a == "--check-recording") o.checkRecording = next("--check-recording");
         else if (a == "--reload-at") o.reloadAt = std::atoi(next("--reload-at").c_str());
+        else if (a == "--script-shot-dir") o.scriptShotDir = next("--script-shot-dir");
         else if (a == "--fb-dump-ppm")
         {
             // Accept one or more <frame>:<path> pairs, comma-separated, in a single flag (the flag
@@ -918,13 +921,27 @@ int main(int argc, char** argv)
             if (frame == mb + 1) prctl(PR_SET_NAME, "headless");
         }
 #endif
+#ifdef LITEV_AMBIENT_LAN
+        const auto runStart = std::chrono::steady_clock::now();
+#endif
         nds->RunFrame();
+        // LITEV_FRAME_LOAD_MS=<ms> (tests): busy-wait that long a frame, as a slower device's emulation (the RG DS
+        // needs ~10 ms a frame where the Mac needs ~2): link round trips then cost frames as they do there
+        if (static const double loadMs = getenv("LITEV_FRAME_LOAD_MS") ? atof(getenv("LITEV_FRAME_LOAD_MS")) : 0; loadMs > 0)
+        {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(loadMs * 1000));
+            while (std::chrono::steady_clock::now() < until) {}
+        }
+#ifdef LITEV_AMBIENT_LAN
+        if (ambient) ambient->NoteFrameUs((u32)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - runStart).count());
+#endif
         if (inputScript.HasProgram())   // closed-loop script steps (@until / @repeat ... rgb) see this frame's screens
         {
             void* top = nullptr; void* bot = nullptr;
             if (nds->GPU.GetFramebuffers(&top, &bot) && top && bot) inputScript.OnFrame(frame, (const u32*)top, (const u32*)bot);
             else inputScript.OnFrame(frame, nullptr, nullptr);
         }
+        const auto scriptMilestones = inputScript.TakeMilestones();
         if (static const bool p2d = getenv("LITEV_PRINT_2D") != nullptr; p2d)   // display registers after the frame
             fprintf(stderr, "2D f%d A: dispcnt=%08x bldcnt=%04x eva=%d evb=%d evy=%d mb=%04x  B: dispcnt=%08x bldcnt=%04x evy=%d mb=%04x cap=%08x\n", frame,
                     nds->GPU.GPU2D_A.DispCnt, nds->GPU.GPU2D_A.BlendCnt, nds->GPU.GPU2D_A.EVA, nds->GPU.GPU2D_A.EVB, nds->GPU.GPU2D_A.EVY, nds->GPU.MasterBrightnessA,
@@ -1010,10 +1027,24 @@ int main(int argc, char** argv)
         {
             melonDS::MPInterface::Get().Process();
 #ifdef LITEV_AMBIENT_LAN
+            static const auto ambT0 = std::chrono::steady_clock::now();
+            const double ambT = std::chrono::duration<double>(std::chrono::steady_clock::now() - ambT0).count();
+            if (ambient)
+            {
+                // the session's state changes, when they happen (links, the slowdown offer)
+                static u32 lastLinks = 0; static bool lastOffer = false;
+                const auto st = ambient->GetStats();
+                if (st.Links != lastLinks || st.SlowdownPending != lastOffer)
+                {
+                    lastLinks = st.Links; lastOffer = st.SlowdownPending;
+                    printf("AMBIENT event t=%.2fs f%d: links=%u offer=%d link_rtt=%.1fms\n", ambT, frame, st.Links, st.SlowdownPending ? 1 : 0, st.LinkRttUs / 1000.0);
+                    fflush(stdout);
+                }
+            }
             if (ambient && frame % 120 == 0)
             {
                 const auto st = ambient->GetStats();
-                printf("AMBIENT f%d: nearby=%u links=%u opened=%llu presence tx=%llu rx=%llu link tx=%llu rx=%llu beacons=%llu blocked=%.1fms exch=%llu rtt=%ums slow_fps=%.2f slow_wait=%.2fms slow_exch=%.2f offer=%d host_wait=%.1fms/%llu miss=%llu timeout=%llu client_wait=%.1fms/%llu miss=%llu stale=%llu/%llu/%llu/%llu\n",
+                printf("AMBIENT f%d: nearby=%u links=%u opened=%llu presence tx=%llu rx=%llu link tx=%llu rx=%llu beacons=%llu blocked=%.1fms exch=%llu rtt=%ums slow_fps=%.2f slow_wait=%.2fms slow_exch=%.2f offer=%d host_wait=%.1fms/%llu miss=%llu timeout=%llu client_wait=%.1fms/%llu miss=%llu stale=%llu/%llu/%llu/%llu link_rtt=%.1fms t=%.1fs\n",
                        frame, st.Nearby, st.Links, (unsigned long long)st.LinksOpened, (unsigned long long)st.PresenceTx, (unsigned long long)st.PresenceRx,
                        (unsigned long long)st.LinkTx, (unsigned long long)st.LinkRx, (unsigned long long)st.BeaconsInjected, st.BlockedUs / 1000.0,
                        (unsigned long long)st.Exchanges, st.MaxRttMs, st.SlowFpsX100 / 100.0, st.SlowWaitUsPerFrame / 1000.0,
@@ -1022,7 +1053,7 @@ int main(int argc, char** argv)
                        (unsigned long long)st.HostWaitTimeouts,
                        st.ClientWaitUs / 1000.0, (unsigned long long)st.ClientWaitCalls, (unsigned long long)st.ClientWaitMisses,
                        (unsigned long long)st.Stale[0], (unsigned long long)st.Stale[1], (unsigned long long)st.Stale[2],
-                       (unsigned long long)st.Stale[3]);
+                       (unsigned long long)st.Stale[3], st.LinkRttUs / 1000.0, ambT);
                 for (const auto& r : ambient->NearbyRows()) printf("AMBIENT  %s\n", r.c_str());
                 fflush(stdout);
             }
@@ -1188,6 +1219,23 @@ int main(int argc, char** argv)
 
             lastTopHash = topHash;
             lastBotHash = botHash;
+
+            if (!opt.scriptShotDir.empty())
+            {
+                for (const auto& label : scriptMilestones)
+                {
+                    std::string safe;
+                    for (unsigned char c : label)
+                        safe += std::isalnum(c) ? (char)c : '_';
+                    if (safe.size() > 48) safe.resize(48);
+                    const std::string path = opt.scriptShotDir + "/f" + std::to_string(frame + 1) + "_" + safe + ".ppm";
+                    if (!DumpPPM(path, (const u32*)top, (const u32*)bot))
+                        fprintf(stderr, "warning: milestone screenshot failed: %s\n", path.c_str());
+                    printf("MILESTONE frame=%d name=%s top=%016llx bottom=%016llx file=%s\n", frame + 1,
+                           safe.c_str(), (unsigned long long)topHash, (unsigned long long)botHash, path.c_str());
+                    fflush(stdout);
+                }
+            }
 
             if (opt.fbHashEvery > 0 && ((frame + 1) % opt.fbHashEvery) == 0)
             {
