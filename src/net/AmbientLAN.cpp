@@ -538,6 +538,7 @@ AmbientLAN::Stats AmbientLAN::GetStats()
     s.ClientWaitUs = StClientWaitUs; s.ClientWaitCalls = StClientWaitCalls; s.ClientWaitMisses = StClientWaitMisses;
     for (int t = 0; t < 4; t++) s.Stale[t] = StStale[t];
     s.LinkRttUs = LinkRttUs;
+    s.EmuUs = FrameEmuUs; s.PredFpsX100 = StPredFps; s.Verdict = StVerdict;
     s.LastFrameBlockedUs = StLastBlocked; s.LastFrameExchanges = StLastExch; s.Links = StLinks; s.Nearby = StNearby; s.MaxRttMs = StMaxRtt;
     s.SlowFpsX100 = StSlowFps; s.SlowWaitUsPerFrame = StSlowWait;
     s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending;
@@ -684,7 +685,8 @@ int AmbientLAN::OpenLink(const Peer& p)
     enet_peer_timeout(e, 0, 5000, 5000);
     StOpened++;
     LinksChanged(true);
-    Platform::Log(Platform::LogLevel::Info, "Ambient: link %d -> %016llx (%s)\n", s, (unsigned long long)p.ID, p.Name.c_str());
+    Platform::Log(Platform::LogLevel::Info, "Ambient: link %d -> %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p.ID, p.Name.c_str(),
+                  (int)PeerVerdict(p.ID), FrameEmuUs / 1000.0);
     return s;
 }
 
@@ -806,7 +808,8 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         ev.peer->data = &n;
         enet_peer_timeout(ev.peer, 0, 5000, 5000);
         LinksChanged(true);
-        Platform::Log(Platform::LogLevel::Info, "Ambient: link %d <- %016llx (%s)\n", s, (unsigned long long)p->ID, p->Name.c_str());
+        Platform::Log(Platform::LogLevel::Info, "Ambient: link %d <- %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p->ID, p->Name.c_str(),
+                      (int)PeerVerdict(p->ID), FrameEmuUs / 1000.0);
         break;
     }
     case ENET_EVENT_TYPE_DISCONNECT:
@@ -1082,13 +1085,79 @@ void AmbientLAN::Process()
     }
     StMaxRtt = rtt;
     SpeedTick();
-    if (StSlowDismissRequested.exchange(false)) Slowdown.Dismiss();
+    Judge(frameBlocked, frameExchanges);
+    if (StSlowDismissRequested.exchange(false)) { Slowdown.Dismiss(); VerdictDismissed = true; }
     const int sp = StSpeed;     // (NetplaySpeed codes: 63 uncapped, else x4)
     const auto slow = Slowdown.Observe(NowUs(), UpMask() != 0, frameBlocked, frameExchanges, sp == 63 ? 0 : sp ? sp * 1500 : 6000);
     StSlowFps = slow.FpsX100;
     StSlowWait = slow.WaitUsPerFrame;
     StSlowExch = slow.ExchangesPerFrameX100;
-    StSlowPending = slow.Pending;
+    // the Netplay offer: the verdict; the fps-and-wait detector only without round trips (presence blocked): it cannot
+    // tell a slow network from a partner busy emulating (2 x 8 ms frames over localhost waited 8 ms a frame at 57 fps)
+    StSlowPending = (StVerdict == Verdict_LanBad && !VerdictDismissed) || (slow.Pending && !LinkRttUs);
+}
+
+// the wait for a peer's MP frame: RecvTimeout, or the link's round trip + margin when that is longer (a slow network
+// keeps its session, slowly, until it moves to Netplay), at most 250 ms
+int AmbientLAN::LinkWaitMs() const
+{
+    return std::max(RecvTimeout, std::min(250, (int)(LinkRttUs * 3 / 2000) + 10));
+}
+
+AmbientLAN::Verdict AmbientLAN::PeerVerdict(u64 id)
+{
+    std::lock_guard<std::mutex> g(Mu);
+    for (const auto& p : Peers)
+        if (p.ID == id) return p.RttN < 3 ? Verdict_Unknown : FrameEmuUs + p.RttUs() > 1000000 / 50 ? Verdict_LanBad : Verdict_LanOk;
+    return Verdict_Unknown;
+}
+
+// once a frame (Process): the emulation time and the session verdict (AmbientLAN.h)
+void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
+{
+    const u32 run = RunUs;
+    if (run)
+    {
+        const u32 e = run > frameBlocked ? run - frameBlocked : 0;
+        FrameEmuUs = (FrameEmuUs * 15 + e) / 16;
+        RunUs = 0;
+    }
+    const u64 now = NowUs();
+    if (!UpMask())
+    {
+        if (StVerdict) Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict cleared (no links)\n");
+        StVerdict = Verdict_Unknown; StPredFps = 0;
+        FirstExchUs = VT0 = 0; VFrames = VExch = VRunN = VBad = VOk = 0; VRunUs = 0; VerdictDismissed = false;
+        return;
+    }
+    if (frameExchanges && !FirstExchUs) FirstExchUs = now;
+    if (!VT0) VT0 = now;
+    VFrames++; VExch += frameExchanges;
+    if (run) { VRunUs += run; VRunN++; }
+    if (now - VT0 < 500000) return;
+    const u32 rtt = LinkRttUs;
+    if (FirstExchUs && now - FirstExchUs >= 1000000 && rtt && VExch)
+    {
+        const double net = (double)VExch / VFrames * rtt;
+        const double frame = VRunN ? (double)VRunUs / VRunN : FrameEmuUs + net;
+        const double pred = std::min(60.0, 1e6 / frame);
+        StPredFps = (u32)(pred * 100);
+        // (50: a margin, a 55-57 fps LAN is no case for Netplay; even one exchange a frame not fitting is bad whatever
+        // else the frames waited for)
+        const bool bad = (frame > 1e6 / 50 && frame - net <= 1e6 / 58) || FrameEmuUs + rtt > 1000000 / 50;
+        VBad = bad ? VBad + 1 : 0;
+        VOk = bad ? 0 : VOk + 1;
+        int v = StVerdict;
+        if (VBad >= 2) v = Verdict_LanBad;
+        else if (VOk >= (v == Verdict_LanBad ? 4u : 2u)) v = Verdict_LanOk;
+        if (v != StVerdict)
+        {
+            Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict %s: %.1f fps (frame %.1f ms, of which %.2f exchanges/frame x %.1f ms round trips)\n",
+                          v == Verdict_LanBad ? "LAN_BAD" : "LAN_OK", pred, frame / 1000.0, (double)VExch / VFrames, rtt / 1000.0);
+            StVerdict = v;
+        }
+    }
+    VT0 = now; VFrames = VExch = VRunN = 0; VRunUs = 0;
 }
 
 void AmbientLAN::Begin(int inst)
@@ -1215,8 +1284,8 @@ int AmbientLAN::RecvHostPacket(int inst, u8* data, u64* timestamp)
         while (RX.empty() && NowUs() < end);
     }
 #endif
-    const u64 spent = NowUs() - t0;     // (the spin counts toward RecvTimeout)
-    Pump(2, spent >= (u64)RecvTimeout * 1000 ? 0 : (int)(((u64)RecvTimeout * 1000 - spent + 999) / 1000));
+    const u64 spent = NowUs() - t0, wait = (u64)LinkWaitMs() * 1000;     // (the spin counts toward it)
+    Pump(2, spent >= wait ? 0 : (int)((wait - spent + 999) / 1000));
     const int r = Pop(data, timestamp);
     const u64 waited = NowUs() - t0;
     FrameBlockedUs += (u32)waited;
@@ -1234,7 +1303,7 @@ u16 AmbientLAN::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
     u16 ret = 0;
     u32 replied = 0;
     std::deque<QueuedPacket> later;      // regular frames meanwhile (a joining child's auth): for RecvPacket
-    const u64 end = t0 + (u64)RecvTimeout * 1000;     // one wait for the call: old replies / regular frames meanwhile do not extend it
+    const u64 end = t0 + (u64)LinkWaitMs() * 1000;    // one wait for the call: old replies / regular frames meanwhile do not extend it
     for (;;)
     {
         const u64 now = NowUs();

@@ -56,9 +56,10 @@ def ppm_evidence(path):
         if f.readline() != b"P6\n" or f.readline() != b"256 384\n" or f.readline() != b"255\n":
             raise ValueError(f"bad framebuffer dimensions/format: {path}")
         pixels = f.read()
-    if len(pixels) != 256 * 384 * 3 or len(set(pixels[::97])) < 4:
-        raise ValueError(f"empty/truncated framebuffer: {path}")
-    return {"sha256": sha(path), "bytes": path.stat().st_size}
+    if len(pixels) != 256 * 384 * 3:
+        raise ValueError(f"truncated framebuffer: {path}")
+    # (a milestone on a fade is a blank frame: kept, flagged, not counted as a distinct phase image)
+    return {"sha256": sha(path), "bytes": path.stat().st_size, "blank": len(set(pixels[::97])) < 4}
 
 
 def trade_icon_scores(path):
@@ -241,7 +242,7 @@ def run_one(args, root, inputs, delay, repeat):
         required = [re.sub(r"[^A-Za-z0-9]", "_", s) for s in spec[side]]
         ordered = [got[s]["frame"] for s in required if s in got]
         missing = [s for s in required if s not in got]
-        distinct = len({got[s]["sha256"] for s in required if s in got})
+        distinct = len({got[s]["sha256"] for s in required if s in got and not got[s]["blank"]})
         failed = ("TIMEOUT at step" in log or "Fatal signal" in log or "data abort" in log or
                   "prefetch abort" in log or procs[i].returncode != 0)
         valid = not failed and not missing and ordered == sorted(ordered) and distinct >= 3

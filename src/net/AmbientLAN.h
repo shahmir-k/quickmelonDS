@@ -64,6 +64,8 @@ public:
         u64 Stale[4];               // MP frames dropped as stale (too old for the chip), by type: regular, CMD, reply, ack
         u32 LastFrameBlockedUs, LastFrameExchanges, Links, Nearby, MaxRttMs;
         u32 LinkRttUs;              // the slowest linked device's median presence round trip
+        u32 EmuUs, PredFpsX100;     // emulation per frame (no link waits); the session's predicted fps (SessionVerdict)
+        int Verdict;                // SessionVerdict
         u32 SlowFpsX100, SlowWaitUsPerFrame, SlowExchangesPerFrameX100;
         bool SlowdownPending;
     };
@@ -101,6 +103,25 @@ public:
     std::string SpeedWho();                     // the name of the player whose key set Speed()
     // the frontend, after each frame: its emulation wall time (RunFrame, link waits included)
     void NoteFrameUs(u32 us) { RunUs = us; }
+
+    // Can a LAN session hold 58 fps on this network, or should it be Netplay? From the presence round trips (median of
+    // the last 8; same-game devices 1 a second, linked ones 4) and this device's emulation time per frame E (NoteFrameUs
+    // without the link waits, average; 10 ms until measured, an RG DS). Each MP exchange stops emulation for one round
+    // trip, so a frame takes E + exchanges/frame x RTT:
+    //  - PeerVerdict (a device, before or at link open): LAN_BAD when E + 1 x RTT > 20 ms (not even one exchange a frame
+    //    fits 50 fps: 58 less a margin for jitter and the partner's turnaround; RG DS: RTT above ~10 ms), UNKNOWN
+    //    before 3 round trips.
+    //  - SessionVerdict (the live session): every 0.5 s from 1 s after the first exchange, a window is bad when its
+    //    frames (NoteFrameUs: emulation + link waits, no pacing) miss 50 fps AND would make 58 without their round
+    //    trips (frame - exchanges/frame x RTT): the network, not a busy / loading partner (an MKDS race start waits
+    //    on its partners at 0 ms too), costs the frames; or when the PeerVerdict rule holds for the link's round trip.
+    //    LAN_BAD after 2 bad windows in a row, back to LAN_OK after 4
+    //    good ones; a spike moves neither the median nor two windows. Without NoteFrameUs: emulation + exchanges x RTT.
+    //    Pacing is not in it (fast-forward never makes it bad); one exchange a frame on a 0-5 ms LAN stays under
+    //    20 ms. LAN_BAD also raises Stats::SlowdownPending (the Netplay offer) at once.
+    enum Verdict { Verdict_Unknown = 0, Verdict_LanOk = 1, Verdict_LanBad = 2 };
+    Verdict PeerVerdict(u64 id);
+    Verdict SessionVerdict() const { return (Verdict)StVerdict.load(); }
 
     void Process() override;
     void Begin(int inst) override;
@@ -201,6 +222,14 @@ private:
     u64 EmuUs = 0;
     u32 FrameBlockedUs = 0, FrameExchanges = 0;
     u32 RunUs = 0;                  // NoteFrameUs
+    std::atomic<u32> FrameEmuUs{10000};     // its emulation part, average
+    u64 FirstExchUs = 0, VT0 = 0, VRunUs = 0;      // the session verdict's windows
+    u32 VFrames = 0, VExch = 0, VRunN = 0, VBad = 0, VOk = 0;
+    bool VerdictDismissed = false;
+    std::atomic<int> StVerdict{0};
+    std::atomic<u32> StPredFps{0};
+    int LinkWaitMs() const;
+    void Judge(u32 frameBlocked, u32 frameExchanges);
     int PendCode = -1;              // group speed to apply at PendAtUs (chip clock), from PendWho
     u64 PendAtUs = 0, PendWho = 0, PendWallUs = 0;
     u32 SpeedSeq = 0;               // parent: its decisions; child: the last one applied

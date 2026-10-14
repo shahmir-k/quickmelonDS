@@ -183,6 +183,54 @@ struct AmbientLANQueueTestAccess
         sender.join();
         std::printf("ambient-queue-test: RecvReplies under an old-reply stream waited %.1f ms (RecvTimeout 25)\n", waited / 1000.0);
         assert(waited >= 24000 && waited < 40000);
+
+        // The LAN verdict (AmbientLAN.h). A device before a link: emulation + one round trip against 1000/58 ms.
+        ambient.Quit = true;        // (the presence thread would write LinkRttUs meanwhile)
+        ambient.Presence.join();
+        ambient.FrameEmuUs = 10000;
+        {
+            std::lock_guard<std::mutex> g(ambient.Mu);
+            AmbientLAN::Peer& p = ambient.Peers[0];
+            p.RttN = 2; p.RttS[0] = p.RttS[1] = 20000;
+        }
+        assert(ambient.PeerVerdict(0x404) == AmbientLAN::Verdict_Unknown);    // (2 round trips: not yet)
+        { std::lock_guard<std::mutex> g(ambient.Mu); auto& p = ambient.Peers[0]; p.RttN = 4; p.RttS[2] = 20000; p.RttS[3] = 400000; }
+        assert(ambient.PeerVerdict(0x404) == AmbientLAN::Verdict_LanBad);     // 10 + 20 ms > 20 (the spike is not the median)
+        { std::lock_guard<std::mutex> g(ambient.Mu); auto& p = ambient.Peers[0]; for (auto& r : p.RttS) r = 5000; }
+        assert(ambient.PeerVerdict(0x404) == AmbientLAN::Verdict_LanOk);      // 10 + 5 ms: a 0-5 ms LAN
+
+        // The live session: half-second windows of exchanges/frame x the link's round trip + emulation.
+        assert(ambient.UpMask());
+        // a window: its frames' emulation + link waits (NoteFrameUs), exchanges/frame, the round trip
+        auto window = [&](u32 rttUs, u32 exchPerFrame, u32 frameUs) {
+            ambient.LinkRttUs = rttUs;
+            ambient.FirstExchUs = NowUs() - 2000000;
+            ambient.VT0 = NowUs() - 600000;
+            ambient.VFrames = 29; ambient.VExch = 29 * exchPerFrame - exchPerFrame;
+            ambient.VRunN = 29; ambient.VRunUs = 29ull * frameUs;
+            ambient.NoteFrameUs(frameUs);
+            ambient.Judge(frameUs - 10000, exchPerFrame);     // (10 ms of each frame emulates, the rest waits)
+            return ambient.SessionVerdict();
+        };
+        assert(window(2000, 1, 11000) == AmbientLAN::Verdict_Unknown);    // one good window
+        assert(window(2000, 1, 11000) == AmbientLAN::Verdict_LanOk);
+        assert(window(5000, 1, 15000) == AmbientLAN::Verdict_LanOk);      // a 5 ms LAN, one exchange a frame
+        assert(window(40000, 1, 50000) == AmbientLAN::Verdict_LanOk);     // a spike: one window
+        assert(window(2000, 1, 11000) == AmbientLAN::Verdict_LanOk);
+        assert(window(5000, 1, 18500) == AmbientLAN::Verdict_LanOk);      // 54 fps: within the margin
+        assert(window(5000, 1, 18500) == AmbientLAN::Verdict_LanOk);
+        assert(window(9000, 1, 21000) == AmbientLAN::Verdict_LanOk);      // 21 ms frames, 12 without the network: bad
+        assert(window(9000, 1, 21000) == AmbientLAN::Verdict_LanBad);
+        assert(ambient.GetStats().SlowdownPending == false);       // (raised by Process, below)
+        ambient.Process();
+        assert(ambient.GetStats().SlowdownPending);
+        for (int i = 0; i < 3; i++) assert(window(2000, 1, 11000) == AmbientLAN::Verdict_LanBad);   // recovery needs 4
+        assert(window(2000, 1, 11000) == AmbientLAN::Verdict_LanOk);
+        // a race start: 5 exchanges a frame, frames slow at 0 ms too (partners loading): not the network
+        for (int i = 0; i < 4; i++) assert(window(4600, 5, 60000) == AmbientLAN::Verdict_LanOk);
+        // Shrek: 3 exchanges a frame at 6.5 ms (+ 1 ms turnaround each): 34 fps, 59 without the round trips
+        assert(window(6500, 3, 32500) == AmbientLAN::Verdict_LanOk);
+        assert(window(6500, 3, 32500) == AmbientLAN::Verdict_LanBad);
         enet_host_destroy(other);
     }
 };

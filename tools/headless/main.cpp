@@ -1032,8 +1032,16 @@ int main(int argc, char** argv)
             if (ambient)
             {
                 // the session's state changes, when they happen (links, the slowdown offer)
-                static u32 lastLinks = 0; static bool lastOffer = false;
+                static u32 lastLinks = 0; static bool lastOffer = false; static int lastVerdict = 0;
                 const auto st = ambient->GetStats();
+                if (st.Verdict != lastVerdict)
+                {
+                    lastVerdict = st.Verdict;
+                    static const char* const kVerdict[] = {"UNKNOWN", "LAN_OK", "LAN_BAD"};
+                    printf("AMBIENT verdict t=%.2fs f%d: %s predicted %.1f fps, emulation %.1f ms, link_rtt %.1f ms\n", ambT, frame,
+                           kVerdict[st.Verdict], st.PredFpsX100 / 100.0, st.EmuUs / 1000.0, st.LinkRttUs / 1000.0);
+                    fflush(stdout);
+                }
                 if (st.Links != lastLinks || st.SlowdownPending != lastOffer)
                 {
                     lastLinks = st.Links; lastOffer = st.SlowdownPending;
