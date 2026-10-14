@@ -2905,8 +2905,16 @@ void ARMJIT::DoSavestate(Savestate* file) noexcept
     const u32 config = sizeof(JitProfileInstr) | (MaxBlockSize << 8) | (LiteralOptimizations << 16)
         | (BranchOptimizations << 17) | (FastMemory << 18);
 
-    if (!file->Saving)
+    // ColdJit: the profile part is empty, so it is tagged build-independent (build 0) with only
+    // the runtime JIT settings that shape blocks (MaxBlockSize, literal/branch optimizations).
+    // FastMemory is left out: Apple hosts never have it and it does not change guest timing.
+    const bool cold = file->Saving && file->ColdJit && NDS.IsJITEnabled();
+    const u32 coldConfig = config & ~0xFFu & ~(1u << 18);
+
+    if (!file->Saving || cold)
     {
+        // a cold save does exactly what a loader does first: this console continues like every copy
+        if (cold) JitEnableWrite();
         Reset();
         for (int r = 0; r < ARMJIT_Memory::memregions_Count; r++)
             if (CodeMemRegions[r])
@@ -2915,14 +2923,18 @@ void ARMJIT::DoSavestate(Savestate* file) noexcept
                     CodeMemRegions[r][k].Code = 0;
                     CodeMemRegions[r][k].Blocks.Clear();
                 }
+        if (cold) JitEnableExecute();
+    }
+    if (!file->Saving)
+    {
         if (!NDS.IsJITEnabled() || !file->HasSection("JITS"))
             return;
     }
 
     std::vector<JitBlock*> blocks;   // live ARM9, live ARM7, restore candidates
     u32 n9 = 0, n7 = 0, nc = 0;
-    u64 b = build;
-    u32 c = config, ok = 1;
+    u64 b = cold ? 0 : build;
+    u32 c = cold ? coldConfig : config, ok = 1;
     if (file->Saving)
     {
         ok = NDS.IsJITEnabled();
@@ -2946,7 +2958,7 @@ void ARMJIT::DoSavestate(Savestate* file) noexcept
     file->Var64(&b);
     file->Var32(&c);
     file->Var32(&ok);
-    if (!file->Saving && (b != build || c != config || !ok))
+    if (!file->Saving && (!ok || (b ? b != build || c != config : c != coldConfig)))
         return;   // another build or JIT configuration, or saved without: load cold
     if (file->Saving && !ok)
         return;

@@ -1890,6 +1890,11 @@ void NetplayLivePrepareBridge::Cancel()
     Changed.notify_all();
 }
 
+u64 NetplayHandoffCompat()
+{
+    return LITEV_HANDOFF_COMPAT;
+}
+
 bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
                                     const std::string& expectedPeerIPv4,
                                     const NetplayLiveCheckpoint& local, const NetplayRom& expectedPeerRom,
@@ -1899,6 +1904,7 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
     error.clear();
     peer = NetplayLiveCheckpoint{};
     constexpr u32 magic = 0x32434C4E; // "NLC2": live console checkpoint + SPI firmware
+    constexpr u16 kVersion = 3;        // 3: cold-JIT checkpoints, compatibility id, prepare reasons
     constexpr u32 maxState = 64u << 20;
     constexpr u32 maxFirmware = 1u << 20;
     constexpr int timeoutS = 15;
@@ -1965,7 +1971,7 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
     };
     auto makeHeader = [&] {
         Header h{};
-        h.Magic = magic; h.Version = 2; h.Player = local.Player;
+        h.Magic = magic; h.Version = kVersion; h.Player = local.Player;
         h.Epoch = local.Epoch; h.Build = local.Build; h.RawClock = local.RawClock;
         h.RomSize = local.Rom.Size; h.Frame = local.Frame; h.StateSize = (u32)local.State.size();
         h.FirmwareSize = (u32)local.Firmware.size();
@@ -1998,13 +2004,21 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
     auto recvState = [&](int fd) {
         Header h{};
         if (!recvBytes(fd, &h, sizeof(h))) { error = "checkpoint header interrupted"; return false; }
-        if (h.Magic != magic || h.Version != 2 || h.Player == local.Player || h.Player > 1 ||
-            h.Epoch != local.Epoch || h.Build != local.Build || h.RomSize != expectedPeerRom.Size ||
-            memcmp(h.FenceToken, local.FenceToken.data(), local.FenceToken.size()) ||
-            memcmp(h.RomSha, expectedPeerRom.Sha, 32) || !h.StateSize || h.StateSize > maxState ||
-            !h.FirmwareSize || h.FirmwareSize > maxFirmware)
+        char why[160] = "";
+        if (h.Magic != magic || h.Version != kVersion)
+            snprintf(why, sizeof(why), "handoff protocol differs (peer v%u, local v%u)", h.Magic == magic ? h.Version : 0, kVersion);
+        else if (h.Build != local.Build)
+            snprintf(why, sizeof(why), "emulation build compatibility differs (peer %016llx, local %016llx: "
+                     "handoff protocol or emulation LITEV options)", (unsigned long long)h.Build, (unsigned long long)local.Build);
+        else if (h.Player == local.Player || h.Player > 1) snprintf(why, sizeof(why), "peer player %u invalid", h.Player);
+        else if (h.Epoch != local.Epoch) snprintf(why, sizeof(why), "peer cut epoch differs");
+        else if (memcmp(h.FenceToken, local.FenceToken.data(), local.FenceToken.size())) snprintf(why, sizeof(why), "peer cut token differs");
+        else if (h.RomSize != expectedPeerRom.Size || memcmp(h.RomSha, expectedPeerRom.Sha, 32)) snprintf(why, sizeof(why), "peer ROM differs from its roster entry");
+        else if (!h.StateSize || h.StateSize > maxState || !h.FirmwareSize || h.FirmwareSize > maxFirmware)
+            snprintf(why, sizeof(why), "peer checkpoint size invalid (state %u, firmware %u)", h.StateSize, h.FirmwareSize);
+        if (why[0])
         {
-            error = "checkpoint epoch, build, ROM, player, or size mismatch";
+            error = std::string("checkpoint header: ") + why;
             return false;
         }
         std::vector<u8> firmware(h.FirmwareSize);
@@ -2030,6 +2044,27 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
         peer.Firmware = std::move(firmware);
         peer.State = std::move(bytes);
         return true;
+    };
+
+    // After both checkpoints crossed: each side's prepare vote, with its reason when it refuses,
+    // so both logs name the exact failure (the guest sends first, the host answers).
+    struct Ready { u8 Ok, Length; char Reason[126]; };
+    auto exchangeReady = [&](int fd, bool host) {
+        std::string reason;
+        Ready mine{}, theirs{};
+        mine.Ok = !preparePeer || preparePeer(peer, reason) ? 1 : 0;
+        if (!mine.Ok && reason.empty()) reason = "unspecified";
+        mine.Length = (u8)std::min(reason.size(), sizeof(mine.Reason));
+        memcpy(mine.Reason, reason.data(), mine.Length);
+        const bool exchanged = host ? recvBytes(fd, &theirs, sizeof(theirs)) && sendBytes(fd, &mine, sizeof(mine))
+                                    : sendBytes(fd, &mine, sizeof(mine)) && recvBytes(fd, &theirs, sizeof(theirs));
+        const char* who = host ? "guest" : "host";
+        if (!mine.Ok) error = "this device rejected the peer checkpoint: " + reason;
+        else if (!exchanged) error = std::string("checkpoint preparation vote from the ") + who + " was lost";
+        else if (theirs.Ok != 1)
+            error = std::string("the ") + who + " rejected our checkpoint: " +
+                    std::string(theirs.Reason, std::min<size_t>(theirs.Length, sizeof(theirs.Reason)));
+        return mine.Ok && exchanged && theirs.Ok == 1;
     };
 
     int fd = -1;
@@ -2087,27 +2122,13 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
     if (local.Player == 0)
     {
         ok = recvState(fd) && sendState(fd);
-        u8 guestReady = 0;
-        if (ok)
-        {
-            const u8 localReady = !preparePeer || preparePeer(peer, error) ? 1 : 0;
-            const bool exchange = recvBytes(fd, &guestReady, 1) && sendBytes(fd, &localReady, 1);
-            ok = exchange && localReady && guestReady == 1;
-            if (!ok && error.empty()) error = guestReady == 0 ? "peer rejected checkpoint preparation" : "checkpoint preparation or peer acknowledgment failed";
-        }
+        if (ok) ok = exchangeReady(fd, true);
         else if (error.empty()) error = "checkpoint transfer interrupted";
     }
     else
     {
         ok = sendState(fd) && recvState(fd);
-        u8 hostReady = 0;
-        if (ok)
-        {
-            const u8 localReady = !preparePeer || preparePeer(peer, error) ? 1 : 0;
-            const bool exchange = sendBytes(fd, &localReady, 1) && recvBytes(fd, &hostReady, 1);
-            ok = exchange && localReady && hostReady == 1;
-            if (!ok && error.empty()) error = hostReady == 0 ? "host rejected checkpoint preparation" : "checkpoint preparation or host acknowledgment failed";
-        }
+        if (ok) ok = exchangeReady(fd, false);
         else if (error.empty()) error = "checkpoint transfer interrupted";
     }
     close(fd);

@@ -382,7 +382,7 @@ bool NetplayHandshake(NetplaySetup& s);
 struct NetplayLiveCheckpoint
 {
     u64 Epoch = 0;
-    u64 Build = 0;                 // exact native-core/protocol compatibility id
+    u64 Build = 0;                 // NetplayHandoffCompat(): protocol + emulation-affecting options
     u64 RawClock = 0;
     u32 Frame = 0;
     u8 Player = 0;
@@ -427,6 +427,21 @@ private:
     bool Stopped = false;
     std::string ResultError;
 };
+
+// The live handoff compatibility id: the same handoff protocol and emulation-affecting LITEV
+// options (CMakeLists.txt, LITEV_HANDOFF_COMPAT), not the same binary: checkpoints carry an empty
+// JIT cache (Savestate::ColdJit). Use it for NetplayLiveCheckpoint::Build and Ambient's BuildID.
+u64 NetplayHandoffCompat();
+
+// The reversible pre-commit proof: the two consoles freshly loaded from the checkpoint pair run
+// two Lockstep frames with neutral input against a temporary backend (the installed MPInterface
+// is restored after). hashes[frame * 2 + player] = NetplayLiveProofHash after each frame. Every
+// peer runs it on its own copies; NetplayAwaitLiveStart starts only when all four hashes agree.
+// runFrame(player) runs one frame of consoles[player] (the frontend's headless frame).
+u64 NetplayLiveProofHash(NDS& nds);
+bool NetplayRunLiveProof(const std::array<NDS*, 2>& consoles, const std::array<u64, 2>& rawClocks,
+                         const std::function<void(int)>& runFrame,
+                         std::array<u64, 4>& hashes, std::string& error);
 
 bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
                                     const std::string& expectedPeerIPv4,

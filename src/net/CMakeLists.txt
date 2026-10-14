@@ -9,6 +9,7 @@ add_library(net-utils STATIC
     LockstepMP.cpp
     Fiber.cpp
     NetplayInput.cpp
+    NetplayLiveProof.cpp
     ../teakra/src/makedsp1/sha256.cpp
     LAN.cpp
     AmbientLAN.cpp

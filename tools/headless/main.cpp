@@ -434,10 +434,11 @@ bool DumpPPM(const std::string& path, const u32* top, const u32* bottom)
 
 // Write a full core savestate to `path` using the same in-memory Savestate API
 // as the Qt frontend (default 32 MB save buffer -> DoSavestate -> flush bytes).
-bool SaveSavestate(NDS& nds, const std::string& path, std::vector<u8>* captured = nullptr)
+bool SaveSavestate(NDS& nds, const std::string& path, std::vector<u8>* captured = nullptr, bool coldJit = false)
 {
     Savestate state; // default ctor: save mode, DEFAULT_SIZE buffer
     if (state.Error) { fprintf(stderr, "error: savestate alloc failed\n"); return false; }
+    state.ColdJit = coldJit;
     if (!nds.DoSavestate(&state) || state.Error)
     {
         fprintf(stderr, "error: DoSavestate failed while dumping\n");
@@ -982,8 +983,9 @@ int main(int argc, char** argv)
                                    atoi(getenv("LITEV_AMBIENT_CUT_SWAP_TRIAL_FRAMES")) : 0;
     // Only the headless cut harness may impersonate an Android handoff build.
     // Production builds still require their compile-time native fingerprint.
+    // LITEV_AMBIENT_CUT_TEST_BUILD overrides it (negative tests: a peer with other emulation options).
     const char* cutBuildText = getenv("LITEV_AMBIENT_CUT_TEST_BUILD");
-    u64 cutTestBuild = 0x4c49544556484f31ull;
+    u64 cutTestBuild = NetplayHandoffCompat();
     if (cutBuildText)
     {
         char* end = nullptr;
@@ -999,11 +1001,11 @@ int main(int argc, char** argv)
     if (cutExternalPeer)
     {
         in_addr peerAddress{};
-        if (!cutXferPort || !cutBuildText || !cutPeerIPText || !cutRole ||
+        if (!cutXferPort || !cutPeerIPText || !cutRole ||
             strcmp(cutRole, "host") != 0 || cutSwapTrialFrames <= 0 ||
             inet_pton(AF_INET, cutPeerIP.c_str(), &peerAddress) != 1 ||
             !getenv("LITEV_NETPLAY"))
-        { fprintf(stderr, "CUTFENCE external peer needs host role, trial frames, port, test build, IPv4 and Netplay configuration\n"); return 2; }
+        { fprintf(stderr, "CUTFENCE external peer needs host role, trial frames, port, IPv4 and Netplay configuration\n"); return 2; }
     }
     const bool cutRetryAfterAbort = getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT") &&
                                     *getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT");
@@ -1031,7 +1033,7 @@ int main(int argc, char** argv)
                                                 : std::hash<std::string>()(opt.ambient) ^ ((u64)getpid() << 32);
         c.Name = opt.ambient;
         c.RequireHandoffOffer = cutXferPort != 0;
-        if (cutBuildText) c.BuildID = (u32)(cutTestBuild ^ (cutTestBuild >> 32));
+        c.BuildID = (u32)(cutTestBuild ^ (cutTestBuild >> 32));
         memcpy(c.GameCode, nds->NDSCartSlot.GetCart()->GetHeader().GameCode, 4);
         if (getenv("LITEV_AMBIENT_UPORT")) c.UnicastPort = (u16)atoi(getenv("LITEV_AMBIENT_UPORT"));
         if (getenv("LITEV_AMBIENT_PPORT")) c.PresencePort = (u16)atoi(getenv("LITEV_AMBIENT_PPORT"));   // (tests: a router that drops broadcast)
@@ -1518,7 +1520,11 @@ int main(int argc, char** argv)
                         const std::string path = getenv("LITEV_AMBIENT_CUT_NO_DUMP") ? "" :
                             std::string(cutDir) + (host ? "/host.mln" : "/client.mln");
                         std::vector<u8> liveState;
-                        if (!SaveSavestate(*nds, path, cutXferPort ? &liveState : nullptr)) { mark(abort); return 2; }
+                        // The handoff checkpoint carries an empty JIT cache and empties this
+                        // console's too: every copy on every build starts from the same cache.
+                        // (LITEV_HANDOFF_WARM_CHECKPOINT=1: the old warm-JIT checkpoint, negative control)
+                        const bool coldCheckpoint = cutXferPort && !getenv("LITEV_HANDOFF_WARM_CHECKPOINT");
+                        if (!SaveSavestate(*nds, path, cutXferPort ? &liveState : nullptr, coldCheckpoint)) { mark(abort); return 2; }
                         printf("CUTFENCE %s saved f%d busy=%02x queued=%zu\n", cutRole, frame,
                                nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames());
                         printf("CUTFENCE watermark local=%u retired=%u peer=%u peerRetired=%u ready=%d/%d aborted=%d\n",
@@ -1664,6 +1670,38 @@ int main(int argc, char** argv)
                             }
                             fflush(stdout);
                         }
+                        // The reversible pre-commit proof, as the app runs it: fresh copies of
+                        // both checkpoints run two Lockstep frames here and on the peer; the
+                        // live-start rendezvous below compares the four state hashes.
+                        std::array<u64, 4> proof{};
+                        if (!transferFailed && cutXferPort)
+                        {
+                            std::unique_ptr<HeadlessHost::InstanceUserData> proofUser[2];
+                            std::unique_ptr<NDS> proofNds[2];
+                            std::string proofError;
+                            const int me = host ? 0 : 1;
+                            const char* peerRomPath = getenv("LITEV_AMBIENT_CUT_PEER_ROM");
+                            bool proven = prepareScratch(local, opt.rom, proofUser[me], proofNds[me], proofError) &&
+                                          prepareScratch(remote, peerRomPath, proofUser[1 - me], proofNds[1 - me], proofError);
+                            if (proven)
+                                proven = NetplayRunLiveProof({proofNds[0].get(), proofNds[1].get()},
+                                    {me == 0 ? local.RawClock : remote.RawClock, me == 1 ? local.RawClock : remote.RawClock},
+                                    [&](int p) { proofNds[p]->RunFrame(); }, proof, proofError);
+                            for (int p = 0; p < 2; p++) { proofNds[p].reset(); proofUser[p].reset(); }
+                            nds->JIT.JitEnableExecute();   // (macOS: scratch JIT teardown left this thread writing)
+                            if (!proven)
+                            {
+                                ambient->AbortHandoffFence();
+                                mark(abort);
+                                transferFailed = true;
+                                printf("CUTFENCE %s proof abort: %s\n", cutRole, proofError.c_str());
+                            }
+                            else
+                                printf("CUTFENCE %s proof p0=%016llx/%016llx p1=%016llx/%016llx\n", cutRole,
+                                       (unsigned long long)proof[0], (unsigned long long)proof[2],
+                                       (unsigned long long)proof[1], (unsigned long long)proof[3]);
+                            fflush(stdout);
+                        }
                         if (!transferFailed && cutXferPort)
                         {
                             auto phase = [&](const char* name, std::function<bool()> send,
@@ -1735,7 +1773,7 @@ int main(int argc, char** argv)
                             std::thread start([&] {
                                 const std::string address = cutPeerIP + ":" + std::to_string(cutXferPort + 1);
                                 startOk = NetplayAwaitLiveStart(cutXferPort + 1, address, cutPeerIP,
-                                                               local, remote, startCancel, startError);
+                                                               local, remote, startCancel, startError, proof);
                                 startDone.store(true, std::memory_order_release);
                             });
                             while (!startDone.load(std::memory_order_acquire))
@@ -1799,9 +1837,26 @@ int main(int argc, char** argv)
                             });
                             std::vector<liteds::PreparedMPConsole> replicas(2);
                             auto& own = replicas[host ? 0 : 1];
-                            own.identity = preparedLocalReplica.get();
-                            own.udata = std::move(preparedLocalUser);
-                            own.nds = std::move(preparedLocalReplica);
+                            // LITEV_AMBIENT_CUT_LIVE_LOCAL=1: the console that kept running plays
+                            // on, as in the app (only the peer's console is a checkpoint copy).
+                            // There is no source left to roll back to: the process exits after.
+                            const bool liveLocal = getenv("LITEV_AMBIENT_CUT_LIVE_LOCAL") && *getenv("LITEV_AMBIENT_CUT_LIVE_LOCAL");
+                            if (liveLocal)
+                            {
+                                preparedLocalReplica.reset();
+                                preparedLocalUser.reset();
+                                nds->JIT.JitEnableExecute();
+                                own.udata = std::make_unique<HeadlessHost::InstanceUserData>();
+                                nds->UserData = own.udata.get();
+                                own.identity = nds.get();
+                                own.nds = std::move(nds);
+                            }
+                            else
+                            {
+                                own.identity = preparedLocalReplica.get();
+                                own.udata = std::move(preparedLocalUser);
+                                own.nds = std::move(preparedLocalReplica);
+                            }
                             auto& other = replicas[host ? 1 : 0];
                             other.identity = preparedReplica.get();
                             other.udata = std::move(preparedUser);
@@ -1812,7 +1867,7 @@ int main(int argc, char** argv)
                             const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, {}, std::move(replicas));
                             keepAmbient.store(false, std::memory_order_release);
                             ambientService.join();
-                            if (cutExternalPeer)
+                            if (cutExternalPeer || liveLocal)
                             {
                                 // The Android peer has committed. This bounded headless
                                 // participant must not roll its source back into Ambient.

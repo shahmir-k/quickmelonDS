@@ -48,6 +48,10 @@ public:
     bool Error;
 
     bool Saving;
+    // Saving only: reset the console's JIT block cache first and store it as a build-independent
+    // empty cache (ARMJIT::DoSavestate). Live handoff checkpoints: the console that keeps running
+    // and every copy loaded from the state, on any build, then start from the same empty cache.
+    bool ColdJit = false;
 
     u32 CurSection;
 
