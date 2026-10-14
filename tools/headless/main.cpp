@@ -1934,9 +1934,134 @@ int main(int argc, char** argv)
                             // LITEV_AMBIENT_CUT_TRIAL_SCRIPT: this player's input script for the trial
                             std::vector<std::string> trialScripts(2);
                             if (const char* ts = getenv("LITEV_AMBIENT_CUT_TRIAL_SCRIPT")) trialScripts[host ? 0 : 1] = ts;
-                            const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, trialScripts, std::move(replicas));
+                            liteds::LiveExitResult ended;
+                            const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, trialScripts, std::move(replicas),
+                                                                   liveLocal ? &ended : nullptr);
                             keepAmbient.store(false, std::memory_order_release);
                             ambientService.join();
+                            if (liveLocal && ended.EndsAfter >= 0)
+                            {
+                                // The return path (LITEV_NP_LIVE_EXIT): the session ended by itself. This
+                                // device's console - the very object that played on - plays on alone in
+                                // Ambient; the peer's copy is dropped (never saved). Its inputs: the ones
+                                // Netplay had already scheduled (the input delay), then live (the trial
+                                // script, same frame numbers). LITEV_AMBIENT_CUT_EXIT_FRAMES of them.
+                                const auto returned = std::chrono::steady_clock::now();
+                                const int me = host ? 0 : 1, F = ended.EndsAfter;
+                                auto& mine = ended.Consoles[me];
+                                // the reference: both consoles as they were after frame F, for the frames
+                                // an uninterrupted session would have run with the inputs already sent
+                                std::array<NetplayLiveCheckpoint, 2> atEnd;
+                                for (int k = 0; k < 2; k++)
+                                {
+                                    Savestate st;
+                                    ended.Consoles[k].nds->DoSavestate(&st);
+                                    atEnd[k].Player = (u8)k;
+                                    atEnd[k].State.assign((const u8*)st.Buffer(), (const u8*)st.Buffer() + st.Length());
+                                    const Firmware& fw = ended.Consoles[k].nds->GetFirmware();
+                                    atEnd[k].Firmware.assign(fw.Buffer(), fw.Buffer() + fw.Length());
+                                }
+                                const auto snapped = std::chrono::steady_clock::now();   // (test-only work ends)
+                                for (int k = 0; k < (int)ended.Consoles.size(); k++)
+                                    if (k != me) { ended.Consoles[k].nds.reset(); ended.Consoles[k].udata.reset(); }
+                                mine.nds->JIT.JitEnableExecute();
+                                mine.udata->instanceID = 0;
+                                melonDS::MPInterface::Take().reset();
+                                melonDS::MPInterface::Set(std::move(savedAmbient), melonDS::MPInterface_Ambient);
+                                ambient->EndCommittedHandoff();
+                                if (mine.nds->Wifi.IsPoweredOn()) melonDS::MPInterface::Get().Begin(0);
+                                liteds::InputScript& live = *ended.Scripts[me];   // (the trial's, as far as it got)
+                                const auto& sched = ended.Scheduled[me];
+                                const int exitFrames = getenv("LITEV_AMBIENT_CUT_EXIT_FRAMES") ? atoi(getenv("LITEV_AMBIENT_CUT_EXIT_FRAMES")) : 600;
+                                double pauseMs = 0, worstMs = 0;
+                                std::vector<u64> realHash;
+                                const u64 exchBefore = ambient->GetStats().Exchanges;
+                                auto pace = std::chrono::steady_clock::now();   // solo: 60 fps from the first frame (no catch-up)
+                                auto last = ended.StoppedAt[me];
+                                for (int f = F + 1; f <= F + exitFrames; f++)
+                                {
+                                    const auto start = std::chrono::steady_clock::now();
+                                    const double gap = std::chrono::duration<double, std::milli>(start - last).count();
+                                    if (f == F + 1)   // the pause without the test-only snapshot of both consoles
+                                        pauseMs = gap - std::chrono::duration<double, std::milli>(snapped - returned).count();
+                                    else worstMs = std::max(worstMs, gap);
+                                    const int i = f - F - 1;
+                                    NetplayFrameInput in;
+                                    if (i < (int)sched.size()) in = sched[i];
+                                    else
+                                    {
+                                        in.Keys = live.Loaded() ? live.KeyMaskForFrame(f) : 0xFFF;
+                                        int tx, ty;
+                                        if (live.HasTouch() && live.TouchForFrame(f, tx, ty)) { in.TouchX = tx; in.TouchY = ty; }
+                                    }
+                                    mine.nds->SetKeyMask(in.Keys);
+                                    if (in.TouchX >= 0) mine.nds->TouchScreen(in.TouchX, in.TouchY);
+                                    else mine.nds->ReleaseScreen();
+                                    mine.nds->RunFrame();
+                                    if (i < (int)sched.size()) realHash.push_back(NetplayLiveProofHash(*mine.nds));
+                                    if (live.HasProgram())   // closed-loop script steps see this frame's screens
+                                    {
+                                        void* top = nullptr; void* bot = nullptr;
+                                        if (mine.nds->GPU.GetFramebuffers(&top, &bot) && top && bot) live.OnFrame(f, (const u32*)top, (const u32*)bot);
+                                        else live.OnFrame(f, nullptr, nullptr);
+                                    }
+                                    // LITEV_AMBIENT_CUT_EXIT_DUMP=<every>: screens of the continuation (cut dir)
+                                    if (static const int every = getenv("LITEV_AMBIENT_CUT_EXIT_DUMP") ? atoi(getenv("LITEV_AMBIENT_CUT_EXIT_DUMP")) : 0;
+                                        every > 0 && (f - F) % every == 0)
+                                    {
+                                        void* top = nullptr; void* bot = nullptr;
+                                        if (mine.nds->GPU.GetFramebuffers(&top, &bot) && top && bot)
+                                            DumpPPM(std::string(cutDir) + "/exit-" + cutRole + "-f" + std::to_string(f) + ".ppm", (const u32*)top, (const u32*)bot);
+                                    }
+                                    ambient->Process();
+                                    pace += std::chrono::microseconds(16715);
+                                    std::this_thread::sleep_until(pace);
+                                    if (f <= F + 64)
+                                        printf("inst%d state f%d: sys=%llu ram=%016llx r9=%016llx\n", me, f,
+                                               (unsigned long long)mine.nds->GetSysTimestamp(),
+                                               (unsigned long long)XXH3_64bits(mine.nds->MainRAM, mine.nds->MainRAMMask + 1),
+                                               (unsigned long long)XXH3_64bits(mine.nds->ARM9.R, sizeof(mine.nds->ARM9.R)));
+                                    last = std::chrono::steady_clock::now();
+                                }
+                                // the uninterrupted run, in-process: both copies, the same link clocks
+                                int same = -1;
+                                const size_t n = std::min(ended.Scheduled[0].size(), ended.Scheduled[1].size());
+                                if (n)
+                                {
+                                    std::unique_ptr<HeadlessHost::InstanceUserData> ru[2];
+                                    std::unique_ptr<NDS> rn[2];
+                                    std::string err;
+                                    const char* peerRomPath = getenv("LITEV_AMBIENT_CUT_PEER_ROM");
+                                    const bool ok = PrepareScratch(atEnd[me], opt.rom, opt.jit, ru[me], rn[me], err) &&
+                                                    PrepareScratch(atEnd[1 - me], peerRomPath, opt.jit, ru[1 - me], rn[1 - me], err);
+                                    std::vector<u64> refHash;
+                                    if (ok)
+                                    {
+                                        ru[0]->instanceID = 0; ru[1]->instanceID = 1;
+                                        auto saved = melonDS::MPInterface::Take();
+                                        const std::array<u64, 2> origins {me == 0 ? local.RawClock : remote.RawClock,
+                                                                          me == 1 ? local.RawClock : remote.RawClock};
+                                        NetplayRunLockstepFrames({rn[0].get(), rn[1].get()}, origins, [&](int p, int f) {
+                                            const NetplayFrameInput in = f < (int)n ? ended.Scheduled[p][f] : NetplayFrameInput{};
+                                            rn[p]->SetKeyMask(in.Keys);
+                                            if (in.TouchX >= 0) rn[p]->TouchScreen(in.TouchX, in.TouchY); else rn[p]->ReleaseScreen();
+                                            rn[p]->RunFrame();
+                                        }, (int)n, refHash, err);
+                                        melonDS::MPInterface::Take().reset();
+                                        melonDS::MPInterface::Set(std::move(saved), melonDS::MPInterface_Ambient);
+                                        same = 0;
+                                        for (size_t f = 0; f < n && f < realHash.size(); f++) same += refHash[f * 2 + me] == realHash[f];
+                                    }
+                                    for (int k = 0; k < 2; k++) { rn[k].reset(); ru[k].reset(); }
+                                    mine.nds->JIT.JitEnableExecute();
+                                }
+                                printf("CUTFENCE %s live exit after f%d: back in Ambient, pause %.1f ms (worst later frame gap %.1f ms), "
+                                       "%zu scheduled inputs applied, then live; link=%u; frames after the exit equal to an "
+                                       "uninterrupted session: %d of %zu; Ambient exchanges after the exit: %llu\n", cutRole, F, pauseMs, worstMs, sched.size(),
+                                       ambient->GetStats().Links, same, n, (unsigned long long)(ambient->GetStats().Exchanges - exchBefore));
+                                fflush(stdout);
+                                return trialResult == 0 ? 0 : 2;
+                            }
                             if (cutExternalPeer || liveLocal)
                             {
                                 // The Android peer has committed. This bounded headless
@@ -1987,6 +2112,10 @@ int main(int argc, char** argv)
             clock_gettime(CLOCK_THREAD_CPUTIME_ID, &windowCpuEnd);
         }
 
+        // diagnostics LITEV_WIFI_TRACE=<every>: the Wi-Fi chip's MP state (live handoff exit rule)
+        if (static const int wt = getenv("LITEV_WIFI_TRACE") ? atoi(getenv("LITEV_WIFI_TRACE")) : 0; wt > 0 && frame % wt == 0)
+            printf("WIFISTATE f%d on=%d mp=%d client=%d exch=%u busy=%02x\n", frame, nds->Wifi.IsPoweredOn(), nds->Wifi.IsMultiplayer(),
+                   nds->Wifi.IsMPClientMode(), nds->Wifi.MPExchanges, nds->Wifi.HandoffBusyMask());
         if (opt.dumpSavestateFrame == frame && !opt.dumpSavestatePath.empty())
         {
             if (!SaveSavestate(*nds, opt.dumpSavestatePath))

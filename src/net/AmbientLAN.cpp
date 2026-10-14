@@ -927,6 +927,11 @@ bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
     return !l->FenceAbort;
 }
 
+void AmbientLAN::EndCommittedHandoff()
+{
+    if (Link* l = HandoffLink()) { CompleteHandoffReset(*l); l->ResetCompleted = false; }
+}
+
 bool AmbientLAN::GetHandoffFenceToken(std::array<u8, 16>& token) const
 {
     const Link* l = HandoffLink();

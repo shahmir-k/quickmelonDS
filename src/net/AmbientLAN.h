@@ -118,6 +118,9 @@ public:
     // every earlier offer on this live link (reconnect resets the counter).
     bool StartHandoffFence(u64 epoch, const std::array<u8, 16>& token = {});
     bool GetHandoffFenceToken(std::array<u8, 16>& token) const;
+    // After a committed handoff's Netplay session ended (every device leaves at the same frame):
+    // the link's fence and offer are over on both sides, with no message needed.
+    void EndCommittedHandoff();
     bool HasPeerHandoffFence() const;
     u64 PeerHandoffEpoch() const;
     bool CanAcknowledgeHandoffFence() const;

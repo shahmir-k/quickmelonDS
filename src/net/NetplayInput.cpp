@@ -176,6 +176,11 @@ NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const
 NetplayInput::~NetplayInput()
 {
     Running = false;
+#ifdef LITEV_NP_LEAN_IO
+    // wake the receiver from its poll (up to the keepalive interval): a session ending under a
+    // running game (live exit) must not stall that game's thread for it
+    if (WakePipe[1] >= 0) { const u8 one = 1; (void)!write(WakePipe[1], &one, 1); }
+#endif
     if (Receiver.joinable()) Receiver.join();
     if (Socket >= 0) close(Socket);
 #ifdef LITEV_NP_LEAN_IO
@@ -1888,6 +1893,50 @@ void NetplayLivePrepareBridge::Cancel()
         ResultError = "live replica prepare cancelled";
         Finished = true;
     }
+    Changed.notify_all();
+}
+
+NetplayLiveExit::NetplayLiveExit(int consoles, int quietFrames, int slack)
+    : Consoles(std::clamp(consoles, 1, 16)), QuietFrames(quietFrames), Slack(std::clamp(slack, 1, kRing / 4))
+{
+    Done.fill(-1);
+}
+
+bool NetplayLiveExit::EndFrame(int console, int frame, u32 exchanges)
+{
+    std::unique_lock<std::mutex> lk(Lock);
+    if (frame == 0 || exchanges != Last[console]) Streak[console] = 0;
+    else Streak[console]++;
+    Last[console] = exchanges;
+    StreakAt[console][frame % kRing] = Streak[console];
+    Done[console] = frame;
+    Changed.notify_all();
+    const int decided = frame - Slack;   // the frame decided now
+    if (decided < 0) return false;
+    if (EndAfter.load() >= 0) return frame >= EndAfter.load();
+    bool quiet = true;
+    for (int c = 0; c < Consoles && quiet; c++)
+    {
+        // (bounded: the others are within a few frames, see the class comment)
+        if (!Changed.wait_for(lk, std::chrono::seconds(2), [&] { return Cancelled || Done[c] >= decided; }))
+        {
+            Platform::Log(Platform::LogLevel::Warn, "NetplayLiveExit: console %d at frame %d still waits for console %d (done %d) to reach %d\n",
+                          console, frame, c, Done[c], decided);
+            Changed.wait(lk, [&] { return Cancelled || Done[c] >= decided; });
+        }
+        if (Cancelled) return false;
+        quiet = StreakAt[c][decided % kRing] >= QuietFrames;
+    }
+    if (!quiet) return false;
+    int expected = -1;
+    EndAfter.compare_exchange_strong(expected, frame);
+    return true;
+}
+
+void NetplayLiveExit::Cancel()
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    Cancelled = true;
     Changed.notify_all();
 }
 

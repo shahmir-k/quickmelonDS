@@ -158,6 +158,13 @@ public:
     void SetFramePeriodUs(int us) { FramePeriodUs = std::max(us, 500); }
 #endif
     int LocalPlayer() const { return Local; }
+    // an input already here for that applied frame (never waits): e.g. this device's own inputs,
+    // scheduled `delay` frames ahead, when a session ends
+    bool HasInput(int player, int frame)
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        return player >= 0 && player < kMaxPlayers && Inputs[player].count(frame) != 0;
+    }
 
     // The local player's input sampled at `frame` (applied at frame + Delay everywhere).
     void SubmitLocal(int frame, const NetplayFrameInput& input);
@@ -442,6 +449,39 @@ u64 NetplayLiveProofHash(NDS& nds);
 bool NetplayRunLiveProof(const std::array<NDS*, 2>& consoles, const std::array<u64, 2>& rawClocks,
                          const std::function<void(int)>& runFrame,
                          std::array<u64, 4>& hashes, std::string& error);
+// The proof's engine: `frames` Lockstep frames of the two consoles (link clocks mapped from
+// rawClocks, as a live session maps them), runFrame(player, frame) applies that frame's input and
+// runs it; hashes[frame * 2 + player] = NetplayLiveProofHash after each.
+bool NetplayRunLockstepFrames(const std::array<NDS*, 2>& consoles, const std::array<u64, 2>& rawClocks,
+                              const std::function<void(int, int)>& runFrame, int frames,
+                              std::vector<u64>& hashes, std::string& error);
+
+// The game-driven end of a live (handed-off) Netplay session, the same on every device: every
+// device runs every console, so each evaluates the same rule on the same emulated frames. A
+// console is quiet after QuietFrames frames without an MP exchange (Wifi::MPExchanges); when
+// every console is quiet at frame f, the session ends after frame f + Slack on every device. The
+// decision for frame f is taken Slack frames later, by which time every other console has
+// published frame f (consoles of one session stay within a few frames of each other: waiting for
+// one never waits on this console's own clock). Each console's thread calls EndFrame after each
+// frame (0 = the first session frame) and stops when it returns true.
+class NetplayLiveExit
+{
+public:
+    explicit NetplayLiveExit(int consoles = 2, int quietFrames = 120, int slack = 30);
+    bool EndFrame(int console, int frame, u32 exchanges);
+    int EndsAfter() const { return EndAfter.load(); }   // -1: not yet
+    void Cancel();
+private:
+    static constexpr int kRing = 1024;
+    const int Consoles, QuietFrames, Slack;
+    std::mutex Lock;
+    std::condition_variable Changed;
+    bool Cancelled = false;
+    std::array<int, 16> Done{}, Streak{};
+    std::array<u32, 16> Last{};
+    std::array<std::array<int, kRing>, 16> StreakAt{};
+    std::atomic<int> EndAfter{-1};
+};
 
 bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
                                     const std::string& expectedPeerIPv4,

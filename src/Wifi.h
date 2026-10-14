@@ -177,6 +177,9 @@ public:
     bool IsPoweredOn() const { return PowerOn; }
     bool IsMultiplayer() const { return IsMP; }
     bool IsMPClientMode() const { return IsMP && IsMPClient; }   // (live handoff: who may freeze first)
+    // MP exchanges taken part in: CMDs sent as a host, CMDs received as a client. Host-side state,
+    // not in savestates: compare its changes, not its value (live handoff exit rule, NetplayLiveExit)
+    u32 MPExchanges = 0;
     // Live-link migration may snapshot only after all chip-side transfers have completed.
     // A nonzero mask is a reason to defer the checkpoint to a later emulated boundary.
     u32 HandoffBusyMask() const

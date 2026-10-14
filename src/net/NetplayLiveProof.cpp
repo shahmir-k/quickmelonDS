@@ -51,7 +51,19 @@ bool NetplayRunLiveProof(const std::array<NDS*, 2>& consoles, const std::array<u
                          const std::function<void(int)>& runFrame,
                          std::array<u64, 4>& hashes, std::string& error)
 {
-    hashes = {};
+    for (NDS* nds : consoles)
+        if (nds) { nds->SetKeyMask(0xFFF); nds->ReleaseScreen(); }   // identical, neutral inputs on every device
+    std::vector<u64> all;
+    const bool ok = NetplayRunLockstepFrames(consoles, rawClocks, [&](int p, int) { runFrame(p); }, 2, all, error);
+    for (int i = 0; i < 4; i++) hashes[i] = i < (int)all.size() ? all[i] : 0;
+    return ok;
+}
+
+bool NetplayRunLockstepFrames(const std::array<NDS*, 2>& consoles, const std::array<u64, 2>& rawClocks,
+                              const std::function<void(int, int)>& runFrame, int frames,
+                              std::vector<u64>& hashes, std::string& error)
+{
+    hashes.assign((size_t)frames * 2, 0);
     error.clear();
     if (!consoles[0] || !consoles[1] || !runFrame) { error = "live proof needs both consoles"; return false; }
     bool timedOut = false, runFailed = false;
@@ -76,8 +88,6 @@ bool NetplayRunLiveProof(const std::array<NDS*, 2>& consoles, const std::array<u
             link->SetClock(p, [nds] { return nds->GetSysTimestamp(); });
 #endif
             link->SetWake(p, *nds);
-            nds->SetKeyMask(0xFFF); // identical, neutral inputs on every device
-            nds->ReleaseScreen();
         }
         MPInterface::Set(std::move(trial), MPInterface_Netplay);
         for (int p = 0; p < 2; ++p)
@@ -87,11 +97,11 @@ bool NetplayRunLiveProof(const std::array<NDS*, 2>& consoles, const std::array<u
         // A console keeps running after its two hashed frames until the other has its two too: the
         // other may still wait for its link frames (a client polls its host up to its own time).
         auto run = [&](int p) {
-            for (int f = 0; (f < 2 || done[1 - p].load(std::memory_order_acquire) < 2) &&
+            for (int f = 0; (f < frames || done[1 - p].load(std::memory_order_acquire) < frames) &&
                             !expired.load(std::memory_order_acquire); f++)
             {
-                runFrame(p);
-                if (f < 2) hashes[f * 2 + p] = NetplayLiveProofHash(*consoles[p]);
+                runFrame(p, f);
+                if (f < frames) hashes[f * 2 + p] = NetplayLiveProofHash(*consoles[p]);
                 done[p].store(f + 1, std::memory_order_release);
             }
             // leave the link: the other console's extra frame must not wait on this clock forever
