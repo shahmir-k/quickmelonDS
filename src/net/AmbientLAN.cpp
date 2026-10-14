@@ -23,6 +23,7 @@ typedef int socklen_t;
 
 #include "AmbientLAN.h"
 #include "Platform.h"
+#include "MPLinkFlags.h"
 #if defined(LITEV_LAN_RX_SPIN) && defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
@@ -409,6 +410,7 @@ AmbientLAN::Stats AmbientLAN::GetStats()
     s.HostWaitUs = StHostWaitUs; s.HostWaitCalls = StHostWaitCalls;
     s.HostWaitMisses = StHostWaitMisses; s.HostWaitTimeouts = StHostWaitTimeouts;
     s.ClientWaitUs = StClientWaitUs; s.ClientWaitCalls = StClientWaitCalls; s.ClientWaitMisses = StClientWaitMisses;
+    for (int t = 0; t < 4; t++) s.Stale[t] = StStale[t];
     s.LastFrameBlockedUs = StLastBlocked; s.LastFrameExchanges = StLastExch; s.Links = StLinks; s.Nearby = StNearby; s.MaxRttMs = StMaxRtt;
     s.SlowFpsX100 = StSlowFps; s.SlowWaitUsPerFrame = StSlowWait;
     s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending;
@@ -436,7 +438,7 @@ void AmbientLAN::RebuildCands()
     std::set<u32> want = OwnGGIDs;
     for (const auto& p : *View) if (p.HasGGID && SameGame(p.Game, Cfg.GameCode)) want.insert(p.GGID);
     std::vector<Cand> c;
-    const u64 now = NowUs();
+    const u64 now = EmuNow(), wall = NowUs();
     for (size_t i = 0; i < View->size(); i++)
     {
         const Peer& p = (*View)[i];
@@ -444,8 +446,9 @@ void AmbientLAN::RebuildCands()
         u32 tu = G16(&p.Beacon[12 + 24 + 8]);
         const u32 iv = std::clamp<u32>(tu * 1024u, 20000u, 1000000u);
         u64 due = now + (p.ID % iv);    // (a new one: spread the phases)
-        for (const auto& o : Cands) if (o.ID == p.ID) due = o.DueUs;
-        c.push_back({i, p.ID, due, iv});
+        u64 base = now - (wall - p.BeaconUs);       // (its age on arrival in real time, then the chip's)
+        for (const auto& o : Cands) if (o.ID == p.ID) { due = o.DueUs; if (o.SrcUs == p.BeaconUs) base = o.BaseUs; }
+        c.push_back({i, p.ID, due, iv, base, p.BeaconUs});
     }
     Cands.swap(c);
     NextInjectUs = ~0ull;
@@ -455,7 +458,7 @@ void AmbientLAN::RebuildCands()
 int AmbientLAN::Inject(u8* data, u64* timestamp)
 {
     if (NextInjectUs == ~0ull || Vis == Vis_Hidden) return 0;
-    const u64 now = NowUs();
+    const u64 now = EmuNow();
     if (now < NextInjectUs) return 0;
     // a due beacon on the channel the chip listens on (one on another channel stays due: the chip would drop it)
     Cand* best = nullptr;
@@ -468,7 +471,7 @@ int AmbientLAN::Inject(u8* data, u64* timestamp)
         len = (int)p.Beacon.size();
         memcpy(data, p.Beacon.data(), len);
         u64 tsf; memcpy(&tsf, &data[12 + 24], 8);
-        tsf += now - p.BeaconUs;
+        tsf += now - best->BaseUs;
         memcpy(&data[12 + 24], &tsf, 8);
         best->DueUs = std::max(best->DueUs + best->IntervalUs, now);
         StInjected++;
@@ -478,6 +481,20 @@ int AmbientLAN::Inject(u8* data, u64* timestamp)
     for (const auto& c : Cands) NextInjectUs = std::min(NextInjectUs, c.DueUs);
     if (timestamp) *timestamp = 0;
     return len;
+}
+
+// the chip's clock (beacons keep their pace per emulated second in fast-forward / slow motion); when it goes back (a
+// savestate, a reset) the schedule goes back with it
+u64 AmbientLAN::EmuNow()
+{
+    const u64 now = WifiUs;
+    if (now < EmuUs)
+    {
+        const u64 d = EmuUs - now;
+        for (auto& c : Cands) { c.DueUs = c.DueUs > d ? c.DueUs - d : 0; c.BaseUs -= d; }
+        if (NextInjectUs != ~0ull) NextInjectUs = NextInjectUs > d ? NextInjectUs - d : 0;
+    }
+    return EmuUs = now;
 }
 
 const AmbientLAN::Peer* AmbientLAN::PeerByMAC(const u8* mac)
@@ -695,7 +712,8 @@ void AmbientLAN::DropQueuedForSlot(int slot)
 }
 
 // as LAN::ProcessLAN: 0 = per frame, 1 = a regular frame wanted, 2 = waiting for an MP frame, 3 = 2 without blocking
-void AmbientLAN::Pump(int type)
+// waitMs: 2's wait (-1: RecvTimeout)
+void AmbientLAN::Pump(int type, int waitMs)
 {
     if (!Host) return;
     u32 now = NowMs();
@@ -716,6 +734,7 @@ void AmbientLAN::Pump(int type)
                 Platform::Log(Platform::LogLevel::Info,
                               "AMBWAIT stale frame type=%04x age_ms=%u keep_ms=%u slot=%d\n",
                               h->Type, h->Magic > now ? 0u : now - h->Magic, keep, q.Slot);
+            StStale[h->Type & 3]++;
             RX.pop_front(); enet_packet_destroy(p); continue;
         }
         if (type >= 2) return;
@@ -726,7 +745,7 @@ void AmbientLAN::Pump(int type)
         }
         break;
     }
-    int timeout = type == 2 ? RecvTimeout : 0;
+    int timeout = type == 2 ? (waitMs < 0 ? RecvTimeout : waitMs) : 0;
     u32 last = NowMs();
     ENetEvent ev;
     while (enet_host_service(Host, &ev, timeout) > 0)
@@ -929,7 +948,8 @@ int AmbientLAN::RecvHostPacket(int inst, u8* data, u64* timestamp)
         while (RX.empty() && NowUs() < end);
     }
 #endif
-    Pump(2);
+    const u64 spent = NowUs() - t0;     // (the spin counts toward RecvTimeout)
+    Pump(2, spent >= (u64)RecvTimeout * 1000 ? 0 : (int)(((u64)RecvTimeout * 1000 - spent + 999) / 1000));
     const int r = Pop(data, timestamp);
     const u64 waited = NowUs() - t0;
     FrameBlockedUs += (u32)waited;
@@ -947,9 +967,11 @@ u16 AmbientLAN::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
     u16 ret = 0;
     u32 replied = 0;
     std::deque<QueuedPacket> later;      // regular frames meanwhile (a joining child's auth): for RecvPacket
+    const u64 end = t0 + (u64)RecvTimeout * 1000;     // one wait for the call: old replies / regular frames meanwhile do not extend it
     for (;;)
     {
-        Pump(2);
+        const u64 now = NowUs();
+        Pump(2, now >= end ? 0 : (int)((end - now + 999) / 1000));
         if (RX.empty()) break;
         const QueuedPacket q = RX.front();
         ENetPacket* p = q.Packet;

@@ -1013,14 +1013,16 @@ int main(int argc, char** argv)
             if (ambient && frame % 120 == 0)
             {
                 const auto st = ambient->GetStats();
-                printf("AMBIENT f%d: nearby=%u links=%u opened=%llu presence tx=%llu rx=%llu link tx=%llu rx=%llu beacons=%llu blocked=%.1fms exch=%llu rtt=%ums slow_fps=%.2f slow_wait=%.2fms slow_exch=%.2f offer=%d host_wait=%.1fms/%llu miss=%llu timeout=%llu client_wait=%.1fms/%llu miss=%llu\n",
+                printf("AMBIENT f%d: nearby=%u links=%u opened=%llu presence tx=%llu rx=%llu link tx=%llu rx=%llu beacons=%llu blocked=%.1fms exch=%llu rtt=%ums slow_fps=%.2f slow_wait=%.2fms slow_exch=%.2f offer=%d host_wait=%.1fms/%llu miss=%llu timeout=%llu client_wait=%.1fms/%llu miss=%llu stale=%llu/%llu/%llu/%llu\n",
                        frame, st.Nearby, st.Links, (unsigned long long)st.LinksOpened, (unsigned long long)st.PresenceTx, (unsigned long long)st.PresenceRx,
                        (unsigned long long)st.LinkTx, (unsigned long long)st.LinkRx, (unsigned long long)st.BeaconsInjected, st.BlockedUs / 1000.0,
                        (unsigned long long)st.Exchanges, st.MaxRttMs, st.SlowFpsX100 / 100.0, st.SlowWaitUsPerFrame / 1000.0,
                        st.SlowExchangesPerFrameX100 / 100.0, st.SlowdownPending ? 1 : 0,
                        st.HostWaitUs / 1000.0, (unsigned long long)st.HostWaitCalls, (unsigned long long)st.HostWaitMisses,
                        (unsigned long long)st.HostWaitTimeouts,
-                       st.ClientWaitUs / 1000.0, (unsigned long long)st.ClientWaitCalls, (unsigned long long)st.ClientWaitMisses);
+                       st.ClientWaitUs / 1000.0, (unsigned long long)st.ClientWaitCalls, (unsigned long long)st.ClientWaitMisses,
+                       (unsigned long long)st.Stale[0], (unsigned long long)st.Stale[1], (unsigned long long)st.Stale[2],
+                       (unsigned long long)st.Stale[3]);
                 for (const auto& r : ambient->NearbyRows()) printf("AMBIENT  %s\n", r.c_str());
                 fflush(stdout);
             }

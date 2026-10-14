@@ -61,6 +61,7 @@ public:
         u64 Frames, PresenceTx, PresenceRx, LinkTx, LinkRx, BeaconsInjected, LinksOpened, BlockedUs, Exchanges;
         u64 HostWaitUs, HostWaitCalls, HostWaitMisses, HostWaitTimeouts;
         u64 ClientWaitUs, ClientWaitCalls, ClientWaitMisses;
+        u64 Stale[4];               // MP frames dropped as stale (too old for the chip), by type: regular, CMD, reply, ack
         u32 LastFrameBlockedUs, LastFrameExchanges, Links, Nearby, MaxRttMs;
         u32 SlowFpsX100, SlowWaitUsPerFrame, SlowExchangesPerFrameX100;
         bool SlowdownPending;
@@ -133,7 +134,7 @@ private:
         u64 ID = 0, Generation = 0;
         int Slot = -1;
     };
-    struct Cand { size_t Idx; u64 ID; u64 DueUs; u32 IntervalUs; };
+    struct Cand { size_t Idx; u64 ID; u64 DueUs; u32 IntervalUs; u64 BaseUs = 0, SrcUs = 0; };    // (us: the chip's clock; BaseUs: when the beacon's TSF was taken, SrcUs: its Peer::BeaconUs)
 
     Config Cfg;
     u8 MyMAC[6];
@@ -173,12 +174,14 @@ private:
     u32 OwnBeaconHash = 0;
     std::vector<Cand> Cands;
     u64 NextInjectUs = ~0ull;
+    u64 EmuUs = 0;
     u32 FrameBlockedUs = 0, FrameExchanges = 0;
     AmbientSlowdown Slowdown;
 
     std::atomic<u64> StFrames{0}, StPresTx{0}, StPresRx{0}, StLinkTx{0}, StLinkRx{0}, StInjected{0}, StOpened{0}, StBlockedUs{0}, StExchanges{0};
     std::atomic<u64> StHostWaitUs{0}, StHostWaitCalls{0}, StHostWaitMisses{0}, StHostWaitTimeouts{0};
     std::atomic<u64> StClientWaitUs{0}, StClientWaitCalls{0}, StClientWaitMisses{0};
+    std::atomic<u64> StStale[4] = {};
     std::atomic<u32> StLastBlocked{0}, StLastExch{0}, StLinks{0}, StNearby{0}, StMaxRtt{0};
     std::atomic<u32> StSlowFps{0}, StSlowWait{0}, StSlowExch{0};
     std::atomic<bool> StSlowPending{false}, StSlowDismissRequested{false};
@@ -186,6 +189,7 @@ private:
     void RefreshView(bool force);
     void RebuildCands();
     int Inject(u8* data, u64* timestamp);
+    u64 EmuNow();
     const Peer* PeerByMAC(const u8* mac);
     int SlotByMAC(const u8* mac);
     int OpenLink(const Peer& p);
@@ -193,7 +197,7 @@ private:
     void LinksChanged();
     void NoteBeacon(const u8* data, int len);
     void SendTo(u32 slots, u32 type, const u8* data, int len, u64 timestamp);
-    void Pump(int type);
+    void Pump(int type, int waitMs = -1);
     void OnEvent(ENetEvent& ev);
     bool Admit(ENetEvent& ev);
     int Pop(u8* data, u64* timestamp);

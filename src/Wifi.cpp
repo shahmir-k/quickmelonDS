@@ -2133,6 +2133,9 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
 
         if (type == 0)
         {
+#ifdef LITEV_AMBIENT_LAN
+            WifiUs = USTimestamp;
+#endif
             rxlen = Platform::MP_RecvPacket(RXBuffer, &timestamp, NDS.UserData);
             if ((rxlen <= 0) && (!IsMP))
                 rxlen = WifiAP->RecvPacket(RXBuffer);
