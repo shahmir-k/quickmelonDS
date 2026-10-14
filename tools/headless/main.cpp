@@ -98,6 +98,7 @@ static void DumpAccessStats()
 #include "AmbientLAN.h"
 #include "NetplayInput.h"
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <atomic>
 #endif
@@ -494,6 +495,36 @@ int main(int argc, char** argv)
 
     HeadlessHost::SetDataDir(opt.dataDir);
 
+#ifdef LITEV_AMBIENT_LAN
+    if (getenv("LITEV_TEST_ROM_REHASH"))
+    {
+        // Same-size replacement: ordinary setup may reuse a hash, but a live
+        // handoff must rehash the current file before accepting a peer ROM.
+        char path[] = "/tmp/litev-romhash-XXXXXX";
+        int fd = mkstemp(path);
+        if (fd < 0) return 2;
+        u8 bytes[32]{};
+        memcpy(bytes, "TEST ROM    ABCD", 16);
+        bytes[31] = 1;
+        const bool firstWrite = write(fd, bytes, sizeof(bytes)) == sizeof(bytes);
+        close(fd);
+        const NetplayRom before = firstWrite ? NetplayDescribeRom(path) : NetplayRom{};
+        fd = open(path, O_WRONLY | O_TRUNC);
+        bytes[31] = 2;
+        const bool secondWrite = fd >= 0 && write(fd, bytes, sizeof(bytes)) == sizeof(bytes);
+        if (fd >= 0) close(fd);
+        const NetplayRom cached = NetplayDescribeRom(path);
+        const NetplayRom fresh = NetplayDescribeRom(path, true);
+        const NetplayRom after = NetplayDescribeRom(path);
+        unlink(path);
+        const bool ok = firstWrite && secondWrite && before.Size == sizeof(bytes) &&
+                        cached == before && fresh != before && after == fresh &&
+                        fresh == NetplayDescribeRomBytes(bytes, sizeof(bytes));
+        printf("ROM_REHASH %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 2;
+    }
+#endif
+
     // --- Unit 1 oracle modes -------------------------------------------------
     if (opt.mode != RunMode::Benchmark)
     {
@@ -531,6 +562,11 @@ int main(int argc, char** argv)
         fprintf(stderr, "error: cannot read ROM '%s'\n", opt.rom.c_str());
         return 1;
     }
+#ifdef LITEV_AMBIENT_LAN
+    NetplayRom acquiredCutRom;
+    if (getenv("LITEV_AMBIENT_CUT_XFER_PORT"))
+        acquiredCutRom = NetplayDescribeRomBytes(romdata.get(), romlen);
+#endif
 
     auto cart = NDSCart::ParseROM(std::move(romdata), romlen, nullptr, std::nullopt);
     if (!cart)
@@ -767,7 +803,7 @@ int main(int argc, char** argv)
         { fprintf(stderr, "CUTFENCE transfer requires cut dir, role, and peer ROM path\n"); return 2; }
         cutOwnRom = NetplayDescribeRom(opt.rom);
         cutPeerRom = NetplayDescribeRom(peerRomPath);
-        if (!cutOwnRom.Size || !cutPeerRom.Size)
+        if (!cutOwnRom.Size || !cutPeerRom.Size || cutOwnRom != acquiredCutRom)
         { fprintf(stderr, "CUTFENCE transfer ROM description failed\n"); return 2; }
     }
     if (!opt.ambient.empty())

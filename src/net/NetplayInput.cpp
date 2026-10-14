@@ -920,10 +920,21 @@ std::string NetplayRom::Name() const
     return line;
 }
 
-NetplayRom NetplayDescribeRom(const std::string& path)
+NetplayRom NetplayDescribeRomBytes(const u8* bytes, u64 size)
 {
-    // ponytail: keyed by path + size, so a file replaced in place by one of the same size keeps
-    // its old hash until the app restarts; add the mtime if that ever happens
+    NetplayRom rom;
+    if (!bytes || size < 16 || size > (512u << 20)) return rom;
+    Sha256 sha;
+    sha.Add(bytes, static_cast<size_t>(size));
+    sha.Get(rom.Sha);
+    rom.Size = size;
+    memcpy(rom.Title, bytes, sizeof(rom.Title));
+    memcpy(rom.GameCode, bytes + 12, sizeof(rom.GameCode));
+    return rom;
+}
+
+NetplayRom NetplayDescribeRom(const std::string& path, bool fresh)
+{
     static std::mutex lock;
     static std::map<std::pair<std::string, u64>, NetplayRom> known;
     NetplayRom rom;
@@ -935,7 +946,7 @@ NetplayRom NetplayDescribeRom(const std::string& path)
     {
         std::lock_guard<std::mutex> lk(lock);
         auto it = known.find({path, size});
-        if (it != known.end()) rom = it->second;
+        if (!fresh && it != known.end()) rom = it->second;
         else
         {
             Sha256 sha;
@@ -957,13 +968,14 @@ NetplayRom NetplayDescribeRom(const std::string& path)
                 memcpy(rom.GameCode, head + 12, 4);
                 known[{path, size}] = rom;
             }
+            else if (fresh) known.erase({path, size});
         }
     }
     Platform::CloseFile(f);
     return rom;
 }
 
-std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths)
+std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths, bool fresh)
 {
     for (const std::string& path : paths)
     {
@@ -973,7 +985,7 @@ std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>
         u64 size;
         bool maybe = RomHead(f, size, head) && size == rom.Size && !memcmp(head + 12, rom.GameCode, 4);
         Platform::CloseFile(f);
-        if (maybe && NetplayDescribeRom(path) == rom) return path;
+        if (maybe && NetplayDescribeRom(path, fresh) == rom) return path;
     }
     return "";
 }

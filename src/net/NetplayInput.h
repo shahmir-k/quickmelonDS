@@ -296,11 +296,16 @@ struct NetplayRom
     std::string Name() const;   // for logs: game code, title, hash, size
 };
 // The ROM at `path` (Platform::OpenFile: a file or, on Android, a document URI). The whole file is
-// hashed once per path and size in this process, then remembered.
-NetplayRom NetplayDescribeRom(const std::string& path);
+// hashed once per path and size in this process, then remembered. Set fresh for
+// a live handoff: a same-size replacement at a SAF URI must not reuse that hash.
+NetplayRom NetplayDescribeRom(const std::string& path, bool fresh = false);
+// Exact bytes acquired by a console, before its cartridge secure area can be
+// re-encrypted in memory. This identity must be used for live checkpoints.
+NetplayRom NetplayDescribeRomBytes(const u8* bytes, u64 size);
 // The first of `paths` that holds `rom`, "" = none. Size and game code filter first, so only
 // candidates that pass are hashed.
-std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths);
+std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths,
+                           bool fresh = false);
 
 // ROM transfer during session setup, for the UI: what is happening, the consent question, cancel.
 struct NetplayXferStatus
