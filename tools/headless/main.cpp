@@ -1427,7 +1427,12 @@ int main(int argc, char** argv)
                            std::chrono::steady_clock::now() < deadline)
                     {
                         ambient->Process();
-                        if (ambient->HandoffQueuedFrames() || nds->Wifi.HandoffBusyMask() || !ambient->GetStats().Links)
+                        // A peer can have an MP packet in flight when our fence is sent.
+                        // Process() retires stale packets under Ambient's normal rules;
+                        // the READY and completion checks still require an empty queue
+                        // and full sequence-watermark retirement. Aborting on the first
+                        // transient queued packet races the peer's fence response.
+                        if (nds->Wifi.HandoffBusyMask() || !ambient->GetStats().Links)
                         { ambient->AbortHandoffFence(); break; }
                         if (ambient->CanAcknowledgeHandoffFence())
                         {

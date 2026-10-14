@@ -183,6 +183,8 @@ private:
         std::vector<std::vector<u8>> Pending;   // frames sent while connecting
         u32 TxSeq = 0, RetiredThrough = 0;
         std::set<u32> RetiredBeyond;
+        u32 GapSinceMs = 0, LastMPMs = 0;
+        u32 LocalFenceMs = 0, PeerFenceMs = 0, DropThroughSeq = 0;
         bool SequenceOverflow = false;
         u64 FenceEpoch = 0;
         // Retry epochs on one link must increase. Any delayed control from a
@@ -244,6 +246,8 @@ private:
     Link* PacketLink(const QueuedPacket& q) const;
     void DestroyRX(const QueuedPacket& q);
     void RetireMP(const QueuedPacket& q);
+    void SettleMPGaps(Link& link, u32 now);
+    void SettleHandoffMP(Link& link, u32 now);
     void SendFenceControl(Link& link, u32 type, u64 epoch, u32 mark);
     bool SendOfferControl(Link& link, u32 type, u64 epoch, u32 mark,
                           const std::array<u8, 16>& token);

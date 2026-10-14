@@ -31,12 +31,12 @@ struct AmbientLANQueueTestAccess
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
-    static AmbientLAN::QueuedPacket Make(int slot, u64 id, u64 generation, u32 type, u8 marker)
+    static AmbientLAN::QueuedPacket Make(int slot, u64 id, u64 generation, u32 type, u8 marker, u32 seq = 0)
     {
         constexpr int len = 12 + 24;
         ENetPacket* p = enet_packet_create(nullptr, sizeof(MPPacketHeader) + len, 0);
         assert(p);
-        MPPacketHeader h = {NowMs(), 0, type, len, 100};
+        MPPacketHeader h = {NowMs(), seq, type, len, 100};
         memcpy(p->data, &h, sizeof(h));
         memset(p->data + sizeof(h), 0, len);
         p->data[sizeof(h)] = marker;
@@ -224,6 +224,63 @@ struct AmbientLANQueueTestAccess
         assert(!ambient.HandoffOfferReady(101, token, AmbientLAN::HandoffHostedNetplay));
         assert(link.LastClosedOfferEpoch == 101);
     }
+
+    static void RunHandoffLoss()
+    {
+        AmbientLAN::Config cfg;
+        cfg.DeviceID = 0x501;
+        cfg.Name = "loss-test";
+        cfg.PresencePort = 0;
+        cfg.LinkPort = 18068;
+        AmbientLAN ambient(cfg);
+        assert(ambient.Ok());
+        AmbientLAN::Peer peer;
+        peer.ID = 0x502;
+        peer.IP = inet_addr("127.0.0.1");
+        peer.LinkPort = ambient.GetLinkPort();
+        const int slot = ambient.OpenLink(peer);
+        assert(slot >= 0);
+        auto& link = ambient.Links[slot];
+        link.Up = true;
+        auto retire = [&](u32 seq) {
+            const auto q = Make(slot, peer.ID, link.Generation, 0, 0, seq);
+            ambient.RetireMP(q);
+            ambient.DestroyRX(q);
+        };
+        retire(1);
+        retire(3); // packet 2 was lost on the unsequenced MP channel
+        retire(4);
+        assert(link.RetiredThrough == 1 && link.RetiredBeyond.size() == 2);
+        link.GapSinceMs = NowMs() - 1001;
+        ambient.SettleMPGaps(link, NowMs());
+        assert(link.RetiredThrough == 4 && link.RetiredBeyond.empty());
+
+        // The last packet can also be lost, leaving no later sequence to
+        // expose the gap. Both frozen peers wait for a quiet drain before the
+        // receiver marks that packet expired and votes READY.
+        link.LocalFence = link.PeerFence = true;
+        link.FenceEpoch = 101;
+        link.PeerLastSent = 5;
+        link.DropThroughSeq = 5;
+        link.LocalFenceMs = link.PeerFenceMs = link.LastMPMs = NowMs() - 1001;
+        ambient.SettleHandoffMP(link, NowMs());
+        assert(link.RetiredThrough == 5);
+
+        auto late = Make(slot, peer.ID, link.Generation, 0, 0, 5);
+        ((MPPacketHeader*)late.Packet->data)->Magic = 0x4946494E;
+        ENetEvent event{};
+        event.peer = link.P;
+        event.packet = late.Packet;
+        assert(!ambient.Admit(event)); // frozen cut never feeds a late frame to the game
+        ambient.DestroyRX(late);
+        link.LocalFence = link.PeerFence = false;
+        link.LastClosedFenceEpoch = 101;
+        late = Make(slot, peer.ID, link.Generation, 0, 0, 5);
+        ((MPPacketHeader*)late.Packet->data)->Magic = 0x4946494E;
+        event.packet = late.Packet;
+        assert(!ambient.Admit(event)); // rollback keeps the old-cut drop boundary
+        ambient.DestroyRX(late);
+    }
 };
 }
 
@@ -231,5 +288,6 @@ int main()
 {
     melonDS::AmbientLANQueueTestAccess::Run();
     melonDS::AmbientLANQueueTestAccess::RunOfferGate();
+    melonDS::AmbientLANQueueTestAccess::RunHandoffLoss();
     std::puts("ambient-queue-test: PASS");
 }
