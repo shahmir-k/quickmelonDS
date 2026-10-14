@@ -593,6 +593,12 @@ int main(int argc, char** argv)
             !peer.ArmHandoffSession(42, token, base + 4, {{0, address(base + 3)}}) ||
             !wrongToken.ArmHandoffSession(42, wrong, base + 6, {{0, address(base + 3)}}))
         { printf("HANDOFF_WIRE_AUTH FAIL: sockets\n"); return 2; }
+        // A correctly tagged packet is still premature until the separate
+        // frame-zero proof completes on this receiver.
+        peer.SendHash(59, 0xBEEF);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        u64 prematureHash = 0;
+        const bool prematureRejected = !host.PeerHash(1, 59, prematureHash);
         host.SubmitLocal(0, NetplayFrameInput{0xFFE, -1, -1});
         peer.SubmitLocal(0, NetplayFrameInput{0xFFD, -1, -1});
         bool hostProof = false, peerProof = false;
@@ -630,7 +636,7 @@ int main(int argc, char** argv)
         while (!(validHash = host.PeerHash(1, 60, hash)) &&
                std::chrono::steady_clock::now() < hashUntil)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        const bool ok = staleRejected && gotInput && received.Keys == 0xFFB &&
+        const bool ok = prematureRejected && staleRejected && gotInput && received.Keys == 0xFFB &&
                         validHash && hash == 0xA55A;
         printf("HANDOFF_WIRE_AUTH %s\n", ok ? "PASS" : "FAIL");
         return ok ? 0 : 2;

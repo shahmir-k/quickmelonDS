@@ -284,6 +284,7 @@ bool NetplayInput::ArmHandoffSession(u64 epoch, const std::array<u8, 16>& token,
     HandoffStartPort = localStartupPort;
     HandoffEpoch = epoch;
     HandoffToken = token;
+    HandoffProofComplete = false;
     memcpy(HandoffStartAddr, addresses, sizeof(addresses));
     for (int peer : Peers)
     {
@@ -407,7 +408,15 @@ bool NetplayInput::WaitForHandoffPeerInput(int timeoutMs)
         }
         bool all = ackSends >= 3;
         for (int peer : Peers) all &= proven[peer] && peerAcked[peer];
-        if (all) { close(fd); return true; }
+        if (all)
+        {
+            {
+                std::lock_guard<std::mutex> lk(Lock);
+                HandoffProofComplete = true;
+            }
+            close(fd);
+            return true;
+        }
     }
     close(fd);
     return false;
@@ -772,6 +781,7 @@ void NetplayInput::Receive(const u8* data, size_t size, u64 now)
                 memcpy(&auth, data + sizeof(wh), sizeof(auth));
                 if (auth.Epoch != HandoffEpoch ||
                     memcmp(auth.Token, HandoffToken.data(), sizeof(auth.Token))) return;
+                if (!HandoffProofComplete) return;
             }
             else if (size != sizeof(wh)) return;
             auto& hashes = PeerHashes[wh.Player];
@@ -795,6 +805,7 @@ void NetplayInput::Receive(const u8* data, size_t size, u64 now)
             memcpy(&auth, data + payload, sizeof(auth));
             if (auth.Epoch != HandoffEpoch ||
                 memcmp(auth.Token, HandoffToken.data(), sizeof(auth.Token))) return;
+            if (!HandoffProofComplete) return;
         }
         int from = header.Player;
         LastPeerUs[from] = now;

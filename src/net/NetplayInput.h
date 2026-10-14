@@ -219,6 +219,7 @@ private:
     u8 HandoffStartAddr[kMaxPlayers][16] {};
     u64 HandoffEpoch = 0;
     std::array<u8, 16> HandoffToken{};
+    bool HandoffProofComplete = false; // Lock: normal packets wait for frame-zero peer proof
     NetFaults Faults;
     int Socket = -1;
     std::vector<int> Peers;                 // the other players
