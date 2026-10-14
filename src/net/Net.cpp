@@ -38,6 +38,11 @@ void Net::UnregisterInstance(int inst)
     Dispatcher.unregisterInstance(inst);
 }
 
+bool Net::ReassignInstance(int from, int to)
+{
+    return Dispatcher.reassignInstance(from, to);
+}
+
 
 void Net::RXEnqueue(const void* buf, int len)
 {

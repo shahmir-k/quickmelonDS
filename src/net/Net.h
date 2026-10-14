@@ -41,6 +41,7 @@ public:
 
     void RegisterInstance(int inst);
     void UnregisterInstance(int inst);
+    bool ReassignInstance(int from, int to);
 
     void RXEnqueue(const void* buf, int len);
 

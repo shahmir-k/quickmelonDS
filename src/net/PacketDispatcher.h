@@ -35,6 +35,9 @@ public:
 
     void registerInstance(int inst);
     void unregisterInstance(int inst);
+    // Move a live console's receive queue to a new slot while it is frozen.
+    // Fails rather than replacing a slot already owned by another console.
+    bool reassignInstance(int from, int to);
 
     void clear();
 

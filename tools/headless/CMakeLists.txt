@@ -37,6 +37,10 @@ endif()
 
 target_link_libraries(liteDS-headless PRIVATE core)
 
+add_executable(packet-dispatcher-test PacketDispatcherTest.cpp "${CMAKE_SOURCE_DIR}/src/net/PacketDispatcher.cpp")
+target_include_directories(packet-dispatcher-test PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/net")
+set_target_properties(packet-dispatcher-test PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+
 if (LITEV_HEADLESS_LAN)
     add_subdirectory("${LITEV_ENET_SOURCE_DIR}" enet-build EXCLUDE_FROM_ALL)
     target_link_libraries(liteDS-headless PRIVATE enet)

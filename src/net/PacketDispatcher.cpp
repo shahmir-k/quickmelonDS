@@ -62,6 +62,22 @@ void PacketDispatcher::unregisterInstance(int inst)
     Mutex_Unlock(mutex);
 }
 
+bool PacketDispatcher::reassignInstance(int from, int to)
+{
+    if (from < 0 || from >= 16 || to < 0 || to >= 16) return false;
+    Mutex_Lock(mutex);
+    const bool sourceExists = (instanceMask & (1 << from)) && packetQueues[from];
+    const bool destinationFree = from == to ||
+        (!(instanceMask & (1 << to)) && !packetQueues[to]);
+    if (sourceExists && destinationFree && from != to)
+    {
+        packetQueues[to] = std::move(packetQueues[from]);
+        instanceMask = (instanceMask & ~(1 << from)) | (1 << to);
+    }
+    Mutex_Unlock(mutex);
+    return sourceExists && destinationFree;
+}
+
 
 void PacketDispatcher::clear()
 {
@@ -85,10 +101,6 @@ void PacketDispatcher::sendPacket(const void* header, int headerlen, const void*
     if ((sizeof(PacketHeader) + headerlen + datalen) >= 0x8000) return;
     if (sender < 0 || sender > 16) return;
 
-    recv_mask &= instanceMask;
-    if (sender < 16) recv_mask &= ~(1 << sender);
-    if (!recv_mask) return;
-
     PacketHeader phdr;
     phdr.magic = kPacketMagic;
     phdr.senderID = sender;
@@ -98,6 +110,9 @@ void PacketDispatcher::sendPacket(const void* header, int headerlen, const void*
     int totallen = sizeof(phdr) + headerlen + datalen;
 
     Mutex_Lock(mutex);
+    recv_mask &= instanceMask;
+    if (sender < 16) recv_mask &= ~(1 << sender);
+    if (!recv_mask) { Mutex_Unlock(mutex); return; }
     for (int i = 0; i < 16; i++)
     {
         if (!(recv_mask & (1 << i)))
@@ -127,6 +142,7 @@ bool PacketDispatcher::recvPacket(void *header, int *headerlen, void *data, int 
 
     Mutex_Lock(mutex);
     PacketQueue* queue = packetQueues[receiver].get();
+    if (!queue) { Mutex_Unlock(mutex); return false; }
 
     PacketHeader phdr;
     if (!queue->Read(&phdr, sizeof(phdr)))
