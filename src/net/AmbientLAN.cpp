@@ -637,7 +637,16 @@ bool AmbientLAN::HandoffBuildCompatible() const
     if (!Cfg.AllowHandoff || !link || !View) return false;
     for (const Peer& peer : *View)
         if (peer.ID == link->ID)
+        {
+            if (peer.BuildID != Cfg.BuildID && peer.BuildID != LoggedBuildMismatch)
+            {
+                LoggedBuildMismatch = peer.BuildID;
+                Platform::Log(Platform::LogLevel::Warn, "Ambient: no Netplay switch with %016llx: handoff compatibility "
+                              "%08x there, %08x here (handoff protocol or emulation LITEV options differ)\n",
+                              (unsigned long long)peer.ID, peer.BuildID, Cfg.BuildID);
+            }
             return peer.BuildID == Cfg.BuildID;
+        }
     return false;
 }
 

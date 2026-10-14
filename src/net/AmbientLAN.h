@@ -172,6 +172,7 @@ public:
     };
 
 private:
+    mutable u32 LoggedBuildMismatch = 0;   // (HandoffBuildCompatible: the peer BuildID last reported)
     struct Link
     {
         u64 ID = 0;
