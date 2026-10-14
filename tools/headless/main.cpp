@@ -507,6 +507,40 @@ int main(int argc, char** argv)
     HeadlessHost::SetDataDir(opt.dataDir);
 
 #ifdef LITEV_AMBIENT_LAN
+    if (getenv("LITEV_TEST_LIVE_PROOF"))
+    {
+        NetplayLiveCheckpoint p0, p1;
+        p0.Player = 0; p1.Player = 1;
+        p0.Epoch = p1.Epoch = 42;
+        p0.Build = p1.Build = 0x123456789abcdef0ull;
+        p0.FenceToken[0] = p1.FenceToken[0] = 1;
+        p0.State = {1, 2, 3}; p1.State = {4, 5, 6};
+        p0.Firmware = {7, 8}; p1.Firmware = {9, 10};
+        const std::string address = "127.0.0.1:";
+        const u16 port = static_cast<u16>(32000 + getpid() % 10000);
+        auto trial = [&](bool mismatch) {
+            const std::array<u64, 4> good {11, 22, 33, 44};
+            std::array<u64, 4> bad = good;
+            if (mismatch) bad[2]++;
+            std::atomic<bool> stop{false};
+            bool host = false, guest = false;
+            std::string hostError, guestError;
+            std::thread hostThread([&] {
+                host = NetplayAwaitLiveStart(port, address + std::to_string(port),
+                    "127.0.0.1", p0, p1, stop, hostError, good);
+            });
+            guest = NetplayAwaitLiveStart(port, address + std::to_string(port),
+                "127.0.0.1", p1, p0, stop, guestError, bad);
+            hostThread.join();
+            return mismatch ? !host && !guest &&
+                hostError.find("pre-commit frame proof") != std::string::npos &&
+                guestError.find("pre-commit frame proof") != std::string::npos :
+                host && guest && hostError.empty() && guestError.empty();
+        };
+        const bool ok = trial(false) && trial(true);
+        printf("LIVE_PROOF %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 2;
+    }
     if (getenv("LITEV_TEST_PREPARE_BRIDGE"))
     {
         NetplayLiveCheckpoint checkpoint;

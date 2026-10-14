@@ -443,7 +443,8 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
 bool NetplayAwaitLiveStart(u16 tcpPort, const std::string& hostAddress,
                            const std::string& expectedPeerIPv4,
                            const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
-                           std::atomic<bool>& cancel, std::string& error);
+                           std::atomic<bool>& cancel, std::string& error,
+                           const std::array<u64, 4>& trialHashes = {});
 
 }
 

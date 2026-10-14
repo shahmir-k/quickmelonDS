@@ -2118,7 +2118,8 @@ bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
 bool NetplayAwaitLiveStart(u16 tcpPort, const std::string& hostAddress,
                            const std::string& expectedPeerIPv4,
                            const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
-                           std::atomic<bool>& cancel, std::string& error)
+                           std::atomic<bool>& cancel, std::string& error,
+                           const std::array<u64, 4>& trialHashes)
 {
     error.clear();
     if (!tcpPort || local.Player > 1 || peer.Player != 1 - local.Player ||
@@ -2134,10 +2135,11 @@ bool NetplayAwaitLiveStart(u16 tcpPort, const std::string& hostAddress,
         u8 Reserved[3];
         u64 Epoch, Build;
         u8 Token[16], State0[32], State1[32], Firmware0[32], Firmware1[32];
+        u64 TrialHashes[4]; // player 0/1 after each of two disposable Lockstep frames
     };
 #pragma pack(pop)
     Start mine{};
-    mine.Magic = 0x31534C4E; // NLS1
+    mine.Magic = 0x32534C4E; // NLS2: includes reversible pre-commit proof
     mine.Player = local.Player;
     mine.Epoch = local.Epoch;
     mine.Build = local.Build;
@@ -2151,6 +2153,7 @@ bool NetplayAwaitLiveStart(u16 tcpPort, const std::string& hostAddress,
     fb.Add(p1.Firmware.data(), p1.Firmware.size());
     a.Get(mine.State0); b.Get(mine.State1);
     fa.Get(mine.Firmware0); fb.Get(mine.Firmware1);
+    memcpy(mine.TrialHashes, trialHashes.data(), sizeof(mine.TrialHashes));
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
     auto waitIO = [&](int fd, short events) {
         while (!cancel.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
@@ -2246,6 +2249,7 @@ bool NetplayAwaitLiveStart(u16 tcpPort, const std::string& hostAddress,
             memcmp(other.State1, mine.State1, sizeof(mine.State1)) ? "player 1 state" :
             memcmp(other.Firmware0, mine.Firmware0, sizeof(mine.Firmware0)) ? "player 0 firmware" :
             memcmp(other.Firmware1, mine.Firmware1, sizeof(mine.Firmware1)) ? "player 1 firmware" :
+            memcmp(other.TrialHashes, mine.TrialHashes, sizeof(mine.TrialHashes)) ? "pre-commit frame proof" :
             "unknown";
         error = std::string("live-start checkpoint manifest mismatch: ") + field;
         return false;
