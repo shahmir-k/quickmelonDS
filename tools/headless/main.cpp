@@ -1604,17 +1604,19 @@ int main(int argc, char** argv)
                             printf("CUTFENCE %s early checkpoint not sent: %s\n", cutRole, sendError.c_str());
                     }
                     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+                    const char* why = "8 s deadline";
                     while (!ambient->HandoffFenceComplete() && !ambient->HandoffFenceAborted() &&
                            std::chrono::steady_clock::now() < deadline)
                     {
                         ambient->Process();
+                        if (ambient->HandoffFenceAborted()) why = ambient->GetStats().Links ? "peer aborted or link lost" : "no Ambient link";
                         // A peer can have an MP packet in flight when our fence is sent.
                         // Process() retires stale packets under Ambient's normal rules;
                         // the READY and completion checks still require an empty queue
                         // and full sequence-watermark retirement. Aborting on the first
                         // transient queued packet races the peer's fence response.
                         if (nds->Wifi.HandoffBusyMask() || !ambient->GetStats().Links)
-                        { ambient->AbortHandoffFence(); break; }
+                        { why = nds->Wifi.HandoffBusyMask() ? "MP exchange busy" : "no Ambient link"; ambient->AbortHandoffFence(); break; }
                         if (getenv("LITEV_AMBIENT_FENCE_TRACE"))
                         {
                             static auto lastTrace = std::chrono::steady_clock::now();
@@ -1643,9 +1645,9 @@ int main(int argc, char** argv)
                         nds->Wifi.HandoffBusyMask() || ambient->HandoffQueuedFrames())
                     {
                         const auto fs = ambient->GetHandoffFenceStats();
-                        printf("CUTFENCE %s abort f%d busy=%02x queued=%zu peerFence=%d ready=%d\n", cutRole, frame,
-                               nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames(), ambient->HasPeerHandoffFence(),
-                               ambient->CanAcknowledgeHandoffFence());
+                        printf("CUTFENCE %s abort f%d t=%ldms (%s) busy=%02x queued=%zu peerFence=%d ready=%d\n", cutRole, frame,
+                               frozenMs(), why, nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames(),
+                               ambient->HasPeerHandoffFence(), ambient->CanAcknowledgeHandoffFence());
                         printf("CUTFENCE watermark local=%u retired=%u peer=%u peerRetired=%u ready=%d/%d aborted=%d\n",
                                fs.LastSent, fs.RetiredThrough, fs.PeerLastSent, fs.PeerRetiredThrough,
                                fs.LocalReady, fs.PeerReady, fs.Aborted);
