@@ -102,6 +102,8 @@ public:
     bool IncomingHandoffOffer(u64& epoch, HandoffMode& mode) const;
     bool RespondToHandoffOffer(u64 epoch, bool accept);
     bool HandoffOfferReady(u64 epoch, const std::array<u8, 16>& token, HandoffMode mode) const;
+    struct HandoffOfferStatus { u64 Epoch; u64 PeerID; HandoffMode Mode; bool Outgoing, Accepted; };
+    bool GetHandoffOfferStatus(HandoffOfferStatus& status) const;
     void CancelHandoffOffer();
     // Emulator-thread-only, two-peer cut fence. Call after the host stops issuing
     // MP commands; the client may keep running until it reaches its own idle cut.

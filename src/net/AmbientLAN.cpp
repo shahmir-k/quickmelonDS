@@ -689,6 +689,16 @@ bool AmbientLAN::HandoffOfferReady(u64 epoch, const std::array<u8, 16>& token,
             (l->PeerOffered && l->LocalOfferAccepted));
 }
 
+bool AmbientLAN::GetHandoffOfferStatus(HandoffOfferStatus& status) const
+{
+    const Link* l = HandoffLink();
+    if (!l || !HandoffBuildCompatible() || !l->OfferEpoch) return false;
+    status = {l->OfferEpoch, l->ID, static_cast<HandoffMode>(l->OfferMode),
+              l->LocalOffered, (l->LocalOffered && l->PeerOfferAccepted) ||
+                                   (l->PeerOffered && l->LocalOfferAccepted)};
+    return true;
+}
+
 void AmbientLAN::CancelHandoffOffer()
 {
     Link* l = HandoffLink();

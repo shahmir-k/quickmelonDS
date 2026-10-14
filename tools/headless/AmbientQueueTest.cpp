@@ -165,12 +165,16 @@ struct AmbientLANQueueTestAccess
         ambient.ReceiveHandoffControl(link, 1, 100, 0, token);
         assert(!link.PeerFence && link.FenceEpoch == 0); // no consent: ignore a peer cut
         ambient.ReceiveHandoffControl(link, 8, 100, AmbientLAN::HandoffPlainNetplay, token);
+        AmbientLAN::HandoffOfferStatus status{};
+        assert(ambient.GetHandoffOfferStatus(status));
+        assert(status.Epoch == 100 && status.PeerID == peer.ID && !status.Outgoing && !status.Accepted);
         u64 epoch = 0;
         AmbientLAN::HandoffMode mode = AmbientLAN::HandoffHostedNetplay;
         assert(ambient.IncomingHandoffOffer(epoch, mode));
         assert(epoch == 100 && mode == AmbientLAN::HandoffPlainNetplay);
         assert(!ambient.HandoffOfferReady(epoch, token, mode));
         link.LocalOfferAccepted = true; // the response send is exercised by the integration gate
+        assert(ambient.GetHandoffOfferStatus(status) && status.Accepted);
         assert(ambient.HandoffOfferReady(epoch, token, mode));
         std::array<u8, 16> wrong = token;
         wrong[0] ^= 1;
