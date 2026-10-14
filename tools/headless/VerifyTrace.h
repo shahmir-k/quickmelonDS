@@ -76,6 +76,12 @@ struct PreparedMPConsole
 // LITEV_NP_LIVE_EXIT=<quiet frames> with prepared consoles: the session ends by itself
 // (NetplayLiveExit); the consoles, the end frame and each console's already scheduled Netplay
 // inputs (the frames after the end, up to the input delay) come back in *ended.
+// LITEV_AUDIO_TAP=<file>: this process's own console's audio, one record per frame
+// ([u32 phase][u32 frame][u32 stereo samples][samples as s16 pairs]); phase 0 = before a live
+// handoff cut (Ambient), 1 = Netplay, 2 = after the session ended (tools/headless/audio_continuity.py).
+void AudioTapWrite(int phase, int frame, const melonDS::s16* samples, int pairs);
+void AudioTapDrain(melonDS::NDS& nds, int phase, int frame);
+
 class InputScript;
 struct LiveExitResult
 {

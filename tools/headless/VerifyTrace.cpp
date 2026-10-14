@@ -848,6 +848,32 @@ static void NetplayHarnessXfer(NetplaySetup& setup)
 
 static int net_local_for_stamp(NetplayInput* n) { return n ? n->LocalPlayer() : 0; }
 
+void AudioTapWrite(int phase, int frame, const s16* samples, int pairs)
+{
+    static FILE* f = getenv("LITEV_AUDIO_TAP") ? fopen(getenv("LITEV_AUDIO_TAP"), "wb") : nullptr;
+    static std::mutex lock;
+    if (!f) return;
+    std::lock_guard<std::mutex> lk(lock);
+    const u32 head[3] = {(u32)phase, (u32)frame, (u32)pairs};
+    fwrite(head, 4, 3, f);
+    if (pairs > 0) fwrite(samples, 4, (size_t)pairs, f);
+    fflush(f);
+}
+
+void AudioTapDrain(NDS& nds, int phase, int frame)
+{
+    if (!getenv("LITEV_AUDIO_TAP")) return;
+    std::vector<s16> all, part(4096);
+    for (;;)
+    {
+        const int got = nds.SPU.ReadOutput(part.data(), 2048);
+        if (got <= 0) break;
+        all.insert(all.end(), part.begin(), part.begin() + got * 2);
+        if (got < 2048) break;
+    }
+    AudioTapWrite(phase, frame, all.data(), (int)all.size() / 2);
+}
+
 int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts,
            std::vector<PreparedMPConsole> prepared, LiveExitResult* ended)
 {
@@ -1599,6 +1625,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #endif
                 if (f >= frames) continue;
                 done[inst].store(f + 1, std::memory_order_relaxed);
+                if (net && inst == net->LocalPlayer()) AudioTapDrain(*bi.nds, 1, f);
                 if (hashFrom >= 0 && f >= hashFrom && f <= hashFrom + 64)
                     printf("inst%d state f%d: sys=%llu ram=%016llx r9=%016llx\n", inst, f, (unsigned long long)bi.nds->GetSysTimestamp(),
                            (unsigned long long)XXH3_64bits(bi.nds->MainRAM, bi.nds->MainRAMMask + 1),

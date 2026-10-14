@@ -483,23 +483,63 @@ private:
     std::atomic<int> EndAfter{-1};
 };
 
-bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
-                                    const std::string& expectedPeerIPv4,
-                                    const NetplayLiveCheckpoint& local, const NetplayRom& expectedPeerRom,
-                                    NetplayLivePrepare preparePeer, std::atomic<bool>& cancel,
-                                    NetplayLiveCheckpoint& peer, std::string& error);
-
-// A second, bounded rendezvous after both peers have voted GO. Neither caller
-// may run the first Netplay frame until this confirms that the *same* pair of
-// checkpoints is present on both sides. A lost GO leaves the other peer here
-// (still on its frozen Ambient source) rather than running predicted inputs.
-// This is a startup gate, not a distributed durable-commit guarantee: a peer
-// disappearing after the response remains an in-doubt recovery case.
-bool NetplayAwaitLiveStart(u16 tcpPort, const std::string& hostAddress,
-                           const std::string& expectedPeerIPv4,
-                           const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
-                           std::atomic<bool>& cancel, std::string& error,
-                           const std::array<u64, 4>& trialHashes = {});
+// The live handoff's one TCP connection, from the offer to the commit (player 0 accepts the
+// expected peer, player 1 connects; a worker owns it). Ahead of the cut each side sends its state as
+// a baseline; at the cut the checkpoints cross both ways at once, each as a delta against the
+// baseline the other side holds (section-wise XOR, zlib), then the prepare votes (with reasons),
+// then after the reversible proof the start manifests: one round trip each, no new connection.
+// (It replaced a TCP connection per step and the Ambient PREPARED/ARMED/GO votes: the RG DS cut
+// froze 5-8 s, most of it transfers, slow start and round trips.)
+class NetplayLiveLink
+{
+public:
+    NetplayLiveLink(int player, u16 port, const std::string& peerIPv4);
+    ~NetplayLiveLink();
+    NetplayLiveLink(const NetplayLiveLink&) = delete;
+    NetplayLiveLink& operator=(const NetplayLiveLink&) = delete;
+    bool Connected() const { return Fd.load() >= 0; }
+    // the peer holds this side's latest baseline (the cut's checkpoint will be a delta)
+    bool BaselineAcked() { std::lock_guard<std::mutex> lk(Lock); return OwnBaseId && OwnBaseAcked == OwnBaseId; }
+    // ahead of the cut, any thread: this console's state, the base of the cut's delta (sent by the worker)
+    void SendBaseline(std::vector<u8> state);
+    // the cut, as soon as this console is frozen (before the fence completes: its state is final
+    // at the freeze); ExchangeCheckpoints with the same checkpoint then sends nothing more
+    bool SendCheckpoint(const NetplayLiveCheckpoint& local, std::string& error);
+    // the cut (synchronous; keep the frozen Ambient link serviced meanwhile). preparePeer loads the
+    // peer's checkpoint into a replica; both votes, with reasons, end it.
+    bool ExchangeCheckpoints(const NetplayLiveCheckpoint& local, const NetplayRom& expectedPeerRom,
+                             NetplayLivePrepare preparePeer, std::atomic<bool>& cancel,
+                             NetplayLiveCheckpoint& peer, std::string& error);
+    // after the proof: both sides start only with the same checkpoint pair and proof hashes. A
+    // startup gate, not a durable commit: a peer that vanishes right after it is an in-doubt case.
+    bool ExchangeStart(const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
+                       const std::array<u64, 4>& trialHashes, std::atomic<bool>& cancel, std::string& error);
+    void Close();
+private:
+    enum : u32 { MsgBase = 1, MsgBaseAck, MsgCheckpoint, MsgReady, MsgStart };
+    bool Send(u32 type, std::vector<u8> payload);   // queued for the sender thread
+    bool Wait(u32 type, std::vector<u8>& payload, std::atomic<bool>& cancel, int timeoutMs);
+    void Run();
+    void RunSender();
+    const int Player;
+    const u16 Port;
+    const std::string PeerIPv4;
+    std::atomic<int> Fd{-1};
+    std::atomic<bool> Stop{false};
+    std::thread Worker, Sender;   // the reader never sends: both sides sending big messages at
+                                  // once while neither reads would deadlock on the TCP buffers
+    std::deque<std::pair<u32, std::vector<u8>>> Outbox;
+    std::mutex Lock;
+    std::condition_variable Changed;
+    std::map<u32, std::vector<u8>> Inbox;        // latest message of each type
+    std::vector<u8> PendingBase;                 // a baseline to send once connected
+    std::vector<u8> OwnBase, PeerBase;           // what each side holds as the other's delta base
+    u32 OwnBaseId = 0, OwnBaseAcked = 0, PeerBaseId = 0;
+    u64 SentEpoch = 0, SentClock = 0;          // the checkpoint already sent (SendCheckpoint)
+    bool Broken = false;
+};
+// (exposed for its self-check, LITEV_TEST_LIVE_DELTA in the headless harness)
+std::vector<u8> NetplayLiveDelta(const std::vector<u8>& state, const std::vector<u8>& base);
 
 }
 

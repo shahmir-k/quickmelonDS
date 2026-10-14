@@ -91,9 +91,6 @@ fi
 if [[ $expect == pass || $expect == retry ]]; then
     for process in p0 p1; do
         log="$out_dir/$process/log.txt"
-        for phase in prepared armed go; do
-            if ! grep -q " $phase agreed" "$log"; then echo "FAIL: $process missing $phase ($out_dir)" >&2; exit 1; fi
-        done
         if ! grep -q 'live-start rendezvous agreed' "$log" ||
            ! grep -q 'swap trial pass sourceIntact=1 link=1' "$log" ||
            ! grep -q 'ran_clean:       yes' "$log"; then
