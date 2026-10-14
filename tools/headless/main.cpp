@@ -1452,7 +1452,10 @@ int main(int argc, char** argv)
                 auto mark = [](const std::string& p) { FILE* f = fopen(p.c_str(), "wb"); if (!f) return false; fclose(f); return true; };
                 const bool retryOpen = cutRetryAfterAbort && cutAttempt == 1 && cutRetryReady;
                 const bool eligible = (cutAttempt == 0 && !exists(abort)) || retryOpen;
-                const u64 nextEpoch = 0x48414e444f464630ull + (u64)cutAttempt + 1;
+                // per process: a peer that already answered one run's offer must not see the next
+                // run's as the same one (the app keeps its answer per epoch)
+                static const u64 epochBase = 0x48414e0000000000ull | ((u64)getpid() << 16) | ((u64)time(nullptr) & 0xFF00);
+                const u64 nextEpoch = epochBase + (u64)cutAttempt + 1;
                 if (cutXferPort && eligible)
                 {
                     if (host && !cutOfferSent)
@@ -1506,12 +1509,15 @@ int main(int argc, char** argv)
                         }
                     }
                 }
+                if (eligible && offerReady && romReady && (frame % 120) == 0)
+                    printf("CUTFENCE %s waiting f%d busy=%02x queued=%zu peerFence=%d\n", cutRole, frame,
+                           nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames(), ambient->HasPeerHandoffFence());
                 if (eligible && offerReady && romReady &&
                     (host || ambient->HasPeerHandoffFence()) &&
                     nds->Wifi.HandoffBusyMask() == 0 && ambient->HandoffQueuedFrames() == 0)
                 {
                     ++cutAttempt;
-                    const u64 epoch = host ? 0x48414e444f464630ull + (u64)cutAttempt : ambient->PeerHandoffEpoch();
+                    const u64 epoch = host ? epochBase + (u64)cutAttempt : ambient->PeerHandoffEpoch();
                     printf("CUTFENCE %s attempt=%d holding f%d clock=%llu epoch=%llx\n", cutRole, cutAttempt,
                            frame, (unsigned long long)nds->GetSysTimestamp(), (unsigned long long)epoch);
                     fflush(stdout);
@@ -1774,7 +1780,9 @@ int main(int argc, char** argv)
                                     ambient->AbortHandoffFence();
                                     return false;
                                 }
-                                const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+                                // (an Android peer stages and proves its replicas before PREPARED: many seconds)
+                                const int waitS = cutExternalPeer && strcmp(name, "prepared") == 0 ? 40 : 8;
+                                const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(waitS);
                                 while (!complete() && !ambient->HandoffFenceAborted() &&
                                        std::chrono::steady_clock::now() < end)
                                 {

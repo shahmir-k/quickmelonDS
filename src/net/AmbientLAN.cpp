@@ -887,6 +887,16 @@ void AmbientLAN::SendFenceControl(Link& l, u32 type, u64 epoch, u32 mark)
     enet_host_flush(Host);
 }
 
+// A fenced link carries only handoff control while each side stages its checkpoint copies, and an
+// Android peer's emulator thread (which services this link) loads ROMs and runs the reversible proof
+// in blocks of up to ~7 s (RG DS, Pokémon B/W 2026-10-14) - past the normal 5 s ENet timeout, which
+// dropped the link right after PREPARED. Allow 30 s while fenced; the normal timeout comes back with
+// the reset.
+static void FencedLinkTimeout(ENetPeer* p, bool fenced)
+{
+    if (p) enet_peer_timeout(p, 0, fenced ? 30000 : 5000, fenced ? 30000 : 5000);
+}
+
 bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
 {
     Link* l = HandoffLink();
@@ -911,6 +921,7 @@ bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
     l->FenceLastSent = l->TxSeq;
     l->LocalFence = true;
     l->LocalFenceMs = NowMs();
+    FencedLinkTimeout(l->P, true);
     SendFenceControl(*l, HandoffFence, epoch, l->FenceLastSent);
     return !l->FenceAbort;
 }
@@ -1042,6 +1053,7 @@ void AmbientLAN::CompleteHandoffReset(Link& l)
         l.LastClosedFenceToken = l.FenceToken;
     }
     l.FenceEpoch = 0;
+    FencedLinkTimeout(l.P, false);
     l.ActiveMs = NowMs(); // give a rolled-back source its normal idle grace period
     l.FenceToken = {};
     l.FenceLastSent = l.PeerLastSent = l.PeerRetiredThrough = 0;
@@ -1130,6 +1142,7 @@ void AmbientLAN::ReceiveHandoffControl(Link& l, u32 type, u64 epoch, u32 mark,
         l.ActiveMs = NowMs();
         l.FenceToken = token;
         l.PeerFence = true;
+        FencedLinkTimeout(l.P, true);
         l.PeerLastSent = mark;
         l.PeerFenceMs = NowMs();
         l.DropThroughSeq = std::max(l.DropThroughSeq, mark);
