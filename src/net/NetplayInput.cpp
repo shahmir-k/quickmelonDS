@@ -2054,6 +2054,20 @@ void NetplayLiveLink::Close()
     if (fd >= 0) close(fd);
 }
 
+void NetplayLiveLink::HoldBaselineAck(bool hold)
+{
+    u32 id;
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        AckHeld = hold;
+        if (hold || !PeerBaseId || PeerBaseAcked == PeerBaseId) return;
+        id = PeerBaseAcked = PeerBaseId;
+    }
+    std::vector<u8> ack(4);
+    memcpy(ack.data(), &id, 4);
+    Send(MsgBaseAck, ack);
+}
+
 void NetplayLiveLink::SendBaseline(std::vector<u8> state)
 {
     std::lock_guard<std::mutex> lk(Lock);
@@ -2200,10 +2214,12 @@ void NetplayLiveLink::Run()
                 uLongf n = (uLongf)state.size();
                 if (uncompress(state.data(), &n, msg.data() + 8, (uLong)msg.size() - 8) == Z_OK && n == state.size())
                 {
-                    { std::lock_guard<std::mutex> lk(Lock); PeerBase = std::move(state); PeerBaseId = id; }
+                    bool held;
+                    { std::lock_guard<std::mutex> lk(Lock); PeerBase = std::move(state); PeerBaseId = id; held = AckHeld;
+                      if (!held) PeerBaseAcked = id; }
                     std::vector<u8> ack(4);
                     memcpy(ack.data(), &id, 4);
-                    Send(MsgBaseAck, ack);
+                    if (!held) Send(MsgBaseAck, ack);
                 }
             }
             else if (type == MsgBaseAck && msg.size() == 4)

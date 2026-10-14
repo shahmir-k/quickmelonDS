@@ -1557,10 +1557,11 @@ int main(int argc, char** argv)
                 // (the host's last ACK retires). Anyone else may start the fence when idle.
                 const bool mayStartFence = ambient->HasPeerHandoffFence() ||
                     (cutXferPort ? !nds->Wifi.IsMPClientMode() : host);
-                // (models the player's answer: the app sends its baseline at the offer, seconds before)
+                // (models the player's answer: the app sends its baseline at the offer, seconds before;
+                // a peer app acks it only once it has read this side's ROM, up to ~10 s on an SD card)
                 const bool baselineReady = !cutLink || cutLink->BaselineAcked() || ambient->HasPeerHandoffFence() ||
                     (cutBaselineAt != std::chrono::steady_clock::time_point{} &&
-                     std::chrono::steady_clock::now() - cutBaselineAt > std::chrono::seconds(5));
+                     std::chrono::steady_clock::now() - cutBaselineAt > std::chrono::seconds(20));
                 if (eligible && offerReady && romReady && mayStartFence && baselineReady &&
                     nds->Wifi.HandoffBusyMask() == 0 && ambient->HandoffQueuedFrames() == 0)
                 {

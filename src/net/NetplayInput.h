@@ -502,6 +502,10 @@ public:
     bool BaselineAcked() { std::lock_guard<std::mutex> lk(Lock); return OwnBaseId && OwnBaseAcked == OwnBaseId; }
     // ahead of the cut, any thread: this console's state, the base of the cut's delta (sent by the worker)
     void SendBaseline(std::vector<u8> state);
+    // The baseline ack also says "ready for the cut": a side that still has to find and read the
+    // peer's ROM holds it (HoldBaselineAck(true) right after construction) and releases it once
+    // ready, so the peer does not fence into a side that cannot stage its checkpoint yet.
+    void HoldBaselineAck(bool hold);
     // the cut, as soon as this console is frozen (before the fence completes: its state is final
     // at the freeze); ExchangeCheckpoints with the same checkpoint then sends nothing more
     bool SendCheckpoint(const NetplayLiveCheckpoint& local, std::string& error);
@@ -534,7 +538,8 @@ private:
     std::map<u32, std::vector<u8>> Inbox;        // latest message of each type
     std::vector<u8> PendingBase;                 // a baseline to send once connected
     std::vector<u8> OwnBase, PeerBase;           // what each side holds as the other's delta base
-    u32 OwnBaseId = 0, OwnBaseAcked = 0, PeerBaseId = 0;
+    u32 OwnBaseId = 0, OwnBaseAcked = 0, PeerBaseId = 0, PeerBaseAcked = 0;
+    bool AckHeld = false;
     u64 SentEpoch = 0, SentClock = 0;          // the checkpoint already sent (SendCheckpoint)
     bool Broken = false;
 };
