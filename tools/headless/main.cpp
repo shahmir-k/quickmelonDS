@@ -496,6 +496,84 @@ int main(int argc, char** argv)
     HeadlessHost::SetDataDir(opt.dataDir);
 
 #ifdef LITEV_AMBIENT_LAN
+    if (getenv("LITEV_TEST_PREPARE_BRIDGE"))
+    {
+        NetplayLiveCheckpoint checkpoint;
+        checkpoint.Epoch = 42;
+        std::atomic<bool> cancel{false};
+        const auto owner = std::this_thread::get_id();
+        auto waitPending = [](NetplayLivePrepareBridge& bridge) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (!bridge.HasPending() && std::chrono::steady_clock::now() < until)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return bridge.HasPending();
+        };
+        NetplayLivePrepareBridge success;
+        bool successResult = false;
+        std::string successError;
+        std::thread worker([&] {
+            successResult = success.Request(checkpoint, successError, cancel, 1000);
+        });
+        const bool queued = waitPending(success);
+        const bool serviced = success.Service([&](const NetplayLiveCheckpoint& request,
+                                                   std::string&) {
+            return &request == &checkpoint && request.Epoch == 42 &&
+                   std::this_thread::get_id() == owner;
+        });
+        worker.join();
+
+        NetplayLivePrepareBridge rejected;
+        bool rejectResult = true;
+        std::string rejectError;
+        std::thread rejectedWorker([&] {
+            rejectResult = rejected.Request(checkpoint, rejectError, cancel, 1000);
+        });
+        const bool rejectQueued = waitPending(rejected);
+        const bool rejectServiced = rejected.Service([](const NetplayLiveCheckpoint&,
+                                                        std::string& reason) {
+            reason = "replica mismatch";
+            return false;
+        });
+        rejectedWorker.join();
+
+        NetplayLivePrepareBridge cancelled;
+        bool cancelResult = true;
+        std::string cancelError;
+        std::thread cancelledWorker([&] {
+            cancelResult = cancelled.Request(checkpoint, cancelError, cancel, 1000);
+        });
+        const bool cancelQueued = waitPending(cancelled);
+        cancelled.Cancel();
+        cancelledWorker.join();
+
+        NetplayLivePrepareBridge timedOut;
+        std::string timeoutError;
+        const bool timeoutResult = timedOut.Request(checkpoint, timeoutError, cancel, 20);
+
+        NetplayLivePrepareBridge cancelledDuringLoad;
+        bool loadResult = true;
+        std::string loadError;
+        std::atomic<bool> loadCancel{false};
+        std::thread loadWorker([&] {
+            loadResult = cancelledDuringLoad.Request(checkpoint, loadError, loadCancel, 1000);
+        });
+        const bool loadQueued = waitPending(cancelledDuringLoad);
+        const bool loadServiced = cancelledDuringLoad.Service([&](const NetplayLiveCheckpoint&,
+                                                                   std::string&) {
+            loadCancel.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            return true;
+        });
+        loadWorker.join();
+        const bool ok = queued && serviced && successResult && successError.empty() &&
+                        rejectQueued && rejectServiced && !rejectResult &&
+                        rejectError == "replica mismatch" &&
+                        cancelQueued && !cancelResult && !cancelError.empty() &&
+                        !timeoutResult && timeoutError == "live replica prepare timed out" &&
+                        loadQueued && loadServiced && !loadResult && !loadError.empty();
+        printf("PREPARE_BRIDGE %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 2;
+    }
     if (getenv("LITEV_TEST_ROM_REHASH"))
     {
         // Same-size replacement: ordinary setup may reuse a hash, but a live

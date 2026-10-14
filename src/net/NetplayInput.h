@@ -396,6 +396,36 @@ struct NetplayLiveCheckpoint
 // Process() serviced. preparePeer must verify/load the remote state into an
 // isolated scratch replica; neither side reports success until both vote ready.
 using NetplayLivePrepare = std::function<bool(const NetplayLiveCheckpoint&, std::string&)>;
+// The checkpoint transport runs on a network worker, but a frontend may need
+// to construct its replica on the emulator/GL thread. Give Request() to the
+// transport's preparePeer callback and poll Service() on that owner thread
+// while continuing to Process() the frozen Ambient link. One request at a
+// time; cancel and join the worker before destroying the bridge.
+class NetplayLivePrepareBridge
+{
+public:
+    NetplayLivePrepareBridge() = default;
+    NetplayLivePrepareBridge(const NetplayLivePrepareBridge&) = delete;
+    NetplayLivePrepareBridge& operator=(const NetplayLivePrepareBridge&) = delete;
+
+    bool Request(const NetplayLiveCheckpoint& checkpoint, std::string& error,
+                 const std::atomic<bool>& cancel, int timeoutMs = 10000);
+    // Returns true if a request was serviced (including a failed prepare).
+    bool Service(const NetplayLivePrepare& prepare);
+    bool HasPending() const;
+    void Cancel();
+
+private:
+    mutable std::mutex Lock;
+    std::condition_variable Changed;
+    const NetplayLiveCheckpoint* Pending = nullptr; // worker keeps it alive until Service returns
+    bool Started = false;
+    bool Finished = false;
+    bool Success = false;
+    bool Stopped = false;
+    std::string ResultError;
+};
+
 bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
                                     const std::string& expectedPeerIPv4,
                                     const NetplayLiveCheckpoint& local, const NetplayRom& expectedPeerRom,

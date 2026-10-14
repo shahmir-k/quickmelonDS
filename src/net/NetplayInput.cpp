@@ -1745,6 +1745,88 @@ bool NetplayHandshake(NetplaySetup& s)
     return s.Player == 0 && !s.Join ? HostHandshake(s) : GuestHandshake(s);
 }
 
+bool NetplayLivePrepareBridge::Request(const NetplayLiveCheckpoint& checkpoint,
+                                       std::string& error, const std::atomic<bool>& cancel,
+                                       int timeoutMs)
+{
+    error.clear();
+    std::unique_lock<std::mutex> lock(Lock);
+    if (Stopped || Pending || timeoutMs <= 0 || cancel.load(std::memory_order_acquire))
+    { error = "live replica prepare unavailable"; return false; }
+    Pending = &checkpoint;
+    Started = Finished = Success = false;
+    ResultError.clear();
+    Changed.notify_all();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    bool abandoned = false;
+    while (!Finished)
+    {
+        const bool cancelled = Stopped || cancel.load(std::memory_order_acquire);
+        const bool expired = std::chrono::steady_clock::now() >= deadline;
+        if (cancelled || expired)
+        {
+            abandoned = true;
+            error = cancelled ? "live replica prepare cancelled" : "live replica prepare timed out";
+            if (!Started)
+            {
+                Finished = true;
+                break;
+            }
+            // The owner thread is using checkpoint now. Do not let the worker
+            // return and destroy it until that synchronous load has finished.
+        }
+        Changed.wait_for(lock, std::chrono::milliseconds(10));
+    }
+    const bool ok = Success && !abandoned && !Stopped &&
+                    !cancel.load(std::memory_order_acquire);
+    if (!abandoned) error = ResultError;
+    if (!ok && error.empty()) error = "live replica prepare failed";
+    Pending = nullptr;
+    Started = Finished = Success = false;
+    ResultError.clear();
+    return ok;
+}
+
+bool NetplayLivePrepareBridge::Service(const NetplayLivePrepare& prepare)
+{
+    const NetplayLiveCheckpoint* checkpoint = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(Lock);
+        if (!Pending || Started || Finished) return false;
+        Started = true;
+        checkpoint = Pending;
+    }
+    std::string error;
+    const bool ok = prepare && prepare(*checkpoint, error);
+    {
+        std::lock_guard<std::mutex> lock(Lock);
+        Success = ok;
+        ResultError = ok ? std::string{} :
+            (error.empty() ? "live replica prepare failed" : std::move(error));
+        Finished = true;
+    }
+    Changed.notify_all();
+    return true;
+}
+
+bool NetplayLivePrepareBridge::HasPending() const
+{
+    std::lock_guard<std::mutex> lock(Lock);
+    return Pending && !Started && !Finished;
+}
+
+void NetplayLivePrepareBridge::Cancel()
+{
+    std::lock_guard<std::mutex> lock(Lock);
+    Stopped = true;
+    if (Pending && !Started)
+    {
+        ResultError = "live replica prepare cancelled";
+        Finished = true;
+    }
+    Changed.notify_all();
+}
+
 bool NetplayExchangeLiveCheckpoints(u16 tcpPort, const std::string& hostAddress,
                                     const std::string& expectedPeerIPv4,
                                     const NetplayLiveCheckpoint& local, const NetplayRom& expectedPeerRom,
