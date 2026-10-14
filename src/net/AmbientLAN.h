@@ -114,7 +114,8 @@ public:
     //  - SessionVerdict (the live session): every 0.5 s from 1 s after the first exchange, a window is bad when its
     //    frames (NoteFrameUs: emulation + link waits, no pacing) miss 50 fps AND would make 58 without their round
     //    trips (frame - exchanges/frame x RTT): the network, not a busy / loading partner (an MKDS race start waits
-    //    on its partners at 0 ms too), costs the frames; or when the PeerVerdict rule holds for the link's round trip.
+    //    on its partners at 0 ms too), or the round trips take half the frame (Shrek, 3 exchanges a frame: 50 fps at
+    //    0 ms, 22 at 9 ms), costs the frames; or when the PeerVerdict rule holds for the link's round trip.
     //    LAN_BAD after 2 bad windows in a row, back to LAN_OK after 4
     //    good ones; a spike moves neither the median nor two windows. Without NoteFrameUs: emulation + exchanges x RTT.
     //    Pacing is not in it (fast-forward never makes it bad); one exchange a frame on a 0-5 ms LAN stays under
@@ -202,6 +203,7 @@ private:
     std::vector<u8> BuildPing(u8 kind, u64 t);
     u64 PingEcho = 0;                                       // presence thread
     std::atomic<u32> LinkRttUs{0};                          // the slowest linked device's median round trip
+    std::atomic<u32> LinkRttMaxUs{0};                       // ... and the longest of their last 8 (the link waits)
 
     // ---- links + synthesis (emulator thread) ----
     ENetHost* Host = nullptr;

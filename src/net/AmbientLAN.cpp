@@ -470,14 +470,18 @@ void AmbientLAN::PresenceLoop()
         // median is the session's
         {
             std::vector<std::pair<u32, u16>> ping;
-            u32 linkRtt = 0;
+            u32 linkRtt = 0, linkRttMax = 0;
             {
                 std::lock_guard<std::mutex> g(Mu);
                 for (auto& p : Peers)
                 {
                     const bool linked = std::find(LinkedIDs.begin(), LinkedIDs.end(), p.ID) != LinkedIDs.end();
                     if (!linked && (!p.Full || !(SameGame(p.Game, Cfg.GameCode) || p.HasGGID))) continue;
-                    if (linked) linkRtt = std::max(linkRtt, p.RttUs());
+                    if (linked)
+                    {
+                        linkRtt = std::max(linkRtt, p.RttUs());
+                        for (int i = 0; i < p.RttN; i++) linkRttMax = std::max(linkRttMax, p.RttS[i]);
+                    }
                     if (p.PingMs && now - p.PingMs < (p.PingN < 5 ? 100u : linked ? 250u : 1000u)) continue;
                     p.PingMs = now;
                     if (p.PingN < 255) p.PingN++;
@@ -486,6 +490,7 @@ void AmbientLAN::PresenceLoop()
                 }
             }
             LinkRttUs = linkRtt;
+            LinkRttMaxUs = linkRttMax;
             if (!ping.empty()) SendPresence(BuildPing(P_Ping, NowUs()), false, ping);
         }
         if (dirty && now - lastFull >= kFullMinMs)
@@ -1099,10 +1104,11 @@ void AmbientLAN::Process()
 }
 
 // the wait for a peer's MP frame: RecvTimeout, or the link's round trip + margin when that is longer (a slow network
-// keeps its session, slowly, until it moves to Netplay), at most 250 ms
+// keeps its session, slowly, until it moves to Netplay), at most 250 ms; the longest of the last 8 round trips, not
+// their median: a spike of 100 ms (Wi-Fi) holds the session for the next 2 s
 int AmbientLAN::LinkWaitMs() const
 {
-    return std::max(RecvTimeout, std::min(250, (int)(LinkRttUs * 3 / 2000) + 10));
+    return std::max(RecvTimeout, std::min(250, (int)(LinkRttMaxUs * 3 / 2000) + 10));
 }
 
 AmbientLAN::Verdict AmbientLAN::PeerVerdict(u64 id)
@@ -1143,9 +1149,9 @@ void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
         const double frame = VRunN ? (double)VRunUs / VRunN : FrameEmuUs + net;
         const double pred = std::min(60.0, 1e6 / frame);
         StPredFps = (u32)(pred * 100);
-        // (50: a margin, a 55-57 fps LAN is no case for Netplay; even one exchange a frame not fitting is bad whatever
-        // else the frames waited for)
-        const bool bad = (frame > 1e6 / 50 && frame - net <= 1e6 / 58) || FrameEmuUs + rtt > 1000000 / 50;
+        // (50: a margin, a 55-57 fps LAN is no case for Netplay; round trips taking half the frame are the network's
+        // doing even where the partner is slow too; one exchange a frame not fitting is bad whatever else waited)
+        const bool bad = (frame > 1e6 / 50 && (frame - net <= 1e6 / 58 || net >= frame / 2)) || FrameEmuUs + rtt > 1000000 / 50;
         VBad = bad ? VBad + 1 : 0;
         VOk = bad ? 0 : VOk + 1;
         int v = StVerdict;

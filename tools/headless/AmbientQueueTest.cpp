@@ -231,6 +231,10 @@ struct AmbientLANQueueTestAccess
         // Shrek: 3 exchanges a frame at 6.5 ms (+ 1 ms turnaround each): 34 fps, 59 without the round trips
         assert(window(6500, 3, 32500) == AmbientLAN::Verdict_LanOk);
         assert(window(6500, 3, 32500) == AmbientLAN::Verdict_LanBad);
+        for (int i = 0; i < 4; i++) window(2000, 1, 11000);
+        // ... at 9 ms with a slow partner (50 fps at 0 ms): 22 fps, the round trips half of it
+        assert(window(9000, 3, 46000) == AmbientLAN::Verdict_LanOk);
+        assert(window(9000, 3, 46000) == AmbientLAN::Verdict_LanBad);
         enet_host_destroy(other);
     }
 };
