@@ -10,6 +10,7 @@
 */
 
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -447,13 +448,23 @@ bool SaveSavestate(NDS& nds, const std::string& path, std::vector<u8>* captured 
         const u8* bytes = static_cast<const u8*>(state.Buffer());
         captured->assign(bytes, bytes + state.Length());
     }
+    if (path.empty())
+    {
+        fprintf(stderr, "captured savestate (%u bytes) in memory\n", state.Length());
+        return true;
+    }
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) { fprintf(stderr, "error: cannot open savestate '%s' for write\n", path.c_str()); return false; }
     size_t wr = fwrite(state.Buffer(), 1, state.Length(), f);
-    fclose(f);
-    if (wr != state.Length())
+    const int writeError = wr == state.Length() ? 0 : errno;
+    const int closeResult = fclose(f);
+    const int closeError = closeResult ? errno : 0;
+    if (wr != state.Length() || closeResult != 0)
     {
-        fprintf(stderr, "error: short write to savestate '%s'\n", path.c_str());
+        const std::string writeText = writeError ? strerror(writeError) : "ok";
+        const std::string closeText = closeError ? strerror(closeError) : "ok";
+        fprintf(stderr, "error: savestate write failed '%s' (%zu/%u bytes, write=%s, close=%s)\n",
+                path.c_str(), wr, state.Length(), writeText.c_str(), closeText.c_str());
         return false;
     }
     fprintf(stderr, "dumped savestate (%u bytes) to %s\n", state.Length(), path.c_str());
@@ -935,6 +946,31 @@ int main(int argc, char** argv)
     const u16 cutXferPort = getenv("LITEV_AMBIENT_CUT_XFER_PORT") ? (u16)atoi(getenv("LITEV_AMBIENT_CUT_XFER_PORT")) : 0;
     const int cutSwapTrialFrames = getenv("LITEV_AMBIENT_CUT_SWAP_TRIAL_FRAMES") ?
                                    atoi(getenv("LITEV_AMBIENT_CUT_SWAP_TRIAL_FRAMES")) : 0;
+    // Only the headless cut harness may impersonate an Android handoff build.
+    // Production builds still require their compile-time native fingerprint.
+    const char* cutBuildText = getenv("LITEV_AMBIENT_CUT_TEST_BUILD");
+    u64 cutTestBuild = 0x4c49544556484f31ull;
+    if (cutBuildText)
+    {
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = strtoull(cutBuildText, &end, 0);
+        if (!cutXferPort || errno || end == cutBuildText || *end || !parsed)
+        { fprintf(stderr, "CUTFENCE invalid test build fingerprint\n"); return 2; }
+        cutTestBuild = (u64)parsed;
+    }
+    const char* cutPeerIPText = getenv("LITEV_AMBIENT_CUT_PEER_IP");
+    const std::string cutPeerIP = cutPeerIPText ? cutPeerIPText : "192.168.18.3";
+    const bool cutExternalPeer = getenv("LITEV_AMBIENT_CUT_EXTERNAL_PEER") != nullptr;
+    if (cutExternalPeer)
+    {
+        in_addr peerAddress{};
+        if (!cutXferPort || !cutBuildText || !cutPeerIPText || !cutRole ||
+            strcmp(cutRole, "host") != 0 || cutSwapTrialFrames <= 0 ||
+            inet_pton(AF_INET, cutPeerIP.c_str(), &peerAddress) != 1 ||
+            !getenv("LITEV_NETPLAY"))
+        { fprintf(stderr, "CUTFENCE external peer needs host role, trial frames, port, test build, IPv4 and Netplay configuration\n"); return 2; }
+    }
     const bool cutRetryAfterAbort = getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT") &&
                                     *getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT");
     int cutAttempt = 0;
@@ -961,6 +997,7 @@ int main(int argc, char** argv)
                                                 : std::hash<std::string>()(opt.ambient) ^ ((u64)getpid() << 32);
         c.Name = opt.ambient;
         c.RequireHandoffOffer = cutXferPort != 0;
+        if (cutBuildText) c.BuildID = (u32)(cutTestBuild ^ (cutTestBuild >> 32));
         memcpy(c.GameCode, nds->NDSCartSlot.GetCart()->GetHeader().GameCode, 4);
         if (getenv("LITEV_AMBIENT_UPORT")) c.UnicastPort = (u16)atoi(getenv("LITEV_AMBIENT_UPORT"));
         if (getenv("LITEV_AMBIENT_PPORT")) c.PresencePort = (u16)atoi(getenv("LITEV_AMBIENT_PPORT"));   // (tests: a router that drops broadcast)
@@ -1439,7 +1476,8 @@ int main(int argc, char** argv)
                             printf("CUTFENCE %s frozen link survived %d ms\n", cutRole, ms);
                         }
                         const auto fs = ambient->GetHandoffFenceStats();
-                        const std::string path = std::string(cutDir) + (host ? "/host.mln" : "/client.mln");
+                        const std::string path = getenv("LITEV_AMBIENT_CUT_NO_DUMP") ? "" :
+                            std::string(cutDir) + (host ? "/host.mln" : "/client.mln");
                         std::vector<u8> liveState;
                         if (!SaveSavestate(*nds, path, cutXferPort ? &liveState : nullptr)) { mark(abort); return 2; }
                         printf("CUTFENCE %s saved f%d busy=%02x queued=%zu\n", cutRole, frame,
@@ -1495,7 +1533,7 @@ int main(int argc, char** argv)
                         if (cutXferPort)
                         {
                             local.Epoch = epoch;
-                            local.Build = 0x4c49544556484f31ull; // test harness protocol/build id
+                            local.Build = cutTestBuild;
                             local.RawClock = nds->GetSysTimestamp();
                             local.Frame = frame;
                             local.Player = host ? 0 : 1;
@@ -1512,7 +1550,7 @@ int main(int argc, char** argv)
                             std::atomic<bool> transferCancel{false};
                             bool transferOk = false;
                             std::thread transfer([&] {
-                                const std::string address = std::string("192.168.18.3:") + std::to_string(cutXferPort);
+                                const std::string address = cutPeerIP + ":" + std::to_string(cutXferPort);
                                 auto prepare = [&](const NetplayLiveCheckpoint& candidate, std::string& reason) {
                                     const char* fail = getenv("LITEV_HANDOFF_XFER_PREPARE_FAIL");
                                     if (fail && strcmp(fail, cutRole) == 0)
@@ -1521,7 +1559,7 @@ int main(int argc, char** argv)
                                     return peerRomPath && prepareScratch(candidate, peerRomPath,
                                                                          preparedUser, preparedReplica, reason);
                                 };
-                                transferOk = NetplayExchangeLiveCheckpoints(cutXferPort, address, "192.168.18.3", local,
+                                transferOk = NetplayExchangeLiveCheckpoints(cutXferPort, address, cutPeerIP, local,
                                                                              cutPeerRom, prepare, transferCancel, remote, transferError);
                                 transferDone.store(true, std::memory_order_release);
                             });
@@ -1557,22 +1595,25 @@ int main(int argc, char** argv)
                             }
                             if (!transferFailed)
                             {
-                                const std::string remotePath = std::string(cutDir) + (host ? "/remote-client.mln" : "/remote-host.mln");
-                                FILE* f = fopen(remotePath.c_str(), "wb");
-                                if (!f || fwrite(remote.State.data(), 1, remote.State.size(), f) != remote.State.size())
-                                { if (f) fclose(f); ambient->AbortHandoffFence(); mark(abort); return 2; }
-                                fclose(f);
-                                auto writeFirmware = [&](const std::string& fwPath, const std::vector<u8>& bytes) {
-                                    FILE* out = fopen(fwPath.c_str(), "wb");
-                                    if (!out) return false;
-                                    const bool wrote = fwrite(bytes.data(), 1, bytes.size(), out) == bytes.size();
-                                    fclose(out);
-                                    return wrote;
-                                };
-                                const std::string ownFwPath = std::string(cutDir) + (host ? "/host.fw" : "/client.fw");
-                                const std::string peerFwPath = std::string(cutDir) + (host ? "/remote-client.fw" : "/remote-host.fw");
-                                if (!writeFirmware(ownFwPath, local.Firmware) || !writeFirmware(peerFwPath, remote.Firmware))
-                                { ambient->AbortHandoffFence(); mark(abort); return 2; }
+                                if (!getenv("LITEV_AMBIENT_CUT_NO_DUMP"))
+                                {
+                                    const std::string remotePath = std::string(cutDir) + (host ? "/remote-client.mln" : "/remote-host.mln");
+                                    FILE* f = fopen(remotePath.c_str(), "wb");
+                                    if (!f || fwrite(remote.State.data(), 1, remote.State.size(), f) != remote.State.size())
+                                    { if (f) fclose(f); ambient->AbortHandoffFence(); mark(abort); return 2; }
+                                    fclose(f);
+                                    auto writeFirmware = [&](const std::string& fwPath, const std::vector<u8>& bytes) {
+                                        FILE* out = fopen(fwPath.c_str(), "wb");
+                                        if (!out) return false;
+                                        const bool wrote = fwrite(bytes.data(), 1, bytes.size(), out) == bytes.size();
+                                        fclose(out);
+                                        return wrote;
+                                    };
+                                    const std::string ownFwPath = std::string(cutDir) + (host ? "/host.fw" : "/client.fw");
+                                    const std::string peerFwPath = std::string(cutDir) + (host ? "/remote-client.fw" : "/remote-host.fw");
+                                    if (!writeFirmware(ownFwPath, local.Firmware) || !writeFirmware(peerFwPath, remote.Firmware))
+                                    { ambient->AbortHandoffFence(); mark(abort); return 2; }
+                                }
                                 Firmware peerFirmware(remote.Firmware.data(), (u32)remote.Firmware.size());
                                 const auto& peerMac = peerFirmware.GetHeader().MacAddr;
                                 printf("CUTFENCE %s transfer verified peer=%u frame=%u clock=%llu bytes=%zu\n",
@@ -1653,8 +1694,8 @@ int main(int argc, char** argv)
                             bool startOk = false;
                             std::string startError;
                             std::thread start([&] {
-                                const std::string address = std::string("192.168.18.3:") + std::to_string(cutXferPort + 1);
-                                startOk = NetplayAwaitLiveStart(cutXferPort + 1, address, "192.168.18.3",
+                                const std::string address = cutPeerIP + ":" + std::to_string(cutXferPort + 1);
+                                startOk = NetplayAwaitLiveStart(cutXferPort + 1, address, cutPeerIP,
                                                                local, remote, startCancel, startError);
                                 startDone.store(true, std::memory_order_release);
                             });
@@ -1691,10 +1732,11 @@ int main(int argc, char** argv)
                             for (int i = 0; i < 16; i++) snprintf(tokenText + i * 2, 3, "%02x", local.FenceToken[i]);
                             setenv("LITEV_MP_HANDOFF_EPOCH", epochText, 1);
                             setenv("LITEV_MP_HANDOFF_TOKEN", tokenText, 1);
-                            const int startPort = (int)cutXferPort + 50 + (host ? 0 : 1);
-                            const int peerStartPort = (int)cutXferPort + 50 + (host ? 1 : 0);
+                            const int startPort = (int)cutXferPort + 50 + (cutExternalPeer ? 0 : (host ? 0 : 1));
+                            const int peerStartPort = (int)cutXferPort + 50 + (cutExternalPeer ? 0 : (host ? 1 : 0));
                             const std::string startPortText = std::to_string(startPort);
-                            const std::string startPeerText = std::string("127.0.0.1:") + std::to_string(peerStartPort);
+                            const std::string startPeerText =
+                                (cutExternalPeer ? cutPeerIP : "127.0.0.1") + ":" + std::to_string(peerStartPort);
                             setenv("LITEV_MP_HANDOFF_START_PORT", startPortText.c_str(), 1);
                             setenv("LITEV_MP_HANDOFF_START_PEER", startPeerText.c_str(), 1);
                             if (getenv("LITEV_AMBIENT_CUT_STALE_FIRST_INPUT") &&
@@ -1731,6 +1773,16 @@ int main(int argc, char** argv)
                             const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, {}, std::move(replicas));
                             keepAmbient.store(false, std::memory_order_release);
                             ambientService.join();
+                            if (cutExternalPeer)
+                            {
+                                // The Android peer has committed. This bounded headless
+                                // participant must not roll its source back into Ambient.
+                                // Exit after the requested real cross-device Netplay frames.
+                                printf("CUTFENCE external peer trial %s frames=%d\n",
+                                       trialResult == 0 ? "pass" : "failed", cutSwapTrialFrames);
+                                fflush(stdout);
+                                return trialResult == 0 ? 0 : 2;
+                            }
                             auto trialLink = melonDS::MPInterface::Take();
                             trialLink.reset();
                             melonDS::MPInterface::Set(std::move(savedAmbient), melonDS::MPInterface_Ambient);
