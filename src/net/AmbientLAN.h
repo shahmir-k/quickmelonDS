@@ -105,7 +105,7 @@ public:
     void NoteFrameUs(u32 us) { RunUs = us; }
 
     // Can a LAN session hold 58 fps on this network, or should it be Netplay? From the presence round trips (median of
-    // the last 8; same-game devices 1 a second, linked ones 4) and this device's emulation time per frame E (NoteFrameUs
+    // the last 8; same-game or hosting devices 1 a second, linked ones 4) and this device's emulation time per frame E (NoteFrameUs
     // without the link waits, average; 10 ms until measured, an RG DS). Each MP exchange stops emulation for one round
     // trip, so a frame takes E + exchanges/frame x RTT:
     //  - PeerVerdict (a device, before or at link open): LAN_BAD when E + 1 x RTT > 20 ms (not even one exchange a frame

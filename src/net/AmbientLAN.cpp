@@ -465,8 +465,9 @@ void AmbientLAN::PresenceLoop()
             continue;
         }
         if (!wasVisible) { dirty = true; wasVisible = true; }
-        // round trips (the verdict, AmbientLAN.h): devices running this game get a ping a second (5 at 100 ms when one
-        // appears), linked ones 4 a second; the slowest linked one's median is the session's
+        // round trips (the verdict, AmbientLAN.h): devices running this game or hosting (a beacon: Pokémon Black joins
+        // White) get a ping a second (5 at 100 ms when one appears), linked ones 4 a second; the slowest linked one's
+        // median is the session's
         {
             std::vector<std::pair<u32, u16>> ping;
             u32 linkRtt = 0;
@@ -474,8 +475,8 @@ void AmbientLAN::PresenceLoop()
                 std::lock_guard<std::mutex> g(Mu);
                 for (auto& p : Peers)
                 {
-                    if (!p.Full || !SameGame(p.Game, Cfg.GameCode)) continue;
                     const bool linked = std::find(LinkedIDs.begin(), LinkedIDs.end(), p.ID) != LinkedIDs.end();
+                    if (!linked && (!p.Full || !(SameGame(p.Game, Cfg.GameCode) || p.HasGGID))) continue;
                     if (linked) linkRtt = std::max(linkRtt, p.RttUs());
                     if (p.PingMs && now - p.PingMs < (p.PingN < 5 ? 100u : linked ? 250u : 1000u)) continue;
                     p.PingMs = now;
