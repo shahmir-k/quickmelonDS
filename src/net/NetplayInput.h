@@ -27,6 +27,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -525,6 +526,7 @@ private:
     bool Wait(u32 type, std::vector<u8>& payload, std::atomic<bool>& cancel, int timeoutMs);
     void Run();
     void RunSender();
+    std::vector<u8> PackCheckpoint(const NetplayLiveCheckpoint& local, u32 baseId);
     const int Player;
     const u16 Port;
     const std::string PeerIPv4;
@@ -537,6 +539,7 @@ private:
     std::condition_variable Changed;
     std::map<u32, std::vector<u8>> Inbox;        // latest message of each type
     std::vector<u8> PendingBase;                 // a baseline to send once connected
+    std::unique_ptr<NetplayLiveCheckpoint> PendingCheckpoint;   // packed and sent by the sender thread
     std::vector<u8> OwnBase, PeerBase;           // what each side holds as the other's delta base
     u32 OwnBaseId = 0, OwnBaseAcked = 0, PeerBaseId = 0, PeerBaseAcked = 0;
     bool AckHeld = false;
