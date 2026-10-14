@@ -2235,7 +2235,21 @@ bool NetplayAwaitLiveStart(u16 tcpPort, const std::string& hostAddress,
     { error = "live-start player mismatch"; return false; }
     other.Player = local.Player; // sender was checked; compare the shared manifest
     if (memcmp(&other, &mine, sizeof(mine)) != 0)
-    { error = "live-start checkpoint manifest mismatch"; return false; }
+    {
+        const char* field =
+            other.Magic != mine.Magic ? "magic" :
+            memcmp(other.Reserved, mine.Reserved, sizeof(mine.Reserved)) ? "reserved" :
+            other.Epoch != mine.Epoch ? "epoch" :
+            other.Build != mine.Build ? "build" :
+            memcmp(other.Token, mine.Token, sizeof(mine.Token)) ? "token" :
+            memcmp(other.State0, mine.State0, sizeof(mine.State0)) ? "player 0 state" :
+            memcmp(other.State1, mine.State1, sizeof(mine.State1)) ? "player 1 state" :
+            memcmp(other.Firmware0, mine.Firmware0, sizeof(mine.Firmware0)) ? "player 0 firmware" :
+            memcmp(other.Firmware1, mine.Firmware1, sizeof(mine.Firmware1)) ? "player 1 firmware" :
+            "unknown";
+        error = std::string("live-start checkpoint manifest mismatch: ") + field;
+        return false;
+    }
     return true;
 }
 
