@@ -268,8 +268,11 @@ void Savestate::VarArray(void* data, u32 len)
 void Savestate::Finish()
 {
     if (Error || finished) return;
-    CloseCurrentSection();
-    WriteStateLength();
+    if (Saving)
+    {
+        CloseCurrentSection();
+        WriteStateLength();
+    }
     finished = true;
 }
 
