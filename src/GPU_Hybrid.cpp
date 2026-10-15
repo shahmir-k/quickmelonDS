@@ -739,6 +739,7 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
     {
         const GLuint edge = GL3D()->GetEdgeTex(tag);   // LITEV_GL_EDGE_MARK
         glUniform1i(EdgeULoc, edge != 0);
+        ProfEdge += edge != 0;
         if (edge) { glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, edge); glActiveTexture(GL_TEXTURE1); }
     }
     glBindTexture(GL_TEXTURE_2D, GL3D()->GetColorTex(tag));
@@ -788,6 +789,7 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
                 glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
                 glBlitFramebuffer(0, 0, 256, 192, 0, y, 256 * Scale, y + 192 * Scale, GL_COLOR_BUFFER_BIT, GL_NEAREST);
                 glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                ProfScr1x++;
                 continue;
             }
 #endif
@@ -815,7 +817,9 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
                         f = mode == 0 || mode == 5 || mode == 6;
                     }
                     fast[l] = f ? int(1 + bright + (bright ? evy << 8 : 0)) : 0;
+                    if (!f) ProfLnFull++; else if (bright) ProfLnFastBr++; else ProfLnCopy++;
                 }
+                ProfScr3D++;
                 glEnable(GL_SCISSOR_TEST);
                 for (int l0 = 0; l0 < 192; )
                 {
@@ -825,6 +829,7 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
                     glUniform1i(FastULoc, fast[l0] & 0xFF);
                     glUniform1i(FastEvyULoc, fast[l0] >> 8);
                     glDrawArrays(GL_TRIANGLES, 0, 3);
+                    ProfRuns++;
                     l0 = l1;
                 }
                 glDisable(GL_SCISSOR_TEST);
@@ -852,10 +857,13 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
             return getenv("LITEV_PROF") != nullptr;
 #endif
         }();
-        if (!on) { ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0; return; }
+        if (!on) { ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0; ProfEdge = ProfScr3D = ProfScr1x = ProfLnCopy = ProfLnFastBr = ProfLnFull = ProfRuns = 0; return; }
         Platform::Log(Platform::Info, "LITEV_HYB 60f: gl3d=%.2f wait3d=%.2f merge=%.2f (upload=%.2f sync=%.2f draw=%.2f) readback=%.2f ms/frame (emu thread, scale %d)\n",
                       ProfGL3D / 60, ProfWait / 60, ProfMerge / 60, ProfUpload / 60, ProfSync / 60, ProfDraw / 60, ProfReadback / 60, Scale);
         ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0;
+        Platform::Log(Platform::Info, "LITEV_HYB merge-mix 60f: edge=%d scr3d=%d scr1x=%d lines copy=%d fastbright=%d full=%d runs=%d\n",
+                      ProfEdge, ProfScr3D, ProfScr1x, ProfLnCopy, ProfLnFastBr, ProfLnFull, ProfRuns);
+        ProfEdge = ProfScr3D = ProfScr1x = ProfLnCopy = ProfLnFastBr = ProfLnFull = ProfRuns = 0;
         GLThread3D* t = Thread3D();
         if (t->JobN)
             Platform::Log(Platform::Info, "LITEV_HYB 3d-job: n=%d queued=%.2f wall=%.2f cpu=%.2f incl-flush=%.2f | emu: prev-job wait=%.2f prepare=%.2f kick-gap=%.2f job-end-from-kick=%.2f polyram-wait=%.2f ms/job (snapcopy %d, bank waits %d)\n",
