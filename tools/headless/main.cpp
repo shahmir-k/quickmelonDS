@@ -2073,7 +2073,11 @@ int main(int argc, char** argv)
                                 std::vector<u64> realHash;
                                 const u64 exchBefore = ambient->GetStats().Exchanges;
                                 auto pace = std::chrono::steady_clock::now();   // solo: 60 fps from the first frame (no catch-up)
-                                auto last = ended.StoppedAt[me];
+                                // (from the end of the session's own teardown: the waits before it - the peer's copy
+                                // reaching the last frame, the peer's scheduled inputs - exist only for the
+                                // reference below; a device drops its copies of the others at once)
+                                const double testWaitMs = std::chrono::duration<double, std::milli>(returned - ended.StoppedAt[me]).count();
+                                auto last = returned;
                                 for (int f = F + 1; f <= F + exitFrames; f++)
                                 {
                                     const auto start = std::chrono::steady_clock::now();
@@ -2093,7 +2097,10 @@ int main(int argc, char** argv)
                                     mine.nds->SetKeyMask(in.Keys);
                                     if (in.TouchX >= 0) mine.nds->TouchScreen(in.TouchX, in.TouchY);
                                     else mine.nds->ReleaseScreen();
+                                    melonDS::MPInterface::Get().Process();   // (once a frame, as the app's loop does)
                                     mine.nds->RunFrame();
+                                    if ((f - F) % 120 == 0)
+                                    { printf("AMBIENT after exit f%d: %s\n", f, ambient->DebugLine().c_str()); fflush(stdout); }
                                     liteds::AudioTapDrain(*mine.nds, 2, f);
                                     if (i < (int)sched.size()) realHash.push_back(NetplayLiveProofHash(*mine.nds));
                                     if (live.HasProgram())   // closed-loop script steps see this frame's screens
@@ -2154,8 +2161,8 @@ int main(int argc, char** argv)
                                 }
                                 printf("CUTFENCE %s live exit after f%d: back in Ambient, pause %.1f ms (worst later frame gap %.1f ms), "
                                        "%zu scheduled inputs applied, then live; link=%u; frames after the exit equal to an "
-                                       "uninterrupted session: %d of %zu; Ambient exchanges after the exit: %llu\n", cutRole, F, pauseMs, worstMs, sched.size(),
-                                       ambient->GetStats().Links, same, n, (unsigned long long)(ambient->GetStats().Exchanges - exchBefore));
+                                       "uninterrupted session: %d of %zu; Ambient exchanges after the exit: %llu (test-only waits before: %.1f ms)\n", cutRole, F, pauseMs, worstMs, sched.size(),
+                                       ambient->GetStats().Links, same, n, (unsigned long long)(ambient->GetStats().Exchanges - exchBefore), testWaitMs);
                                 fflush(stdout);
                                 return trialResult == 0 ? 0 : 2;
                             }

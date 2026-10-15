@@ -815,6 +815,28 @@ void AmbientLAN::ReceiveHandoffRom(Link& l, const u8* bytes, size_t length)
     l.PeerOfferRom = rom;
 }
 
+std::string AmbientLAN::DebugLine()
+{
+    const Stats st = GetStats();
+    char b[512];
+    snprintf(b, sizeof(b), "wifi=%d fg=%d vis=%d parent=%d lasthost=%016llx nearby=%u links=%u opened=%llu presence tx=%llu rx=%llu link tx=%llu rx=%llu beacons=%llu exch=%llu rx_queue=%zu",
+             (int)WifiOn.load(), (int)Foreground.load(), Vis.load(), ParentSlot, (unsigned long long)LastHostID, st.Nearby, st.Links, (unsigned long long)st.LinksOpened,
+             (unsigned long long)st.PresenceTx, (unsigned long long)st.PresenceRx, (unsigned long long)st.LinkTx, (unsigned long long)st.LinkRx,
+             (unsigned long long)st.BeaconsInjected, (unsigned long long)st.Exchanges, RX.size());
+    std::string line = b;
+    for (int s = 0; s < 16; s++)
+        if (Links[s].P)
+        {
+            const Link& l = Links[s];
+            snprintf(b, sizeof(b), " | link%d id=%016llx up=%d gen=%llu active=%ums ago fence=%llx closedFence=%llx offer=%llx",
+                     s, (unsigned long long)l.ID, l.Up, (unsigned long long)l.Generation, NowMs() - l.ActiveMs, (unsigned long long)l.FenceEpoch,
+                     (unsigned long long)l.LastClosedFenceEpoch, (unsigned long long)l.OfferEpoch);
+            line += b;
+        }
+    for (const auto& r : NearbyRows()) { line += " | near "; line += r; }
+    return line;
+}
+
 void AmbientLAN::CancelHandoffOffer()
 {
     Link* l = HandoffLink();
@@ -1573,7 +1595,17 @@ int AmbientLAN::SendPacket(int inst, u8* data, int len, u64 timestamp)
     if (s < 0)
     {
         const Peer* p = PeerByMAC(a1);
-        if (!p || (s = OpenLink(*p)) < 0) return len;
+        if (!p || (s = OpenLink(*p)) < 0)
+        {
+            static u32 lastLog = 0;   // (at most once a second)
+            if (NowMs() - lastLog >= 1000)
+            {
+                lastLog = NowMs();
+                Platform::Log(Platform::LogLevel::Info, "Ambient: no link for a frame to %02x:%02x:%02x:%02x:%02x:%02x (fc %02x): %s\n",
+                              a1[0], a1[1], a1[2], a1[3], a1[4], a1[5], f[0], p ? "link open failed" : "no nearby device with that MAC");
+            }
+            return len;
+        }
     }
     // a child's auth request (sequence 1): joining that device's session; any other session of ours is over
     if (f[0] == 0xB0 && len >= 12 + 24 + 4 && G16(f + 24 + 2) == 1)

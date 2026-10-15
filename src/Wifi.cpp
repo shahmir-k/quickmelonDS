@@ -358,6 +358,10 @@ void Wifi::DoSavestate(Savestate* file)
 #ifdef LITEV_LAN_EARLY_REPLY
     if (!file->Saving) EarlyReplyLen = -1;
 #endif
+    // the link bookkeeping of an exchange in progress is not in a savestate: a loaded state starts with
+    // none, as a new console does (a live handoff's replica reloaded after its proof frames kept a stale
+    // MPInExchange: HandoffBusyMask() != 0, the cut rolled back - ret9-mac)
+    if (!file->Saving) { MPInExchange = false; MPRepliesPending = false; }
 #ifdef LITEV_WIFI_EVT
     // own section: states without it (other builds) load with no idle ticks pending
     if (!file->Saving && !file->HasSection("WEVT"))

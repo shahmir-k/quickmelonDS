@@ -103,6 +103,10 @@ public:
     // LITEV_MP_CLOCKWAKE: inst's console (`nds`) wakes the consoles waiting on its clock as soon as
     // it reaches what they wait for; nothing without the flag. After SetClock.
     void SetWake(int inst, NDS& nds);
+    // takes back every hook SetWake (and a QuietHook) put on a console: a console that outlives this link
+    // (a live Netplay session's end: it plays on in Ambient) must never call into it again
+    void Detach();
+    ~LockstepMP() override { Detach(); }
 #ifdef LITEV_MP_FASTPOLL
     static bool HostFrameMaybe(void* self, int inst);
 #endif

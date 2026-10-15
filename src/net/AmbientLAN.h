@@ -86,6 +86,8 @@ public:
     void AddPeerAddress(u32 ipNetOrder, u16 port);
     void SetVisibility(int vis);
     void SetForeground(bool fg) { Foreground = fg; }
+    // one line of state for diagnosis: stats, Wi-Fi/parent/host state, every link, the nearby table
+    std::string DebugLine();
     // nearby devices: "id \t name \t game \t ip:port \t ggid \t build \t linked"
     std::vector<std::string> NearbyRows();
     Stats GetStats();

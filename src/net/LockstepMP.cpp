@@ -45,6 +45,20 @@ void LockstepMP::Begin(int inst)
     NotifyAll();
 }
 
+void LockstepMP::Detach()
+{
+    for (int i = 0; i < kMaxInst; i++)
+    {
+        NDS* n = const_cast<NDS*>(Console[i]);
+        if (!n) continue;
+        if (n->MPWakeAt == &WakeAt[i]) { n->MPWakeAt = nullptr; n->MPWake = nullptr; }
+        if (n->MPHostPollCtx == this) { n->MPHostPoll = nullptr; n->MPHostPollCtx = nullptr; }
+        if (n->MPHostQuietCtx == this || (QuietHook && n->MPHostQuietCtx == QuietHookCtx))
+        { n->MPHostQuiet = nullptr; n->MPHostQuietCtx = nullptr; }
+        Console[i] = nullptr;
+    }
+}
+
 void LockstepMP::SetWake(int inst, NDS& nds)
 {
     Console[inst] = &nds;
