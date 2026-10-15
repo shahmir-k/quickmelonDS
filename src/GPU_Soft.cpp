@@ -468,6 +468,10 @@ void SoftRenderer::InitBands()
                 static const bool hybPlanes = litevPropInt("debug.litev.hybplanes", 1) != 0;
                 static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->HybPlanes = hybPlanes;
 #endif
+#ifdef LITEV_HYB_COMPOSITE_VEC
+                static const bool hybCompVec = litevPropInt("debug.litev.hybcompvec", 1) != 0;
+                static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->HybCompVec = hybCompVec;
+#endif
             }
 #else
     for (int b = 0; b < S2D_NBANDS; b++)
@@ -671,9 +675,15 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
                 alignas(8) u32 desc2[HybStride];
                 memset(desc2, 0x5A, sizeof(desc2));
                 rA->HybridDesc = true; rA->HybPlanes = false;
+#ifdef LITEV_HYB_COMPOSITE_VEC
+                rA->HybCompVec = false;
+#endif
                 S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
                 S2DJ_LINE(); rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, desc2);
                 rA->HybridDesc = false; rA->HybPlanes = true;
+#ifdef LITEV_HYB_COMPOSITE_VEC
+                rA->HybCompVec = true;
+#endif
                 HybPlanesLines++;
                 if (!rA->LastLineHas3D || memcmp(desc, desc2, 512 * 4))
                 {

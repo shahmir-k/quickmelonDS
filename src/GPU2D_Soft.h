@@ -183,6 +183,10 @@ public:
 #ifdef LITEV_HYB_PLANES
     bool HybPlanes = true;   // 3D descriptor lines through the plane pipeline (debug.litev.hybplanes)
 #endif
+#ifdef LITEV_HYB_COMPOSITE_VEC
+    bool HybCompVec = true;  // NEON HybridCompositeLine (debug.litev.hybcompvec)
+    void HybridCompositeLineVec(u32* dst);
+#endif
     static u32 HybridResolvePixel(u32 val1, u32 val2, u32 c3d);
 #ifdef S2D_PLANES
     // a new frame: the extended palettes are revalidated on first use

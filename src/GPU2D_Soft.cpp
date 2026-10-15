@@ -1545,6 +1545,13 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
 {
     LastLineHas3D = true;
     const u32 blendCnt = GPU2D.BlendCnt;
+#if defined(LITEV_HYB_COMPOSITE_VEC) && defined(LITEV_HYB_COMPOSITE_NEON) && defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
+    if (HybCompVec)
+    {
+        HybridCompositeLineVec(dst);
+        return;
+    }
+#endif
 #if defined(LITEV_HYB_COMPOSITE_NEON) && defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
     // The ColorComposite each pixel needs, a whole line at a time with the bit-exact NEON
     // compositor. A pixel needs exactly one: of the two layers under the 3D when the 3D is on
@@ -1633,6 +1640,106 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
 #undef CC_UNDER
 }
 
+#if defined(LITEV_HYB_COMPOSITE_VEC) && defined(LITEV_HYB_COMPOSITE_NEON) && defined(LITEV_SOFT2D_NEON) && defined(__aarch64__)
+// LITEV_HYB_COMPOSITE_VEC: HybridCompositeLine with every step 16 pixels at a time (same words:
+// a pixel without the 3D keeps its old dst[256+i], as the scalar loop leaves it). Pixel kinds:
+// 3D on top (descriptor of the layers under it), 3D directly under the top layer, no 3D.
+void SoftRenderer2D::HybridCompositeLineVec(u32* dst)
+{
+    const u32 bc = GPU2D.BlendCnt;
+    const u32 EVA = GPU2D.EVA, EVB = GPU2D.EVB, EVY = GPU2D.EVY;
+    alignas(16) u32 ccIn[512], cc[256];
+    // the ColorComposite each pixel needs: of the two layers under the 3D when the 3D is on top,
+    // else of its own two layers; and whether any pixel has the 3D directly under its top layer
+    const uint32x4_t cC0 = vdupq_n_u32(0xC0000000), c40 = vdupq_n_u32(0x40000000);
+    uint32x4_t anyUnder = vdupq_n_u32(0);
+    for (u32 i = 0; i < 256; i += 4)
+    {
+        const uint32x4_t v1 = vld1q_u32(BGOBJLine + i), v2 = vld1q_u32(BGOBJLine + 256 + i);
+        const uint32x4_t top3D = vceqq_u32(vandq_u32(v1, cC0), c40);
+        anyUnder = vorrq_u32(anyUnder, vbicq_u32(vceqq_u32(vandq_u32(v2, cC0), c40), top3D));
+        vst1q_u32(ccIn + i, vbslq_u32(top3D, vld1q_u32(Under3D[0] + i), v1));
+        vst1q_u32(ccIn + 256 + i, vbslq_u32(top3D, vld1q_u32(Under3D[1] + i), v2));
+    }
+    GPU2DNeon::ColorCompositeLine(cc, ccIn, WindowMask, bc, EVA, EVB, EVY);
+    // 3D under the top layer: ColorComposite(top, layer under the 3D) for dst[256+i]
+    alignas(16) u32 cc2[256];
+    const bool under = vmaxvq_u32(anyUnder) != 0;
+    if (under)
+    {
+        memcpy(ccIn, BGOBJLine, 256 * 4);
+        memcpy(ccIn + 256, Under3D[0], 256 * 4);
+        GPU2DNeon::ColorCompositeLine(cc2, ccIn, WindowMask, bc, EVA, EVB, EVY);
+    }
+
+    const uint8x16_t k80 = vdupq_n_u8(0x80), k40 = vdupq_n_u8(0x40), kC0 = vdupq_n_u8(0xC0), k20 = vdupq_n_u8(0x20), k1F = vdupq_n_u8(0x1F);
+    const uint8x16_t z = vdupq_n_u8(0);
+    // 3D on top: mode 4 if the layer under it is a second target (OBJ bit 12, 3D bit 8, else its
+    // flag << 8), else the BLDCNT brightness effect (window bit 0x20, first-target bit 0)
+    const uint8x16_t hitObj = vdupq_n_u8((bc & 0x1000) ? 0xFF : 0), hit3D = vdupq_n_u8((bc & 0x0100) ? 0xFF : 0);
+    const uint8x16_t bcHi = vdupq_n_u8((u8)(bc >> 8)), bcLo = vdupq_n_u8((u8)bc);
+    u32 fxMode = (bc >> 6) & 3; if (fxMode == 1) fxMode = 0;
+    const uint8x16_t fxOn = vdupq_n_u8((bc & 1) ? 0xFF : 0);
+    const uint8x16_t topByte4 = vdupq_n_u8((u8)((4 << 5) | (EVY & 0x1F)));
+    const uint8x16_t topByteFx = vdupq_n_u8((u8)((fxMode << 5) | (EVY & 0x1F)));
+    // 3D under the top layer: blend with the top's own alpha (semi-transparent / bitmap sprite) or
+    // the BLDCNT alpha blend
+    const uint8x16_t objBlend = vdupq_n_u8((bc & 0x0100) ? 0xFF : 0);
+    const uint8x16_t bgBlend = vdupq_n_u8((((bc >> 6) & 3) == 1 && (bc & 0x0100)) ? 0xFF : 0);
+    const uint8x16_t vEVA = vdupq_n_u8((u8)EVA), vEVB = vdupq_n_u8((u8)EVB), k16 = vdupq_n_u8(16);
+    const uint8x16_t k7 = vdupq_n_u8(7 << 5), k1 = vdupq_n_u8(1 << 5);
+    for (u32 i = 0; i < 256; i += 16)
+    {
+        const uint8x16x4_t V1 = vld4q_u8(reinterpret_cast<const u8*>(BGOBJLine + i));
+        const uint8x16x4_t V2 = vld4q_u8(reinterpret_cast<const u8*>(BGOBJLine + 256 + i));
+        const uint8x16x4_t U = vld4q_u8(reinterpret_cast<const u8*>(Under3D[0] + i));
+        const uint8x16x4_t C = vld4q_u8(reinterpret_cast<const u8*>(cc + i));
+        const uint8x16_t win = vld1q_u8(WindowMask + i);
+        const uint8x16_t f1 = V1.val[3], f2 = V2.val[3], fu = U.val[3];
+        const uint8x16_t top3D = vceqq_u8(vandq_u8(f1, kC0), k40);
+        const uint8x16_t und3D = vbicq_u8(vceqq_u8(vandq_u8(f2, kC0), k40), top3D);
+        const uint8x16_t winFx = vtstq_u8(win, k20);
+
+        // 3D on top
+        const uint8x16_t hit = vbslq_u8(vtstq_u8(fu, k80), hitObj, vbslq_u8(vtstq_u8(fu, k40), hit3D, vtstq_u8(fu, bcHi)));
+        const uint8x16_t byteTop = vbslq_u8(hit, topByte4, vbslq_u8(vandq_u8(fxOn, winFx), topByteFx, vandq_u8(topByteFx, k1F)));
+
+        // 3D under the top layer
+        const uint8x16_t s80 = vtstq_u8(f1, k80), s40 = vtstq_u8(f1, k40);
+        const uint8x16_t blendA = vandq_u8(s80, objBlend);
+        const uint8x16_t blendB = vandq_u8(vbicq_u8(vandq_u8(vtstq_u8(f1, bcLo), winFx), s80), bgBlend);
+        const uint8x16_t ownA = vandq_u8(f1, k1F);
+        const uint8x16_t evaA = vbslq_u8(s40, ownA, vEVA), evbA = vbslq_u8(s40, vsubq_u8(k16, ownA), vEVB);
+        const uint8x16_t eva = vbslq_u8(blendA, evaA, vbslq_u8(blendB, vEVA, k16));
+        const uint8x16_t evb = vbslq_u8(blendA, evbA, vbslq_u8(blendB, vEVB, z));
+        const uint8x16_t blend = vorrq_u8(blendA, blendB);
+
+        uint8x16x4_t o;
+        for (int c = 0; c < 3; c++)
+            o.val[c] = vbslq_u8(top3D, U.val[c], vbslq_u8(vandq_u8(und3D, blend), V1.val[c], C.val[c]));
+        o.val[3] = vbslq_u8(top3D, byteTop, vbslq_u8(und3D, vorrq_u8(k1, vandq_u8(eva, k1F)), k7));
+        vst4q_u8(reinterpret_cast<u8*>(dst + i), o);
+
+        // dst[256+i]: the composite under the 3D (3D on top), ColorComposite(top, under) | EVB
+        // (3D under), else unchanged. The old words are loaded only if a pixel keeps its own: the
+        // descriptor buffer is cold (a load miss stalls the in-order A55; stores don't).
+        const uint8x16_t has3D = vorrq_u8(top3D, und3D);
+        uint8x16x4_t q;
+        if (vminvq_u8(has3D)) q.val[0] = q.val[1] = q.val[2] = q.val[3] = z;
+        else if (!vmaxvq_u8(has3D)) continue;
+        else q = vld4q_u8(reinterpret_cast<const u8*>(dst + 256 + i));
+        if (under)
+        {
+            const uint8x16x4_t C2 = vld4q_u8(reinterpret_cast<const u8*>(cc2 + i));
+            for (int c = 0; c < 3; c++) q.val[c] = vbslq_u8(top3D, C.val[c], vbslq_u8(und3D, C2.val[c], q.val[c]));
+        }
+        else
+            for (int c = 0; c < 3; c++) q.val[c] = vbslq_u8(top3D, C.val[c], q.val[c]);
+        q.val[3] = vbslq_u8(top3D, z, vbslq_u8(und3D, vandq_u8(evb, k1F), q.val[3]));
+        vst4q_u8(reinterpret_cast<u8*>(dst + 256 + i), q);
+    }
+}
+#endif
 
 // CPU version of the hybrid merge (HybridMergeFS.glsl) for one native pixel: c3d is the
 // 3D pixel in software format (6-bit RGB, 5-bit alpha in bits 24-28). Used for display

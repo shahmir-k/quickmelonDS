@@ -1290,6 +1290,12 @@ option(LITEV_HYB_PLANES "Hybrid: 3D descriptor lines through the 2D plane pipeli
 if (LITEV_HYB_PLANES)
     add_compile_definitions(LITEV_HYB_PLANES=1)
 endif()
+# Hybrid: HybridCompositeLine fully in NEON (pick, per-pixel descriptor mode, the composite for
+# pixels with the 3D under the top layer). Same descriptor words. Runtime: debug.litev.hybcompvec=0 off.
+option(LITEV_HYB_COMPOSITE_VEC "Hybrid: NEON descriptor composite (needs LITEV_HYB_COMPOSITE_NEON)" OFF)
+if (LITEV_HYB_COMPOSITE_VEC)
+    add_compile_definitions(LITEV_HYB_COMPOSITE_VEC=1)
+endif()
 
 # GL 3D, W-buffer frames: depth 1 - z0/w from the rasterizer instead of gl_FragDepth, so the GPU's
 # early depth test works (display only; same depth order, fog converts back to w).
