@@ -2130,6 +2130,9 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
     for (;;)
     {
         timestamp = 0;
+#ifdef LITEV_AMBIENT_LAN
+        WifiUs = USTimestamp;
+#endif
 
         if (type == 0)
         {

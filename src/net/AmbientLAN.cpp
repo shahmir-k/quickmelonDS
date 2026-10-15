@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <chrono>
 #include <algorithm>
+#include <math.h>
 
 #ifdef __WIN32__
 #include <winsock2.h>
@@ -23,6 +24,7 @@ typedef int socklen_t;
 
 #include "AmbientLAN.h"
 #include "Platform.h"
+#include "MPLinkFlags.h"
 #if defined(LITEV_LAN_RX_SPIN) && defined(__ANDROID__)
 #include <sys/system_properties.h>
 #endif
@@ -33,13 +35,50 @@ namespace
 {
 constexpr u32 kPresMagic = 0x4E534453;      // "SDSN"
 constexpr u8 kPresVersion = 1;
-enum : u8 { P_Live = 1, P_Full = 2, P_Req = 3, P_Bye = 4 };
+enum : u8 { P_Live = 1, P_Full = 2, P_Req = 3, P_Bye = 4, P_Ping = 5, P_Pong = 6 };   // (ping / pong: + u64 sender time, us)
 constexpr u32 kNifi = 0x4946494E;           // MPPacketHeader magic (LAN.cpp)
 enum { Chan_Ctl = 0, Chan_MP = 1 };
 constexpr u32 kLiveMs = 2000, kFullMinMs = 500, kExpireMs = 6000, kIdleMs = 10000, kOwnBeaconStaleMs = 3000;
 
 u64 NowUs() { return (u64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 u32 NowMs() { return (u32)(NowUs() / 1000); }
+
+// Tests: a slower network on the receiving side of each end (set on both ends: the round trip). A received MP frame or
+// presence ping / pong is held RTT/2 +- JITTER/2 ms, LOSS % are dropped (env LITEV_AMBIENT_RTT_MS, _JITTER_MS, _LOSS).
+// LITEV_AMBIENT_RTT_AT=S:MS[:R]: the RTT goes to MS from S s after start, over R s; LITEV_AMBIENT_SPIKE=EVERY:DUR:MS:
+// MS for DUR ms every EVERY ms. ENet's handshake, acks and control channel are not held.
+struct NetSim
+{
+    double Rtt = 0, Jit = 0, Loss = 0, AtS = -1, AtRtt = 0, RampS = 0, SpEvery = 0, SpDur = 0, SpRtt = 0;
+    u64 T0 = NowUs();
+    bool On = false;
+    NetSim()
+    {
+        auto f = [](const char* k, double d) { const char* v = getenv(k); return v ? atof(v) : d; };
+        Rtt = f("LITEV_AMBIENT_RTT_MS", 0); Jit = f("LITEV_AMBIENT_JITTER_MS", 0); Loss = f("LITEV_AMBIENT_LOSS", 0);
+        if (const char* v = getenv("LITEV_AMBIENT_RTT_AT")) sscanf(v, "%lf:%lf:%lf", &AtS, &AtRtt, &RampS);
+        if (const char* v = getenv("LITEV_AMBIENT_SPIKE")) sscanf(v, "%lf:%lf:%lf", &SpEvery, &SpDur, &SpRtt);
+        On = Rtt > 0 || Jit > 0 || Loss > 0 || AtS >= 0 || SpEvery > 0;
+    }
+    double RttMs(u64 now) const
+    {
+        const double t = (now - T0) / 1e6;
+        double rtt = Rtt;
+        if (AtS >= 0 && t >= AtS) rtt += (AtRtt - Rtt) * (RampS > 0 ? std::min(1.0, (t - AtS) / RampS) : 1.0);
+        if (SpEvery > 0 && fmod(t * 1000, SpEvery) < SpDur) rtt = std::max(rtt, SpRtt);
+        return rtt;
+    }
+    // how long a packet received now is held (us), ~0 = lost
+    u64 Hold(u64 now) const
+    {
+        thread_local u64 x = 0x9E3779B97F4A7C15ull ^ now;
+        auto rnd = [] { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return (x >> 11) * (1.0 / 9007199254740992.0); };
+        if (Loss > 0 && rnd() * 100 < Loss) return ~0ull;
+        const double ms = RttMs(now) / 2 + (rnd() - 0.5) * Jit;
+        return ms <= 0 ? 0 : (u64)(ms * 1000);
+    }
+};
+const NetSim kSim;
 u16 G16(const u8* p) { return p[0] | p[1] << 8; }
 u32 G32(const u8* p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24; }
 void P16(std::vector<u8>& v, u16 x) { v.push_back(x); v.push_back(x >> 8); }
@@ -177,6 +216,7 @@ AmbientLAN::~AmbientLAN()
         for (int s = 0; s < 16; s++) if (Links[s].P) enet_peer_disconnect(Links[s].P, 0);
         enet_host_flush(Host);
         while (!RX.empty()) { enet_packet_destroy(RX.front().Packet); RX.pop_front(); }
+        for (auto& d : Delayed) enet_packet_destroy(d.second.Packet);
         enet_host_destroy(Host);
         enet_deinitialize();
     }
@@ -227,6 +267,31 @@ std::vector<u8> AmbientLAN::BuildPresence(u8 kind)
     return v;
 }
 
+std::vector<u8> AmbientLAN::BuildPing(u8 kind, u64 t)
+{
+    std::vector<u8> v;
+    P32(v, kPresMagic); v.push_back(kPresVersion); v.push_back(kind); P16(v, LinkPort);
+    P64(v, Cfg.DeviceID); P32(v, Cfg.BuildID); P32(v, 0); P64(v, t);
+    return v;
+}
+
+u32 AmbientLAN::Peer::RttUs() const
+{
+    if (!RttN) return 0;
+    u32 v[8];
+    std::copy(RttS, RttS + RttN, v);
+    std::nth_element(v, v + (RttN - 1) / 2, v + RttN);
+    return v[(RttN - 1) / 2];       // (the lower median: half the window may spike)
+}
+
+u32 AmbientLAN::Peer::JitterUs() const
+{
+    const u32 m = RttUs();
+    u64 d = 0;
+    for (int i = 0; i < RttN; i++) d += RttS[i] > m ? RttS[i] - m : m - RttS[i];
+    return RttN ? (u32)(d / RttN) : 0;
+}
+
 void AmbientLAN::SendPresence(const std::vector<u8>& pkt, bool bcast, const std::vector<std::pair<u32, u16>>& to)
 {
     sockaddr_in a = {};
@@ -253,7 +318,22 @@ u8 AmbientLAN::HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, boo
     auto it = std::find_if(Peers.begin(), Peers.end(), [&](const Peer& x) { return x.ID == id; });
     if (kind == P_Bye) { if (it != Peers.end()) Peers.erase(it); return 0; }
     if (kind == P_Req && it == Peers.end()) return 0;     // (a request alone does not make a device nearby)
-    if (it == Peers.end()) { Peers.emplace_back(); it = Peers.end() - 1; it->ID = id; }
+    // round trips (the verdict, AmbientLAN.h), answered here at once
+    if (kind == P_Ping || kind == P_Pong)
+    {
+        if (it == Peers.end() || n < 32) return 0;
+        u64 t; memcpy(&t, p + 24, 8);
+        if (kind == P_Ping) { PingEcho = t; return P_Pong; }
+        const u64 nowUs = NowUs();
+        if (t > nowUs || nowUs - t > 10000000) return 0;      // (not one of ours)
+        it->RttS[it->RttPos] = (u32)std::min<u64>(nowUs - t, 1000000);
+        it->RttPos = (it->RttPos + 1) % 8;
+        if (it->RttN < 8) it->RttN++;
+        it->Recv++;
+        return 0;
+    }
+    const bool fresh = it == Peers.end();
+    if (fresh) { Peers.emplace_back(); it = Peers.end() - 1; it->ID = id; }
     Peer& e = *it;
     e.IP = ip; e.UniPort = port; e.LinkPort = G16(p + 6); e.BuildID = G32(p + 16); e.SeenMs = now;
     if (bcast) e.BcastMs = now;
@@ -282,6 +362,9 @@ u8 AmbientLAN::HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, boo
         // stale details: ask that device (unicast), at most once a second
         if (now - e.ReqMs >= 1000 || !e.ReqMs) { e.ReqMs = now; return P_Req; }
     }
+    // a device new here gets our details at once (else it waits up to kLiveMs for our liveness: a game run in
+    // fast-forward can finish its scan before that)
+    if (fresh && Announcing) { e.ReqMs = now; return P_Full; }
     return 0;
 }
 
@@ -291,6 +374,17 @@ void AmbientLAN::PresenceLoop()
     u32 lastHash = 0;
     bool wasVisible = false;
     u8 buf[4096];
+    struct Held { u64 At; std::vector<u8> Data; u32 IP; u16 Port; };
+    std::vector<Held> held;         // (tests, NetSim: pings / pongs on their way)
+    bool changed = false;
+    auto handle = [&](const u8* d, int n, u32 ip, u16 port, bool bcast)
+    {
+        u8 reply;
+        { std::lock_guard<std::mutex> g(Mu); reply = HandlePresence(d, n, ip, port, NowMs(), bcast); }
+        if (reply == P_Pong) SendPresence(BuildPing(P_Pong, PingEcho), false, {{ip, port}});
+        else if (reply) SendPresence(BuildPresence(reply), false, {{ip, port}});
+        changed = true;
+    };
     while (!Quit)
     {
         fd_set fds; FD_ZERO(&fds);
@@ -298,10 +392,19 @@ void AmbientLAN::PresenceLoop()
         FD_SET(UniSock, &fds);
         if (BcastSock >= 0) { FD_SET(BcastSock, &fds); mx = std::max(mx, BcastSock); }
         timeval tv = {0, 100000};
-        bool changed = false;
+        changed = false;
+        if (!held.empty())
+        {
+            const u64 n = NowUs();
+            for (size_t i = 0; i < held.size(); )
+                if (held[i].At <= n) { const Held h = held[i]; held.erase(held.begin() + i); handle(h.Data.data(), (int)h.Data.size(), h.IP, h.Port, false); }
+                else i++;
+            u64 due = ~0ull;
+            for (const auto& h : held) due = std::min(due, h.At);
+            if (due != ~0ull) tv.tv_usec = (long)std::min<u64>(100000, due > n ? due - n : 0);
+        }
         if (select(mx + 1, &fds, nullptr, nullptr, &tv) > 0)
         {
-            const u32 now = NowMs();
             for (int s : {UniSock, BcastSock})
             {
                 if (s < 0 || !FD_ISSET(s, &fds)) continue;
@@ -314,10 +417,12 @@ void AmbientLAN::PresenceLoop()
                     const int n = (int)recvfrom(s, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
 #endif
                     if (n <= 0) break;
-                    u8 reply;
-                    { std::lock_guard<std::mutex> g(Mu); reply = HandlePresence(buf, n, from.sin_addr.s_addr, ntohs(from.sin_port), now, s == BcastSock); }
-                    if (reply) SendPresence(BuildPresence(reply), false, {{from.sin_addr.s_addr, ntohs(from.sin_port)}});
-                    changed = true;
+                    if (kSim.On && n >= 32 && (buf[5] == P_Ping || buf[5] == P_Pong))
+                    {
+                        const u64 hold = kSim.Hold(NowUs());
+                        if (hold != ~0ull) held.push_back({NowUs() + hold, std::vector<u8>(buf, buf + n), from.sin_addr.s_addr, ntohs(from.sin_port)});
+                    }
+                    else handle(buf, n, from.sin_addr.s_addr, ntohs(from.sin_port), s == BcastSock);
 #ifndef MSG_DONTWAIT
                     break;
 #endif
@@ -360,6 +465,34 @@ void AmbientLAN::PresenceLoop()
             continue;
         }
         if (!wasVisible) { dirty = true; wasVisible = true; }
+        // round trips (the verdict, AmbientLAN.h): devices running this game or hosting (a beacon: Pokémon Black joins
+        // White) get a ping a second (5 at 100 ms when one appears), linked ones 4 a second; the slowest linked one's
+        // median is the session's
+        {
+            std::vector<std::pair<u32, u16>> ping;
+            u32 linkRtt = 0, linkRttMax = 0;
+            {
+                std::lock_guard<std::mutex> g(Mu);
+                for (auto& p : Peers)
+                {
+                    const bool linked = std::find(LinkedIDs.begin(), LinkedIDs.end(), p.ID) != LinkedIDs.end();
+                    if (!linked && (!p.Full || !(SameGame(p.Game, Cfg.GameCode) || p.HasGGID))) continue;
+                    if (linked)
+                    {
+                        linkRtt = std::max(linkRtt, p.RttUs());
+                        for (int i = 0; i < p.RttN; i++) linkRttMax = std::max(linkRttMax, p.RttS[i]);
+                    }
+                    if (p.PingMs && now - p.PingMs < (p.PingN < 5 ? 100u : linked ? 250u : 1000u)) continue;
+                    p.PingMs = now;
+                    if (p.PingN < 255) p.PingN++;
+                    if (++p.Sent >= 16) { p.LossPct = (u8)((p.Sent - std::min(p.Recv, p.Sent)) * 100 / p.Sent); p.Sent = p.Recv = 0; }
+                    ping.push_back({p.IP, p.UniPort});
+                }
+            }
+            LinkRttUs = linkRtt;
+            LinkRttMaxUs = linkRttMax;
+            if (!ping.empty()) SendPresence(BuildPing(P_Ping, NowUs()), false, ping);
+        }
         if (dirty && now - lastFull >= kFullMinMs)
         {
             std::vector<u8> full = BuildPresence(P_Full);
@@ -393,9 +526,9 @@ std::vector<std::string> AmbientLAN::NearbyRows()
         char row[256], gg[16] = "-";
         if (p.HasGGID) snprintf(gg, sizeof(gg), "%08x", p.GGID);
         const u32 ip = p.IP;
-        snprintf(row, sizeof(row), "%016llx\t%s\t%.4s\t%u.%u.%u.%u:%u\t%s\t%08x\t%d", (unsigned long long)p.ID, p.Name.c_str(),
+        snprintf(row, sizeof(row), "%016llx\t%s\t%.4s\t%u.%u.%u.%u:%u\t%s\t%08x\t%d\t%u\t%u\t%u", (unsigned long long)p.ID, p.Name.c_str(),
                  p.Game[0] ? p.Game : "----", ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, ip >> 24, p.UniPort, gg, p.BuildID,
-                 std::find(linked.begin(), linked.end(), p.ID) != linked.end() ? 1 : 0);
+                 std::find(linked.begin(), linked.end(), p.ID) != linked.end() ? 1 : 0, p.RttUs(), p.JitterUs(), (unsigned)p.LossPct);
         rows.emplace_back(row);
     }
     return rows;
@@ -409,6 +542,9 @@ AmbientLAN::Stats AmbientLAN::GetStats()
     s.HostWaitUs = StHostWaitUs; s.HostWaitCalls = StHostWaitCalls;
     s.HostWaitMisses = StHostWaitMisses; s.HostWaitTimeouts = StHostWaitTimeouts;
     s.ClientWaitUs = StClientWaitUs; s.ClientWaitCalls = StClientWaitCalls; s.ClientWaitMisses = StClientWaitMisses;
+    for (int t = 0; t < 4; t++) s.Stale[t] = StStale[t];
+    s.LinkRttUs = LinkRttUs;
+    s.EmuUs = EmuBaseUs; s.PredFpsX100 = StPredFps; s.Verdict = StVerdict;
     s.LastFrameBlockedUs = StLastBlocked; s.LastFrameExchanges = StLastExch; s.Links = StLinks; s.Nearby = StNearby; s.MaxRttMs = StMaxRtt;
     s.SlowFpsX100 = StSlowFps; s.SlowWaitUsPerFrame = StSlowWait;
     s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending;
@@ -436,7 +572,7 @@ void AmbientLAN::RebuildCands()
     std::set<u32> want = OwnGGIDs;
     for (const auto& p : *View) if (p.HasGGID && SameGame(p.Game, Cfg.GameCode)) want.insert(p.GGID);
     std::vector<Cand> c;
-    const u64 now = NowUs();
+    const u64 now = EmuNow(), wall = NowUs();
     for (size_t i = 0; i < View->size(); i++)
     {
         const Peer& p = (*View)[i];
@@ -444,8 +580,12 @@ void AmbientLAN::RebuildCands()
         u32 tu = G16(&p.Beacon[12 + 24 + 8]);
         const u32 iv = std::clamp<u32>(tu * 1024u, 20000u, 1000000u);
         u64 due = now + (p.ID % iv);    // (a new one: spread the phases)
-        for (const auto& o : Cands) if (o.ID == p.ID) due = o.DueUs;
-        c.push_back({i, p.ID, due, iv});
+        // its TSF: as received, aged by the real time since, then the chip's time only (monotonic, one beacon interval
+        // per interval, also when that device's beacon changes)
+        u64 tsf; memcpy(&tsf, &p.Beacon[12 + 24], 8);
+        u64 off = tsf + (wall - p.BeaconUs) - now;
+        for (const auto& o : Cands) if (o.ID == p.ID) { due = o.DueUs; off = o.TsfOff; }
+        c.push_back({i, p.ID, due, iv, off});
     }
     Cands.swap(c);
     NextInjectUs = ~0ull;
@@ -455,7 +595,7 @@ void AmbientLAN::RebuildCands()
 int AmbientLAN::Inject(u8* data, u64* timestamp)
 {
     if (NextInjectUs == ~0ull || Vis == Vis_Hidden) return 0;
-    const u64 now = NowUs();
+    const u64 now = EmuNow();
     if (now < NextInjectUs) return 0;
     // a due beacon on the channel the chip listens on (one on another channel stays due: the chip would drop it)
     Cand* best = nullptr;
@@ -467,8 +607,7 @@ int AmbientLAN::Inject(u8* data, u64* timestamp)
         const Peer& p = (*View)[best->Idx];
         len = (int)p.Beacon.size();
         memcpy(data, p.Beacon.data(), len);
-        u64 tsf; memcpy(&tsf, &data[12 + 24], 8);
-        tsf += now - p.BeaconUs;
+        const u64 tsf = now + best->TsfOff;
         memcpy(&data[12 + 24], &tsf, 8);
         best->DueUs = std::max(best->DueUs + best->IntervalUs, now);
         StInjected++;
@@ -478,6 +617,20 @@ int AmbientLAN::Inject(u8* data, u64* timestamp)
     for (const auto& c : Cands) NextInjectUs = std::min(NextInjectUs, c.DueUs);
     if (timestamp) *timestamp = 0;
     return len;
+}
+
+// the chip's clock (beacons keep their pace per emulated second in fast-forward / slow motion); when it goes back (a
+// savestate, a reset) the schedule goes back with it, the TSF does not
+u64 AmbientLAN::EmuNow()
+{
+    const u64 now = WifiUs;
+    if (now < EmuUs)
+    {
+        const u64 d = EmuUs - now;
+        for (auto& c : Cands) { c.DueUs = c.DueUs > d ? c.DueUs - d : 0; c.TsfOff += d; }
+        if (NextInjectUs != ~0ull) NextInjectUs = NextInjectUs > d ? NextInjectUs - d : 0;
+    }
+    return EmuUs = now;
 }
 
 const AmbientLAN::Peer* AmbientLAN::PeerByMAC(const u8* mac)
@@ -501,11 +654,22 @@ u32 AmbientLAN::UpMask() const
     return m;
 }
 
-void AmbientLAN::LinksChanged()
+void AmbientLAN::LinksChanged(bool opened)
 {
     std::vector<u64> ids;
     NumLinks = 0;
     for (int s = 0; s < 16; s++) if (Links[s].P) { NumLinks++; ids.push_back(Links[s].ID); }
+    // a player joining: the whole group to normal speed (the join runs at 1x on both ends; a parent tells its other
+    // children); one leaving: only the leaver (its last link closed), the others keep the group's speed
+    if (opened || !NumLinks)
+    {
+        const bool fast = StSpeed || PendCode > 0;
+        PendCode = -1;
+        StSpeed = StShown = 0;
+        StSpeedWho = 0;
+        SpeedReq = -1;
+        if (fast && ParentSlot < 0 && UpMask()) SpeedDecide(0, 0, 0);
+    }
     StLinks = NumLinks;
     std::lock_guard<std::mutex> g(Mu);
     LinkedIDs.swap(ids);
@@ -526,8 +690,9 @@ int AmbientLAN::OpenLink(const Peer& p)
     e->data = &l;
     enet_peer_timeout(e, 0, 5000, 5000);
     StOpened++;
-    LinksChanged();
-    Platform::Log(Platform::LogLevel::Info, "Ambient: link %d -> %016llx (%s)\n", s, (unsigned long long)p.ID, p.Name.c_str());
+    LinksChanged(true);
+    Platform::Log(Platform::LogLevel::Info, "Ambient: link %d -> %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p.ID, p.Name.c_str(),
+                  (int)PeerVerdict(p.ID), EmuBaseUs / 1000.0);
     return s;
 }
 
@@ -541,7 +706,7 @@ void AmbientLAN::CloseLink(int s, const char* why)
     Platform::Log(Platform::LogLevel::Info, "Ambient: link %d to %016llx closed (%s)\n", s, (unsigned long long)l.ID, why);
     if (ParentSlot == s) ParentSlot = -1;
     l = Link();
-    LinksChanged();
+    LinksChanged(false);
 }
 
 void AmbientLAN::NoteBeacon(const u8* data, int len)
@@ -648,8 +813,9 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         n.ID = p->ID; n.Generation = ++NextLinkGeneration; n.P = ev.peer; n.Up = true; memcpy(n.MAC, p->MAC, 6); n.ActiveMs = NowMs();
         ev.peer->data = &n;
         enet_peer_timeout(ev.peer, 0, 5000, 5000);
-        LinksChanged();
-        Platform::Log(Platform::LogLevel::Info, "Ambient: link %d <- %016llx (%s)\n", s, (unsigned long long)p->ID, p->Name.c_str());
+        LinksChanged(true);
+        Platform::Log(Platform::LogLevel::Info, "Ambient: link %d <- %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p->ID, p->Name.c_str(),
+                      (int)PeerVerdict(p->ID), EmuBaseUs / 1000.0);
         break;
     }
     case ENET_EVENT_TYPE_DISCONNECT:
@@ -662,12 +828,16 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         if (ParentSlot == s) ParentSlot = -1;
         DropQueuedForSlot(s);
         *l = Link();
-        LinksChanged();
+        LinksChanged(false);
         break;
     }
     case ENET_EVENT_TYPE_RECEIVE:
-        enet_packet_destroy(ev.packet);     // (control channel: unused)
+    {
+        const Link* l = (const Link*)ev.peer->data;
+        if (l && ev.channelID == Chan_Ctl) SpeedControl((int)(l - Links), ev.packet->data, ev.packet->dataLength);
+        enet_packet_destroy(ev.packet);
         break;
+    }
     default:
         break;
     }
@@ -683,6 +853,11 @@ bool AmbientLAN::QueueCurrent(const QueuedPacket& q) const
 
 void AmbientLAN::DropQueuedForSlot(int slot)
 {
+    for (auto it = Delayed.begin(); it != Delayed.end(); )
+    {
+        if (it->second.Slot == slot) { enet_packet_destroy(it->second.Packet); it = Delayed.erase(it); }
+        else ++it;
+    }
     for (auto it = RX.begin(); it != RX.end(); )
     {
         if (it->Slot == slot)
@@ -695,7 +870,8 @@ void AmbientLAN::DropQueuedForSlot(int slot)
 }
 
 // as LAN::ProcessLAN: 0 = per frame, 1 = a regular frame wanted, 2 = waiting for an MP frame, 3 = 2 without blocking
-void AmbientLAN::Pump(int type)
+// waitMs: 2's wait (-1: RecvTimeout)
+void AmbientLAN::Pump(int type, int waitMs)
 {
     if (!Host) return;
     u32 now = NowMs();
@@ -716,6 +892,7 @@ void AmbientLAN::Pump(int type)
                 Platform::Log(Platform::LogLevel::Info,
                               "AMBWAIT stale frame type=%04x age_ms=%u keep_ms=%u slot=%d\n",
                               h->Type, h->Magic > now ? 0u : now - h->Magic, keep, q.Slot);
+            StStale[h->Type & 3]++;
             RX.pop_front(); enet_packet_destroy(p); continue;
         }
         if (type >= 2) return;
@@ -726,31 +903,145 @@ void AmbientLAN::Pump(int type)
         }
         break;
     }
-    int timeout = type == 2 ? RecvTimeout : 0;
+    int timeout = type == 2 ? (waitMs < 0 ? RecvTimeout : waitMs) : 0;
     u32 last = NowMs();
     ENetEvent ev;
-    while (enet_host_service(Host, &ev, timeout) > 0)
+    for (;;)
     {
-        if (ev.type == ENET_EVENT_TYPE_RECEIVE && ev.channelID == Chan_MP)
+        if (!Delayed.empty() && ReleaseDelayed()) return;
+        int t = timeout;
+        if (!Delayed.empty())       // (tests, NetSim: wake for the next held frame)
         {
-            if (Admit(ev))
-            {
-                ((MPPacketHeader*)ev.packet->data)->Magic = NowMs();
-                const Link* l = (const Link*)ev.peer->data;
-                RX.push_back({ev.packet, l->ID, l->Generation, (int)(l - Links)});
-                return;
-            }
-            enet_packet_destroy(ev.packet);
+            u64 due = ~0ull;
+            for (const auto& d : Delayed) due = std::min(due, d.first);
+            const u64 n = NowUs();
+            t = std::min<int>(t, due <= n ? 0 : (int)((due - n + 999) / 1000));
         }
-        else OnEvent(ev);
+        const int r = enet_host_service(Host, &ev, t);
+        if (r > 0)
+        {
+            if (ev.type == ENET_EVENT_TYPE_RECEIVE && ev.channelID == Chan_MP)
+            {
+                if (Admit(ev))
+                {
+                    const Link* l = (const Link*)ev.peer->data;
+                    const QueuedPacket q = {ev.packet, l->ID, l->Generation, (int)(l - Links)};
+                    if (!kSim.On)
+                    {
+                        ((MPPacketHeader*)ev.packet->data)->Magic = NowMs();
+                        RX.push_back(q);
+                        return;
+                    }
+                    const u64 hold = kSim.Hold(NowUs());
+                    if (hold == ~0ull) enet_packet_destroy(ev.packet);
+                    else Delayed.push_back({NowUs() + hold, q});
+                }
+                else enet_packet_destroy(ev.packet);
+            }
+            else OnEvent(ev);
+        }
+        else if (r < 0 || t == timeout) { if (!Delayed.empty()) ReleaseDelayed(); return; }    // nothing within the wait
         if (type == 2)
         {
-            const u32 t = NowMs();
-            timeout -= (int)(t - last);
-            last = t;
-            if (timeout <= 0) return;
+            const u32 n = NowMs();
+            timeout -= (int)(n - last);
+            last = n;
+            if (timeout <= 0) { if (!Delayed.empty()) ReleaseDelayed(); return; }
         }
     }
+}
+
+// tests (NetSim): the held frames that are due reach RX
+bool AmbientLAN::ReleaseDelayed()
+{
+    bool any = false;
+    const u64 now = NowUs();
+    for (size_t i = 0; i < Delayed.size(); )
+    {
+        if (Delayed[i].first > now) { i++; continue; }
+        const QueuedPacket q = Delayed[i].second;
+        Delayed.erase(Delayed.begin() + i);
+        if (!QueueCurrent(q)) { enet_packet_destroy(q.Packet); continue; }
+        ((MPPacketHeader*)q.Packet->data)->Magic = NowMs();
+        RX.push_back(q);
+        any = true;
+    }
+    return any;
+}
+
+// ---- group fast-forward (AmbientLAN.h) ----
+// control channel: {1, code, seq u32, at u64, who u64} parent -> children: the group speed from the chip time `at`;
+// {2, code} child -> parent: its key asks for `code`
+
+int AmbientLAN::ToggleSpeed(int onCode)
+{
+    const int c = StShown ? 0 : onCode;
+    StShown = c;
+    SpeedReq = c;
+    return c;
+}
+
+std::string AmbientLAN::SpeedWho()
+{
+    const u64 id = StSpeedWho;
+    if (id == Cfg.DeviceID) return Cfg.Name;
+    std::lock_guard<std::mutex> g(Mu);
+    for (const auto& p : *Snap) if (p.ID == id) return p.Name;
+    return "";
+}
+
+void AmbientLAN::SendCtl(u32 slots, const u8* m, int n)
+{
+    if (!Host || !slots) return;
+    ENetPacket* pkt = enet_packet_create(m, n, ENET_PACKET_FLAG_RELIABLE);
+    for (int s = 0; s < 16; s++) if ((slots >> s & 1) && Links[s].Up) enet_peer_send(Links[s].P, Chan_Ctl, pkt);
+    if (!pkt->referenceCount) enet_packet_destroy(pkt);
+    enet_host_flush(Host);
+}
+
+// parent: the group speed from chip time atUs, for every member
+void AmbientLAN::SpeedDecide(int code, u64 who, u64 atUs)
+{
+    SpeedSeq++;
+    PendCode = code; PendWho = who; PendAtUs = atUs; PendWallUs = NowUs();
+    StShown = code;
+    u8 m[22] = {1, (u8)code};
+    memcpy(m + 2, &SpeedSeq, 4); memcpy(m + 6, &atUs, 8); memcpy(m + 14, &who, 8);
+    SendCtl(UpMask(), m, sizeof(m));
+}
+
+void AmbientLAN::SpeedControl(int slot, const u8* p, size_t n)
+{
+    if (n >= 2 && p[0] == 2 && ParentSlot < 0) SpeedDecide(p[1] & 63, Links[slot].ID, WifiUs + kSpeedLagUs);
+    else if (n >= 22 && p[0] == 1 && slot == ParentSlot)
+    {
+        u32 seq;
+        memcpy(&seq, p + 2, 4);
+        if (seq == SpeedSeq) return;
+        SpeedSeq = seq;
+        PendCode = p[1] & 63; memcpy(&PendAtUs, p + 6, 8); memcpy(&PendWho, p + 14, 8); PendWallUs = NowUs();
+        StShown = PendCode;
+    }
+}
+
+void AmbientLAN::SpeedTick()
+{
+    const int req = SpeedReq.exchange(-1);
+    if (req >= 0 && NumLinks)
+    {
+        if (ParentSlot >= 0 && Links[ParentSlot].Up) { const u8 m[2] = {2, (u8)req}; SendCtl(1u << ParentSlot, m, 2); }
+        else if (ParentSlot >= 0) StShown = StSpeed.load();     // (not up yet: the press is dropped)
+        else SpeedDecide(req, Cfg.DeviceID, WifiUs + kSpeedLagUs);
+    }
+    // at the agreed chip time (one far ahead: a clock not following the parent's yet, at once; a chip that stopped
+    // polling: after 2 s)
+    const u64 now = WifiUs;
+    if (PendCode < 0 || (now < PendAtUs && PendAtUs - now <= 4 * kSpeedLagUs && NowUs() - PendWallUs < 2000000)) return;
+    Platform::Log(Platform::LogLevel::Info, "Ambient: group speed %d by %016llx (chip %llu us, due %llu)\n", PendCode,
+                  (unsigned long long)PendWho, (unsigned long long)now, (unsigned long long)PendAtUs);
+    StSpeed = PendCode;
+    StSpeedWho = PendWho;
+    PendCode = -1;
 }
 
 int AmbientLAN::Pop(u8* data, u64* timestamp)
@@ -799,12 +1090,97 @@ void AmbientLAN::Process()
         else if (now - l.ActiveMs > kIdleMs) CloseLink(s, "idle");
     }
     StMaxRtt = rtt;
-    if (StSlowDismissRequested.exchange(false)) Slowdown.Dismiss();
-    const auto slow = Slowdown.Observe(NowUs(), UpMask() != 0, frameBlocked, frameExchanges);
+    SpeedTick();
+    Judge(frameBlocked, frameExchanges);
+    if (StSlowDismissRequested.exchange(false)) { Slowdown.Dismiss(); VerdictDismissed = true; }
+    const int sp = StSpeed;     // (NetplaySpeed codes: 63 uncapped, else x4)
+    const auto slow = Slowdown.Observe(NowUs(), UpMask() != 0, frameBlocked, frameExchanges, sp == 63 ? 0 : sp ? sp * 1500 : 6000);
     StSlowFps = slow.FpsX100;
     StSlowWait = slow.WaitUsPerFrame;
     StSlowExch = slow.ExchangesPerFrameX100;
-    StSlowPending = slow.Pending;
+    // the Netplay offer: the verdict; the fps-and-wait detector only without round trips (presence blocked): it cannot
+    // tell a slow network from a partner busy emulating (2 x 8 ms frames over localhost waited 8 ms a frame at 57 fps)
+    StSlowPending = (StVerdict == Verdict_LanBad && !VerdictDismissed) || (slow.Pending && !LinkRttUs);
+}
+
+// the wait for a peer's MP frame: RecvTimeout, or the link's round trip + margin when that is longer (a slow network
+// keeps its session, slowly, until it moves to Netplay), at most 250 ms; the longest of the last 8 round trips, not
+// their median: a spike of 100 ms (Wi-Fi) holds the session for the next 2 s
+int AmbientLAN::LinkWaitMs() const
+{
+    return std::max(RecvTimeout, std::min(250, (int)(LinkRttMaxUs * 3 / 2000) + 10));
+}
+
+AmbientLAN::Verdict AmbientLAN::PeerVerdict(u64 id)
+{
+    std::lock_guard<std::mutex> g(Mu);
+    for (const auto& p : Peers)
+        if (p.ID == id) return p.RttN < 3 ? Verdict_Unknown : EmuBaseUs + p.RttUs() > 1000000 / 58 ? Verdict_LanBad : Verdict_LanOk;
+    return Verdict_Unknown;
+}
+
+// once a frame (Process): the emulation time and the session verdict (AmbientLAN.h)
+void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
+{
+    const u32 run = RunUs;
+    const u64 now = NowUs();
+    if (run)
+    {
+        const u32 e = run > frameBlocked ? run - frameBlocked : 0;
+        FrameEmuUs = (FrameEmuUs * 15 + std::min<u32>(e, 2 * FrameEmuUs)) / 16;     // (a loading frame: at most 2x)
+        RunUs = 0;
+        // E for the round-trip rule: the lowest half-second average of the last 2 s (a loading phase emulates more)
+        EmSum += e; EmN++;
+        if (!EmT0) EmT0 = now;
+        if (now - EmT0 >= 500000)
+        {
+            EmRing[EmPos++ % 4] = (u32)(EmSum / EmN);
+            u32 m = ~0u;
+            for (u32 x : EmRing) if (x) m = std::min(m, x);
+            EmuBaseUs = m;
+            EmT0 = now; EmSum = 0; EmN = 0;
+        }
+    }
+    if (!UpMask())
+    {
+        if (StVerdict) Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict cleared (no links)\n");
+        StVerdict = Verdict_Unknown; StPredFps = 0;
+        FirstExchUs = VT0 = 0; VFrames = VExch = VRunN = VBad = VWeak = VOk = 0; VRunUs = 0; VerdictDismissed = false;
+        return;
+    }
+    const u64 stalls = StHostWaitTimeouts + StClientWaitMisses;
+    if (frameExchanges && !FirstExchUs) FirstExchUs = now;
+    if (!VT0) { VT0 = now; VStallAt = stalls; VEmuAtLink = EmuBaseUs; }
+    VFrames++; VExch += frameExchanges;
+    if (run) { VRunUs += run; VRunN++; }
+    if (now - VT0 < 500000) return;
+    const u32 rtt = LinkRttUs;
+    if (FirstExchUs && now - FirstExchUs >= 1000000 && rtt && VExch)
+    {
+        const double net = (double)VExch / VFrames * rtt;
+        const double frame = VRunN ? (double)VRunUs / VRunN : EmuBaseUs + net;
+        const double pred = std::min(60.0, 1e6 / frame);
+        StPredFps = (u32)(pred * 100);
+        // strong: the round trips alone take the frames below 50 fps (50: a margin, a 55-57 fps LAN is no case for
+        // Netplay), or one exchange a frame does not fit 58; weak: they take 40% of the frame with no wait timing out
+        // (a partner slow too; a timeout = a partner loading, an MKDS race start)
+        // (E: the session's lowest, a loading phase emulates more)
+        const bool strong = (frame > 1e6 / 50 && frame - net <= 1e6 / 58) || std::min<u32>(VEmuAtLink, EmuBaseUs) + rtt > 1000000 / 58;
+        const bool weak = frame > 1e6 / 50 && net >= frame * 0.4 && stalls == VStallAt;
+        VBad = strong ? VBad + 1 : 0;
+        VWeak = strong || weak ? VWeak + 1 : 0;
+        VOk = strong || weak ? 0 : VOk + 1;
+        int v = StVerdict;
+        if (VBad >= 2 || VWeak >= 6) v = Verdict_LanBad;
+        else if (VOk >= (v == Verdict_LanBad ? 4u : 2u)) v = Verdict_LanOk;
+        if (v != StVerdict)
+        {
+            Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict %s: %.1f fps (frame %.1f ms, of which %.2f exchanges/frame x %.1f ms round trips; emulation %.1f ms)\n",
+                          v == Verdict_LanBad ? "LAN_BAD" : "LAN_OK", pred, frame / 1000.0, (double)VExch / VFrames, rtt / 1000.0, EmuBaseUs / 1000.0);
+            StVerdict = v;
+        }
+    }
+    VT0 = now; VFrames = VExch = VRunN = 0; VRunUs = 0; VStallAt = stalls;
 }
 
 void AmbientLAN::Begin(int inst)
@@ -820,6 +1196,8 @@ void AmbientLAN::End(int inst)
     WifiOn = false;
     for (int s = 0; s < 16; s++) CloseLink(s, "Wi-Fi off");
     while (!RX.empty()) { enet_packet_destroy(RX.front().Packet); RX.pop_front(); }
+    for (auto& d : Delayed) enet_packet_destroy(d.second.Packet);
+    Delayed.clear();
     if (Host) enet_host_flush(Host);
     ParentSlot = -1;
     std::lock_guard<std::mutex> g(Mu);
@@ -929,7 +1307,8 @@ int AmbientLAN::RecvHostPacket(int inst, u8* data, u64* timestamp)
         while (RX.empty() && NowUs() < end);
     }
 #endif
-    Pump(2);
+    const u64 spent = NowUs() - t0, wait = (u64)LinkWaitMs() * 1000;     // (the spin counts toward it)
+    Pump(2, spent >= wait ? 0 : (int)((wait - spent + 999) / 1000));
     const int r = Pop(data, timestamp);
     const u64 waited = NowUs() - t0;
     FrameBlockedUs += (u32)waited;
@@ -947,9 +1326,11 @@ u16 AmbientLAN::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
     u16 ret = 0;
     u32 replied = 0;
     std::deque<QueuedPacket> later;      // regular frames meanwhile (a joining child's auth): for RecvPacket
+    const u64 end = t0 + (u64)LinkWaitMs() * 1000;    // one wait for the call: old replies / regular frames meanwhile do not extend it
     for (;;)
     {
-        Pump(2);
+        const u64 now = NowUs();
+        Pump(2, now >= end ? 0 : (int)((end - now + 999) / 1000));
         if (RX.empty()) break;
         const QueuedPacket q = RX.front();
         ENetPacket* p = q.Packet;

@@ -61,7 +61,11 @@ public:
         u64 Frames, PresenceTx, PresenceRx, LinkTx, LinkRx, BeaconsInjected, LinksOpened, BlockedUs, Exchanges;
         u64 HostWaitUs, HostWaitCalls, HostWaitMisses, HostWaitTimeouts;
         u64 ClientWaitUs, ClientWaitCalls, ClientWaitMisses;
+        u64 Stale[4];               // MP frames dropped as stale (too old for the chip), by type: regular, CMD, reply, ack
         u32 LastFrameBlockedUs, LastFrameExchanges, Links, Nearby, MaxRttMs;
+        u32 LinkRttUs;              // the slowest linked device's median presence round trip
+        u32 EmuUs, PredFpsX100;     // emulation per frame (no link waits); the session's predicted fps (SessionVerdict)
+        int Verdict;                // SessionVerdict
         u32 SlowFpsX100, SlowWaitUsPerFrame, SlowExchangesPerFrameX100;
         bool SlowdownPending;
     };
@@ -81,11 +85,44 @@ public:
     void AddPeerAddress(u32 ipNetOrder, u16 port);
     void SetVisibility(int vis);
     void SetForeground(bool fg) { Foreground = fg; }
-    // nearby devices: "id \t name \t game \t ip:port \t ggid \t build \t linked"
+    // nearby devices: "id \t name \t game \t ip:port \t ggid \t build \t linked \t rtt_us \t jitter_us \t loss_%"
     std::vector<std::string> NearbyRows();
     Stats GetStats();
     void DismissSlowdownPrompt() { StSlowDismissRequested = true; StSlowPending = false; }
     bool HasLinks() const { return StLinks.load(std::memory_order_relaxed) != 0; }
+    // Group fast-forward: ONE speed for the LAN session (the linked players), in NetplaySpeed codes (0 = normal). Any
+    // member's key asks for it; the parent decides and relays it (a child links only to its parent) and every member
+    // switches at the same emulated time (the parent's chip clock + kSpeedLagUs: a child's clock follows its parent's),
+    // so a host never runs faster than its children (it would time out their replies). A link opening is normal speed
+    // for the whole group (the join runs at 1x); a player leaving runs 1x (its last link closed), the others keep the
+    // group's speed. No links = no group (the frontend's own fast-forward, off for a player who just left).
+    static constexpr u64 kSpeedLagUs = 250000;
+    int ToggleSpeed(int onCode);                // any thread: the key; returns the code it shows
+    int SpeedShown() const { return StShown.load(); }
+    int Speed() const { return StSpeed.load(); }
+    std::string SpeedWho();                     // the name of the player whose key set Speed()
+    // the frontend, after each frame: its emulation wall time (RunFrame, link waits included)
+    void NoteFrameUs(u32 us) { RunUs = us; }
+
+    // Can a LAN session hold 58 fps on this network, or should it be Netplay? From the presence round trips (RTT: the
+    // median of the last 8; same-game or hosting devices 1 a second, linked ones 4) and this device's emulation per
+    // frame (E: NoteFrameUs without the link waits; the lowest half-second average of the last 2 s, as a loading
+    // phase emulates more; 10 ms until measured, an RG DS). Each MP exchange stops emulation for one round trip.
+    //  - PeerVerdict (a device, before or at link open): LAN_BAD when E + 1 x RTT > 1000/58 ms (not even one exchange
+    //    a frame fits; RG DS: RTT above ~7 ms), UNKNOWN before 3 round trips.
+    //  - SessionVerdict (the live session), a vote every 0.5 s from 1 s after the first exchange, from the window's
+    //    frames F (NoteFrameUs: emulation + link waits, no pacing) and round trips N = exchanges/frame x RTT:
+    //      strong: F misses 50 fps and F - N makes 58 (the network alone), or the PeerVerdict rule holds (with the
+    //        lower of E now and at link: a loading phase emulates more);
+    //      weak: F misses 50 fps and N is 40% of F, with no wait timing out (a partner slow too: Shrek, 3 exchanges a
+    //        frame, 50 fps at 0 ms, 27 at 6 ms; a timeout is a partner loading, as at an MKDS race start, 0 ms too).
+    //    LAN_BAD after 2 strong windows in a row or 6 strong / weak ones, back to LAN_OK after 4 good ones. 50: a
+    //    margin (a 55-57 fps LAN is no case for Netplay); a spike moves neither the median nor 2 windows; pacing is
+    //    not in it (fast-forward never makes it bad); one exchange a frame on a 0-5 ms LAN stays under 20 ms.
+    //    LAN_BAD also raises Stats::SlowdownPending (the Netplay offer) at once.
+    enum Verdict { Verdict_Unknown = 0, Verdict_LanOk = 1, Verdict_LanBad = 2 };
+    Verdict PeerVerdict(u64 id);
+    Verdict SessionVerdict() const { return (Verdict)StVerdict.load(); }
 
     void Process() override;
     void Begin(int inst) override;
@@ -114,6 +151,13 @@ public:
         std::string Name;
         std::vector<u8> Beacon;     // the DS TX header + beacon frame as sent (empty: not beaconing)
         u64 BeaconUs = 0;           // when it arrived (TSF aging)
+        // presence round trips (same game only): the last 8, the loss of the last 16 pings
+        u32 RttS[8] = {};
+        u8 RttN = 0, RttPos = 0, PingN = 0, LossPct = 0;
+        u16 Sent = 0, Recv = 0;
+        u32 PingMs = 0;
+        u32 RttUs() const;          // median (0: none yet)
+        u32 JitterUs() const;       // mean deviation from it
     };
 
 private:
@@ -133,7 +177,7 @@ private:
         u64 ID = 0, Generation = 0;
         int Slot = -1;
     };
-    struct Cand { size_t Idx; u64 ID; u64 DueUs; u32 IntervalUs; };
+    struct Cand { size_t Idx; u64 ID; u64 DueUs; u32 IntervalUs; u64 TsfOff = 0; };    // (us: the chip's clock; TSF = the chip's clock + TsfOff)
 
     Config Cfg;
     u8 MyMAC[6];
@@ -156,6 +200,10 @@ private:
     u8 HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, bool bcast);     // (under Mu) the reply to send
     std::vector<u8> BuildPresence(u8 kind);
     void SendPresence(const std::vector<u8>& pkt, bool bcast, const std::vector<std::pair<u32, u16>>& to);
+    std::vector<u8> BuildPing(u8 kind, u64 t);
+    u64 PingEcho = 0;                                       // presence thread
+    std::atomic<u32> LinkRttUs{0};                          // the slowest linked device's median round trip
+    std::atomic<u32> LinkRttMaxUs{0};                       // ... and the longest of their last 8 (the link waits)
 
     // ---- links + synthesis (emulator thread) ----
     ENetHost* Host = nullptr;
@@ -173,12 +221,32 @@ private:
     u32 OwnBeaconHash = 0;
     std::vector<Cand> Cands;
     u64 NextInjectUs = ~0ull;
+    u64 EmuUs = 0;
     u32 FrameBlockedUs = 0, FrameExchanges = 0;
+    u32 RunUs = 0;                  // NoteFrameUs
+    std::atomic<u32> FrameEmuUs{10000};     // its emulation part, average
+    u64 FirstExchUs = 0, VT0 = 0, VRunUs = 0, VStallAt = 0;     // the session verdict's windows
+    u32 VEmuAtLink = 0;
+    u32 VFrames = 0, VExch = 0, VRunN = 0, VBad = 0, VWeak = 0, VOk = 0;
+    std::atomic<u32> EmuBaseUs{10000};      // E: the lowest half-second emulation average of the last 2 s
+    u64 EmT0 = 0, EmSum = 0;
+    u32 EmN = 0, EmPos = 0, EmRing[4] = {};
+    bool VerdictDismissed = false;
+    std::atomic<int> StVerdict{0};
+    std::atomic<u32> StPredFps{0};
+    int LinkWaitMs() const;
+    void Judge(u32 frameBlocked, u32 frameExchanges);
+    int PendCode = -1;              // group speed to apply at PendAtUs (chip clock), from PendWho
+    u64 PendAtUs = 0, PendWho = 0, PendWallUs = 0;
+    u32 SpeedSeq = 0;               // parent: its decisions; child: the last one applied
+    std::atomic<int> SpeedReq{-1}, StSpeed{0}, StShown{0};
+    std::atomic<u64> StSpeedWho{0};
     AmbientSlowdown Slowdown;
 
     std::atomic<u64> StFrames{0}, StPresTx{0}, StPresRx{0}, StLinkTx{0}, StLinkRx{0}, StInjected{0}, StOpened{0}, StBlockedUs{0}, StExchanges{0};
     std::atomic<u64> StHostWaitUs{0}, StHostWaitCalls{0}, StHostWaitMisses{0}, StHostWaitTimeouts{0};
     std::atomic<u64> StClientWaitUs{0}, StClientWaitCalls{0}, StClientWaitMisses{0};
+    std::atomic<u64> StStale[4] = {};
     std::atomic<u32> StLastBlocked{0}, StLastExch{0}, StLinks{0}, StNearby{0}, StMaxRtt{0};
     std::atomic<u32> StSlowFps{0}, StSlowWait{0}, StSlowExch{0};
     std::atomic<bool> StSlowPending{false}, StSlowDismissRequested{false};
@@ -186,14 +254,21 @@ private:
     void RefreshView(bool force);
     void RebuildCands();
     int Inject(u8* data, u64* timestamp);
+    u64 EmuNow();
     const Peer* PeerByMAC(const u8* mac);
     int SlotByMAC(const u8* mac);
     int OpenLink(const Peer& p);
     void CloseLink(int s, const char* why);
-    void LinksChanged();
+    void LinksChanged(bool opened);
     void NoteBeacon(const u8* data, int len);
     void SendTo(u32 slots, u32 type, const u8* data, int len, u64 timestamp);
-    void Pump(int type);
+    void Pump(int type, int waitMs = -1);
+    void SpeedDecide(int code, u64 who, u64 atUs);
+    void SpeedControl(int slot, const u8* p, size_t n);
+    void SpeedTick();
+    void SendCtl(u32 slots, const u8* m, int n);
+    std::vector<std::pair<u64, QueuedPacket>> Delayed;      // tests (NetSim): received MP frames held until then (us)
+    bool ReleaseDelayed();
     void OnEvent(ENetEvent& ev);
     bool Admit(ENetEvent& ev);
     int Pop(u8* data, u64* timestamp);

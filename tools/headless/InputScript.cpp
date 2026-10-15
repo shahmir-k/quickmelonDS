@@ -341,7 +341,11 @@ void InputScript::OnFrame(int frame, const u32* top, const u32* bot)
             if (el % s.every < s.hold) { progKeys_ = s.keys; progTx_ = s.tx; progTy_ = s.ty; }
             else done = Eval(s.conds, top, bot);
             break;
-        case 4: printf("script %s: %s (frame %d)\n", path_.c_str(), s.text.c_str(), frame + 1); done = true; break;
+        case 4:
+            printf("script %s: %s (frame %d)\n", path_.c_str(), s.text.c_str(), frame + 1);
+            milestones_.push_back(s.text);
+            done = true;
+            break;
         case 5:
             if (Eval(s.conds, top, bot)) { printf("script %s: step %zu (%s) skips %d at frame %d\n", path_.c_str(), pc_ + 1, s.text.c_str(), s.n, frame + 1); pc_ += s.n; }
             done = true;
@@ -365,5 +369,12 @@ void InputScript::OnFrame(int frame, const u32* top, const u32* bot)
         if (s.op != 4) printf("script %s: step %zu (%s) done at frame %d\n", path_.c_str(), pc_ + 1, s.text.c_str(), frame + 1);
         pc_++; stepStart_ = -1; progKeys_ = 0; progTx_ = progTy_ = -1;
     }
+}
+
+std::vector<std::string> InputScript::TakeMilestones()
+{
+    std::vector<std::string> result;
+    result.swap(milestones_);
+    return result;
 }
 }

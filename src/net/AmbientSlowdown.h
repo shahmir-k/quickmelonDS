@@ -18,7 +18,8 @@ public:
         bool Pending = false;
     };
 
-    Sample Observe(u64 nowUs, bool linked, u32 blockedUs, u32 exchanges)
+    // targetFpsX100: the session's frame rate (6000; fast-forward / slow motion: theirs, 0 = uncapped)
+    Sample Observe(u64 nowUs, bool linked, u32 blockedUs, u32 exchanges, u32 targetFpsX100 = 6000)
     {
         if (!linked)
         {
@@ -49,7 +50,10 @@ public:
         Last.WaitUsPerFrame = (u32)(BlockedUs / Frames);
         Last.ExchangesPerFrameX100 = (u32)((u64)Exchanges * 100 / Frames);
 
-        const bool networkSlow = Last.FpsX100 < 5800 && Last.WaitUsPerFrame > 3000 && Exchanges > 0;
+        // below normal speed, or below a slow-motion session's: fast-forward missing its target (often the CPU) is
+        // not a slow network, the waits are judged once the session runs slower than 1x
+        const u64 want = targetFpsX100 && targetFpsX100 < 6000 ? targetFpsX100 : 6000;
+        const bool networkSlow = (u64)Last.FpsX100 * 60 < want * 58 && Last.WaitUsPerFrame > 3000 && Exchanges > 0;
         if (networkSlow)
         {
             RecoverySinceUs = 0;

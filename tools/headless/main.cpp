@@ -124,6 +124,7 @@ struct Options
     // frame:path pairs to dump as PPM. Multiple frames in ONE run (comma-separated in a single
     // --fb-dump-ppm, or the flag repeated) so a visual A/B needs one replay, not one-per-frame.
     std::vector<std::pair<int, std::string>> fbDumps;
+    std::string scriptShotDir;          // capture both screens on each reactive @log milestone
     std::string videoMp4;               // --video-mp4: every frame, through ffmpeg
     std::string checkRecording;         // --check-recording: an app recording's frames.csv
     int reloadAt = -1;                  // --reload-at: load --savestate again after this many frames
@@ -182,6 +183,7 @@ struct Options
         "  --fastmem on|off          JIT fast-memory path (default on; no-op where unsupported)\n"
         "  --fb-hash-every N         print xxhash of both framebuffers every N frames\n"
         "  --fb-dump-ppm <f>:<path>[,<f>:<path>...]  dump both framebuffers at each frame as PPM\n"
+        "  --script-shot-dir <dir>   dump both screens at each @log milestone (directory must exist)\n"
         "                            (multiple frames in ONE run; flag may also repeat)\n"
         "  --audio-interp <mode>     SPU interpolation: none|linear|cosine|cubic|gaussian (default none)\n"
         "  --frameskip N             skip N of every N+1 frames' rasterization (LITEV_AGGRESSIVE_SKIP build)\n"
@@ -266,6 +268,7 @@ bool ParseArgs(int argc, char** argv, Options& o)
         else if (a == "--video-mp4") o.videoMp4 = next("--video-mp4");
         else if (a == "--check-recording") o.checkRecording = next("--check-recording");
         else if (a == "--reload-at") o.reloadAt = std::atoi(next("--reload-at").c_str());
+        else if (a == "--script-shot-dir") o.scriptShotDir = next("--script-shot-dir");
         else if (a == "--fb-dump-ppm")
         {
             // Accept one or more <frame>:<path> pairs, comma-separated, in a single flag (the flag
@@ -918,13 +921,27 @@ int main(int argc, char** argv)
             if (frame == mb + 1) prctl(PR_SET_NAME, "headless");
         }
 #endif
+#ifdef LITEV_AMBIENT_LAN
+        const auto runStart = std::chrono::steady_clock::now();
+#endif
         nds->RunFrame();
+        // LITEV_FRAME_LOAD_MS=<ms> (tests): busy-wait that long a frame, as a slower device's emulation (the RG DS
+        // needs ~10 ms a frame where the Mac needs ~2): link round trips then cost frames as they do there
+        if (static const double loadMs = getenv("LITEV_FRAME_LOAD_MS") ? atof(getenv("LITEV_FRAME_LOAD_MS")) : 0; loadMs > 0)
+        {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(loadMs * 1000));
+            while (std::chrono::steady_clock::now() < until) {}
+        }
+#ifdef LITEV_AMBIENT_LAN
+        if (ambient) ambient->NoteFrameUs((u32)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - runStart).count());
+#endif
         if (inputScript.HasProgram())   // closed-loop script steps (@until / @repeat ... rgb) see this frame's screens
         {
             void* top = nullptr; void* bot = nullptr;
             if (nds->GPU.GetFramebuffers(&top, &bot) && top && bot) inputScript.OnFrame(frame, (const u32*)top, (const u32*)bot);
             else inputScript.OnFrame(frame, nullptr, nullptr);
         }
+        const auto scriptMilestones = inputScript.TakeMilestones();
         if (static const bool p2d = getenv("LITEV_PRINT_2D") != nullptr; p2d)   // display registers after the frame
             fprintf(stderr, "2D f%d A: dispcnt=%08x bldcnt=%04x eva=%d evb=%d evy=%d mb=%04x  B: dispcnt=%08x bldcnt=%04x evy=%d mb=%04x cap=%08x\n", frame,
                     nds->GPU.GPU2D_A.DispCnt, nds->GPU.GPU2D_A.BlendCnt, nds->GPU.GPU2D_A.EVA, nds->GPU.GPU2D_A.EVB, nds->GPU.GPU2D_A.EVY, nds->GPU.MasterBrightnessA,
@@ -1010,17 +1027,41 @@ int main(int argc, char** argv)
         {
             melonDS::MPInterface::Get().Process();
 #ifdef LITEV_AMBIENT_LAN
+            static const auto ambT0 = std::chrono::steady_clock::now();
+            const double ambT = std::chrono::duration<double>(std::chrono::steady_clock::now() - ambT0).count();
+            if (ambient)
+            {
+                // the session's state changes, when they happen (links, the slowdown offer)
+                static u32 lastLinks = 0; static bool lastOffer = false; static int lastVerdict = 0;
+                const auto st = ambient->GetStats();
+                if (st.Verdict != lastVerdict)
+                {
+                    lastVerdict = st.Verdict;
+                    static const char* const kVerdict[] = {"UNKNOWN", "LAN_OK", "LAN_BAD"};
+                    printf("AMBIENT verdict t=%.2fs f%d: %s predicted %.1f fps, emulation %.1f ms, link_rtt %.1f ms\n", ambT, frame,
+                           kVerdict[st.Verdict], st.PredFpsX100 / 100.0, st.EmuUs / 1000.0, st.LinkRttUs / 1000.0);
+                    fflush(stdout);
+                }
+                if (st.Links != lastLinks || st.SlowdownPending != lastOffer)
+                {
+                    lastLinks = st.Links; lastOffer = st.SlowdownPending;
+                    printf("AMBIENT event t=%.2fs f%d: links=%u offer=%d link_rtt=%.1fms\n", ambT, frame, st.Links, st.SlowdownPending ? 1 : 0, st.LinkRttUs / 1000.0);
+                    fflush(stdout);
+                }
+            }
             if (ambient && frame % 120 == 0)
             {
                 const auto st = ambient->GetStats();
-                printf("AMBIENT f%d: nearby=%u links=%u opened=%llu presence tx=%llu rx=%llu link tx=%llu rx=%llu beacons=%llu blocked=%.1fms exch=%llu rtt=%ums slow_fps=%.2f slow_wait=%.2fms slow_exch=%.2f offer=%d host_wait=%.1fms/%llu miss=%llu timeout=%llu client_wait=%.1fms/%llu miss=%llu\n",
+                printf("AMBIENT f%d: nearby=%u links=%u opened=%llu presence tx=%llu rx=%llu link tx=%llu rx=%llu beacons=%llu blocked=%.1fms exch=%llu rtt=%ums slow_fps=%.2f slow_wait=%.2fms slow_exch=%.2f offer=%d host_wait=%.1fms/%llu miss=%llu timeout=%llu client_wait=%.1fms/%llu miss=%llu stale=%llu/%llu/%llu/%llu link_rtt=%.1fms t=%.1fs\n",
                        frame, st.Nearby, st.Links, (unsigned long long)st.LinksOpened, (unsigned long long)st.PresenceTx, (unsigned long long)st.PresenceRx,
                        (unsigned long long)st.LinkTx, (unsigned long long)st.LinkRx, (unsigned long long)st.BeaconsInjected, st.BlockedUs / 1000.0,
                        (unsigned long long)st.Exchanges, st.MaxRttMs, st.SlowFpsX100 / 100.0, st.SlowWaitUsPerFrame / 1000.0,
                        st.SlowExchangesPerFrameX100 / 100.0, st.SlowdownPending ? 1 : 0,
                        st.HostWaitUs / 1000.0, (unsigned long long)st.HostWaitCalls, (unsigned long long)st.HostWaitMisses,
                        (unsigned long long)st.HostWaitTimeouts,
-                       st.ClientWaitUs / 1000.0, (unsigned long long)st.ClientWaitCalls, (unsigned long long)st.ClientWaitMisses);
+                       st.ClientWaitUs / 1000.0, (unsigned long long)st.ClientWaitCalls, (unsigned long long)st.ClientWaitMisses,
+                       (unsigned long long)st.Stale[0], (unsigned long long)st.Stale[1], (unsigned long long)st.Stale[2],
+                       (unsigned long long)st.Stale[3], st.LinkRttUs / 1000.0, ambT);
                 for (const auto& r : ambient->NearbyRows()) printf("AMBIENT  %s\n", r.c_str());
                 fflush(stdout);
             }
@@ -1035,9 +1076,51 @@ int main(int argc, char** argv)
                 printf("\n");
                 fflush(stdout);
             }
+            int period = 16667;
+#ifdef LITEV_AMBIENT_LAN
+            if (ambient)
+            {
+                // the LAN session's fast-forward (AmbientLAN::ToggleSpeed): LITEV_AMBIENT_FF=[NAME@]F:t/F:u...: at frame F
+                // this player presses the key (t: 2x, u: uncapped); NAME@: only the player named NAME
+                static std::map<int, int> ffPlan = [&] {
+                    std::map<int, int> m;
+                    std::string v = getenv("LITEV_AMBIENT_FF") ? getenv("LITEV_AMBIENT_FF") : "";
+                    const size_t at = v.find('@');
+                    if (at != std::string::npos) { if (v.substr(0, at) != opt.ambient) v.clear(); else v = v.substr(at + 1); }
+                    for (size_t i = 0; i < v.size(); )
+                    {
+                        size_t e = v.find('/', i); if (e == std::string::npos) e = v.size();
+                        const std::string t = v.substr(i, e - i);
+                        const size_t c = t.find(':');
+                        if (c != std::string::npos) m[atoi(t.c_str())] = t[c + 1] == 'u' ? 63 : 8;
+                        i = e + 1;
+                    }
+                    return m;
+                }();
+                static int lastSpeed = 0;
+                if (ffPlan.count(frame))
+                    printf("AMBIENT ff press f%d: links=%u shows %d\n", frame, (unsigned)ambient->HasLinks(), ambient->HasLinks() ? ambient->ToggleSpeed(ffPlan[frame]) : -1);
+                const int sp = ambient->HasLinks() ? ambient->Speed() : 0;
+                if (sp != lastSpeed)
+                {
+                    lastSpeed = sp;
+                    printf("AMBIENT speed f%d: %d by '%s'\n", frame, sp, ambient->SpeedWho().c_str());
+                    fflush(stdout);
+                }
+                period = sp == 63 ? 0 : sp ? 16667 * 4 / sp : 16667;
+                // LITEV_AMBIENT_SOLO_FF=<multiplier> (0: uncapped): this player's own fast-forward during discovery; a LAN
+                // session ends it (1x from the first link; leaving the session stays 1x)
+                static float soloFf = getenv("LITEV_AMBIENT_SOLO_FF") ? (float)atof(getenv("LITEV_AMBIENT_SOLO_FF")) : 1.0f;
+                if (ambient->HasLinks() && soloFf != 1.0f) { soloFf = 1.0f; printf("AMBIENT solo ff off f%d: a link opened\n", frame); }
+                if (soloFf != 1.0f) period = soloFf <= 0 ? 0 : (int)(16667 / soloFf);
+            }
+#endif
             if (!getenv("LITEV_LAN_NOPACE"))
             {
-                lanNext += std::chrono::microseconds(16667);
+                lanNext += std::chrono::microseconds(period);
+                // time lost (a link wait, a slow start, uncapped) is not made up in a burst: at most 100 ms behind
+                const auto now = std::chrono::steady_clock::now();
+                if (!period || now - lanNext > std::chrono::milliseconds(100)) lanNext = now;
                 std::this_thread::sleep_until(lanNext);
             }
         }
@@ -1145,6 +1228,23 @@ int main(int argc, char** argv)
             lastTopHash = topHash;
             lastBotHash = botHash;
 
+            if (!opt.scriptShotDir.empty())
+            {
+                for (const auto& label : scriptMilestones)
+                {
+                    std::string safe;
+                    for (unsigned char c : label)
+                        safe += std::isalnum(c) ? (char)c : '_';
+                    if (safe.size() > 48) safe.resize(48);
+                    const std::string path = opt.scriptShotDir + "/f" + std::to_string(frame + 1) + "_" + safe + ".ppm";
+                    if (!DumpPPM(path, (const u32*)top, (const u32*)bot))
+                        fprintf(stderr, "warning: milestone screenshot failed: %s\n", path.c_str());
+                    printf("MILESTONE frame=%d name=%s top=%016llx bottom=%016llx file=%s\n", frame + 1,
+                           safe.c_str(), (unsigned long long)topHash, (unsigned long long)botHash, path.c_str());
+                    fflush(stdout);
+                }
+            }
+
             if (opt.fbHashEvery > 0 && ((frame + 1) % opt.fbHashEvery) == 0)
             {
                 static const bool fbRetire = getenv("LITEV_FB_RETIRE") != nullptr;   // + frames finished, drawn / skip-repeat
@@ -1213,6 +1313,11 @@ int main(int argc, char** argv)
 
     u64 audioHash = XXH3_64bits_digest(audioHashState);
     XXH3_freeState(audioHashState);
+#ifdef LITEV_AMBIENT_LAN
+    // leave the LAN session at the last frame (as the app does on stop): the others see the links close now, not
+    // after the exit's summary work
+    if (ambient) { melonDS::MPInterface::Set(melonDS::MPInterface_Dummy); ambient = nullptr; }
+#endif
 
 #if defined(LITEV_A9HLE) && defined(LITEV_HLE_DIAG)
     if (getenv("LITEV_HLESIG_SCAN")) melonDS::A9HLE::SigScan(*nds);

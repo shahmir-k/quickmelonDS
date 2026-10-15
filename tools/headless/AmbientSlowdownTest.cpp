@@ -11,13 +11,13 @@ using melonDS::u32;
 using melonDS::u64;
 
 static AmbientSlowdown::Sample Run(AmbientSlowdown& detector, u64& now, int frames,
-                                   u32 frameUs, u32 waitUs, u32 exchanges)
+                                   u32 frameUs, u32 waitUs, u32 exchanges, u32 targetFpsX100 = 6000)
 {
     AmbientSlowdown::Sample sample;
     for (int i = 0; i < frames; i++)
     {
         now += frameUs;
-        sample = detector.Observe(now, true, waitUs, exchanges);
+        sample = detector.Observe(now, true, waitUs, exchanges, targetFpsX100);
     }
     return sample;
 }
@@ -67,5 +67,13 @@ int main()
     now += 500000;                                             // pause/background must break the streak
     detector.Observe(now, true, 5000, 3);
     assert(!Run(detector, now, 120, 25000, 5000, 3).Pending);
+
+    // the session's fast-forward: judged against its speed, not 60 fps
+    detector.Observe(now + 25000, false, 0, 0);
+    now += 25000;
+    assert(!Run(detector, now, 1200, 33333, 5000, 3, 3000).Pending);  // 0.5x: 30 fps at its speed is not slow
+    assert(!Run(detector, now, 1200, 5000, 4000, 3, 0).Pending);      // uncapped at 200 fps
+    assert(!Run(detector, now, 1200, 16667, 5000, 3, 12000).Pending); // 2x missing its target, still 60 fps: not slow
+    assert(Run(detector, now, 1200, 25000, 5000, 3, 12000).Pending);  // 2x below 1x with network waits: slow
     std::puts("ambient-slowdown-test: PASS");
 }
