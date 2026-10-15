@@ -1926,7 +1926,7 @@ option(LITEV_GXFIFO_THREADED "DraStic #3: batched GXFIFO threaded-code interpret
 # do not matter. Every enabled LITEV option counts except the host-only ones below; a Mac build
 # made from the app's -DLITEV_* list therefore matches the APK. Bump the protocol string when the
 # handoff wire format or its savestate contents change.
-set(LITEV_HANDOFF_PROTOCOL "sereneds-live-handoff-v2")
+set(LITEV_HANDOFF_PROTOCOL "sereneds-live-handoff-v3")   # v3: N players (pair links, roster, start manifest over every checkpoint)
 set(_host_only "^LITEV_(HEADLESS.*|PROFILE|SOFTPROF|.*STATS|JIT_PERFMAP|JIT_PATCHLOG|HLE_DIAG|A7PROF|SHADOW_ASSERT|IDLE_CENSUS|SLOWMEM_HIST|HOT_ORDER|PGO_.*|THINLTO|MTUNE_.*|SPLIT_FUNCS|PIN_RENDER|TOPO_PIN|NETPLAY_HEADLESS)$")
 get_cmake_property(_cache_vars CACHE_VARIABLES)
 list(SORT _cache_vars)
