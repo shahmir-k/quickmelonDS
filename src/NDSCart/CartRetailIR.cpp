@@ -85,7 +85,7 @@ u8 CartRetailIR::SPITransmitReceive(u8 val)
 
     // TODO: emulate actual IR comm
 
-    u8 ret;
+    u8 ret = 0;   // unknown commands read back 0x00
     switch (IRCmd)
     {
     case 0x00: // pass-through
