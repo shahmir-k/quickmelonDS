@@ -132,6 +132,11 @@ bool BeaconGGID(const u8* d, int len, u32& ggid)
     return true;
 }
 bool IsBeacon(const u8* d, int len) { return len >= 12 + 36 && d[12] == 0x80; }
+// a management frame other than a beacon (auth / assoc / deauth ...), d = DS TX header + 802.11 frame. On air the chip
+// resends a unicast frame until it is acked (the MAC's retry count); the WM sends each handshake frame once and gives the
+// join up 2 s later. So over a link they go reliably (ENet resends a lost one), as the air would: one lost frame of the
+// auth / assoc handshake must not end a talk.
+bool MgmtFrame(u32 type, const u8* d) { return type == 0 && (d[12] & 0x0C) == 0 && d[12] != 0x80; }
 // a beacon's hash without the fields that change every beacon (TX header status, sequence, TSF, DTIM count, the
 // Nintendo IE's active zone / V-count)
 u32 BeaconHash(const u8* d, int len)
@@ -726,6 +731,10 @@ int AmbientLAN::OpenLink(const Peer& p)
     ENetAddress a; a.host = p.IP; a.port = p.LinkPort;
     ENetPeer* e = enet_host_connect(Host, &a, 2, (u32)Cfg.DeviceID);
     if (!e) return -1;
+    // ENet resends a lost connect after its default 500 ms round trip (x2 each time): from the presence round trip
+    // instead (its first ack sets the real one), so a lost connect does not use up the WM's 2 s auth wait
+    e->roundTripTime = std::max<u32>(p.RttUs() / 1000, 20);
+    e->roundTripTimeVariance = e->roundTripTime / 2;
     Link& l = Links[s];
     l = Link();
     l.ID = p.ID; l.Generation = ++NextLinkGeneration; l.P = e; memcpy(l.MAC, p.MAC, 6); l.ActiveMs = NowMs();
@@ -788,7 +797,8 @@ void AmbientLAN::SendTo(u32 slots, u32 type, const u8* data, int len, u64 timest
         }
         // SenderID is unused by Ambient (manual LAN uses it for player id).
         // A separate packet per recipient gives each link a contiguous watermark.
-        ENetPacket* pkt = enet_packet_create(nullptr, sizeof(MPPacketHeader) + len, ENET_PACKET_FLAG_UNSEQUENCED);
+        const bool mg = MgmtFrame(type, data);
+        ENetPacket* pkt = enet_packet_create(nullptr, sizeof(MPPacketHeader) + len, mg ? ENET_PACKET_FLAG_RELIABLE : ENET_PACKET_FLAG_UNSEQUENCED);
         if (!pkt) continue;
         MPPacketHeader h = {kNifi, ++l.TxSeq, type, (u32)len, timestamp};
         if (kFenceTrace && h.SenderID <= 8)
@@ -797,7 +807,7 @@ void AmbientLAN::SendTo(u32 slots, u32 type, const u8* data, int len, u64 timest
         memcpy(pkt->data + sizeof(h), data, len);
         l.LastMP.assign(pkt->data, pkt->data + pkt->dataLength);
         static std::mt19937 lossRandom(std::random_device{}());
-        if (kTestLossPct > 0 && std::uniform_real_distribution<double>(0, 100)(lossRandom) < kTestLossPct)
+        if (!mg && kTestLossPct > 0 && std::uniform_real_distribution<double>(0, 100)(lossRandom) < kTestLossPct)   // (a reliable one is resent)
         { enet_packet_destroy(pkt); continue; }
         if (kTestDropMPSeq && h.SenderID == kTestDropMPSeq)
         {
@@ -1496,7 +1506,8 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
             l->Up = true;
             for (auto& f : l->Pending)
             {
-                ENetPacket* p = enet_packet_create(f.data(), f.size(), ENET_PACKET_FLAG_UNSEQUENCED);
+                const bool mg = MgmtFrame(((const MPPacketHeader*)f.data())->Type, f.data() + sizeof(MPPacketHeader));
+                ENetPacket* p = enet_packet_create(f.data(), f.size(), mg ? ENET_PACKET_FLAG_RELIABLE : ENET_PACKET_FLAG_UNSEQUENCED);
                 enet_peer_send(ev.peer, Chan_MP, p);
                 StLinkTx++;
             }
@@ -1627,8 +1638,7 @@ void AmbientLAN::Pump(int type, int waitMs)
         // stale after a frame (LAN.cpp), but a management frame (auth / assoc / deauth) waits for the chip up to 1 s: a
         // parent's chip only listens around its beacons, and a child here does not send right after a real beacon
         // (it heard a synthesized one), so its auth request arrives while the parent dozes
-        const u8 fc = p->data[sizeof(MPPacketHeader) + 12];
-        const u32 keep = (h->Type == 0 && (fc & 0x0C) == 0 && fc != 0x80) ? 1000 : 16;
+        const u32 keep = MgmtFrame(h->Type, p->data + sizeof(MPPacketHeader)) ? 1000 : 16;
         if (h->Magic > now || now - h->Magic > keep)
         {
             if (kWaitTrace)
