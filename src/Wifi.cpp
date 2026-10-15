@@ -358,6 +358,10 @@ void Wifi::DoSavestate(Savestate* file)
 #ifdef LITEV_LAN_EARLY_REPLY
     if (!file->Saving) EarlyReplyLen = -1;
 #endif
+    // the link bookkeeping of an exchange in progress is not in a savestate: a loaded state starts with
+    // none, as a new console does (a live handoff's replica reloaded after its proof frames kept a stale
+    // MPInExchange: HandoffBusyMask() != 0, the cut rolled back - ret9-mac)
+    if (!file->Saving) { MPInExchange = false; MPRepliesPending = false; }
 #ifdef LITEV_WIFI_EVT
     // own section: states without it (other builds) load with no idle ticks pending
     if (!file->Saving && !file->HasSection("WEVT"))
@@ -2133,6 +2137,7 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
         timestamp = 0;
 #ifdef LITEV_AMBIENT_LAN
         WifiUs = USTimestamp;
+        WifiChannel = CurChannel;   // (process-wide: a live Netplay session's other consoles set it too)
 #endif
 
         if (type == 0)

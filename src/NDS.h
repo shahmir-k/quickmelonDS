@@ -493,6 +493,20 @@ public: // TODO: Encapsulate the rest of these members
     int MPHostPollInst = 0;
 #endif
 #endif
+    // a console that outlives its Netplay link (a live session's end: it plays on in Ambient) lets go of every
+    // hook the link put on it (SetWake): the next MP its game does would call into the freed link
+    void DetachMPLink() noexcept
+    {
+#ifdef LITEV_MP_CLOCKWAKE
+        MPWakeAt = nullptr; MPWake = nullptr;
+#ifdef LITEV_MP_POLL_INLINE
+        MPHostPoll = nullptr; MPHostPollCtx = nullptr;
+#endif
+#endif
+#ifdef LITEV_WIFI_EVT
+        MPHostQuiet = nullptr; MPHostQuietCtx = nullptr;
+#endif
+    }
 #ifdef LITEV_LCD_EVT
     bool LcdMerge = false;   // this slice runs with both CPUs halted (GPU::LcdRun runs every LCD step due)
 #endif

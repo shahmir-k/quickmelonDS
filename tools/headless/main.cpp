@@ -2161,6 +2161,9 @@ int main(int argc, char** argv)
                                     atEnd[k].Firmware.assign(fw.Buffer(), fw.Buffer() + fw.Length());
                                 }
                                 const auto snapped = std::chrono::steady_clock::now();   // (test-only work ends)
+                                // the session's link lets go of every console first (its hooks on ours would call into
+                                // the freed link the next time the game does MP)
+                                mine.nds->DetachMPLink();
                                 for (int k = 0; k < (int)ended.Consoles.size(); k++)
                                     if (k != me) { ended.Consoles[k].nds.reset(); ended.Consoles[k].udata.reset(); }
                                 mine.nds->JIT.JitEnableExecute();
@@ -2176,7 +2179,11 @@ int main(int argc, char** argv)
                                 std::vector<u64> realHash;
                                 const u64 exchBefore = ambient->GetStats().Exchanges;
                                 auto pace = std::chrono::steady_clock::now();   // solo: 60 fps from the first frame (no catch-up)
-                                auto last = ended.StoppedAt[me];
+                                // (from the end of the session's own teardown: the waits before it - the peer's copy
+                                // reaching the last frame, the peer's scheduled inputs - exist only for the
+                                // reference below; a device drops its copies of the others at once)
+                                const double testWaitMs = std::chrono::duration<double, std::milli>(returned - ended.StoppedAt[me]).count();
+                                auto last = returned;
                                 for (int f = F + 1; f <= F + exitFrames; f++)
                                 {
                                     const auto start = std::chrono::steady_clock::now();
@@ -2197,6 +2204,8 @@ int main(int argc, char** argv)
                                     if (in.TouchX >= 0) mine.nds->TouchScreen(in.TouchX, in.TouchY);
                                     else mine.nds->ReleaseScreen();
                                     mine.nds->RunFrame();
+                                    if ((f - F) % 120 == 0)
+                                    { printf("AMBIENT after exit f%d: %s\n", f, ambient->DebugLine().c_str()); fflush(stdout); }
                                     liteds::AudioTapDrain(*mine.nds, 2, f);
                                     if (i < (int)sched.size()) realHash.push_back(NetplayLiveProofHash(*mine.nds));
                                     if (live.HasProgram())   // closed-loop script steps see this frame's screens
@@ -2257,8 +2266,8 @@ int main(int argc, char** argv)
                                 }
                                 printf("CUTFENCE %s live exit after f%d: back in Ambient, pause %.1f ms (worst later frame gap %.1f ms), "
                                        "%zu scheduled inputs applied, then live; link=%u; frames after the exit equal to an "
-                                       "uninterrupted session: %d of %zu; Ambient exchanges after the exit: %llu\n", cutRole, F, pauseMs, worstMs, sched.size(),
-                                       ambient->GetStats().Links, same, n, (unsigned long long)(ambient->GetStats().Exchanges - exchBefore));
+                                       "uninterrupted session: %d of %zu; Ambient exchanges after the exit: %llu (test-only waits before: %.1f ms)\n", cutRole, F, pauseMs, worstMs, sched.size(),
+                                       ambient->GetStats().Links, same, n, (unsigned long long)(ambient->GetStats().Exchanges - exchBefore), testWaitMs);
                                 fflush(stdout);
                                 return trialResult == 0 ? 0 : 2;
                             }
