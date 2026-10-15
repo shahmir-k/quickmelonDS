@@ -12,7 +12,18 @@
 @press T:217:179 hold 6 gap 500
 @press T:200:55 hold 6 gap 300
 @log offered
-# The exchange returns here, not to the Union Room. Do not send more A presses.
+# both offered: accept "select one each", pick the partner's offer (the first tap closes the prompt), TRADE, confirm
 @wait 120
-@until rgb top 0 0 120 14 73 73 73 10 & rgb bot 4 10 120 14 208 206 208 15 timeout 9000
+@press T:200:55 hold 6 gap 400
+@log select one each
+@wait 60
+@press T:60:54 hold 6 gap 300
+@press T:60:45 hold 6 gap 300
+@log picked
+@press T:200:133 hold 6 gap 300
+@press T:200:156 hold 6 gap 300
+@log trade confirmed
+# the exchange (animation, "Stopping communications" = the save), then the offer screen again
+@until !rgb top 0 0 120 14 73 73 73 10 timeout 3000
+@until rgb top 0 0 120 14 73 73 73 10 & rgb bot 4 10 120 14 208 206 208 15 timeout 20000
 @log returned to trade selection

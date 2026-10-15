@@ -27,7 +27,7 @@ typedef int socklen_t;
 #include "AmbientLAN.h"
 #include "Platform.h"
 #include "MPLinkFlags.h"
-#if defined(LITEV_LAN_RX_SPIN) && defined(__ANDROID__)
+#ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
 
@@ -61,7 +61,8 @@ u32 NowMs() { return (u32)(NowUs() / 1000); }
 // Tests: a slower network on the receiving side of each end (set on both ends: the round trip). A received MP frame or
 // presence ping / pong is held RTT/2 +- JITTER/2 ms, LOSS % are dropped (env LITEV_AMBIENT_RTT_MS, _JITTER_MS, _LOSS).
 // LITEV_AMBIENT_RTT_AT=S:MS[:R]: the RTT goes to MS from S s after start, over R s; LITEV_AMBIENT_SPIKE=EVERY:DUR:MS:
-// MS for DUR ms every EVERY ms. ENet's handshake, acks and control channel are not held.
+// MS for DUR ms every EVERY ms. ENet's handshake, acks and control channel are not held. Android (device tests):
+// debug.litev.ambdelay=RTT[:JITTER[:LOSS]], read when the first LAN session or presence packet needs it.
 struct NetSim
 {
     double Rtt = 0, Jit = 0, Loss = 0, AtS = -1, AtRtt = 0, RampS = 0, SpEvery = 0, SpDur = 0, SpRtt = 0;
@@ -73,6 +74,10 @@ struct NetSim
         Rtt = f("LITEV_AMBIENT_RTT_MS", 0); Jit = f("LITEV_AMBIENT_JITTER_MS", 0); Loss = f("LITEV_AMBIENT_LOSS", 0);
         if (const char* v = getenv("LITEV_AMBIENT_RTT_AT")) sscanf(v, "%lf:%lf:%lf", &AtS, &AtRtt, &RampS);
         if (const char* v = getenv("LITEV_AMBIENT_SPIKE")) sscanf(v, "%lf:%lf:%lf", &SpEvery, &SpDur, &SpRtt);
+#ifdef __ANDROID__
+        char b[PROP_VALUE_MAX] = {};
+        if (__system_property_get("debug.litev.ambdelay", b) > 0) sscanf(b, "%lf:%lf:%lf", &Rtt, &Jit, &Loss);
+#endif
         On = Rtt > 0 || Jit > 0 || Loss > 0 || AtS >= 0 || SpEvery > 0;
     }
     double RttMs(u64 now) const
@@ -93,7 +98,7 @@ struct NetSim
         return ms <= 0 ? 0 : (u64)(ms * 1000);
     }
 };
-const NetSim kSim;
+const NetSim& Sim() { static const NetSim s; return s; }
 u16 G16(const u8* p) { return p[0] | p[1] << 8; }
 u32 G32(const u8* p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24; }
 void P16(std::vector<u8>& v, u16 x) { v.push_back(x); v.push_back(x >> 8); }
@@ -300,7 +305,7 @@ std::vector<u8> AmbientLAN::BuildPing(u8 kind, u64 t)
 u32 AmbientLAN::Peer::RttUs() const
 {
     if (!RttN) return 0;
-    u32 v[8];
+    u32 v[16];
     std::copy(RttS, RttS + RttN, v);
     std::nth_element(v, v + (RttN - 1) / 2, v + RttN);
     return v[(RttN - 1) / 2];       // (the lower median: half the window may spike)
@@ -351,8 +356,8 @@ u8 AmbientLAN::HandlePresence(const u8* p, int n, u32 ip, u16 port, u32 now, boo
         const u64 nowUs = NowUs();
         if (t > nowUs || nowUs - t > 10000000) return 0;      // (not one of ours)
         it->RttS[it->RttPos] = (u32)std::min<u64>(nowUs - t, 1000000);
-        it->RttPos = (it->RttPos + 1) % 8;
-        if (it->RttN < 8) it->RttN++;
+        it->RttPos = (it->RttPos + 1) % 16;
+        if (it->RttN < 16) it->RttN++;
         it->Recv++;
         return 0;
     }
@@ -441,9 +446,9 @@ void AmbientLAN::PresenceLoop()
                     const int n = (int)recvfrom(s, (char*)buf, sizeof(buf), 0, (sockaddr*)&from, &fl);
 #endif
                     if (n <= 0) break;
-                    if (kSim.On && n >= 32 && (buf[5] == P_Ping || buf[5] == P_Pong))
+                    if (Sim().On && n >= 32 && (buf[5] == P_Ping || buf[5] == P_Pong))
                     {
-                        const u64 hold = kSim.Hold(NowUs());
+                        const u64 hold = Sim().Hold(NowUs());
                         if (hold != ~0ull) held.push_back({NowUs() + hold, std::vector<u8>(buf, buf + n), from.sin_addr.s_addr, ntohs(from.sin_port)});
                     }
                     else handle(buf, n, from.sin_addr.s_addr, ntohs(from.sin_port), s == BcastSock);
@@ -571,6 +576,7 @@ AmbientLAN::Stats AmbientLAN::GetStats()
     s.ClientWaitUs = StClientWaitUs; s.ClientWaitCalls = StClientWaitCalls; s.ClientWaitMisses = StClientWaitMisses;
     for (int t = 0; t < 4; t++) s.Stale[t] = StStale[t];
     s.LinkRttUs = LinkRttUs;
+    s.LinkTxBytes = StLinkTxBytes; s.LinkRxBytes = StLinkRxBytes;
     s.EmuUs = EmuBaseUs; s.PredFpsX100 = StPredFps; s.Verdict = StVerdict;
     s.LastFrameBlockedUs = StLastBlocked; s.LastFrameExchanges = StLastExch; s.Links = StLinks; s.Nearby = StNearby; s.MaxRttMs = StMaxRtt;
     s.SlowFpsX100 = StSlowFps; s.SlowWaitUsPerFrame = StSlowWait;
@@ -796,6 +802,7 @@ void AmbientLAN::SendTo(u32 slots, u32 type, const u8* data, int len, u64 timest
             enet_packet_destroy(pkt); l.SequenceOverflow = true; continue;
         }
         StLinkTx++;
+        StLinkTxBytes += len;
         if (kTrace) Trace("tx", s, type, data, len, timestamp);
         sent = true;
     }
@@ -1434,6 +1441,7 @@ bool AmbientLAN::Admit(ENetEvent& ev)
     if (!(f[10] & 1)) memcpy(l->MAC, f + 10, 6);     // (the sender's own MAC)
     if (f[0] == 0xC0 && !l->CloseAtMs) l->CloseAtMs = NowMs() + 500;   // deauth: the session is over
     StLinkRx++;
+    StLinkRxBytes += h->Length;
     if (kTrace) Trace("rx", s, h->Type, ev.packet->data + sizeof(MPPacketHeader), (int)h->Length, h->Timestamp);
     return true;
 }
@@ -1634,13 +1642,13 @@ void AmbientLAN::Pump(int type, int waitMs)
                 {
                     const Link* l = (const Link*)ev.peer->data;
                     const QueuedPacket q = {ev.packet, l->ID, l->Generation, (int)(l - Links)};
-                    if (!kSim.On)
+                    if (!Sim().On)
                     {
                         ((MPPacketHeader*)ev.packet->data)->Magic = NowMs();
                         RX.push_back(q);
                         return;
                     }
-                    const u64 hold = kSim.Hold(NowUs());
+                    const u64 hold = Sim().Hold(NowUs());
                     if (hold == ~0ull) enet_packet_destroy(ev.packet);
                     else Delayed.push_back({NowUs() + hold, q});
                 }
@@ -1818,18 +1826,25 @@ void AmbientLAN::Process()
 }
 
 // the wait for a peer's MP frame: RecvTimeout, or the link's round trip + margin when that is longer (a slow network
-// keeps its session, slowly, until it moves to Netplay), at most 250 ms; the longest of the last 8 round trips, not
-// their median: a spike of 100 ms (Wi-Fi) holds the session for the next 2 s
+// keeps its session, slowly, until it moves to Netplay), at most 250 ms; the longest of the last 16 round trips (4 s
+// linked), not their median: a 100 ms Wi-Fi spike keeps the waits long for the next 4 s
 int AmbientLAN::LinkWaitMs() const
 {
     return std::max(RecvTimeout, std::min(250, (int)(LinkRttMaxUs * 3 / 2000) + 10));
+}
+
+// one exchange a frame does not fit 58 fps because of the round trip: this device alone fits it (a device too slow
+// for 58 fps on its own is no case for Netplay: Netplay would not make it faster) and the round trip is 2 ms or more
+bool AmbientLAN::LinkRule(u32 emuUs, u32 rttUs)
+{
+    return emuUs < 1000000 / 58 && rttUs >= 2000 && emuUs + rttUs > 1000000 / 58;
 }
 
 AmbientLAN::Verdict AmbientLAN::PeerVerdict(u64 id)
 {
     std::lock_guard<std::mutex> g(Mu);
     for (const auto& p : Peers)
-        if (p.ID == id) return p.RttN < 3 ? Verdict_Unknown : EmuBaseUs + p.RttUs() > 1000000 / 58 ? Verdict_LanBad : Verdict_LanOk;
+        if (p.ID == id) return p.RttN < 3 ? Verdict_Unknown : LinkRule(EmuBaseUs, p.RttUs()) ? Verdict_LanBad : Verdict_LanOk;
     return Verdict_Unknown;
 }
 
@@ -1859,13 +1874,14 @@ void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
     {
         if (StVerdict) Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict cleared (no links)\n");
         StVerdict = Verdict_Unknown; StPredFps = 0;
-        FirstExchUs = VT0 = 0; VFrames = VExch = VRunN = VBad = VWeak = VOk = 0; VRunUs = 0; VerdictDismissed = false;
+        FirstExchUs = VT0 = 0; VFrames = VExch = VRunN = VBad = VWeak = VOk = 0; VExchFrames = 0; VRunUs = 0; VerdictDismissed = false;
         return;
     }
     const u64 stalls = StHostWaitTimeouts + StClientWaitMisses;
     if (frameExchanges && !FirstExchUs) FirstExchUs = now;
     if (!VT0) { VT0 = now; VStallAt = stalls; VEmuAtLink = EmuBaseUs; }
     VFrames++; VExch += frameExchanges;
+    if (FirstExchUs) VExchFrames++;
     if (run) { VRunUs += run; VRunN++; }
     if (now - VT0 < 500000) return;
     const u32 rtt = LinkRttUs;
@@ -1875,17 +1891,21 @@ void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
         const double frame = VRunN ? (double)VRunUs / VRunN : EmuBaseUs + net;
         const double pred = std::min(60.0, 1e6 / frame);
         StPredFps = (u32)(pred * 100);
-        // strong: the round trips alone take the frames below 50 fps (50: a margin, a 55-57 fps LAN is no case for
-        // Netplay), or one exchange a frame does not fit 58; weak: they take 40% of the frame with no wait timing out
-        // (a partner slow too; a timeout = a partner loading, an MKDS race start)
-        // (E: the session's lowest, a loading phase emulates more)
-        const bool strong = (frame > 1e6 / 50 && frame - net <= 1e6 / 58) || std::min<u32>(VEmuAtLink, EmuBaseUs) + rtt > 1000000 / 58;
-        const bool weak = frame > 1e6 / 50 && net >= frame * 0.4 && stalls == VStallAt;
-        VBad = strong ? VBad + 1 : 0;
+        // the link rule (2 windows): one exchange a frame does not fit 58 (E: the session's lowest; a loading phase
+        // emulates more). With no wait timing out and frames missing 50 fps (a margin: 55-57 fps is no case for
+        // Netplay), 4 windows: they make 50 without the round trips; or (only after 600 frames of exchanges) the round
+        // trips take 40% of them and they make 40 without (a partner slow too). 4 windows and the 600 frames wait out
+        // setup bursts: an MKDS lobby / race start runs 5-6 exchanges a frame at 14-48 fps at 0 ms for ~400 frames,
+        // then 1 a frame (Pokémon B/W: 2 a frame from link to the end, Shrek 3: no burst)
+        const bool linkRule = LinkRule(std::min<u32>(VEmuAtLink, EmuBaseUs), rtt);
+        const bool calm = frame > 1e6 / 50 && stalls == VStallAt && net >= 2000;     // (2 ms: a round trip that matters)
+        const bool strong = linkRule || (calm && frame - net <= 1e6 / 50);
+        const bool weak = calm && net >= frame * 0.4 && frame - net <= 1e6 / 40 && VExchFrames >= 600;
+        VBad = linkRule ? VBad + 1 : 0;
         VWeak = strong || weak ? VWeak + 1 : 0;
         VOk = strong || weak ? 0 : VOk + 1;
         int v = StVerdict;
-        if (VBad >= 2 || VWeak >= 6) v = Verdict_LanBad;
+        if (VBad >= 2 || VWeak >= 4) v = Verdict_LanBad;
         else if (VOk >= (v == Verdict_LanBad ? 4u : 2u)) v = Verdict_LanOk;
         if (v != StVerdict)
         {

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Four-process Just Play regression. Requires an MKDS ROM and the p0..p3 input
-# scripts that navigate into the same race. No output path is ever deleted.
+# scripts that navigate into the same race. No output path is ever deleted. Off the default Ambient ports (presence
+# 17065, links 17066+): a device on this LAN (and a device test using this Mac's 7065 / 7066) never sees these.
 set -euo pipefail
 
 if [[ $# -ne 3 && $# -ne 4 ]]; then
@@ -44,7 +45,7 @@ for seat in 0 1 2 3; do
     identity=$(printf '00000000e1e0%04x' "$seat")
     (
         cd -- "$output/p$seat"
-        env LITEV_AMBIENT_ID="$identity" "$binary" \
+        env LITEV_AMBIENT_ID="$identity" LITEV_AMBIENT_PPORT=17065 LITEV_AMBIENT_LPORT=17066 "$binary" \
             --rom "$rom" --input-script "$scripts/p$seat.txt" \
             --frames "$frames" --data-dir hd --ambient "P$seat" > log.txt 2>&1
     ) &

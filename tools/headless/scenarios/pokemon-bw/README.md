@@ -6,10 +6,8 @@ advance, then `@log` marks each milestone. The headless `--script-shot-dir` opti
 both DS screens at the exact milestone frame; the runner records SHA-256 of each PPM and
 the core's XXH3 hashes, confirms the phases are in order and visually distinct, and
 rejects any script timeout, guest abort, process failure or missing phase. Only a complete
-zero-delay baseline permits a delayed case. The trade scripts are a candidate, **not** a
-validated complete trade: the historical zero-delay run reached both `offered` marks but
-timed out before returning to the Union Room. That is an honest baseline failure, not a
-measured latency limit. The battle scripts did historically return to the battle room.
+zero-delay baseline permits a delayed case. The trade scripts complete a trade (proven from the
+saves, below); the battle scripts return to the battle room.
 
 Build this branch's Mac headless with `LITEV_HEADLESS_LAN` and `LITEV_AMBIENT_LAN` enabled.
 Supply *your own* Black/White ROMs, matching `.ml5` savestates and `.sav` files. No
@@ -34,14 +32,12 @@ and a JSON result in a new directory; the runner never removes previous results.
 are copied (not symlinked or hardlinked), input copies are read-only, and hashes are
 checked before and after. The original game files are never passed to the emulators.
 
-For the fixed trade fixtures, the last script step waits passively for the trade
-selection panel (the game does not return to the Union Room). The runner compares
-the trainer-board icon colors at `offered` and `returned to trade selection` on
-**both** consoles: blue/orange must become orange/blue on Black, and the reverse on
-White. Missing, grayscale or unexpectedly colored icons fail closed. The historical
-final screenshots match the expected *post*-trade colors, but there is no saved
-`offered` frame from that run, so this before/after oracle remains unproven until a
-fresh zero-delay baseline. No trade latency claim may be made before it passes.
+The trade scripts run the whole exchange: both offer, accept "select one each", pick the partner's
+offer, TRADE, confirm; the games trade, save ("Stopping communications") and return to the offer
+screen. The runner proves the trade from the saves the games wrote (`LITEV_HEADLESS_SAVOUT`): every
+Pokémon in the 24 boxes and the party is decoded (Gen 5 PK5) and Black must have given one species and
+got another, White the reverse (the fixtures: Black's Latios for White's Darumaka "CUTIE"). Entering
+the Union Room saves too, so a changed save alone proves nothing. A run without a trade fails closed.
 
 NetSim (`LITEV_AMBIENT_RTT_MS`, `_JITTER_MS`, `_LOSS`, `_RTT_AT`, `_SPIKE`; AmbientLAN.cpp) holds the
 received MP frames and presence pings / pongs on both ends; ENet's connection setup, acks and

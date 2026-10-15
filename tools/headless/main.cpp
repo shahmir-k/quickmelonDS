@@ -1144,6 +1144,8 @@ int main(int argc, char** argv)
         memcpy(c.GameCode, nds->NDSCartSlot.GetCart()->GetHeader().GameCode, 4);
         if (getenv("LITEV_AMBIENT_UPORT")) c.UnicastPort = (u16)atoi(getenv("LITEV_AMBIENT_UPORT"));
         if (getenv("LITEV_AMBIENT_PPORT")) c.PresencePort = (u16)atoi(getenv("LITEV_AMBIENT_PPORT"));   // (tests: a router that drops broadcast)
+        // (tests: off the default ports, so Mac test runs never meet a device's discovery or a device test's ports)
+        if (getenv("LITEV_AMBIENT_LPORT")) c.LinkPort = (u16)atoi(getenv("LITEV_AMBIENT_LPORT"));
         if (getenv("LITEV_AMBIENT_VIS")) c.Vis = atoi(getenv("LITEV_AMBIENT_VIS"));
         auto a = std::make_unique<melonDS::AmbientLAN>(c);
         if (!a->Ok()) { fprintf(stderr, "Ambient: could not start\n"); return 1; }
@@ -1489,6 +1491,24 @@ int main(int argc, char** argv)
                 if (frame >= start)
                     printf("CUTSCAN f%d busy=%02x queued=%zu\n", frame,
                            nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames());
+            }
+            // LITEV_AMBIENT_TIMELINE=1: the LAN session's traffic every 0.25 s (exchanges = CMDs sent / received, MP frames
+            // and their bytes each way) for burst-vs-steady studies
+            if (static const bool tl = getenv("LITEV_AMBIENT_TIMELINE") != nullptr; tl && ambient)
+            {
+                static double t0 = -1; static int f0 = 0; static melonDS::AmbientLAN::Stats s0 = {};
+                if (t0 < 0) { t0 = ambT; f0 = frame; s0 = ambient->GetStats(); }
+                if (ambT - t0 >= 0.25)
+                {
+                    const auto s1 = ambient->GetStats();
+                    const int n = std::max(1, frame - f0);
+                    if (s1.Links)
+                        printf("AMBTL t=%.2f f%d frames=%d exch/f=%.2f tx/f=%.2f rx/f=%.2f txB/f=%.0f rxB/f=%.0f fps=%.1f links=%u\n", ambT, frame, n,
+                               (double)(s1.Exchanges - s0.Exchanges) / n, (double)(s1.LinkTx - s0.LinkTx) / n,
+                               (double)(s1.LinkRx - s0.LinkRx) / n, (double)(s1.LinkTxBytes - s0.LinkTxBytes) / n,
+                               (double)(s1.LinkRxBytes - s0.LinkRxBytes) / n, n / (ambT - t0), s1.Links);
+                    t0 = ambT; f0 = frame; s0 = s1;
+                }
             }
             if (ambient && frame % 120 == 0)
             {

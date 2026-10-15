@@ -69,6 +69,7 @@ public:
         u64 Stale[4];               // MP frames dropped as stale (too old for the chip), by type: regular, CMD, reply, ack
         u32 LastFrameBlockedUs, LastFrameExchanges, Links, Nearby, MaxRttMs;
         u32 LinkRttUs;              // the slowest linked device's median presence round trip
+        u64 LinkTxBytes, LinkRxBytes;   // MP frame bytes (DS TX header + 802.11 frame) over the links
         u32 EmuUs, PredFpsX100;     // emulation per frame (no link waits); the session's predicted fps (SessionVerdict)
         int Verdict;                // SessionVerdict
         u32 SlowFpsX100, SlowWaitUsPerFrame, SlowExchangesPerFrameX100;
@@ -110,21 +111,26 @@ public:
     void NoteFrameUs(u32 us) { RunUs = us; }
 
     // Can a LAN session hold 58 fps on this network, or should it be Netplay? From the presence round trips (RTT: the
-    // median of the last 8; same-game or hosting devices 1 a second, linked ones 4) and this device's emulation per
+    // median of the last 16; same-game or hosting devices 1 a second, linked ones 4) and this device's emulation per
     // frame (E: NoteFrameUs without the link waits; the lowest half-second average of the last 2 s, as a loading
     // phase emulates more; 10 ms until measured, an RG DS). Each MP exchange stops emulation for one round trip.
     //  - PeerVerdict (a device, before or at link open): LAN_BAD when E + 1 x RTT > 1000/58 ms (not even one exchange
-    //    a frame fits; RG DS: RTT above ~7 ms), UNKNOWN before 3 round trips.
+    //    a frame fits), with E alone under it (a device slow on its own is no case for Netplay) and RTT >= 2 ms;
+    //    UNKNOWN before 3 round trips. RG DS #1 measured E 3.8-4.8 ms in Pokémon B/W: LAN_BAD above ~12.5 ms.
     //  - SessionVerdict (the live session), a vote every 0.5 s from 1 s after the first exchange, from the window's
     //    frames F (NoteFrameUs: emulation + link waits, no pacing) and round trips N = exchanges/frame x RTT:
-    //      strong: F misses 50 fps and F - N makes 58 (the network alone), or the PeerVerdict rule holds (with the
-    //        lower of E now and at link: a loading phase emulates more);
-    //      weak: F misses 50 fps and N is 40% of F, with no wait timing out (a partner slow too: Shrek, 3 exchanges a
-    //        frame, 50 fps at 0 ms, 27 at 6 ms; a timeout is a partner loading, as at an MKDS race start, 0 ms too).
-    //    LAN_BAD after 2 strong windows in a row or 6 strong / weak ones, back to LAN_OK after 4 good ones. 50: a
-    //    margin (a 55-57 fps LAN is no case for Netplay); a spike moves neither the median nor 2 windows; pacing is
-    //    not in it (fast-forward never makes it bad); one exchange a frame on a 0-5 ms LAN stays under 20 ms.
-    //    LAN_BAD also raises Stats::SlowdownPending (the Netplay offer) at once.
+    //      the link rule (the PeerVerdict rule, with the lower of E now and at link: a loading phase emulates more):
+    //        LAN_BAD after 2 windows in a row;
+    //      with F missing 50 fps and no wait timing out (a timeout: a partner loading), LAN_BAD after 4 in a row:
+    //        F - N makes 50 (the network holds it back), or, after 600 frames of exchanges, N is 40% of F and F - N
+    //        makes 40 (a partner slow too).
+    //    Back to LAN_OK after 4 good windows. Setup bursts, measured at 0 ms: an MKDS lobby / race start runs 5-6
+    //    exchanges a frame at 14-48 fps for ~400 frames, then 1 a frame; Pokémon B/W runs 2 a frame from link to the
+    //    end (join, room, trade, battle), Shrek 3 (no burst). The 4 windows, the timeouts a burst brings and the 600
+    //    frames keep a burst on a delay where steady play is fine from switching. All steady rates are >= 1 a frame,
+    //    as the link rule assumes. RTT here: the median of 16 (4 s linked): a Wi-Fi spike moves neither it nor 2
+    //    windows. 50: a margin; pacing is not in it (fast-forward never makes it bad); one exchange a frame on a 0-5
+    //    ms LAN stays under 20 ms. LAN_BAD also raises Stats::SlowdownPending at once.
     enum Verdict { Verdict_Unknown = 0, Verdict_LanOk = 1, Verdict_LanBad = 2 };
     Verdict PeerVerdict(u64 id);
     Verdict SessionVerdict() const { return (Verdict)StVerdict.load(); }
@@ -211,8 +217,8 @@ public:
         std::string Name;
         std::vector<u8> Beacon;     // the DS TX header + beacon frame as sent (empty: not beaconing)
         u64 BeaconUs = 0;           // when it arrived (TSF aging)
-        // presence round trips (same game only): the last 8, the loss of the last 16 pings
-        u32 RttS[8] = {};
+        // presence round trips (same game or hosting, linked): the last 16, the loss of the last 16 pings
+        u32 RttS[16] = {};
         u8 RttN = 0, RttPos = 0, PingN = 0, LossPct = 0;
         u16 Sent = 0, Recv = 0;
         u32 PingMs = 0;
@@ -295,7 +301,7 @@ private:
     std::vector<u8> BuildPing(u8 kind, u64 t);
     u64 PingEcho = 0;                                       // presence thread
     std::atomic<u32> LinkRttUs{0};                          // the slowest linked device's median round trip
-    std::atomic<u32> LinkRttMaxUs{0};                       // ... and the longest of their last 8 (the link waits)
+    std::atomic<u32> LinkRttMaxUs{0};                       // ... and the longest of their last 16 (the link waits)
 
     // ---- links + synthesis (emulator thread) ----
     ENetHost* Host = nullptr;
@@ -335,6 +341,7 @@ private:
     u64 FirstExchUs = 0, VT0 = 0, VRunUs = 0, VStallAt = 0;     // the session verdict's windows
     u32 VEmuAtLink = 0;
     u32 VFrames = 0, VExch = 0, VRunN = 0, VBad = 0, VWeak = 0, VOk = 0;
+    u64 VExchFrames = 0;            // frames since the first exchange (the weak rule waits out setup bursts)
     std::atomic<u32> EmuBaseUs{10000};      // E: the lowest half-second emulation average of the last 2 s
     u64 EmT0 = 0, EmSum = 0;
     u32 EmN = 0, EmPos = 0, EmRing[4] = {};
@@ -342,6 +349,7 @@ private:
     std::atomic<int> StVerdict{0};
     std::atomic<u32> StPredFps{0};
     int LinkWaitMs() const;
+    static bool LinkRule(u32 emuUs, u32 rttUs);
     void Judge(u32 frameBlocked, u32 frameExchanges);
     int PendCode = -1;              // group speed to apply at PendAtUs (chip clock), from PendWho
     u64 PendAtUs = 0, PendWho = 0, PendWallUs = 0;
@@ -354,6 +362,7 @@ private:
     std::atomic<u64> StHostWaitUs{0}, StHostWaitCalls{0}, StHostWaitMisses{0}, StHostWaitTimeouts{0};
     std::atomic<u64> StClientWaitUs{0}, StClientWaitCalls{0}, StClientWaitMisses{0};
     std::atomic<u64> StStale[4] = {};
+    std::atomic<u64> StLinkTxBytes{0}, StLinkRxBytes{0};
     std::atomic<u32> StLastBlocked{0}, StLastExch{0}, StLinks{0}, StNearby{0}, StMaxRtt{0};
     std::atomic<u32> StSlowFps{0}, StSlowWait{0}, StSlowExch{0};
     std::atomic<bool> StSlowPending{false}, StSlowDismissRequested{false};
