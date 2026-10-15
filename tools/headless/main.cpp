@@ -663,6 +663,9 @@ static int MultiCutFrame(MultiCut& mc, std::unique_ptr<NDS>& nds, AmbientLAN* am
         fflush(stdout);
         return -1;
     }
+    // a member aborted (its fence, a vote, a lost link) before this one froze: roll back too
+    if (ambient->HandoffFenceAborted() && ambient->GetHandoffFenceStats().Epoch) return fail("a member aborted the cut before this console froze");
+    if (std::chrono::steady_clock::now() - mc.BaselineAt > std::chrono::seconds(40)) return fail("no cut within 40 s of the roster");
     // the cut: the parent (not an MP client) freezes first when idle; a child once a fence reached it
     bool baselines = std::chrono::steady_clock::now() - mc.BaselineAt > std::chrono::seconds(20);
     if (!baselines) { baselines = true; for (auto& l : mc.Links) if (l && !l->BaselineAcked()) baselines = false; }
@@ -1597,6 +1600,12 @@ int main(int argc, char** argv)
         fprintf(stderr, "warning: --lan-join ignored (build lacks LITEV_HEADLESS_LAN)\n");
 #endif
 
+    // LITEV_CLONE_MAC=<12 hex>:<k>, LITEV_CLONE_RAMPATCH=<hex>:<hex> (tests): this console started from another's
+    // savestate becomes another player (as --mp-test's LITEV_MP_MACSWAP / LITEV_MP_RAMPATCH do for its consoles k > 0)
+    if (const char* cm = getenv("LITEV_CLONE_MAC"); cm && strchr(cm, ':'))
+        printf("clone MAC: %d copies\n", liteds::CloneMac(*nds, cm, atoi(strchr(cm, ':') + 1)));
+    if (const char* rp = getenv("LITEV_CLONE_RAMPATCH"))
+        printf("clone RAM patch: %d copies\n", liteds::PatchRam(*nds, rp));
     // App record mode (MelonDS.cpp recordFrame): every 60 frames the app logs a hash of the input
     // applied, the clock and the RAM. Same formula here, so a replay proves it matches the device.
     std::map<int, unsigned long long> recordedHashes;

@@ -52,6 +52,8 @@ constexpr u32 kLiveMs = 2000, kFullMinMs = 500, kExpireMs = 6000, kIdleMs = 1000
 // MP uses ENet's unsequenced channel. After a second, a missing datagram is
 // past the game's 16 ms receive window; a cut also waits for a quiet drain.
 constexpr u32 kMPGapExpireMs = 1000, kHandoffMPDrainMs = 1000;
+// how far a link's retired watermark may trail the newest MP frame it took (a larger gap = overflow)
+constexpr u32 kMPSeqWindow = 8192;
 // The game's MP clock is frozen through checkpoint transfer and both startup
 // proofs. Keep the already-consented link alive long enough for that bounded
 // transaction; ordinary gameplay still closes after 10 seconds of inactivity.
@@ -1103,7 +1105,10 @@ void AmbientLAN::RetireMP(const QueuedPacket& q)
         while (l->RetiredBeyond.erase(l->RetiredThrough + 1)) l->RetiredThrough++;
         l->GapSinceMs = l->RetiredBeyond.empty() ? 0 : NowMs();
     }
-    else if (seq - l->RetiredThrough <= 1024)
+    // (the window: a parent of several children sends each one a CMD and an ACK per exchange, up to 6
+    // exchanges a frame in a Mario Kart DS lobby: ~700 frames a second per link, so a lost frame
+    // held RetiredThrough back past 1024 before its 1 s gap expiry - "sequence overflow", 4-player cut)
+    else if (seq - l->RetiredThrough <= kMPSeqWindow)
     {
         l->RetiredBeyond.emplace(seq, NowMs());
         if (!l->GapSinceMs) l->GapSinceMs = NowMs();
@@ -1143,7 +1148,7 @@ void AmbientLAN::SettleHandoffMP(Link& l, u32 now)
     // unreliable channel to go quiet (as this did) froze both games 1-2.5 s longer at every cut.
     // Late arrivals are dropped at admission (DropThroughSeq), also across a rollback.
     (void)now;
-    if (l.PeerLastSent - l.RetiredThrough > 4096)
+    if (l.PeerLastSent - l.RetiredThrough > 4 * kMPSeqWindow)
     {
         if (kFenceTrace) fprintf(stderr, "AMBFENCE overflow: settle peer mark=%u through=%u\n", l.PeerLastSent, l.RetiredThrough);
         l.SequenceOverflow = true; return;

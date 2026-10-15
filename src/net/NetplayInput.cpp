@@ -665,6 +665,24 @@ void NetplayInput::DropPlayer(int player, int lastFrame)
     for (int peer : Peers) if (!Dropped(peer)) allAcked = std::min(allAcked, PeerAck[peer]);
     while (!Unacked.empty() && Unacked.front().first <= allAcked) Unacked.pop_front();
     Changed.notify_all();
+    // A last acknowledgement of everything it sent (no inputs of ours): nothing goes to it after
+    // this, and its device waits for that acknowledgement before it lets go of its inputs (a few
+    // copies: a lost datagram would cost it its 10 s wait).
+#ifdef LITEV_NP_WIRE_RUNS
+    WireHeader header {kMagic, (u8)Local, 0, RemoteUpTo[player], (u32)NowUs(), 0, 0};
+#else
+    WireHeader header {kMagic, (u8)Local, 0, RemoteUpTo[player]};
+#endif
+    std::vector<u8> packet(sizeof(header));
+    memcpy(packet.data(), &header, sizeof(header));
+    if (HandoffEpoch)
+    {
+        HandoffWireAuth auth {HandoffEpoch, {}};
+        memcpy(auth.Token, HandoffToken.data(), sizeof(auth.Token));
+        packet.resize(sizeof(header) + sizeof(auth));
+        memcpy(packet.data() + sizeof(header), &auth, sizeof(auth));
+    }
+    for (int i = 0; i < 4; i++) sendto(Socket, packet.data(), packet.size(), 0, (sockaddr*)PeerAddr[player], sizeof(sockaddr_in));
 }
 
 void NetplayInput::Release()

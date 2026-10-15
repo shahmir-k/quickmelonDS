@@ -874,6 +874,51 @@ void AudioTapDrain(NDS& nds, int phase, int frame)
     AudioTapWrite(phase, frame, all.data(), (int)all.size() / 2);
 }
 
+int CloneMac(NDS& nd, const char* h, int k)
+{
+    // every copy of that MAC in main RAM / ARM7 WRAM (the guest's cached firmware MAC) and the firmware header: last
+    // byte ^= k. (A copy inside the WL's RAM image of the firmware Wi-Fi table - {crc16, size, ..., MAC at +0xc} - gets
+    // its CRC redone: the WL verifies it at every MLME request, a mismatch = WM_ERRCODE_FLASH_ERROR)
+    u8 m[6];
+    for (int i = 0; i < 6; i++) m[i] = (u8)strtoul(std::string(h + 2 * i, 2).c_str(), nullptr, 16);
+    int hits = 0;
+    auto swap = [&](u8* p, u32 len) {
+        for (u32 i = 0; i + 6 <= len; i++)
+        {
+            if (memcmp(p + i, m, 6)) continue;
+            p[i + 5] ^= (u8)k; hits++;
+            if (i < 0xC) continue;
+            u8* t = p + i - 0xC; const u32 ts = t[2] | t[3] << 8;
+            if (ts >= 0x100 && ts < 0x200 && i - 0xC + 2 + ts <= len) { const u16 c = CRC16(t + 2, ts, 0); t[0] = c & 0xFF; t[1] = c >> 8; }
+        }
+    };
+    swap(nd.MainRAM, nd.MainRAMMask + 1);
+    swap(nd.ARM7WRAM, 0x10000);
+    swap(nd.Wifi.RAMPtr(), 0x2000);
+    for (int i = 0; i < 3; i++)       // (W_MACADDR, restored by the savestate)
+    {
+        const u16 r = nd.Wifi.Read(0x04808018 + 2 * i), w = (u16)(m[2 * i] | m[2 * i + 1] << 8);
+        if (r == w) nd.Wifi.Write(0x04808018 + 2 * i, i == 2 ? (u16)(w ^ (k << 8)) : w);
+    }
+    Firmware& fw = nd.GetFirmware();
+    memcpy(fw.GetHeader().MacAddr.data(), m, 6); fw.GetHeader().MacAddr[5] ^= (u8)k;
+    fw.UpdateChecksums();
+    return hits;
+}
+
+int PatchRam(NDS& nd, const char* spec)
+{
+    std::string e = spec, a = e.substr(0, e.find(':')), r = e.substr(e.find(':') + 1);
+    std::vector<u8> pa, re;
+    for (size_t i = 0; i + 1 < a.size(); i += 2) pa.push_back((u8)strtoul(a.substr(i, 2).c_str(), nullptr, 16));
+    for (size_t i = 0; i + 1 < r.size(); i += 2) re.push_back((u8)strtoul(r.substr(i, 2).c_str(), nullptr, 16));
+    int hits = 0;
+    if (!pa.empty() && pa.size() == re.size())
+        for (u32 i = 0; i + pa.size() <= nd.MainRAMMask + 1; i++)
+            if (!memcmp(nd.MainRAM + i, pa.data(), pa.size())) { memcpy(nd.MainRAM + i, re.data(), re.size()); hits++; }
+    return hits;
+}
+
 int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts,
            std::vector<PreparedMPConsole> prepared, LiveExitResult* ended)
 {
@@ -1347,53 +1392,11 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         if (const char* wm = getenv("LITEV_A7WM_INST")) WMNative::SetInstance(*b[k].nds, k, (strtoul(wm, nullptr, 0) >> k) & 1);
         else WMNative::SetInstance(*b[k].nds, k, -1);
 #endif
-        // LITEV_MP_MACSWAP=<12 hex digits> (test only): consoles k > 0 started from one savestate get another MAC - every copy
-        // of that MAC in main RAM / ARM7 WRAM (the guest's cached firmware MAC) and the firmware header: last byte ^= k
-        if (k && getenv("LITEV_MP_MACSWAP"))
-        {
-            u8 m[6]; const char* h = getenv("LITEV_MP_MACSWAP");
-            for (int i = 0; i < 6; i++) m[i] = (u8)strtoul(std::string(h + 2 * i, 2).c_str(), nullptr, 16);
-            NDS& nd = *b[k].nds;
-            int hits = 0;
-            // (a copy inside the WL's RAM image of the firmware Wi-Fi table - {crc16, size, ..., MAC at +0xc} - gets its CRC
-            //  redone: the WL verifies it at every MLME request, a mismatch = WM_ERRCODE_FLASH_ERROR)
-            auto swap = [&](u8* p, u32 len) {
-                for (u32 i = 0; i + 6 <= len; i++)
-                {
-                    if (memcmp(p + i, m, 6)) continue;
-                    p[i + 5] ^= (u8)k; hits++;
-                    if (i < 0xC) continue;
-                    u8* t = p + i - 0xC; const u32 ts = t[2] | t[3] << 8;
-                    if (ts >= 0x100 && ts < 0x200 && i - 0xC + 2 + ts <= len) { const u16 c = CRC16(t + 2, ts, 0); t[0] = c & 0xFF; t[1] = c >> 8; }
-                }
-            };
-            swap(nd.MainRAM, nd.MainRAMMask + 1);
-            swap(nd.ARM7WRAM, 0x10000);
-            swap(nd.Wifi.RAMPtr(), 0x2000);
-            for (int i = 0; i < 3; i++)       // (W_MACADDR, restored by the savestate)
-            {
-                const u16 r = nd.Wifi.Read(0x04808018 + 2 * i), w = (u16)(m[2 * i] | m[2 * i + 1] << 8);
-                if (r == w) nd.Wifi.Write(0x04808018 + 2 * i, i == 2 ? (u16)(w ^ (k << 8)) : w);
-            }
-            Firmware& fw = nd.GetFirmware();
-            memcpy(fw.GetHeader().MacAddr.data(), m, 6); fw.GetHeader().MacAddr[5] ^= (u8)k;
-            fw.UpdateChecksums();
-            printf("inst%d MACSWAP: %d copies -> ..%02x\n", k, hits, m[5] ^ k);
-        }
+        // LITEV_MP_MACSWAP=<12 hex digits> (test only): consoles k > 0 started from one savestate get another MAC (CloneMac)
+        if (k && getenv("LITEV_MP_MACSWAP")) printf("inst%d MACSWAP: %d copies\n", k, CloneMac(*b[k].nds, getenv("LITEV_MP_MACSWAP"), k));
         // LITEV_MP_RAMPATCH=<hex pattern>:<hex replacement> (test only, consoles k > 0): every copy of the pattern in main
         // RAM becomes the replacement (e.g. another trainer ID for a second console from one savestate)
-        if (k && getenv("LITEV_MP_RAMPATCH"))
-        {
-            std::string e = getenv("LITEV_MP_RAMPATCH"), a = e.substr(0, e.find(':')), r = e.substr(e.find(':') + 1);
-            std::vector<u8> pa, re;
-            for (size_t i = 0; i + 1 < a.size(); i += 2) pa.push_back((u8)strtoul(a.substr(i, 2).c_str(), nullptr, 16));
-            for (size_t i = 0; i + 1 < r.size(); i += 2) re.push_back((u8)strtoul(r.substr(i, 2).c_str(), nullptr, 16));
-            NDS& nd = *b[k].nds; int hits = 0;
-            if (!pa.empty() && pa.size() == re.size())
-                for (u32 i = 0; i + pa.size() <= nd.MainRAMMask + 1; i++)
-                    if (!memcmp(nd.MainRAM + i, pa.data(), pa.size())) { memcpy(nd.MainRAM + i, re.data(), re.size()); hits++; }
-            printf("inst%d RAMPATCH: %d copies\n", k, hits);
-        }
+        if (k && getenv("LITEV_MP_RAMPATCH")) printf("inst%d RAMPATCH: %d copies\n", k, PatchRam(*b[k].nds, getenv("LITEV_MP_RAMPATCH")));
         // Distinct MAC per instance so they associate as different wireless players.
         if (k && !adoptPrepared && !getenv("LITEV_APP_FW") && !getenv("LITEV_MP_MACSWAP"))
         {
