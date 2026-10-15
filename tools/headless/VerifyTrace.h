@@ -16,6 +16,7 @@
 #include <chrono>
 #include <vector>
 #include <memory>
+#include <thread>
 #include "types.h"
 #include "net/NetplayInput.h"
 
@@ -90,7 +91,13 @@ struct LiveExitResult
     std::vector<std::vector<melonDS::NetplayFrameInput>> Scheduled;   // [console][i] = input of frame EndsAfter+1+i
     std::vector<std::chrono::steady_clock::time_point> StoppedAt;   // when each console's last frame ended
     std::vector<std::shared_ptr<InputScript>> Scripts;   // each console's script, as far as it got
+    bool Partial = false;   // this device alone left (its console quit / its game left / it was left alone); the others play on
+    std::thread Linger;     // (partial) re-sends our last inputs until the peers have them: join before exiting
 };
+// Test only: a second console started from another's savestate becomes another player: its MAC (hex, 12 digits)
+// everywhere the guest keeps it, last byte ^= k (returns the copies changed); a RAM pattern replaced ("hex:hex").
+int CloneMac(melonDS::NDS& nds, const char* macHex, int k);
+int PatchRam(melonDS::NDS& nds, const char* spec);
 int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts,
            std::vector<PreparedMPConsole> prepared = {}, LiveExitResult* ended = nullptr);
 

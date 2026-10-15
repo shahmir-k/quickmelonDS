@@ -89,6 +89,17 @@ inline void Set(NetplayFrameInput& in, int field) { in.Keys = (in.Keys & ~kMask)
 }
 #endif
 
+// A player leaving a live (handed-off) Netplay session for good travels in its input stream, like
+// a speed press: bit 24 of Keys (active high; NDS::SetKeyMask reads only bits 0..11, NetplaySpeed
+// bits 16..23). Set on every input sampled once the player asked to leave (sticky), so the first
+// applied frame that carries it is the same on every device: that player's console runs that frame
+// and then leaves the session everywhere (NetplayLiveExit::EndFrame).
+namespace NetplayLeave
+{
+constexpr u32 kBit = 1u << 24;
+inline bool Of(const NetplayFrameInput& in) { return (in.Keys & kBit) != 0; }
+}
+
 // Netplay input exchange: every device emulates every player's console, so only inputs cross the
 // network. A player's input sampled at frame F is applied at frame F + Delay on every device; the
 // local device sends it at once, so the network has Delay frames to deliver it and nobody waits.
@@ -195,6 +206,21 @@ public:
     bool QuietHeartbeat = false;
 #endif
     bool Dropped(int player) const { return (DroppedMask.load() >> player) & 1; }
+    // Live Netplay partial exit: `player`'s console ran its last frame `lastFrame` on this device (it
+    // left the session; the same frame on every device). From now on nothing waits for, is sent to or
+    // is measured from that player; its speed events after lastFrame (inputs it sent ahead) are
+    // dropped, so SpeedAt stays the same on every device.
+    void DropPlayer(int player, int lastFrame);
+    // The local player asks to leave the session: every input it submits from now on carries
+    // NetplayLeave::kBit.
+    void RequestLeave() { LeaveRequested = true; }
+    // This device left the session (its own console's last frame ran): Get() stops waiting, but the
+    // receive thread keeps re-sending our inputs and acknowledging until the object is destroyed.
+    void Release();
+    // Every peer still in the session has acknowledged our inputs up to applied frame `frame` (true),
+    // or the timeout passed (false). For a device leaving: the others still need our inputs up to the
+    // last frame of our console.
+    bool WaitAcked(int frame, int timeoutMs);
     // `peer` has acknowledged all of our inputs up to this applied frame. Hosted Netplay: the server
     // applies a player's input exactly when it acknowledged it (it ignores a dropped player's
     // packets), so a replica may apply its own input at frame F <= this; past it, only the
@@ -246,6 +272,7 @@ private:
     std::atomic<u64> StallUs {0};
     std::atomic<u64> LastPeerUs[kMaxPlayers] {};
     std::atomic<u32> DroppedMask {0};
+    std::atomic<bool> LeaveRequested {false}, Released {false};
     std::atomic<int> CurDelay;
     std::atomic<s64> RttMaxUs {-1};
 #ifdef LITEV_NP_WIRE_RUNS
@@ -456,31 +483,49 @@ bool NetplayRunLiveProof(const std::array<NDS*, 2>& consoles, const std::array<u
 bool NetplayRunLockstepFrames(const std::array<NDS*, 2>& consoles, const std::array<u64, 2>& rawClocks,
                               const std::function<void(int, int)>& runFrame, int frames,
                               std::vector<u64>& hashes, std::string& error);
+// The same for any number of consoles (a live handoff of N players): consoles[p] = player p's,
+// hashes[frame * N + p]. NetplayRunLiveProofN: the proof (2 frames, neutral input) on N consoles.
+bool NetplayRunLockstepFramesN(const std::vector<NDS*>& consoles, const std::vector<u64>& rawClocks,
+                               const std::function<void(int, int)>& runFrame, int frames,
+                               std::vector<u64>& hashes, std::string& error);
+bool NetplayRunLiveProofN(const std::vector<NDS*>& consoles, const std::vector<u64>& rawClocks,
+                          const std::function<void(int)>& runFrame, std::vector<u64>& hashes, std::string& error);
 
 // The game-driven end of a live (handed-off) Netplay session, the same on every device: every
 // device runs every console, so each evaluates the same rule on the same emulated frames. A
-// console is quiet after QuietFrames frames without an MP exchange (Wifi::MPExchanges); when
-// every console is quiet at frame f, the session ends after frame f + Slack on every device. The
-// decision for frame f is taken Slack frames later, by which time every other console has
-// published frame f (consoles of one session stay within a few frames of each other: waiting for
-// one never waits on this console's own clock). Each console's thread calls EndFrame after each
-// frame (0 = the first session frame) and stops when it returns true.
+// console is quiet after QuietFrames frames without an MP exchange (Wifi::MPExchanges). The
+// decision for frame d is taken Slack frames later (at frame d + Slack), by which time every other
+// console still in the session has published frame d (consoles of one session stay within a few
+// frames of each other: waiting for one never waits on this console's own clock). At d, with A the
+// consoles still in the session at d:
+//  - every console of A quiet: the whole session ends after frame d + Slack on every device;
+//  - A has 3 or more consoles and some are quiet: those leave the session after frame d + Slack
+//    (a partial exit: e.g. a player whose game left the others' wireless session); the others play on.
+// A console whose input carries NetplayLeave::kBit at frame f (its player quit) leaves after frame f.
+// Each console's thread calls EndFrame after each frame (0 = the first session frame) and stops
+// when it returns true; DroppedAfter() then tells whether it alone left (>= 0) or the whole session
+// ended (EndsAfter()).
 class NetplayLiveExit
 {
 public:
     explicit NetplayLiveExit(int consoles = 2, int quietFrames = 120, int slack = 30);
-    bool EndFrame(int console, int frame, u32 exchanges);
+    bool EndFrame(int console, int frame, u32 exchanges, bool leaving = false);
     int EndsAfter() const { return EndAfter.load(); }   // -1: not yet
+    // the last frame of a console that left the session alone (-1: still in, or it ended with all)
+    int DroppedAfter(int console) const { return console >= 0 && console < 16 ? DropAt[console].load() : -1; }
+    // consoles still in the session (not left alone; the whole session ending keeps them in)
+    u32 InMask() const;
     void Cancel();
 private:
     static constexpr int kRing = 1024;
     const int Consoles, QuietFrames, Slack;
-    std::mutex Lock;
+    mutable std::mutex Lock;
     std::condition_variable Changed;
     bool Cancelled = false;
     std::array<int, 16> Done{}, Streak{};
     std::array<u32, 16> Last{};
     std::array<std::array<int, kRing>, 16> StreakAt{};
+    std::array<std::atomic<int>, 16> DropAt;
     std::atomic<int> EndAfter{-1};
 };
 
@@ -494,7 +539,11 @@ private:
 class NetplayLiveLink
 {
 public:
-    NetplayLiveLink(int player, u16 port, const std::string& peerIPv4);
+    NetplayLiveLink(int player, u16 port, const std::string& peerIPv4)
+        : NetplayLiveLink(player, 1 - player, port, peerIPv4) {}
+    // A link of an N-player handoff (one per pair of players): the lower player listens on `port`
+    // (accepting only peerIPv4), the higher one connects.
+    NetplayLiveLink(int localPlayer, int peerPlayer, u16 port, const std::string& peerIPv4);
     ~NetplayLiveLink();
     NetplayLiveLink(const NetplayLiveLink&) = delete;
     NetplayLiveLink& operator=(const NetplayLiveLink&) = delete;
@@ -519,6 +568,13 @@ public:
     // startup gate, not a durable commit: a peer that vanishes right after it is an in-doubt case.
     bool ExchangeStart(const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
                        const std::array<u64, 4>& trialHashes, std::atomic<bool>& cancel, std::string& error);
+    // N players: `all` = every player's checkpoint by player (this side's and every peer's), trialHashes
+    // = the proof's hashes (frame * N + player). Every pair of players compares its manifests, so all
+    // start only with the same checkpoints and proof. Send, then wait (a member sends to every peer
+    // before it waits on any).
+    bool SendStart(const std::vector<const NetplayLiveCheckpoint*>& all, const std::vector<u64>& trialHashes, std::string& error);
+    bool WaitStart(const std::vector<const NetplayLiveCheckpoint*>& all, const std::vector<u64>& trialHashes,
+                   std::atomic<bool>& cancel, std::string& error);
     void Close();
 private:
     enum : u32 { MsgBase = 1, MsgBaseAck, MsgCheckpoint, MsgReady, MsgStart };
@@ -527,7 +583,7 @@ private:
     void Run();
     void RunSender();
     std::vector<u8> PackCheckpoint(const NetplayLiveCheckpoint& local, u32 baseId);
-    const int Player;
+    const int Player, PeerPlayer;
     const u16 Port;
     const std::string PeerIPv4;
     std::atomic<int> Fd{-1};

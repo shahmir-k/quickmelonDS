@@ -142,6 +142,11 @@ public:
 #endif
     // Ends every wait (the session is shutting down).
     void Stop();
+    // A console that left the session for good (a live Netplay partial exit): call from its own thread
+    // after its last frame. From then on its clock counts as past every time, so nobody waits on it,
+    // and nothing is queued for it. Deterministic: it sends nothing after its last frame, so whatever
+    // a console asks the link after that has the same answer whenever the call happens.
+    void Leave(int inst);
 
     u16 ObserveConnectedBitmask() const noexcept override { return Connected; }
     u64 ObserveCmdCount() const noexcept override { return CmdCount; }
@@ -263,7 +268,10 @@ private:
 #endif
     u64 ClockOrigin[kMaxInst] {};
     u64 ClockEpoch[kMaxInst] {};
-    u64 Now(int inst) const { return RawNow(inst) - ClockOrigin[inst] + ClockEpoch[inst]; }
+    static constexpr u64 kLeftClock = 1ull << 60;   // a console that left: past every time
+    std::atomic<u16> Left {0};
+    bool HasLeft(int inst) const { return (Left.load(std::memory_order_relaxed) >> inst) & 1; }
+    u64 Now(int inst) const { return HasLeft(inst) ? kLeftClock : RawNow(inst) - ClockOrigin[inst] + ClockEpoch[inst]; }
     u64 RawWake(int inst, u64 linkTime) const
     {
         // A wake threshold belongs to NDS::RunSystem's raw clock, not this link's normalized one.

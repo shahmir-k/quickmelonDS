@@ -138,12 +138,12 @@ public:
     Verdict PeerVerdict(u64 id);
     Verdict SessionVerdict() const { return (Verdict)StVerdict.load(); }
     // The automatic Netplay switch (emulator thread; the app's default, its "Ask before switching" turns it off): true
-    // when this two-player session should be offered the live handoff now. LAN_BAD at link open (PeerVerdict then):
+    // when this session (2-4 players) should be offered the live handoff now. LAN_BAD at link open (PeerVerdict then):
     // as soon as the join is done (the first MP exchange: both at 1x, a link opening is normal speed for the group);
     // SessionVerdict LAN_BAD later: at once (it is burst-proof, never fast-forward) when the link rule says it (the
     // network alone does not fit one exchange a frame) or the session runs under 40 fps; a LAN_BAD of 40-50 fps on a
-    // fast network (e.g. Pokémon's 2 exchanges a frame at a 4-6 ms round trip: 48 fps) only raises the prompt. The game's MP host offers; a child
-    // only 2 s later (no offer came: the host asks first). Never twice on a link (a declined or failed switch stays on
+    // fast network (e.g. Pokémon's 2 exchanges a frame at a 4-6 ms round trip: 48 fps) only raises the prompt. The game's MP host offers (to its
+    // whole group); a child only 2 s later (no offer came: the host asks first; with 3-4 players the host declines it at once). Never twice on a link (a declined or failed switch stays on
     // LAN; no automatic way back to LAN), never with an offer or a fence open.
     bool AutoHandoffDue();
     // Emulator-thread-only diagnostic: MP frames already admitted locally or buffered while a link opens.
@@ -167,6 +167,15 @@ public:
     bool PublishHandoffRom(const NetplayRom& rom);
     bool GetPeerHandoffRom(NetplayRom& rom) const;
     void CancelHandoffOffer();
+    // N players (a LAN session of a parent and its children: a child links only to its parent): the
+    // handoff group is every link of a parent, or a child's one link to its parent. Only the device
+    // that offered (with more than one link: the parent; a child's own offer is then declined) knows
+    // every member: once every member accepted and published its ROM it numbers them (itself 0, the
+    // others by device id) and sends that roster to each; every member then has the same roster.
+    // IPv4 in network order; the offerer's entry as its members reach it. Emulator thread.
+    struct HandoffMember { int Player = 0; u64 ID = 0; u32 IPv4 = 0; NetplayRom Rom; };
+    bool GetHandoffRoster(std::vector<HandoffMember>& roster, int& localPlayer);
+    int HandoffGroupSize() const;
     // Emulator-thread-only, two-peer cut fence. Call after the host stops issuing
     // MP commands; the client may keep running until it reaches its own idle cut.
     // A received FENCE is not READY: unsequenced MP packets must first retire.
@@ -337,9 +346,17 @@ private:
     void ReceiveHandoffControl(Link& link, u32 type, u64 epoch, u32 mark,
                                const std::array<u8, 16>& token);
     void ReceiveHandoffRom(Link& link, const u8* bytes, size_t length);
+    void ReceiveHandoffRoster(Link& link, const u8* bytes, size_t length);
     void CloseHandoffOffer(Link& link);
     void CompleteHandoffReset(Link& link);
-    Link* HandoffLink();
+    // the handoff group (see GetHandoffRoster); empty: no session, a link not up yet, or a member of
+    // the offer's group gone (GroupIDs)
+    std::vector<Link*> Group() const;
+    bool GroupBroken() const;
+    std::vector<u64> GroupIDs;          // the members (device ids) of the open offer / fence
+    std::vector<HandoffMember> Roster;  // the offer's roster, once known
+    u64 RosterEpoch = 0;
+    Link* HandoffLink();                // the group's only link (two players), else none
     const Link* HandoffLink() const;
     std::shared_ptr<const std::vector<Peer>> View;
     u32 ViewMs = 0;
