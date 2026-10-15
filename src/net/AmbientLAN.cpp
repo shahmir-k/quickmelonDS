@@ -253,7 +253,9 @@ void AmbientLAN::SendPresence(const std::vector<u8>& pkt, bool bcast, const std:
 {
     sockaddr_in a = {};
     a.sin_family = AF_INET;
-    if (bcast)
+    // (tests) LITEV_AMBIENT_NO_BCAST_TX=1: this device's broadcasts never arrive (a Wi-Fi that drops them one way)
+    static const bool noBcastTx = getenv("LITEV_AMBIENT_NO_BCAST_TX") != nullptr;
+    if (bcast && !noBcastTx)
     {
         a.sin_addr.s_addr = htonl(INADDR_BROADCAST); a.sin_port = htons(Cfg.PresencePort);
         if (sendto(UniSock, (const char*)pkt.data(), pkt.size(), 0, (sockaddr*)&a, sizeof(a)) > 0) StPresTx++;
@@ -360,8 +362,11 @@ void AmbientLAN::PresenceLoop()
             changed |= Peers.size() != before;
             for (auto& p : Peers)
             {
+                // Unicast to every known device, also one whose broadcasts we hear: hearing its broadcasts
+                // does not mean it hears ours (a Wi-Fi that drops one device's broadcasts; r8b-dev-9: the
+                // RG DS heard the Mac's, the Mac lost the RG DS 4 s in and the talk never linked).
                 all.push_back({p.IP, p.UniPort});
-                if (!p.BcastMs || now - p.BcastMs > kExpireMs) to.push_back({p.IP, p.UniPort});
+                to.push_back({p.IP, p.UniPort});
             }
             for (auto& e : Extra)
                 if (std::none_of(all.begin(), all.end(), [&](auto& t) { return t == e; })) { to.push_back(e); all.push_back(e); }
@@ -395,8 +400,8 @@ void AmbientLAN::PresenceLoop()
         }
         else
         {
-            // liveness: broadcast every 2 s, unicast every 4 s (two per expiry window)
-            const bool b = now - lastLive >= kLiveMs, u = !to.empty() && now - lastUni >= 2 * kLiveMs;
+            // liveness: broadcast and unicast every 2 s (three per expiry window)
+            const bool b = now - lastLive >= kLiveMs, u = !to.empty() && now - lastUni >= kLiveMs;
             if (b || u) SendPresence(BuildPresence(P_Live), b, u ? to : std::vector<std::pair<u32, u16>>());
             if (b) lastLive = now;
             if (u) lastUni = now;
