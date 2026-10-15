@@ -282,6 +282,11 @@ protected:
     // (else only plane 1 + the control column need uploading).
     static constexpr int HybStride = 256*2 + 1;
     bool HybHas3D[NFB][2] {};
+#ifdef LITEV_HYB_FASTLINES_2D
+    // per slot, screen, line: every descriptor of the line is mode 0 (3D on top, no effect), found
+    // by the 2D thread while the line is in its cache (the merge's FASTLINES test reads this)
+    u8 HybLineMode0[NFB][2][192] {};
+#endif
     bool Hybrid = false;
     u32* HybFB[NFB] {};
     int HybTag[NFB] {};              // 3D colour-ring index the slot's frame pairs with
@@ -301,6 +306,9 @@ protected:
     // that differ from the real composite. Must stay 0.
     bool HybridCheck = false;
     std::atomic<u64> HybCheckBad { 0 }, HybCheckLines { 0 };
+#ifdef LITEV_HYB_PLANES
+    u64 HybPlanesLines = 0, HybPlanesBad = 0;   // HybridCheck: plane vs layer-push descriptors
+#endif
 
     void StartAsyncThread();              // lazy-create the persistent render thread
     void StopAsyncThread();               // flush in-flight + join (Stop/dtor)

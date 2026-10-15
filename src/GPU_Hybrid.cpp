@@ -31,6 +31,9 @@
 #include <mutex>
 #include <thread>
 #include <time.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #ifdef __ANDROID__
 #include <EGL/egl.h>
 #include <sched.h>
@@ -520,6 +523,36 @@ void HybridRenderer::HybridReadback3D(u32* dst)
 void HybridRenderer::CapConvert(const u8* src, u32* dst)
 {
 #endif
+#if defined(LITEV_HYB_CAPCONV_NEON) && defined(LITEV_HYB_CAPTURE_ASYNC) && defined(__aarch64__)
+    // LITEV_HYB_CAPCONV_NEON: 16 pixels at a time; t / 255 = (t + 1 + (t >> 8)) >> 8 for t < 65535
+    // (t <= 255 * 63 + 127 here): the same words. debug.litev.capconvneon=0 turns it off.
+    static const bool neon = OpenGL::Prop("capconvneon", 1) != 0;
+    if (neon)
+    {
+        const uint8x8_t k63 = vdup_n_u8(63), k31 = vdup_n_u8(31);
+        const uint16x8_t k127 = vdupq_n_u16(127), k1 = vdupq_n_u16(1);
+        auto q = [&](uint8x16_t x, uint8x8_t m) {
+            uint16x8_t lo = vmlal_u8(k127, vget_low_u8(x), m), hi = vmlal_u8(k127, vget_high_u8(x), m);
+            lo = vshrq_n_u16(vaddq_u16(vaddq_u16(lo, k1), vshrq_n_u16(lo, 8)), 8);
+            hi = vshrq_n_u16(vaddq_u16(vaddq_u16(hi, k1), vshrq_n_u16(hi, 8)), 8);
+            return vcombine_u8(vmovn_u16(lo), vmovn_u16(hi));
+        };
+        for (int i = 0; i < 256 * 192; i += 16)
+        {
+            const uint8x16x4_t p = vld4q_u8(src + i * 4);
+            uint8x16x4_t o;
+#ifdef __ANDROID__
+            o.val[0] = q(p.val[2], k63); o.val[2] = q(p.val[0], k63);   // the GLES 3D pass emits BGRA
+#else
+            o.val[0] = q(p.val[0], k63); o.val[2] = q(p.val[2], k63);
+#endif
+            o.val[1] = q(p.val[1], k63);
+            o.val[3] = q(p.val[3], k31);
+            vst4q_u8((u8*)(dst + i), o);
+        }
+        return;
+    }
+#endif
     for (int i = 0; i < 256 * 192; i++)
     {
 #ifdef LITEV_HYB_CAPTURE_ASYNC
@@ -739,6 +772,7 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
     {
         const GLuint edge = GL3D()->GetEdgeTex(tag);   // LITEV_GL_EDGE_MARK
         glUniform1i(EdgeULoc, edge != 0);
+        ProfEdge += edge != 0;
         if (edge) { glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, edge); glActiveTexture(GL_TEXTURE1); }
     }
     glBindTexture(GL_TEXTURE_2D, GL3D()->GetColorTex(tag));
@@ -788,6 +822,7 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
                 glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
                 glBlitFramebuffer(0, 0, 256, 192, 0, y, 256 * Scale, y + 192 * Scale, GL_COLOR_BUFFER_BIT, GL_NEAREST);
                 glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+                ProfScr1x++;
                 continue;
             }
 #endif
@@ -809,13 +844,26 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
                     const u32 evy = std::min<u32>(c & 0x1F, 16);
                     if (bright == 3 || evy == 0) bright = 0;
                     bool f = ((c >> 16) & 3) == 1 && (c & (1 << 18)) && !(c >> 23);
+#ifdef LITEV_HYB_FASTLINES_2D
+                    // LITEV_HYB_FASTLINES_2D: the per-pixel mode test was done by the 2D thread
+                    // (modes 5/6 are never written). debug.litev.hybfast2d=0: the scan here;
+                    // =2: both, mismatches counted in the merge-mix line.
+                    static const int fast2d = OpenGL::Prop("hybfast2d", 1);
+                    if (fast2d == 1) f = f && HybLineMode0[fb][sc][l];
+                    else
+#endif
                     for (int x = 0; f && x < 256; x++)
                     {
                         const u32 mode = ln[x] >> 29;
                         f = mode == 0 || mode == 5 || mode == 6;
                     }
+#ifdef LITEV_HYB_FASTLINES_2D
+                    if (fast2d == 2 && (((c >> 16) & 3) == 1 && (c & (1 << 18)) && !(c >> 23)) && f != (bool)HybLineMode0[fb][sc][l]) ProfFastBad++;
+#endif
                     fast[l] = f ? int(1 + bright + (bright ? evy << 8 : 0)) : 0;
+                    if (!f) ProfLnFull++; else if (bright) ProfLnFastBr++; else ProfLnCopy++;
                 }
+                ProfScr3D++;
                 glEnable(GL_SCISSOR_TEST);
                 for (int l0 = 0; l0 < 192; )
                 {
@@ -825,6 +873,7 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
                     glUniform1i(FastULoc, fast[l0] & 0xFF);
                     glUniform1i(FastEvyULoc, fast[l0] >> 8);
                     glDrawArrays(GL_TRIANGLES, 0, 3);
+                    ProfRuns++;
                     l0 = l1;
                 }
                 glDisable(GL_SCISSOR_TEST);
@@ -852,10 +901,14 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
             return getenv("LITEV_PROF") != nullptr;
 #endif
         }();
-        if (!on) { ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0; return; }
+        if (!on) { ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0; ProfEdge = ProfScr3D = ProfScr1x = ProfLnCopy = ProfLnFastBr = ProfLnFull = ProfRuns = 0; return; }
         Platform::Log(Platform::Info, "LITEV_HYB 60f: gl3d=%.2f wait3d=%.2f merge=%.2f (upload=%.2f sync=%.2f draw=%.2f) readback=%.2f ms/frame (emu thread, scale %d)\n",
                       ProfGL3D / 60, ProfWait / 60, ProfMerge / 60, ProfUpload / 60, ProfSync / 60, ProfDraw / 60, ProfReadback / 60, Scale);
         ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0;
+        Platform::Log(Platform::Info, "LITEV_HYB merge-mix 60f: edge=%d scr3d=%d scr1x=%d lines copy=%d fastbright=%d full=%d runs=%d fast2d-mismatch=%d\n",
+                      ProfEdge, ProfScr3D, ProfScr1x, ProfLnCopy, ProfLnFastBr, ProfLnFull, ProfRuns, ProfFastBad);
+        ProfFastBad = 0;
+        ProfEdge = ProfScr3D = ProfScr1x = ProfLnCopy = ProfLnFastBr = ProfLnFull = ProfRuns = 0;
         GLThread3D* t = Thread3D();
         if (t->JobN)
             Platform::Log(Platform::Info, "LITEV_HYB 3d-job: n=%d queued=%.2f wall=%.2f cpu=%.2f incl-flush=%.2f | emu: prev-job wait=%.2f prepare=%.2f kick-gap=%.2f job-end-from-kick=%.2f polyram-wait=%.2f ms/job (snapcopy %d, bank waits %d)\n",

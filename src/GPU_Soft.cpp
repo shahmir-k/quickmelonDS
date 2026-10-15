@@ -29,6 +29,9 @@
 #include "GPU_ColorOp.h"
 #include "Platform.h"
 #include "LitevSoftProf.h"
+#if defined(LITEV_HYB_FASTLINES_2D) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #ifdef LITEV_SOFT3D_DRASTIC
 #include "GPU3D_TileSoft.h"   // alternate tile-based 3D renderer (P1 skeleton)
@@ -167,6 +170,10 @@ SoftRenderer::~SoftRenderer()
     if (HybridCheck)
         fprintf(stderr, "hybrid_check: lines=%llu bad_px=%llu\n",
                 (unsigned long long)HybCheckLines.load(), (unsigned long long)HybCheckBad.load());
+#ifdef LITEV_HYB_PLANES
+    if (HybridCheck)
+        fprintf(stderr, "hybplanes_check: 3d_lines=%llu differ=%llu\n", (unsigned long long)HybPlanesLines, (unsigned long long)HybPlanesBad);
+#endif
     for (int i = 0; i < NFB; i++) delete[] HybFB[i];
     for (int i = 0; i < 2; i++) delete[] Hyb3D[i];
     Platform::Semaphore_Free(AsyncStart);
@@ -460,6 +467,14 @@ void SoftRenderer::InitBands()
                 S2DBands[p][b].rend[e] = std::make_unique<SoftRenderer2D>(*S2DBands[p][b].unit[e], *this);
                 static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->Reset();
                 static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->HybridDesc = Hybrid && e == 0;
+#ifdef LITEV_HYB_PLANES
+                static const bool hybPlanes = litevPropInt("debug.litev.hybplanes", 1) != 0;
+                static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->HybPlanes = hybPlanes;
+#endif
+#ifdef LITEV_HYB_COMPOSITE_VEC
+                static const bool hybCompVec = litevPropInt("debug.litev.hybcompvec", 1) != 0;
+                static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->HybCompVec = hybCompVec;
+#endif
             }
 #else
     for (int b = 0; b < S2D_NBANDS; b++)
@@ -644,6 +659,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         {
             // self-test: descriptor + CPU resolve must equal the real composite below
             alignas(8) u32 desc[HybStride];
+            memset(desc, 0x5A, sizeof(desc));   // the same stale words as the reference pass below
             rA->Cur3DLine = l3d; rA->CurOAM = oamSnap; rA->CurPalette = palSnap; S2D_PALCONV_SET(rA); S2D_OAMGEN_SET(rA);
             rA->HybridDesc = true;
 #ifdef LITEV_SOFT2D_DEPTH2
@@ -655,6 +671,31 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
 #endif
             rA->HybridDesc = false;
             const bool has3D = rA->LastLineHas3D;
+#if defined(LITEV_HYB_PLANES) && defined(LITEV_SOFT2D_DEPTH2)
+            // the plane pipeline's descriptors must equal the layer-push path's, word for word
+            if (has3D)
+            {
+                alignas(8) u32 desc2[HybStride];
+                memset(desc2, 0x5A, sizeof(desc2));
+                rA->HybridDesc = true; rA->HybPlanes = false;
+#ifdef LITEV_HYB_COMPOSITE_VEC
+                rA->HybCompVec = false;
+#endif
+                S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
+                S2DJ_LINE(); rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, desc2);
+                rA->HybridDesc = false; rA->HybPlanes = true;
+#ifdef LITEV_HYB_COMPOSITE_VEC
+                rA->HybCompVec = true;
+#endif
+                HybPlanesLines++;
+                if (!rA->LastLineHas3D || memcmp(desc, desc2, 512 * 4))
+                {
+                    if (HybPlanesBad++ < 8)
+                        for (int i = 0; i < 512; i++)
+                            if (desc[i] != desc2[i]) { fprintf(stderr, "hybplanes: line %u word %d planes %08x push %08x\n", line, i, desc[i], desc2[i]); break; }
+                }
+            }
+#endif
             u32 ref[256];
 #ifdef LITEV_SOFT2D_DEPTH2
             S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
@@ -1558,6 +1599,20 @@ void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32*
     }
     if (has3D)
     {
+#ifdef LITEV_HYB_FASTLINES_2D
+        {
+            // descriptor mode (bits 29-31) 0 on every pixel
+#ifdef __aarch64__
+            uint32x4_t acc = vdupq_n_u32(0);
+            for (int i = 0; i < 256; i += 4) acc = vorrq_u32(acc, vld1q_u32(descA + i));
+            const u32 any = vmaxvq_u32(acc);
+#else
+            u32 any = 0;
+            for (int i = 0; i < 256; i++) any |= descA[i];
+#endif
+            HybLineMode0[AsyncTargetBuf][f.ScreenSwap ? 0 : 1][line] = (any >> 29) == 0;
+        }
+#endif
         ctlA |= 1u << 18;
         // relaxed atomic: two 2D bands may set the same screen's flag (LITEV_SOFT2D_HYB_BANDS)
         __atomic_store_n(&HybHas3D[AsyncTargetBuf][f.ScreenSwap ? 0 : 1], true, __ATOMIC_RELAXED);
