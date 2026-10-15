@@ -1377,6 +1377,9 @@ void AmbientLAN::ReceiveHandoffControl(Link& l, u32 type, u64 epoch, u32 mark,
         if (!HandoffBuildCompatible() || !epoch || token == std::array<u8, 16>{} ||
             (mark != HandoffPlainNetplay && mark != HandoffHostedNetplay) || l.FenceEpoch ||
             epoch <= std::max(l.LastClosedOfferEpoch, l.LastClosedFenceEpoch)) return;
+        // a device with other links (the host of a 3-4 player session) cannot switch: say no at once (a child of
+        // that session sees only its own link and would wait on its offer)
+        if (HandoffLink() != &l) { SendOfferControl(l, HandoffDecline, epoch, 0, token); return; }
         if (l.OfferEpoch)
         {
             // Concurrent offers fail closed. Both users can retry once the
