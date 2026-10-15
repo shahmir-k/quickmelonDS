@@ -31,6 +31,9 @@
 #include <mutex>
 #include <thread>
 #include <time.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #ifdef __ANDROID__
 #include <EGL/egl.h>
 #include <sched.h>
@@ -519,6 +522,36 @@ void HybridRenderer::HybridReadback3D(u32* dst)
 
 void HybridRenderer::CapConvert(const u8* src, u32* dst)
 {
+#endif
+#if defined(LITEV_HYB_CAPCONV_NEON) && defined(LITEV_HYB_CAPTURE_ASYNC) && defined(__aarch64__)
+    // LITEV_HYB_CAPCONV_NEON: 16 pixels at a time; t / 255 = (t + 1 + (t >> 8)) >> 8 for t < 65535
+    // (t <= 255 * 63 + 127 here): the same words. debug.litev.capconvneon=0 turns it off.
+    static const bool neon = OpenGL::Prop("capconvneon", 1) != 0;
+    if (neon)
+    {
+        const uint8x8_t k63 = vdup_n_u8(63), k31 = vdup_n_u8(31);
+        const uint16x8_t k127 = vdupq_n_u16(127), k1 = vdupq_n_u16(1);
+        auto q = [&](uint8x16_t x, uint8x8_t m) {
+            uint16x8_t lo = vmlal_u8(k127, vget_low_u8(x), m), hi = vmlal_u8(k127, vget_high_u8(x), m);
+            lo = vshrq_n_u16(vaddq_u16(vaddq_u16(lo, k1), vshrq_n_u16(lo, 8)), 8);
+            hi = vshrq_n_u16(vaddq_u16(vaddq_u16(hi, k1), vshrq_n_u16(hi, 8)), 8);
+            return vcombine_u8(vmovn_u16(lo), vmovn_u16(hi));
+        };
+        for (int i = 0; i < 256 * 192; i += 16)
+        {
+            const uint8x16x4_t p = vld4q_u8(src + i * 4);
+            uint8x16x4_t o;
+#ifdef __ANDROID__
+            o.val[0] = q(p.val[2], k63); o.val[2] = q(p.val[0], k63);   // the GLES 3D pass emits BGRA
+#else
+            o.val[0] = q(p.val[0], k63); o.val[2] = q(p.val[2], k63);
+#endif
+            o.val[1] = q(p.val[1], k63);
+            o.val[3] = q(p.val[3], k31);
+            vst4q_u8((u8*)(dst + i), o);
+        }
+        return;
+    }
 #endif
     for (int i = 0; i < 256 * 192; i++)
     {

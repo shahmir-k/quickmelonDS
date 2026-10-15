@@ -1296,6 +1296,12 @@ option(LITEV_HYB_COMPOSITE_VEC "Hybrid: NEON descriptor composite (needs LITEV_H
 if (LITEV_HYB_COMPOSITE_VEC)
     add_compile_definitions(LITEV_HYB_COMPOSITE_VEC=1)
 endif()
+# Hybrid display capture: the 3D read back converted to the 6-bit line format 16 pixels at a time
+# (GL 3D thread; same words). Runtime: debug.litev.capconvneon=0 off.
+option(LITEV_HYB_CAPCONV_NEON "Hybrid: NEON capture readback conversion" OFF)
+if (LITEV_HYB_CAPCONV_NEON)
+    add_compile_definitions(LITEV_HYB_CAPCONV_NEON=1)
+endif()
 
 # GL 3D, W-buffer frames: depth 1 - z0/w from the rasterizer instead of gl_FragDepth, so the GPU's
 # early depth test works (display only; same depth order, fog converts back to w).
