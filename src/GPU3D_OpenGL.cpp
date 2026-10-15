@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <time.h>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -137,6 +138,14 @@ void GLRenderer3D::UseRenderShader(int flags)
 #ifdef LITEV_GL_OPAQUE_NODISCARD
 // Opaque polygons that can't produce a transparent pixel use a shader without the alpha test.
 // debug.litev.glnodiscard=0 turns it off.
+#ifdef LITEV_GL_LEAN_UPLOAD
+bool GLRenderer3D::LeanUpload()
+{
+    static const bool on = OpenGL::Prop("gllean", 1) != 0;   // debug.litev.gllean=0: off
+    return on;
+}
+#endif
+
 bool GLRenderer3D::NoDiscard()
 {
     static const bool on = OpenGL::Prop("glnodiscard", 1) != 0;
@@ -1107,6 +1116,9 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
 
         rp->EdgeIndicesOffset = eidx;
         rp->NumEdgeIndices = 0;
+#ifdef LITEV_GL_LEAN_UPLOAD
+        if (LeanUpload()) continue;   // edge indices: only the disabled edge pass reads them
+#endif
 
         if (poly->Type == 1)
         {
@@ -2029,10 +2041,19 @@ int GLRenderer3D::PrepareFrame(int slot, const std::function<void()>& beforeVRAM
     return n.Skip ? -1 : bank;   // a skipped frame reads no polygons
 }
 
+static double GL3DCpuMs()
+{
+    timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
 void GLRenderer3D::RenderPreparedFrame(int slot)
 {
+    double tp = GL3DCpuMs();
+    auto phase = [&](int i) { const double t = GL3DCpuMs(); StatPhase[i] += t - tp; tp = t; };
     u8 clrBitmapDirty;
     Texcache.Apply(slot, clrBitmapDirty);
+    phase(0);
     if (Next[slot].Skip)
         return;
     const int nPolys = Next[slot].RenderNumPolygons;
@@ -2294,12 +2315,51 @@ cleared:
                 const Polygon* p = rp.PolyData;
                 return std::make_tuple((p->Attr >> 14) & 1, p->Type == 1, rp.RenderKey, p->TexParam, p->TexPalette);
             };
+#ifdef LITEV_GL_SORT_KEYS
+            // LITEV_GL_SORT_KEYS: the same key packed into two integers once per polygon (the
+            // comparator dereferenced both polygons' PolyData ~2 n log n times: cache misses on
+            // the in-order A55). Field widths are fixed, so (hi, lo) orders exactly like the
+            // tuple: same stable order. debug.litev.glsortkeys=0: the tuple comparator.
+            static const bool sortKeys = OpenGL::Prop("glsortkeys", 1) != 0;
+            if (sortKeys)
+            {
+                for (int i = 0; i < nopaque; i++)
+                {
+                    RendererPolygon& rp = PolygonList[i];
+                    const Polygon* p = rp.PolyData;
+                    rp.SortHi = ((u64)((p->Attr >> 14) & 1) << 33) | ((u64)(p->Type == 1) << 32) | rp.RenderKey;
+                    rp.SortLo = ((u64)(u32)p->TexParam << 32) | (u32)p->TexPalette;
+                }
+                std::stable_sort(&PolygonList[0], &PolygonList[nopaque], [](const RendererPolygon& a, const RendererPolygon& b) {
+                    return a.SortHi != b.SortHi ? a.SortHi < b.SortHi : a.SortLo < b.SortLo; });
+            }
+            else
+#endif
             std::stable_sort(&PolygonList[0], &PolygonList[nopaque],
                              [&](const RendererPolygon& a, const RendererPolygon& b) { return key(a) < key(b); });
         }
 #endif
 
+        phase(1);
         BuildPolygons(&PolygonList[0], npolys, captureinfo);
+        phase(2);
+#ifdef LITEV_GL_LEAN_UPLOAD
+        // LITEV_GL_LEAN_UPLOAD: orphan + fill only the bytes this frame uses, in one call per
+        // buffer (was: re-specify the whole 280 KB vertex / 160 KB index store, then sub-upload),
+        // and no edge indices (no pass reads them). Same vertices/indices for every draw.
+        if (LeanUpload())
+        {
+            glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
+            glBufferData(GL_ARRAY_BUFFER, NumVertices*7*4, VertexBuffer, GL_DYNAMIC_DRAW);
+            glBindVertexArray(VertexArrayID);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, NumIndices * 2, IndexBuffer, GL_DYNAMIC_DRAW);
+            phase(3);
+            RenderSceneChunk(0, 192);
+            phase(4);
+        }
+        else
+#endif
+        {
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
         glBufferData(GL_ARRAY_BUFFER, sizeof(VertexBuffer), nullptr, GL_DYNAMIC_DRAW);
         glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*7*4, VertexBuffer);
@@ -2309,8 +2369,11 @@ cleared:
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(IndexBuffer), nullptr, GL_DYNAMIC_DRAW);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, NumIndices * 2, IndexBuffer);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, EdgeIndicesOffset * 2, NumEdgeIndices * 2, IndexBuffer + EdgeIndicesOffset);
+        phase(3);
 
         RenderSceneChunk(0, 192);
+        phase(4);
+        }
     }
 
     if (TileMode)

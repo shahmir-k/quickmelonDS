@@ -1645,6 +1645,14 @@ endif()
 
 # GL 3D: group opaque polygons by state + texture before batching (display only; exact-depth ties
 # and the stencil polygon ID may differ). Runtime: debug.litev.glsortopaque=0 off.
+option(LITEV_GL_LEAN_UPLOAD "GL 3D: upload only the used vertex/index bytes (one call per buffer), no unused edge indices" OFF)
+if (LITEV_GL_LEAN_UPLOAD)
+    add_compile_definitions(LITEV_GL_LEAN_UPLOAD=1)
+endif()
+option(LITEV_GL_SORT_KEYS "GL 3D: opaque sort on keys packed once per polygon (same order)" OFF)
+if (LITEV_GL_SORT_KEYS)
+    add_compile_definitions(LITEV_GL_SORT_KEYS=1)
+endif()
 option(LITEV_GL_OPAQUE_FULLMASK "GL 3D: opaque pass writes every attribute channel (Mali forward pixel kill)" OFF)
 if (LITEV_GL_OPAQUE_FULLMASK)
     add_compile_definitions(LITEV_GL_OPAQUE_FULLMASK=1)

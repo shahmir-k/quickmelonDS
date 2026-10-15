@@ -948,6 +948,13 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
         if (t->JobN)
             Platform::Log(Platform::Info, "LITEV_HYB 3d-draws: %.1f draws %.1f polys per job\n",
                           (double)GL3D()->StatDraws / t->JobN, (double)GL3D()->StatPolys / t->JobN);
+        if (t->JobN)
+        {
+            const double* ph = GL3D()->StatPhase;
+            Platform::Log(Platform::Info, "LITEV_HYB 3d-phases: texcache=%.2f setup=%.2f build=%.2f upload=%.2f scene=%.2f ms cpu/job\n",
+                          ph[0] / t->JobN, ph[1] / t->JobN, ph[2] / t->JobN, ph[3] / t->JobN, ph[4] / t->JobN);
+        }
+        for (double& d : GL3D()->StatPhase) d = 0;
         GL3D()->StatDraws = GL3D()->StatPolys = 0;
         OpenGL::GLStatLog(60);
         t->JobQueued = t->JobWall = t->JobCpu = t->PrepWait = t->PrepMs = t->JobTail = t->KickGap = t->JobEndFromKick = t->FinishWait = 0; t->JobN = t->CopyN = t->BankWaitN = 0;
