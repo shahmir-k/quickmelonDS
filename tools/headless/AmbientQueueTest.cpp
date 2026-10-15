@@ -199,6 +199,13 @@ struct AmbientLANQueueTestAccess
         assert(ambient.PeerVerdict(0x404) == AmbientLAN::Verdict_LanBad);     // 10 + 20 ms > 17.2 (the spike is not the median)
         { std::lock_guard<std::mutex> g(ambient.Mu); auto& p = ambient.Peers[0]; for (auto& r : p.RttS) r = 5000; }
         assert(ambient.PeerVerdict(0x404) == AmbientLAN::Verdict_LanOk);      // 10 + 5 ms: a 0-5 ms LAN
+        ambient.EmuBaseUs = 17600;
+        assert(ambient.PeerVerdict(0x404) == AmbientLAN::Verdict_LanOk);      // a device too slow on its own: not the network
+        ambient.EmuBaseUs = 16000;
+        { std::lock_guard<std::mutex> g(ambient.Mu); for (auto& r : ambient.Peers[0].RttS) r = 1500; }
+        assert(ambient.PeerVerdict(0x404) == AmbientLAN::Verdict_LanOk);      // a 1.5 ms LAN never
+        { std::lock_guard<std::mutex> g(ambient.Mu); for (auto& r : ambient.Peers[0].RttS) r = 5000; }
+        ambient.EmuBaseUs = 10000;
 
         // The live session: half-second windows of exchanges/frame x the link's round trip + emulation.
         assert(ambient.UpMask());

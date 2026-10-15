@@ -485,7 +485,7 @@ void AmbientLAN::PresenceLoop()
                     if (linked)
                     {
                         linkRtt = std::max(linkRtt, p.RttUs());
-                        for (int i = 1; i <= std::min<int>(p.RttN, 8); i++) linkRttMax = std::max(linkRttMax, p.RttS[(p.RttPos + 16 - i) % 16]);
+                        for (int i = 0; i < p.RttN; i++) linkRttMax = std::max(linkRttMax, p.RttS[i]);
                     }
                     if (p.PingMs && now - p.PingMs < (p.PingN < 5 ? 100u : linked ? 250u : 1000u)) continue;
                     p.PingMs = now;
@@ -1112,18 +1112,25 @@ void AmbientLAN::Process()
 }
 
 // the wait for a peer's MP frame: RecvTimeout, or the link's round trip + margin when that is longer (a slow network
-// keeps its session, slowly, until it moves to Netplay), at most 250 ms; the longest of the last 8 round trips, not
-// their median: a spike of 100 ms (Wi-Fi) holds the session for the next 2 s
+// keeps its session, slowly, until it moves to Netplay), at most 250 ms; the longest of the last 16 round trips (4 s
+// linked), not their median: a 100 ms Wi-Fi spike keeps the waits long for the next 4 s
 int AmbientLAN::LinkWaitMs() const
 {
     return std::max(RecvTimeout, std::min(250, (int)(LinkRttMaxUs * 3 / 2000) + 10));
+}
+
+// one exchange a frame does not fit 58 fps because of the round trip: this device alone fits it (a device too slow
+// for 58 fps on its own is no case for Netplay: Netplay would not make it faster) and the round trip is 2 ms or more
+bool AmbientLAN::LinkRule(u32 emuUs, u32 rttUs)
+{
+    return emuUs < 1000000 / 58 && rttUs >= 2000 && emuUs + rttUs > 1000000 / 58;
 }
 
 AmbientLAN::Verdict AmbientLAN::PeerVerdict(u64 id)
 {
     std::lock_guard<std::mutex> g(Mu);
     for (const auto& p : Peers)
-        if (p.ID == id) return p.RttN < 3 ? Verdict_Unknown : EmuBaseUs + p.RttUs() > 1000000 / 58 ? Verdict_LanBad : Verdict_LanOk;
+        if (p.ID == id) return p.RttN < 3 ? Verdict_Unknown : LinkRule(EmuBaseUs, p.RttUs()) ? Verdict_LanBad : Verdict_LanOk;
     return Verdict_Unknown;
 }
 
@@ -1176,8 +1183,8 @@ void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
         // trips take 40% of them and they make 40 without (a partner slow too). 4 windows and the 600 frames wait out
         // setup bursts: an MKDS lobby / race start runs 5-6 exchanges a frame at 14-48 fps at 0 ms for ~400 frames,
         // then 1 a frame (Pokémon B/W: 2 a frame from link to the end, Shrek 3: no burst)
-        const bool linkRule = std::min<u32>(VEmuAtLink, EmuBaseUs) + rtt > 1000000 / 58;
-        const bool calm = frame > 1e6 / 50 && stalls == VStallAt;
+        const bool linkRule = LinkRule(std::min<u32>(VEmuAtLink, EmuBaseUs), rtt);
+        const bool calm = frame > 1e6 / 50 && stalls == VStallAt && net >= 2000;     // (2 ms: a round trip that matters)
         const bool strong = linkRule || (calm && frame - net <= 1e6 / 50);
         const bool weak = calm && net >= frame * 0.4 && frame - net <= 1e6 / 40 && VExchFrames >= 600;
         VBad = linkRule ? VBad + 1 : 0;

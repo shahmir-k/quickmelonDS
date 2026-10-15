@@ -110,7 +110,8 @@ public:
     // frame (E: NoteFrameUs without the link waits; the lowest half-second average of the last 2 s, as a loading
     // phase emulates more; 10 ms until measured, an RG DS). Each MP exchange stops emulation for one round trip.
     //  - PeerVerdict (a device, before or at link open): LAN_BAD when E + 1 x RTT > 1000/58 ms (not even one exchange
-    //    a frame fits; RG DS: RTT above ~7 ms), UNKNOWN before 3 round trips.
+    //    a frame fits), with E alone under it (a device slow on its own is no case for Netplay) and RTT >= 2 ms;
+    //    UNKNOWN before 3 round trips. RG DS #1 measured E 3.8-4.8 ms in Pokémon B/W: LAN_BAD above ~12.5 ms.
     //  - SessionVerdict (the live session), a vote every 0.5 s from 1 s after the first exchange, from the window's
     //    frames F (NoteFrameUs: emulation + link waits, no pacing) and round trips N = exchanges/frame x RTT:
     //      the link rule (the PeerVerdict rule, with the lower of E now and at link: a loading phase emulates more):
@@ -208,7 +209,7 @@ private:
     std::vector<u8> BuildPing(u8 kind, u64 t);
     u64 PingEcho = 0;                                       // presence thread
     std::atomic<u32> LinkRttUs{0};                          // the slowest linked device's median round trip
-    std::atomic<u32> LinkRttMaxUs{0};                       // ... and the longest of their last 8 (the link waits)
+    std::atomic<u32> LinkRttMaxUs{0};                       // ... and the longest of their last 16 (the link waits)
 
     // ---- links + synthesis (emulator thread) ----
     ENetHost* Host = nullptr;
@@ -241,6 +242,7 @@ private:
     std::atomic<int> StVerdict{0};
     std::atomic<u32> StPredFps{0};
     int LinkWaitMs() const;
+    static bool LinkRule(u32 emuUs, u32 rttUs);
     void Judge(u32 frameBlocked, u32 frameExchanges);
     int PendCode = -1;              // group speed to apply at PendAtUs (chip clock), from PendWho
     u64 PendAtUs = 0, PendWho = 0, PendWallUs = 0;
