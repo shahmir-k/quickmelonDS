@@ -594,7 +594,7 @@ AmbientLAN::Stats AmbientLAN::GetStats()
     s.EmuUs = EmuBaseUs; s.PredFpsX100 = StPredFps; s.Verdict = StVerdict;
     s.LastFrameBlockedUs = StLastBlocked; s.LastFrameExchanges = StLastExch; s.Links = StLinks; s.Nearby = StNearby; s.MaxRttMs = StMaxRtt;
     s.SlowFpsX100 = StSlowFps; s.SlowWaitUsPerFrame = StSlowWait;
-    s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending;
+    s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending; s.AutoSwitchOk = StAutoOk;
     return s;
 }
 
@@ -1907,7 +1907,7 @@ bool AmbientLAN::AutoHandoffDue()
 {
     const Link* l = HandoffLink();
     const bool bad = l && HandoffBuildCompatible() && !l->OfferEpoch && !l->FenceEpoch && !l->LastClosedOfferEpoch &&
-        !l->LastClosedFenceEpoch && (StVerdict == Verdict_LanBad || (l->OpenVerdict == Verdict_LanBad && FirstExchUs));
+        !l->LastClosedFenceEpoch && ((StVerdict == Verdict_LanBad && StAutoOk) || (l->OpenVerdict == Verdict_LanBad && FirstExchUs));
     if (!bad) { AutoDueUs = 0; return false; }
     const u64 now = NowUs();
     if (!AutoDueUs) AutoDueUs = now;
@@ -1939,7 +1939,7 @@ void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
     if (!UpMask())
     {
         if (StVerdict) Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict cleared (no links)\n");
-        StVerdict = Verdict_Unknown; StPredFps = 0;
+        StVerdict = Verdict_Unknown; StPredFps = 0; StAutoOk = false;
         FirstExchUs = VT0 = 0; VFrames = VExch = VRunN = VBad = VWeak = VOk = 0; VExchFrames = 0; VRunUs = 0; VerdictDismissed = false;
         return;
     }
@@ -1979,6 +1979,8 @@ void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
                           v == Verdict_LanBad ? "LAN_BAD" : "LAN_OK", pred, frame / 1000.0, (double)VExch / VFrames, rtt / 1000.0, EmuBaseUs / 1000.0);
             StVerdict = v;
         }
+        const Link* hl = HandoffLink();
+        StAutoOk = v == Verdict_LanBad && (VBad >= 2 || pred < 40.0 || (hl && hl->OpenVerdict == Verdict_LanBad));
     }
     VT0 = now; VFrames = VExch = VRunN = 0; VRunUs = 0; VStallAt = stalls;
 }

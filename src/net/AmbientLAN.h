@@ -74,6 +74,7 @@ public:
         int Verdict;                // SessionVerdict
         u32 SlowFpsX100, SlowWaitUsPerFrame, SlowExchangesPerFrameX100;
         bool SlowdownPending;
+        bool AutoSwitchOk;          // a LAN_BAD the automatic switch acts on (AutoHandoffDue)
     };
 
     explicit AmbientLAN(const Config& cfg);
@@ -139,7 +140,9 @@ public:
     // The automatic Netplay switch (emulator thread; the app's default, its "Ask before switching" turns it off): true
     // when this two-player session should be offered the live handoff now. LAN_BAD at link open (PeerVerdict then):
     // as soon as the join is done (the first MP exchange: both at 1x, a link opening is normal speed for the group);
-    // SessionVerdict LAN_BAD later: at once (it is burst-proof, never fast-forward). The game's MP host offers; a child
+    // SessionVerdict LAN_BAD later: at once (it is burst-proof, never fast-forward) when the link rule says it (the
+    // network alone does not fit one exchange a frame) or the session runs under 40 fps; a LAN_BAD of 40-50 fps on a
+    // fast network (e.g. Pokémon's 2 exchanges a frame at a 4-6 ms round trip: 48 fps) only raises the prompt. The game's MP host offers; a child
     // only 2 s later (no offer came: the host asks first). Never twice on a link (a declined or failed switch stays on
     // LAN; no automatic way back to LAN), never with an offer or a fence open.
     bool AutoHandoffDue();
@@ -358,6 +361,7 @@ private:
     bool VerdictDismissed = false;
     u64 AutoDueUs = 0;              // AutoHandoffDue: since when
     std::atomic<int> StVerdict{0};
+    std::atomic<bool> StAutoOk{false};      // (Stats::AutoSwitchOk)
     std::atomic<u32> StPredFps{0};
     int LinkWaitMs() const;
     static bool LinkRule(u32 emuUs, u32 rttUs);
