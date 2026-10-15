@@ -140,7 +140,7 @@ private:
     // emu-thread CPU time per 60 frames (logged as LITEV_HYB)
     double ProfGL3D = 0, ProfWait = 0, ProfMerge = 0, ProfUpload = 0, ProfSync = 0, ProfDraw = 0, ProfReadback = 0;
     int ProfFrames = 0;
-    int ProfEdge = 0, ProfScr3D = 0, ProfScr1x = 0, ProfLnCopy = 0, ProfLnFastBr = 0, ProfLnFull = 0, ProfRuns = 0;   // merge mix (diagnostic)
+    int ProfEdge = 0, ProfScr3D = 0, ProfScr1x = 0, ProfLnCopy = 0, ProfLnFastBr = 0, ProfLnFull = 0, ProfRuns = 0, ProfFastBad = 0;   // merge mix (diagnostic)
 };
 
 }

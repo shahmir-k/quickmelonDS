@@ -1302,6 +1302,13 @@ option(LITEV_HYB_CAPCONV_NEON "Hybrid: NEON capture readback conversion" OFF)
 if (LITEV_HYB_CAPCONV_NEON)
     add_compile_definitions(LITEV_HYB_CAPCONV_NEON=1)
 endif()
+# Hybrid FASTLINES: the per-line "every descriptor mode 0" test on the 2D thread (NEON, line in
+# cache) instead of a 256-pixel scalar scan per line on the present thread. Same merge.
+# Runtime: debug.litev.hybfast2d=0 off, =2 both + mismatch count.
+option(LITEV_HYB_FASTLINES_2D "Hybrid: FASTLINES line test on the 2D thread" OFF)
+if (LITEV_HYB_FASTLINES_2D)
+    add_compile_definitions(LITEV_HYB_FASTLINES_2D=1)
+endif()
 
 # GL 3D, W-buffer frames: depth 1 - z0/w from the rasterizer instead of gl_FragDepth, so the GPU's
 # early depth test works (display only; same depth order, fog converts back to w).

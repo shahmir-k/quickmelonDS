@@ -29,6 +29,9 @@
 #include "GPU_ColorOp.h"
 #include "Platform.h"
 #include "LitevSoftProf.h"
+#if defined(LITEV_HYB_FASTLINES_2D) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #ifdef LITEV_SOFT3D_DRASTIC
 #include "GPU3D_TileSoft.h"   // alternate tile-based 3D renderer (P1 skeleton)
@@ -1596,6 +1599,20 @@ void SoftRenderer::HybridLine(u32 line, const FrameLineSnap& f, u32* descA, u32*
     }
     if (has3D)
     {
+#ifdef LITEV_HYB_FASTLINES_2D
+        {
+            // descriptor mode (bits 29-31) 0 on every pixel
+#ifdef __aarch64__
+            uint32x4_t acc = vdupq_n_u32(0);
+            for (int i = 0; i < 256; i += 4) acc = vorrq_u32(acc, vld1q_u32(descA + i));
+            const u32 any = vmaxvq_u32(acc);
+#else
+            u32 any = 0;
+            for (int i = 0; i < 256; i++) any |= descA[i];
+#endif
+            HybLineMode0[AsyncTargetBuf][f.ScreenSwap ? 0 : 1][line] = (any >> 29) == 0;
+        }
+#endif
         ctlA |= 1u << 18;
         // relaxed atomic: two 2D bands may set the same screen's flag (LITEV_SOFT2D_HYB_BANDS)
         __atomic_store_n(&HybHas3D[AsyncTargetBuf][f.ScreenSwap ? 0 : 1], true, __ATOMIC_RELAXED);

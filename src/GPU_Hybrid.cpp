@@ -844,11 +844,22 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
                     const u32 evy = std::min<u32>(c & 0x1F, 16);
                     if (bright == 3 || evy == 0) bright = 0;
                     bool f = ((c >> 16) & 3) == 1 && (c & (1 << 18)) && !(c >> 23);
+#ifdef LITEV_HYB_FASTLINES_2D
+                    // LITEV_HYB_FASTLINES_2D: the per-pixel mode test was done by the 2D thread
+                    // (modes 5/6 are never written). debug.litev.hybfast2d=0: the scan here;
+                    // =2: both, mismatches counted in the merge-mix line.
+                    static const int fast2d = OpenGL::Prop("hybfast2d", 1);
+                    if (fast2d == 1) f = f && HybLineMode0[fb][sc][l];
+                    else
+#endif
                     for (int x = 0; f && x < 256; x++)
                     {
                         const u32 mode = ln[x] >> 29;
                         f = mode == 0 || mode == 5 || mode == 6;
                     }
+#ifdef LITEV_HYB_FASTLINES_2D
+                    if (fast2d == 2 && (((c >> 16) & 3) == 1 && (c & (1 << 18)) && !(c >> 23)) && f != (bool)HybLineMode0[fb][sc][l]) ProfFastBad++;
+#endif
                     fast[l] = f ? int(1 + bright + (bright ? evy << 8 : 0)) : 0;
                     if (!f) ProfLnFull++; else if (bright) ProfLnFastBr++; else ProfLnCopy++;
                 }
@@ -894,8 +905,9 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
         Platform::Log(Platform::Info, "LITEV_HYB 60f: gl3d=%.2f wait3d=%.2f merge=%.2f (upload=%.2f sync=%.2f draw=%.2f) readback=%.2f ms/frame (emu thread, scale %d)\n",
                       ProfGL3D / 60, ProfWait / 60, ProfMerge / 60, ProfUpload / 60, ProfSync / 60, ProfDraw / 60, ProfReadback / 60, Scale);
         ProfGL3D = ProfWait = ProfMerge = ProfUpload = ProfSync = ProfDraw = ProfReadback = 0;
-        Platform::Log(Platform::Info, "LITEV_HYB merge-mix 60f: edge=%d scr3d=%d scr1x=%d lines copy=%d fastbright=%d full=%d runs=%d\n",
-                      ProfEdge, ProfScr3D, ProfScr1x, ProfLnCopy, ProfLnFastBr, ProfLnFull, ProfRuns);
+        Platform::Log(Platform::Info, "LITEV_HYB merge-mix 60f: edge=%d scr3d=%d scr1x=%d lines copy=%d fastbright=%d full=%d runs=%d fast2d-mismatch=%d\n",
+                      ProfEdge, ProfScr3D, ProfScr1x, ProfLnCopy, ProfLnFastBr, ProfLnFull, ProfRuns, ProfFastBad);
+        ProfFastBad = 0;
         ProfEdge = ProfScr3D = ProfScr1x = ProfLnCopy = ProfLnFastBr = ProfLnFull = ProfRuns = 0;
         GLThread3D* t = Thread3D();
         if (t->JobN)
