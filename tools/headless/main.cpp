@@ -1072,6 +1072,9 @@ int main(int argc, char** argv)
     const char* cutDir = getenv("LITEV_AMBIENT_CUT_DIR");
     const char* cutRole = getenv("LITEV_AMBIENT_CUT_ROLE");
     const int cutMinFrame = getenv("LITEV_AMBIENT_CUT_MIN_FRAME") ? atoi(getenv("LITEV_AMBIENT_CUT_MIN_FRAME")) : 0;
+    // LITEV_AMBIENT_AUTO_HANDOFF=1: the host role offers when AmbientLAN::AutoHandoffDue (the app's automatic switch)
+    // instead of at LITEV_AMBIENT_CUT_MIN_FRAME
+    const bool cutAuto = getenv("LITEV_AMBIENT_AUTO_HANDOFF") && atoi(getenv("LITEV_AMBIENT_AUTO_HANDOFF"));
     const u16 cutXferPort = getenv("LITEV_AMBIENT_CUT_XFER_PORT") ? (u16)atoi(getenv("LITEV_AMBIENT_CUT_XFER_PORT")) : 0;
     const int cutSwapTrialFrames = getenv("LITEV_AMBIENT_CUT_SWAP_TRIAL_FRAMES") ?
                                    atoi(getenv("LITEV_AMBIENT_CUT_SWAP_TRIAL_FRAMES")) : 0;
@@ -1584,9 +1587,39 @@ int main(int argc, char** argv)
                 if (!period || now - lanNext > std::chrono::milliseconds(100)) lanNext = now;
                 std::this_thread::sleep_until(lanNext);
             }
+            // (auto without the cut harness, e.g. a 4-player session: only says when the switch would be offered)
+            if (ambient && cutAuto && !cutRole)
+            {
+                static bool said = false;
+                if (!said && ambient->AutoHandoffDue())
+                {
+                    said = true;
+                    printf("AMBIENT auto switch due f%d (links %u)\n", frame, ambient->GetStats().Links);
+                }
+            }
             if (ambient && cutDir && cutRole && (frame >= cutMinFrame || ambient->HasPeerHandoffFence()) && ambient->GetStats().Links)
             {
-                const bool host = strcmp(cutRole, "host") == 0;
+                // (auto: the peer's automatic offer came first - an app whose game hosts the MP session offers at
+                // once - so the host role answers it as the client role would, Netplay player 1)
+                static bool cutAutoAnswered = false;
+                if (cutAuto && !cutAutoAnswered && !cutOfferSent && cutAttempt == 0 && strcmp(cutRole, "host") == 0)
+                {
+                    u64 offeredEpoch = 0;
+                    melonDS::AmbientLAN::HandoffMode offeredMode;
+                    if (ambient->IncomingHandoffOffer(offeredEpoch, offeredMode) &&
+                        offeredMode == melonDS::AmbientLAN::HandoffPlainNetplay)
+                    {
+                        cutAutoAnswered = true;
+                        if (const char* np = getenv("LITEV_NETPLAY"))
+                        {
+                            std::string v = np;
+                            const size_t at = v.find("player=0");
+                            if (at != std::string::npos) { v[at + 7] = '1'; setenv("LITEV_NETPLAY", v.c_str(), 1); }
+                        }
+                        printf("CUTFENCE auto: the peer offered first f%d, answering as Netplay player 1\n", frame);
+                    }
+                }
+                const bool host = strcmp(cutRole, "host") == 0 && !cutAutoAnswered;
                 const std::string abort = std::string(cutDir) + "/abort";
                 auto exists = [](const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (!f) return false; fclose(f); return true; };
                 auto mark = [](const std::string& p) { FILE* f = fopen(p.c_str(), "wb"); if (!f) return false; fclose(f); return true; };
@@ -1608,8 +1641,14 @@ int main(int argc, char** argv)
                 const u64 nextEpoch = epochBase + (u64)cutAttempt + 1;
                 if (cutXferPort && eligible)
                 {
-                    if (host && !cutOfferSent)
+                    if (host && !cutOfferSent && (!cutAuto || ambient->AutoHandoffDue()))
                     {
+                        if (cutAuto)
+                        {
+                            const auto st = ambient->GetStats();
+                            printf("CUTFENCE auto switch due f%d: session verdict %d, rtt %.1f ms, exchanges %llu\n", frame,
+                                   (int)ambient->SessionVerdict(), st.LinkRttUs / 1000.0, (unsigned long long)st.Exchanges);
+                        }
                         std::random_device random;
                         for (u8& byte : cutOfferToken) byte = (u8)random();
                         if (ambient->ProposeHandoff(nextEpoch, cutOfferToken,

@@ -741,9 +741,10 @@ int AmbientLAN::OpenLink(const Peer& p)
     e->data = &l;
     enet_peer_timeout(e, 0, 5000, 5000);
     StOpened++;
+    l.OpenVerdict = PeerVerdict(p.ID);
     LinksChanged(true);
     Platform::Log(Platform::LogLevel::Info, "Ambient: link %d -> %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p.ID, p.Name.c_str(),
-                  (int)PeerVerdict(p.ID), EmuBaseUs / 1000.0);
+                  l.OpenVerdict, EmuBaseUs / 1000.0);
     return s;
 }
 
@@ -1532,9 +1533,10 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         n.ID = p->ID; n.Generation = ++NextLinkGeneration; n.P = ev.peer; n.Up = true; memcpy(n.MAC, p->MAC, 6); n.ActiveMs = NowMs();
         ev.peer->data = &n;
         enet_peer_timeout(ev.peer, 0, 5000, 5000);
+        n.OpenVerdict = PeerVerdict(p->ID);
         LinksChanged(true);
         Platform::Log(Platform::LogLevel::Info, "Ambient: link %d <- %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p->ID, p->Name.c_str(),
-                      (int)PeerVerdict(p->ID), EmuBaseUs / 1000.0);
+                      n.OpenVerdict, EmuBaseUs / 1000.0);
         break;
     }
     case ENET_EVENT_TYPE_DISCONNECT:
@@ -1896,6 +1898,17 @@ AmbientLAN::Verdict AmbientLAN::PeerVerdict(u64 id)
     for (const auto& p : Peers)
         if (p.ID == id) return p.RttN < 3 ? Verdict_Unknown : LinkRule(EmuBaseUs, p.RttUs()) ? Verdict_LanBad : Verdict_LanOk;
     return Verdict_Unknown;
+}
+
+bool AmbientLAN::AutoHandoffDue()
+{
+    const Link* l = HandoffLink();
+    const bool bad = l && HandoffBuildCompatible() && !l->OfferEpoch && !l->FenceEpoch && !l->LastClosedOfferEpoch &&
+        !l->LastClosedFenceEpoch && (StVerdict == Verdict_LanBad || (l->OpenVerdict == Verdict_LanBad && FirstExchUs));
+    if (!bad) { AutoDueUs = 0; return false; }
+    const u64 now = NowUs();
+    if (!AutoDueUs) AutoDueUs = now;
+    return ParentSlot < 0 || now - AutoDueUs >= 2000000;
 }
 
 // once a frame (Process): the emulation time and the session verdict (AmbientLAN.h)
