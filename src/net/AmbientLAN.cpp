@@ -1,4 +1,3 @@
-#include <random>
 // LITEV_AMBIENT_LAN: lobby-free local wireless (see AmbientLAN.h)
 #ifdef LITEV_AMBIENT_LAN
 
@@ -8,6 +7,7 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <random>
 
 #ifdef __WIN32__
 #include <winsock2.h>
