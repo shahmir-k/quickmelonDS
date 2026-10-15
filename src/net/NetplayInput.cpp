@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <algorithm>
+#include <cstddef>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -209,8 +210,10 @@ void NetplayInput::Adapt(int frame)
 }
 #endif
 
-void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
+void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& inputIn)
 {
+    NetplayFrameInput input = inputIn;
+    if (LeaveRequested.load()) input.Keys |= NetplayLeave::kBit;
 #ifdef LITEV_NP_ADAPTIVE_DELAY
     if (Adaptive) Adapt(frame);
 #endif
@@ -448,6 +451,7 @@ u64 NetplayInput::NextHeartbeatUs()
     u64 next = UINT64_MAX;
     for (int peer : Peers)
     {
+        if (Dropped(peer)) continue;
         next = std::min(next, LastSentTo[peer] + kKeepaliveMs * 1000);
         if (OweAckSince[peer]) next = std::min(next, OweAckSince[peer] + kAckDelayMs * 1000);
         if (!Unacked.empty() && Unacked.back().first > PeerAck[peer]) next = std::min(next, LastSentTo[peer] + 2 * kAckDelayMs * 1000 + RttP90[peer]);
@@ -461,6 +465,7 @@ void NetplayInput::Send(bool all)
     std::vector<u8> packet;
     for (int peer : Peers)
     {
+        if (Dropped(peer)) continue;
         {
             std::lock_guard<std::mutex> lk(Lock);
 #ifdef LITEV_NP_QUIET_HB
@@ -641,8 +646,48 @@ int NetplayInput::AckedBy(int peer)
 double NetplayInput::MsSincePeer() const
 {
     u64 oldest = UINT64_MAX;
-    for (int peer : Peers) oldest = std::min<u64>(oldest, LastPeerUs[peer].load());
+    for (int peer : Peers) if (!Dropped(peer)) oldest = std::min<u64>(oldest, LastPeerUs[peer].load());
+    if (oldest == UINT64_MAX) return 0;
     return (NowUs() - oldest) / 1000.0;
+}
+
+void NetplayInput::DropPlayer(int player, int lastFrame)
+{
+    if (!IsPeer(player)) return;
+    std::lock_guard<std::mutex> lk(Lock);
+    DroppedMask |= 1u << player;
+#ifdef LITEV_NP_SPEED
+    auto& ch = SpeedChanges[player];
+    ch.erase(ch.upper_bound(lastFrame), ch.end());
+#endif
+    (void)lastFrame;
+    int allAcked = INT32_MAX;
+    for (int peer : Peers) if (!Dropped(peer)) allAcked = std::min(allAcked, PeerAck[peer]);
+    while (!Unacked.empty() && Unacked.front().first <= allAcked) Unacked.pop_front();
+    Changed.notify_all();
+}
+
+void NetplayInput::Release()
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    Released = true;
+    Changed.notify_all();
+}
+
+bool NetplayInput::WaitAcked(int frame, int timeoutMs)
+{
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;)
+    {
+        {
+            std::lock_guard<std::mutex> lk(Lock);
+            bool all = true;
+            for (int peer : Peers) if (!Dropped(peer) && PeerAck[peer] < frame) all = false;
+            if (all) return true;
+        }
+        if (!Running || std::chrono::steady_clock::now() >= until) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
 }
 
 void NetplayInput::Abort()
@@ -663,7 +708,7 @@ NetplayFrameInput NetplayInput::Get(int player, int frame)
     if (inputs.find(frame) == inputs.end())
     {
         u64 start = NowUs();
-        auto known = [&] { return inputs.find(frame) != inputs.end() || !Running; };
+        auto known = [&] { return inputs.find(frame) != inputs.end() || !Running || Released; };
         if (DropAfterMs <= 0 || player == Local) Changed.wait(lk, known);
         else
             // late input only stalls (a paused guest still sends its 10 ms heartbeat); only a
@@ -679,6 +724,7 @@ NetplayFrameInput NetplayInput::Get(int player, int frame)
         if (player != Local) StallUs += NowUs() - start;
     }
     if (Dropped(player)) return {};
+    if (inputs.find(frame) == inputs.end()) return {};   // (Abort / Release)
     NetplayFrameInput in = inputs[frame];
     inputs.erase(inputs.begin(), inputs.lower_bound(frame - 64)); // keep a little history
     return in;
@@ -851,10 +897,11 @@ void NetplayInput::Receive(const u8* data, size_t size, u64 now)
                 std::nth_element(us.begin(), us.begin() + us.size() * 9 / 10, us.end());
                 RttP90[from] = us[us.size() * 9 / 10];
             }
-            for (int peer : Peers) if (!Rtt[peer].empty()) worst = std::max(worst, RttP90[peer]);
+            for (int peer : Peers) if (!Rtt[peer].empty() && !Dropped(peer)) worst = std::max(worst, RttP90[peer]);
 #else
             for (int peer : Peers)
             {
+                if (Dropped(peer)) continue;
                 std::vector<u32> us;
                 for (auto& [t, v] : Rtt[peer]) us.push_back(v);
                 if (us.empty()) continue;
@@ -875,7 +922,7 @@ void NetplayInput::Receive(const u8* data, size_t size, u64 now)
 #endif
         PeerAck[from] = std::max(PeerAck[from], header.Ack);
         int allAcked = INT32_MAX;
-        for (int peer : Peers) allAcked = std::min(allAcked, PeerAck[peer]);
+        for (int peer : Peers) if (!Dropped(peer)) allAcked = std::min(allAcked, PeerAck[peer]);
         while (!Unacked.empty() && Unacked.front().first <= allAcked) Unacked.pop_front();
 #ifdef LITEV_NP_LEAN_IO
         if (inputs.size() != had)   // Get() waits only for inputs (a re-sent packet adds none)
@@ -1900,37 +1947,70 @@ NetplayLiveExit::NetplayLiveExit(int consoles, int quietFrames, int slack)
     : Consoles(std::clamp(consoles, 1, 16)), QuietFrames(quietFrames), Slack(std::clamp(slack, 1, kRing / 4))
 {
     Done.fill(-1);
+    for (auto& d : DropAt) d.store(-1);
 }
 
-bool NetplayLiveExit::EndFrame(int console, int frame, u32 exchanges)
+u32 NetplayLiveExit::InMask() const
+{
+    u32 m = 0;
+    for (int c = 0; c < Consoles; c++) if (DropAt[c].load() < 0) m |= 1u << c;
+    return m;
+}
+
+bool NetplayLiveExit::EndFrame(int console, int frame, u32 exchanges, bool leaving)
 {
     std::unique_lock<std::mutex> lk(Lock);
     if (frame == 0 || exchanges != Last[console]) Streak[console] = 0;
     else Streak[console]++;
     Last[console] = exchanges;
     StreakAt[console][frame % kRing] = Streak[console];
+    if (leaving && EndAfter.load() < 0)
+    {
+        // its player quit: it leaves after this frame (the frame its input says, on every device)
+        DropAt[console] = frame;
+        Done[console] = frame;
+        Changed.notify_all();
+        return true;
+    }
     Done[console] = frame;
     Changed.notify_all();
     const int decided = frame - Slack;   // the frame decided now
     if (decided < 0) return false;
     if (EndAfter.load() >= 0) return frame >= EndAfter.load();
-    bool quiet = true;
-    for (int c = 0; c < Consoles && quiet; c++)
+    // the consoles in the session at `decided`: not left, or left after it (they ran it)
+    auto settled = [&](int c) { return Cancelled || Done[c] >= decided || DropAt[c].load() >= 0; };
+    int in = 0, quiet = 0;
+    bool meQuiet = false;
+    for (int c = 0; c < Consoles; c++)
     {
         // (bounded: the others are within a few frames, see the class comment)
-        if (!Changed.wait_for(lk, std::chrono::seconds(2), [&] { return Cancelled || Done[c] >= decided; }))
+        if (!Changed.wait_for(lk, std::chrono::seconds(2), [&] { return settled(c); }))
         {
             Platform::Log(Platform::LogLevel::Warn, "NetplayLiveExit: console %d at frame %d still waits for console %d (done %d) to reach %d\n",
                           console, frame, c, Done[c], decided);
-            Changed.wait(lk, [&] { return Cancelled || Done[c] >= decided; });
+            Changed.wait(lk, [&] { return settled(c); });
         }
         if (Cancelled) return false;
-        quiet = StreakAt[c][decided % kRing] >= QuietFrames;
+        const int dropped = DropAt[c].load();
+        if (dropped >= 0 && dropped < decided) continue;
+        in++;
+        const bool q = StreakAt[c][decided % kRing] >= QuietFrames;
+        quiet += q;
+        if (c == console) meQuiet = q;
     }
-    if (!quiet) return false;
-    int expected = -1;
-    EndAfter.compare_exchange_strong(expected, frame);
-    return true;
+    if (in && quiet == in)
+    {
+        int expected = -1;
+        EndAfter.compare_exchange_strong(expected, frame);
+        return true;
+    }
+    if (meQuiet && in >= 3)
+    {
+        DropAt[console] = frame;
+        Changed.notify_all();
+        return true;
+    }
+    return false;
 }
 
 void NetplayLiveExit::Cancel()
@@ -1998,45 +2078,48 @@ struct LiveCheckpointHeader
     u8 RomSha[32], StateSha[32], FirmwareSha[32];
 };
 struct LiveReadyVote { u8 Ok, Length; char Reason[126]; };
-struct LiveStartManifest
+struct LiveStartHead
 {
     u32 Magic;
-    u8 Player;
-    u8 Reserved[3];
+    u8 Player, Count;
+    u8 Reserved[2];
     u64 Epoch, Build;
-    u8 Token[16], State0[32], State1[32], Firmware0[32], Firmware1[32];
-    u64 TrialHashes[4]; // player 0/1 after each of two disposable Lockstep frames
+    u8 Token[16];
+    // then per player: state SHA-256, firmware SHA-256; then the proof hashes (frame * Count + player)
 };
 #pragma pack(pop)
 constexpr u32 kLiveMagic = 0x33434C4E;   // "NLC3": the live link's checkpoint
-constexpr u16 kLiveVersion = 5;          // 5: one link, baselines and deltas, start manifest on the link
+constexpr u16 kLiveVersion = 6;          // 6: N players (a link per pair, start manifest over every checkpoint)
 constexpr u32 kMaxLiveState = 64u << 20, kMaxLiveFirmware = 1u << 20;
 
-LiveStartManifest MakeLiveStart(const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
-                                const std::array<u64, 4>& trialHashes)
+std::vector<u8> MakeLiveStart(int sender, const std::vector<const NetplayLiveCheckpoint*>& all, const std::vector<u64>& trialHashes)
 {
-    LiveStartManifest m{};
-    m.Magic = 0x33534C4E; // NLS3
-    m.Player = local.Player;
-    m.Epoch = local.Epoch;
-    m.Build = local.Build;
-    memcpy(m.Token, local.FenceToken.data(), 16);
-    const auto& p0 = local.Player == 0 ? local : peer;
-    const auto& p1 = local.Player == 1 ? local : peer;
-    Sha256 a, b, fa, fb;
-    a.Add(p0.State.data(), p0.State.size());
-    b.Add(p1.State.data(), p1.State.size());
-    fa.Add(p0.Firmware.data(), p0.Firmware.size());
-    fb.Add(p1.Firmware.data(), p1.Firmware.size());
-    a.Get(m.State0); b.Get(m.State1);
-    fa.Get(m.Firmware0); fb.Get(m.Firmware1);
-    memcpy(m.TrialHashes, trialHashes.data(), sizeof(m.TrialHashes));
+    LiveStartHead h{};
+    h.Magic = 0x34534C4E; // NLS4
+    h.Player = (u8)sender;
+    h.Count = (u8)all.size();
+    const NetplayLiveCheckpoint& local = *all[sender];
+    h.Epoch = local.Epoch;
+    h.Build = local.Build;
+    memcpy(h.Token, local.FenceToken.data(), 16);
+    std::vector<u8> m(sizeof(h) + all.size() * 64 + trialHashes.size() * 8);
+    memcpy(m.data(), &h, sizeof(h));
+    u8* p = m.data() + sizeof(h);
+    for (const NetplayLiveCheckpoint* c : all)
+    {
+        Sha256 st, fw;
+        st.Add(c->State.data(), c->State.size());
+        fw.Add(c->Firmware.data(), c->Firmware.size());
+        st.Get(p); fw.Get(p + 32);
+        p += 64;
+    }
+    memcpy(p, trialHashes.data(), trialHashes.size() * 8);
     return m;
 }
 }
 
-NetplayLiveLink::NetplayLiveLink(int player, u16 port, const std::string& peerIPv4)
-    : Player(player), Port(port), PeerIPv4(peerIPv4)
+NetplayLiveLink::NetplayLiveLink(int localPlayer, int peerPlayer, u16 port, const std::string& peerIPv4)
+    : Player(localPlayer), PeerPlayer(peerPlayer), Port(port), PeerIPv4(peerIPv4)
 {
     Worker = std::thread([this] { Run(); });
 }
@@ -2165,7 +2248,7 @@ void NetplayLiveLink::Run()
     int fd = -1;
     in_addr expected{};
     inet_pton(AF_INET, PeerIPv4.c_str(), &expected);
-    if (Player == 0)
+    if (Player < PeerPlayer)
     {
         int ls = socket(AF_INET, SOCK_STREAM, 0);
         int one = 1;
@@ -2254,7 +2337,7 @@ void NetplayLiveLink::Run()
 
 bool NetplayLiveLink::SendCheckpoint(const NetplayLiveCheckpoint& local, std::string& error)
 {
-    if (local.Player > 1 || (int)local.Player != Player || !local.Epoch || !local.Build || !local.Rom.Size ||
+    if ((int)local.Player != Player || !local.Epoch || !local.Build || !local.Rom.Size ||
         local.FenceToken == std::array<u8, 16>{} || local.State.empty() ||
         local.State.size() > kMaxLiveState || local.Firmware.empty() || local.Firmware.size() > kMaxLiveFirmware)
     { error = "invalid live checkpoint manifest"; return false; }
@@ -2303,7 +2386,7 @@ bool NetplayLiveLink::ExchangeCheckpoints(const NetplayLiveCheckpoint& local, co
 {
     error.clear();
     peer = NetplayLiveCheckpoint{};
-    if (local.Player > 1 || (int)local.Player != Player || !local.Epoch || !local.Build || !local.Rom.Size ||
+    if ((int)local.Player != Player || !local.Epoch || !local.Build || !local.Rom.Size ||
         !expectedPeerRom.Size || local.FenceToken == std::array<u8, 16>{} || local.State.empty() ||
         local.State.size() > kMaxLiveState || local.Firmware.empty() || local.Firmware.size() > kMaxLiveFirmware)
     { error = "invalid live checkpoint manifest"; return false; }
@@ -2336,7 +2419,7 @@ bool NetplayLiveLink::ExchangeCheckpoints(const NetplayLiveCheckpoint& local, co
     else if (ph.Build != local.Build)
         snprintf(why, sizeof(why), "emulation build compatibility differs (peer %016llx, local %016llx: "
                  "handoff protocol or emulation LITEV options)", (unsigned long long)ph.Build, (unsigned long long)local.Build);
-    else if (ph.Player == local.Player || ph.Player > 1) snprintf(why, sizeof(why), "peer player %u invalid", ph.Player);
+    else if ((int)ph.Player != PeerPlayer) snprintf(why, sizeof(why), "peer player %u invalid (expected %d)", ph.Player, PeerPlayer);
     else if (ph.Epoch != local.Epoch) snprintf(why, sizeof(why), "peer cut epoch differs");
     else if (memcmp(ph.FenceToken, local.FenceToken.data(), 16)) snprintf(why, sizeof(why), "peer cut token differs");
     else if (ph.RomSize != expectedPeerRom.Size || memcmp(ph.RomSha, expectedPeerRom.Sha, 32)) snprintf(why, sizeof(why), "peer ROM differs from its roster entry");
@@ -2397,35 +2480,68 @@ bool NetplayLiveLink::ExchangeCheckpoints(const NetplayLiveCheckpoint& local, co
 bool NetplayLiveLink::ExchangeStart(const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
                                     const std::array<u64, 4>& trialHashes, std::atomic<bool>& cancel, std::string& error)
 {
+    if (local.Player > 1 || peer.Player != 1 - local.Player) { error = "live-start checkpoint pair mismatch"; return false; }
+    std::vector<const NetplayLiveCheckpoint*> all(2);
+    all[local.Player] = &local;
+    all[peer.Player] = &peer;
+    const std::vector<u64> hashes(trialHashes.begin(), trialHashes.end());
+    return SendStart(all, hashes, error) && WaitStart(all, hashes, cancel, error);
+}
+
+static bool LiveStartValid(int local, int peer, const std::vector<const NetplayLiveCheckpoint*>& all,
+                           const std::vector<u64>& trialHashes, std::string& error)
+{
+    const int n = (int)all.size();
+    bool ok = n >= 2 && n <= 16 && local >= 0 && local < n && peer >= 0 && peer < n && local != peer &&
+              trialHashes.size() == (size_t)n * 2;
+    for (int p = 0; ok && p < n; p++)
+    {
+        const NetplayLiveCheckpoint* c = all[p];
+        ok = c && c->Player == p && c->Epoch && c->Epoch == all[local]->Epoch && c->Build == all[local]->Build &&
+             c->FenceToken == all[local]->FenceToken && !c->State.empty();
+    }
+    if (!ok) error = "live-start checkpoint set mismatch";
+    return ok;
+}
+
+bool NetplayLiveLink::SendStart(const std::vector<const NetplayLiveCheckpoint*>& all, const std::vector<u64>& trialHashes, std::string& error)
+{
     error.clear();
-    if (local.Player > 1 || peer.Player != 1 - local.Player || !local.Epoch || local.Epoch != peer.Epoch ||
-        local.Build != peer.Build || local.FenceToken != peer.FenceToken || local.State.empty() || peer.State.empty())
-    { error = "live-start checkpoint pair mismatch"; return false; }
-    const LiveStartManifest mine = MakeLiveStart(local, peer, trialHashes);
-    std::vector<u8> out(sizeof(mine)), in;
-    memcpy(out.data(), &mine, sizeof(mine));
-    if (!Send(MsgStart, out) || !Wait(MsgStart, in, cancel, 8000) || in.size() != sizeof(mine))
+    if (!LiveStartValid(Player, PeerPlayer, all, trialHashes, error)) return false;
+    if (!Send(MsgStart, MakeLiveStart(Player, all, trialHashes))) { error = "live-start rendezvous interrupted"; return false; }
+    return true;
+}
+
+bool NetplayLiveLink::WaitStart(const std::vector<const NetplayLiveCheckpoint*>& all, const std::vector<u64>& trialHashes,
+                                std::atomic<bool>& cancel, std::string& error)
+{
+    error.clear();
+    if (!LiveStartValid(Player, PeerPlayer, all, trialHashes, error)) return false;
+    std::vector<u8> mine = MakeLiveStart(Player, all, trialHashes), in;
+    if (!Wait(MsgStart, in, cancel, 8000) || in.size() != mine.size())
     { error = "live-start rendezvous interrupted"; return false; }
-    LiveStartManifest other{};
-    memcpy(&other, in.data(), sizeof(other));
-    if (local.Player == 0 && getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE") &&
+    if (Player == 0 && getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE") &&
         strcmp(getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE"), "host:afterlive") == 0)
     { error = "injected afterlive failure"; return false; }
-    if (other.Player != peer.Player) { error = "live-start player mismatch"; return false; }
-    other.Player = local.Player;
-    if (memcmp(&other, &mine, sizeof(mine)) != 0)
+    LiveStartHead other{}, me{};
+    memcpy(&other, in.data(), sizeof(other));
+    memcpy(&me, mine.data(), sizeof(me));
+    if (other.Player != PeerPlayer) { error = "live-start player mismatch"; return false; }
+    in[offsetof(LiveStartHead, Player)] = (u8)Player;
+    if (in != mine)
     {
-        const char* field =
-            other.Magic != mine.Magic ? "magic" :
-            other.Epoch != mine.Epoch ? "epoch" :
-            other.Build != mine.Build ? "build" :
-            memcmp(other.Token, mine.Token, sizeof(mine.Token)) ? "token" :
-            memcmp(other.State0, mine.State0, sizeof(mine.State0)) ? "player 0 state" :
-            memcmp(other.State1, mine.State1, sizeof(mine.State1)) ? "player 1 state" :
-            memcmp(other.Firmware0, mine.Firmware0, sizeof(mine.Firmware0)) ? "player 0 firmware" :
-            memcmp(other.Firmware1, mine.Firmware1, sizeof(mine.Firmware1)) ? "player 1 firmware" :
-            memcmp(other.TrialHashes, mine.TrialHashes, sizeof(mine.TrialHashes)) ? "pre-commit frame proof" : "unknown";
-        error = std::string("live-start checkpoint manifest mismatch: ") + field;
+        const size_t at = std::mismatch(mine.begin(), mine.end(), in.begin()).first - mine.begin();
+        const size_t head = sizeof(LiveStartHead), n = all.size();
+        std::string field;
+        if (other.Magic != me.Magic) field = "magic";
+        else if (other.Count != me.Count) field = "player count";
+        else if (other.Epoch != me.Epoch) field = "epoch";
+        else if (other.Build != me.Build) field = "build";
+        else if (at < head) field = "token";
+        else if (at < head + n * 64)
+            field = "player " + std::to_string((at - head) / 64) + ((at - head) % 64 < 32 ? " state" : " firmware");
+        else field = "pre-commit frame proof";
+        error = "live-start checkpoint manifest mismatch: " + field;
         return false;
     }
     return true;

@@ -894,6 +894,8 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     std::map<int, float> ffPlan;
     int player = 0, delay = -1, port = 7100, latency = 0, players = 0, jitter = 0, loss = 0, pace = 0, adaptive = -1, seed = -1;
     std::string peer, host = "127.0.0.1:7100";
+    // peers=P@IP:PORT|P@IP:PORT...: N-player Netplay with fixed peers (a live handoff of N players)
+    std::vector<std::pair<int, std::string>> peerList;
     const char* np = getenv("LITEV_NETPLAY");
     if (np)
     {
@@ -917,10 +919,19 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             else if (k == "adaptive") adaptive = atoi(v.c_str());
             else if (k == "seed") seed = atoi(v.c_str());   // jitter/loss random sequence (default: 12345, every player)
             else if (k == "ff") ffPlan = ParseFfPlan(v);
+            else if (k == "peers")
+                for (size_t a = 0; a < v.size();)
+                {
+                    size_t e = v.find('|', a); if (e == std::string::npos) e = v.size();
+                    const std::string t = v.substr(a, e - a);
+                    if (t.find('@') != std::string::npos) peerList.push_back({atoi(t.c_str()), t.substr(t.find('@') + 1)});
+                    a = e + 1;
+                }
             if (end == std::string::npos) break;
             pos = end + 1;
         }
         if (players == 0 && peer.empty()) peer = "127.0.0.1:7101";
+        if (!peerList.empty()) players = 0;
     }
 
 #ifdef LITEV_HOSTED_NETPLAY
@@ -948,7 +959,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #endif
 
     // LITEV_MP_PLAYERS=N: N consoles (default 2; Netplay: its player count)
-    int n = players ? players : getenv("LITEV_MP_PLAYERS") ? atoi(getenv("LITEV_MP_PLAYERS")) : 2;
+    int n = players ? players : !peerList.empty() ? (int)peerList.size() + 1 : getenv("LITEV_MP_PLAYERS") ? atoi(getenv("LITEV_MP_PLAYERS")) : 2;
     if (n < 2 || n > LockstepMP::kMaxInst) { fprintf(stderr, "error: %d instances (2..%d)\n", n, LockstepMP::kMaxInst); return 1; }
     const bool adoptPrepared = !prepared.empty();
     if (adoptPrepared && (int)prepared.size() != n)
@@ -1218,9 +1229,12 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         faults.JitterMs = jitter;
         faults.LossPct = loss;
         if (seed >= 0) faults.Rng.seed(seed * 16 + player);
-        net = std::make_unique<NetplayInput>(player, delay, port, std::vector<std::pair<int, std::string>> {{1 - player, peer}}, latency, faults);
+        const std::vector<std::pair<int, std::string>> fixedPeers = peerList.empty() ? std::vector<std::pair<int, std::string>> {{1 - player, peer}} : peerList;
+        net = std::make_unique<NetplayInput>(player, delay, port, fixedPeers, latency, faults);
         if (!net->Ok()) { fprintf(stderr, "netplay: socket setup failed\n"); return 1; }
-        printf("netplay: player %d, delay %d frames, port %d, peer %s, faults latency %d jitter %d loss %d%%\n", player, delay, port, peer.c_str(), latency, jitter, loss);
+        printf("netplay: player %d of %d, delay %d frames, port %d, peers", player, n, delay, port);
+        for (auto& [p, a] : fixedPeers) printf(" %d@%s", p, a.c_str());
+        printf(", faults latency %d jitter %d loss %d%%\n", latency, jitter, loss);
     }
     else if (np)
     {
@@ -1261,8 +1275,18 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         { fprintf(stderr, "handoff startup epoch/token/endpoint missing\n"); return 2; }
         for (int i = 0; i < 16; i++)
             token[i] = (u8)strtoul(std::string(tokenText + i * 2, 2).c_str(), nullptr, 16);
+        // LITEV_MP_HANDOFF_START_PEER: the one peer's startup endpoint; N players: P@IP:PORT|...
+        std::vector<std::pair<int, std::string>> startPeers;
+        if (!strchr(startPeerText, '@')) startPeers.push_back({1 - player, startPeerText});
+        else for (std::string v = startPeerText; !v.empty();)
+        {
+            size_t e = v.find('|');
+            const std::string t = v.substr(0, e);
+            startPeers.push_back({atoi(t.c_str()), t.substr(t.find('@') + 1)});
+            v = e == std::string::npos ? "" : v.substr(e + 1);
+        }
         if (!net->ArmHandoffSession(strtoull(epochText, nullptr, 10), token,
-                                    atoi(startPortText), {{1 - player, startPeerText}}))
+                                    atoi(startPortText), startPeers))
         { fprintf(stderr, "handoff startup arm failed\n"); return 2; }
         // The source consoles are still frozen outside this function. Publish
         // the actual first local input, then require the remote's frame-0 input
@@ -1387,14 +1411,29 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 
     std::unique_ptr<std::atomic<int>[]> done(new std::atomic<int>[n]);
     for (int k = 0; k < n; k++) done[k] = 0;
-    auto minDone = [&] { int m = INT32_MAX; for (int k = 0; k < n; k++) m = std::min(m, done[k].load()); return m; };
     std::unique_ptr<NetplayLiveExit> liveExit;
+    // consoles that left the session alone (a partial exit) no longer count
+    auto minDone = [&] {
+        int m = INT32_MAX;
+        for (int k = 0; k < n; k++) if (!liveExit || liveExit->DroppedAfter(k) < 0) m = std::min(m, done[k].load());
+        return m == INT32_MAX ? frames : m;
+    };
     std::vector<std::chrono::steady_clock::time_point> stoppedAt(n);
-    if (const char* q = getenv("LITEV_NP_LIVE_EXIT"); q && ended)
+    // A live session of 3+ players always has partial exits (a player quitting: its input stream; the
+    // device whose own console leaves, or is left alone, leaves Netplay); LITEV_NP_LIVE_EXIT adds the
+    // game-driven rule (no MP exchange for that many frames).
+    if (const char* q = getenv("LITEV_NP_LIVE_EXIT"); (q || n > 2) && ended && net)
     {
-        liveExit = std::make_unique<NetplayLiveExit>(n, atoi(q) > 0 ? atoi(q) : 120);
-        printf("live exit: a session with no MP exchange for %d frames ends\n", atoi(q) > 0 ? atoi(q) : 120);
+        const int quiet = q ? (atoi(q) > 0 ? atoi(q) : 120) : 1 << 30;
+        liveExit = std::make_unique<NetplayLiveExit>(n, quiet);
+        if (q) printf("live exit: a session with no MP exchange for %d frames ends; with 3+ consoles a quiet one leaves alone\n", quiet);
+        else printf("live exit: partial exits only (a player quitting)\n");
     }
+    const int own = net ? net->LocalPlayer() : -1;
+    std::atomic<bool> ownOut{false};    // this device's own console left (or is alone): the device leaves Netplay
+    std::atomic<int> ownLast{-1};
+    // LITEV_NP_QUIT_AT=<frame>: this player quits the live session at that frame of its own console
+    const int quitAt = getenv("LITEV_NP_QUIT_AT") ? atoi(getenv("LITEV_NP_QUIT_AT")) : -1;
     // diagnostics LITEV_MP_HASH_FROM=<f>: every console's state after each frame f .. f+64
     const int hashFrom = getenv("LITEV_MP_HASH_FROM") ? atoi(getenv("LITEV_MP_HASH_FROM")) : -1;
     std::atomic<bool> crashed{false};
@@ -1440,6 +1479,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         if (const char* nv = getenv(inst ? "LITEV_MP_NICE1" : "LITEV_MP_NICE0"))
             if (setpriority(PRIO_PROCESS, 0, atoi(nv)) != 0) fprintf(stderr, "inst%d: setpriority %s failed\n", inst, nv);
         u32 lastSwaps = 0;
+        int exitKind = 0;   // 1: this console left the session alone (the others play on)
         auto lastT = std::chrono::steady_clock::now();
         try
         {
@@ -1447,6 +1487,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             // need this one's MP frames, and without a partner they stall a full receive timeout per tick.
             for (int f = 0; f < frames || (minDone() < frames && !(liveExit && liveExit->EndsAfter() >= 0)); f++)
             {
+                if (ownOut.load()) { exitKind = 2; break; }   // (this device left: the other copies stop)
                 NetplayFrameInput applied;  // for the Hosted Netplay frame marker
                 if (hostedSpec)
                 {
@@ -1487,6 +1528,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
 #ifdef LITEV_NP_SPEED
                         FfPress(*net, ffPlan, inst, f, local);
 #endif
+                        if (f == quitAt) { net->RequestLeave(); printf("inst%d quits the session at frame %d\n", inst, f); }
                         if (!handoffStartupGate || f != 0) net->SubmitLocal(f, local);
                     }
                     NetplayFrameInput in = net->Get(inst, f);
@@ -1630,10 +1672,23 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
                     printf("inst%d state f%d: sys=%llu ram=%016llx r9=%016llx\n", inst, f, (unsigned long long)bi.nds->GetSysTimestamp(),
                            (unsigned long long)XXH3_64bits(bi.nds->MainRAM, bi.nds->MainRAMMask + 1),
                            (unsigned long long)XXH3_64bits(bi.nds->ARM9.R, sizeof(bi.nds->ARM9.R)));
-                if (liveExit && liveExit->EndFrame(inst, f, bi.nds->Wifi.MPExchanges))
+                if (liveExit && liveExit->EndFrame(inst, f, bi.nds->Wifi.MPExchanges, net && NetplayLeave::Of(applied)))
                 {
                     stoppedAt[inst] = std::chrono::steady_clock::now();
-                    printf("inst%d live exit after frame %d\n", inst, f);
+                    if (liveExit->DroppedAfter(inst) < 0) { printf("inst%d live exit after frame %d\n", inst, f); break; }
+                    printf("inst%d left the session after frame %d (%s)\n", inst, f,
+                           NetplayLeave::Of(applied) ? "its player quit" : "its game left the others");
+                    if (inst == own) { ownLast = f; ownOut = true; net->Release(); exitKind = 2; }
+                    else { if (lockstepMP) lockstepMP->Leave(inst); net->DropPlayer(inst, f); exitKind = 1; }
+                    fflush(stdout);
+                    break;
+                }
+                if (liveExit && inst == own && liveExit->InMask() == (1u << own))
+                {
+                    stoppedAt[inst] = std::chrono::steady_clock::now();
+                    printf("inst%d alone in the session after frame %d: this device leaves Netplay\n", inst, f);
+                    ownLast = f; ownOut = true; net->Release(); exitKind = 2;
+                    fflush(stdout);
                     break;
                 }
                 static const int every = getenv("LITEV_MP_EVERY") ? atoi(getenv("LITEV_MP_EVERY")) : 60;
@@ -1762,7 +1817,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
         }
         catch (...) { crashed.store(true); }
         // leave the link, so a peer still finishing a frame does not wait on this clock forever
-        if (lockstepMP) { lockstepMP->End(inst); lockstepMP->Stop(); }
+        if (lockstepMP && exitKind != 1) { lockstepMP->End(inst); lockstepMP->Stop(); }
     };
 
     std::vector<std::thread> threads;
@@ -1811,7 +1866,7 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     // Poll MP health from the main thread while the instances run, and log the
     // first frame all of them associate (ConnectedBitmask == every instance).
     int firstAssocFrame = -1;
-    while (minDone() < frames && !(liveExit && liveExit->EndsAfter() >= 0 && minDone() > liveExit->EndsAfter()))
+    while (minDone() < frames && !ownOut.load() && !(liveExit && liveExit->EndsAfter() >= 0 && minDone() > liveExit->EndsAfter()))
     {
         u16 mask = MPInterface::Get().ObserveConnectedBitmask();
         if (mask > peakConnected.load()) peakConnected.store(mask);
@@ -1854,15 +1909,36 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
     u64 reply = MPInterface::Get().ObserveReplyCount();
     u64 pkt = MPInterface::Get().ObservePacketCount();
     if (net) printf("netplay stall: %.1f ms waiting for the remote players' input\n", net->StallMs());
-    const bool exited = liveExit && liveExit->EndsAfter() >= 0;
+    const bool partial = ownOut.load();
+    const bool exited = (liveExit && liveExit->EndsAfter() >= 0) || partial;
     bool ranClean = !crashed.load() && (minDone() == frames || exited);
     if (exited)
     {
         printf("live exit teardown: collecting %.1f ms\n", msSinceStop());
-        ended->EndsAfter = liveExit->EndsAfter();
+        ended->EndsAfter = partial ? ownLast.load() : liveExit->EndsAfter();
+        ended->Partial = partial;
         ended->StoppedAt = stoppedAt;
+        if (partial) ended->StoppedAt[0] = stoppedAt[own];
         for (int k = 0; k < n; k++)
         {
+            if (liveExit && liveExit->DroppedAfter(k) >= 0 && k != own)
+            {   // (left before: nothing scheduled)
+                ended->Scheduled.emplace_back();
+                ended->Scripts.push_back(std::make_shared<InputScript>(std::move(b[k].inputScript)));
+                PreparedMPConsole back;
+                back.udata = std::move(b[k].udata); back.nds = std::move(b[k].nds); back.identity = back.nds.get();
+                ended->Consoles.push_back(std::move(back));
+                continue;
+            }
+            if (partial && k != own)
+            {   // the copies of the players still in the session: dropped by this device
+                ended->Scheduled.emplace_back();
+                ended->Scripts.push_back(std::make_shared<InputScript>(std::move(b[k].inputScript)));
+                PreparedMPConsole back;
+                back.udata = std::move(b[k].udata); back.nds = std::move(b[k].nds); back.identity = back.nds.get();
+                ended->Consoles.push_back(std::move(back));
+                continue;
+            }
             // every player's inputs already sent for the frames after the end (the input delay): this
             // device's own, and the peer's (it sent them before running the last frame; allow 1 s)
             std::vector<NetplayFrameInput> sched;
@@ -1881,6 +1957,19 @@ int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>
             back.nds = std::move(b[k].nds);
             back.identity = back.nds.get();
             ended->Consoles.push_back(std::move(back));
+        }
+        if (partial && net)
+        {
+            // the others still need our inputs up to our console's last frame: keep re-sending (on a
+            // worker, as the app does) until every peer still in the session acknowledged them
+            const int last = ownLast.load();
+            ended->Linger = std::thread([np = std::move(net), last] {
+                const auto t0 = std::chrono::steady_clock::now();
+                const bool acked = np->WaitAcked(last, 10000);
+                printf("live exit: our inputs through frame %d %s after %.0f ms\n", last, acked ? "acknowledged by every peer" : "NOT acknowledged",
+                       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                fflush(stdout);
+            });
         }
     }
     bool associated = (peakConnected.load() == allMask);

@@ -157,6 +157,15 @@ public:
     bool PublishHandoffRom(const NetplayRom& rom);
     bool GetPeerHandoffRom(NetplayRom& rom) const;
     void CancelHandoffOffer();
+    // N players (a LAN session of a parent and its children: a child links only to its parent): the
+    // handoff group is every link of a parent, or a child's one link to its parent. Only the device
+    // that offered (with more than one link: the parent; a child's own offer is then declined) knows
+    // every member: once every member accepted and published its ROM it numbers them (itself 0, the
+    // others by device id) and sends that roster to each; every member then has the same roster.
+    // IPv4 in network order; the offerer's entry as its members reach it. Emulator thread.
+    struct HandoffMember { int Player = 0; u64 ID = 0; u32 IPv4 = 0; NetplayRom Rom; };
+    bool GetHandoffRoster(std::vector<HandoffMember>& roster, int& localPlayer);
+    int HandoffGroupSize() const;
     // Emulator-thread-only, two-peer cut fence. Call after the host stops issuing
     // MP commands; the client may keep running until it reaches its own idle cut.
     // A received FENCE is not READY: unsequenced MP packets must first retire.
@@ -326,9 +335,17 @@ private:
     void ReceiveHandoffControl(Link& link, u32 type, u64 epoch, u32 mark,
                                const std::array<u8, 16>& token);
     void ReceiveHandoffRom(Link& link, const u8* bytes, size_t length);
+    void ReceiveHandoffRoster(Link& link, const u8* bytes, size_t length);
     void CloseHandoffOffer(Link& link);
     void CompleteHandoffReset(Link& link);
-    Link* HandoffLink();
+    // the handoff group (see GetHandoffRoster); empty: no session, a link not up yet, or a member of
+    // the offer's group gone (GroupIDs)
+    std::vector<Link*> Group() const;
+    bool GroupBroken() const;
+    std::vector<u64> GroupIDs;          // the members (device ids) of the open offer / fence
+    std::vector<HandoffMember> Roster;  // the offer's roster, once known
+    u64 RosterEpoch = 0;
+    Link* HandoffLink();                // the group's only link (two players), else none
     const Link* HandoffLink() const;
     std::shared_ptr<const std::vector<Peer>> View;
     u32 ViewMs = 0;

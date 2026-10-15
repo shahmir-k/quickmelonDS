@@ -106,11 +106,12 @@ int LockstepMP::HostQuiet(void* self, int inst, u64 until, u64* time, int* sende
 // clock) until its clock reaches its host's (frozen, so deterministic) clock.
 void LockstepMP::ResolveDeadlock()
 {
-    if ((BlockedMask & Members) != Members || !(InQuiet & Members)) return;
+    const u16 active = Members & (u16)~Left.load(std::memory_order_relaxed);   // (a console that left never blocks)
+    if ((BlockedMask & active) != active || !(InQuiet & active)) return;
     for (int i = 0; i < kMaxInst; i++)
-        if ((Members & (1 << i)) && (*BlockedPred[i])()) return;
+        if ((active & (1 << i)) && (*BlockedPred[i])()) return;
     for (int i = 0; i < kMaxInst; i++)
-        if (InQuiet & Members & (1 << i))
+        if (InQuiet & active & (1 << i))
         {
             QuietOff[i] = ClientHost[i] >= 0 ? Now(ClientHost[i]) : 0;
             QuietGiveUp |= (u16)(1 << i);
@@ -160,6 +161,16 @@ void LockstepMP::Stop()
 {
     std::lock_guard<std::mutex> lk(Lock);
     Stopped = true;
+    NotifyAll();
+}
+
+void LockstepMP::Leave(int inst)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    Connected &= ~(1 << inst);
+    Left.fetch_or((u16)(1 << inst), std::memory_order_seq_cst);
+    Regular[inst].clear(); FromHost[inst].clear(); Replies[inst].clear();
+    FromHostChanged(inst);
     NotifyAll();
 }
 
@@ -292,7 +303,7 @@ void LockstepMP::Broadcast(int inst, u32 type, u8* data, int len, u64 timestamp,
 {
     for (int i = 0; i < kMaxInst; i++)
     {
-        if (i == inst || !(Members & (1 << i))) continue;
+        if (i == inst || !(Members & (1 << i)) || HasLeft(i)) continue;
         u64 now = Now(inst);
         // a console with Wi-Fi off can only Begin at or after its current time, and then never
         // reads anything sent before that
@@ -517,7 +528,7 @@ int LockstepMP::SendReply(int inst, u8* data, int len, u64 timestamp, u16 aid)
     if (St.On > 0 && St.T1 && !St.T2) St.T2 = NowNs();
     TLog(inst, "REPLY");
     PacketCount++; ReplyCount++;
-    if (HostID >= 0 && HostID != inst && (Members & (1 << HostID)))
+    if (HostID >= 0 && HostID != inst && (Members & (1 << HostID)) && !HasLeft(HostID))
         Replies[HostID].push_back({inst, 2u | ((u32)aid << 16), timestamp, Now(inst), std::vector<u8>(data, data + len)});
     NotifyOne(HostID >= 0 ? HostID : inst);
     return len;
