@@ -10,6 +10,7 @@
 */
 
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include <utility>
 #include <memory>
 #include <optional>
+#include <random>
 #include <chrono>
 #include <time.h>
 #include <algorithm>
@@ -95,8 +97,11 @@ static void DumpAccessStats()
 #include "LAN.h"
 #ifdef LITEV_AMBIENT_LAN
 #include "AmbientLAN.h"
+#include "NetplayInput.h"
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <unistd.h>
+#include <atomic>
 #endif
 #endif
 
@@ -432,22 +437,38 @@ bool DumpPPM(const std::string& path, const u32* top, const u32* bottom)
 
 // Write a full core savestate to `path` using the same in-memory Savestate API
 // as the Qt frontend (default 32 MB save buffer -> DoSavestate -> flush bytes).
-bool SaveSavestate(NDS& nds, const std::string& path)
+bool SaveSavestate(NDS& nds, const std::string& path, std::vector<u8>* captured = nullptr, bool coldCaches = false)
 {
     Savestate state; // default ctor: save mode, DEFAULT_SIZE buffer
     if (state.Error) { fprintf(stderr, "error: savestate alloc failed\n"); return false; }
+    state.ColdCaches = coldCaches;
     if (!nds.DoSavestate(&state) || state.Error)
     {
         fprintf(stderr, "error: DoSavestate failed while dumping\n");
         return false;
     }
+    if (captured)
+    {
+        const u8* bytes = static_cast<const u8*>(state.Buffer());
+        captured->assign(bytes, bytes + state.Length());
+    }
+    if (path.empty())
+    {
+        fprintf(stderr, "captured savestate (%u bytes) in memory\n", state.Length());
+        return true;
+    }
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) { fprintf(stderr, "error: cannot open savestate '%s' for write\n", path.c_str()); return false; }
     size_t wr = fwrite(state.Buffer(), 1, state.Length(), f);
-    fclose(f);
-    if (wr != state.Length())
+    const int writeError = wr == state.Length() ? 0 : errno;
+    const int closeResult = fclose(f);
+    const int closeError = closeResult ? errno : 0;
+    if (wr != state.Length() || closeResult != 0)
     {
-        fprintf(stderr, "error: short write to savestate '%s'\n", path.c_str());
+        const std::string writeText = writeError ? strerror(writeError) : "ok";
+        const std::string closeText = closeError ? strerror(closeError) : "ok";
+        fprintf(stderr, "error: savestate write failed '%s' (%zu/%u bytes, write=%s, close=%s)\n",
+                path.c_str(), wr, state.Length(), writeText.c_str(), closeText.c_str());
         return false;
     }
     fprintf(stderr, "dumped savestate (%u bytes) to %s\n", state.Length(), path.c_str());
@@ -478,6 +499,41 @@ bool LoadSavestate(NDS& nds, const std::string& path)
 
 } // namespace
 
+// A live handoff checkpoint loaded into a fresh scratch console (its own userdata and save files)
+static bool PrepareScratch(const NetplayLiveCheckpoint& candidate, const std::string& romPath, bool jit,
+                           std::unique_ptr<HeadlessHost::InstanceUserData>& user,
+                           std::unique_ptr<NDS>& instance, std::string& reason)
+{
+    auto scratch = std::make_unique<HeadlessHost::InstanceUserData>();
+    scratch->savePrefix = candidate.Player == 0 ? "handoff-scratch-host" : "handoff-scratch-client";
+    u32 romLength = 0;
+    auto romData = ReadFile(romPath, romLength);
+    if (!romData) { reason = "scratch replica ROM unavailable"; return false; }
+    auto cart = NDSCart::ParseROM(std::move(romData), romLength, scratch.get(), std::nullopt);
+    if (!cart) { reason = "scratch replica ROM parse failed"; return false; }
+    NDSArgs replicaArgs;
+    replicaArgs.Firmware = Firmware(candidate.Firmware.data(), (u32)candidate.Firmware.size());
+#ifdef JIT_ENABLED
+    replicaArgs.JIT = jit ? std::optional<JITArgs>(JITArgs{}) : std::nullopt;
+#endif
+    auto replica = std::make_unique<NDS>(std::move(replicaArgs), scratch.get());
+    replica->SetRenderer(std::make_unique<SoftRenderer>(*replica));
+    replica->SetNDSCart(std::move(cart));
+    replica->Reset();
+    replica->SetupDirectBoot("headless.nds");
+    replica->Start();
+    Savestate parsed((void*)candidate.State.data(), (u32)candidate.State.size(), false);
+    if (parsed.Error || !replica->DoSavestate(&parsed) || parsed.Error)
+    { reason = "scratch replica savestate load failed"; return false; }
+    const Firmware& loaded = replica->GetFirmware();
+    if (loaded.Length() != candidate.Firmware.size() ||
+        memcmp(loaded.Buffer(), candidate.Firmware.data(), loaded.Length()) != 0)
+    { reason = "scratch replica firmware mismatch"; return false; }
+    user = std::move(scratch);
+    instance = std::move(replica);
+    return true;
+}
+
 int main(int argc, char** argv)
 {
 #ifdef LITEV_ACCESS_STATS
@@ -488,6 +544,274 @@ int main(int argc, char** argv)
         Usage(argv[0], 2);
 
     HeadlessHost::SetDataDir(opt.dataDir);
+
+#ifdef LITEV_AMBIENT_LAN
+    // LITEV_TEST_PROOF_STATES=state0|fw0|rom0|state1|fw1|rom1: the reversible proof on two
+    // checkpoint files (a cut's host.mln/host.fw and client.mln/client.fw); prints its hashes.
+    if (const char* spec = getenv("LITEV_TEST_PROOF_STATES"))
+    {
+        std::vector<std::string> f(1);
+        for (const char* q = spec; *q; q++) if (*q == '|') f.emplace_back(); else f.back() += *q;
+        if (f.size() != 6) { fprintf(stderr, "LITEV_TEST_PROOF_STATES needs 6 paths\n"); return 2; }
+        std::unique_ptr<HeadlessHost::InstanceUserData> user[2];
+        std::unique_ptr<NDS> console[2];
+        std::array<u64, 2> clocks{};
+        std::string error;
+        for (int p = 0; p < 2; p++)
+        {
+            NetplayLiveCheckpoint c;
+            c.Player = (u8)p;
+            u32 len = 0;
+            auto st = ReadFile(f[p * 3], len);
+            if (!st) { fprintf(stderr, "cannot read %s\n", f[p * 3].c_str()); return 2; }
+            c.State.assign(st.get(), st.get() + len);
+            auto fw = ReadFile(f[p * 3 + 1], len);
+            if (!fw) { fprintf(stderr, "cannot read %s\n", f[p * 3 + 1].c_str()); return 2; }
+            c.Firmware.assign(fw.get(), fw.get() + len);
+            if (!PrepareScratch(c, f[p * 3 + 2], opt.jit, user[p], console[p], error)) { fprintf(stderr, "prepare %d: %s\n", p, error.c_str()); return 2; }
+            user[p]->instanceID = p;
+            clocks[p] = console[p]->GetSysTimestamp();
+        }
+        std::array<u64, 4> hashes{};
+        const bool ok = NetplayRunLiveProof({console[0].get(), console[1].get()}, clocks,
+                                            [&](int p) { console[p]->RunFrame(); }, hashes, error);
+        printf("PROOF %s p0=%016llx/%016llx p1=%016llx/%016llx %s\n", ok ? "ok" : "FAIL",
+               (unsigned long long)hashes[0], (unsigned long long)hashes[2],
+               (unsigned long long)hashes[1], (unsigned long long)hashes[3], error.c_str());
+        return ok ? 0 : 2;
+    }
+    // LITEV_TEST_LIVE_LINK: the live handoff link on loopback: baselines, checkpoints both ways
+    // as deltas, the prepare votes, the start manifests (equal, and a proof mismatch)
+    if (getenv("LITEV_TEST_LIVE_LINK"))
+    {
+        auto fakeState = [](u8 seed, u8 change) {   // savestate-shaped: a header and two sections
+            std::vector<u8> v(16 + 2 * (16 + 4096), 0);
+            for (int k = 0; k < 2; k++)
+            {
+                u8* sec = &v[16 + k * (16 + 4096)];
+                memcpy(sec, k ? "BBBB" : "AAAA", 4);
+                const u32 len = 16 + 4096;
+                memcpy(sec + 4, &len, 4);
+                for (int i = 0; i < 4096; i++) sec[16 + i] = (u8)(seed + i * 7);
+            }
+            v[16 + 16 + 100] ^= change; v.back() ^= change;
+            return v;
+        };
+        NetplayLiveCheckpoint c[2];
+        for (int p = 0; p < 2; p++)
+        {
+            c[p].Player = (u8)p; c[p].Epoch = 42; c[p].Build = 0x123456789abcdef0ull; c[p].FenceToken[0] = 1;
+            c[p].RawClock = 1000 + p; c[p].Frame = 7;
+            c[p].Rom.Size = 4096 + p; c[p].Rom.Sha[0] = (u8)(p + 1); memcpy(c[p].Rom.GameCode, "TEST", 4);
+            c[p].Firmware = {7, 8, (u8)p};
+            c[p].State = fakeState((u8)(p * 50), 0x5A);
+        }
+        bool ok = NetplayLiveDelta(NetplayLiveDelta(c[0].State, fakeState(0, 0)), fakeState(0, 0)) == c[0].State;
+        const u16 port = static_cast<u16>(32000 + getpid() % 10000);
+        NetplayLiveLink l0(0, port, "127.0.0.1"), l1(1, port, "127.0.0.1");
+        l0.SendBaseline(fakeState(0, 0));
+        l1.SendBaseline(fakeState(50, 0));
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::atomic<bool> stop{false};
+        NetplayLiveCheckpoint got[2];
+        std::string err[2];
+        bool ex[2];
+        std::thread t([&] { ex[1] = l1.ExchangeCheckpoints(c[1], c[0].Rom, nullptr, stop, got[1], err[1]); });
+        ex[0] = l0.ExchangeCheckpoints(c[0], c[1].Rom, nullptr, stop, got[0], err[0]);
+        t.join();
+        ok = ok && ex[0] && ex[1] && got[0].State == c[1].State && got[1].State == c[0].State;
+        if (!ok) printf("LIVE_LINK exchange: %d %d '%s' '%s'\n", ex[0], ex[1], err[0].c_str(), err[1].c_str());
+        auto start = [&](bool mismatch) {
+            const std::array<u64, 4> good {11, 22, 33, 44};
+            std::array<u64, 4> bad = good;
+            if (mismatch) bad[2]++;
+            bool r[2];
+            std::thread u([&] { r[1] = l1.ExchangeStart(c[1], got[1], bad, stop, err[1]); });
+            r[0] = l0.ExchangeStart(c[0], got[0], good, stop, err[0]);
+            u.join();
+            return mismatch ? !r[0] && !r[1] && err[0].find("pre-commit frame proof") != std::string::npos
+                            : r[0] && r[1];
+        };
+        ok = ok && start(false) && start(true);
+        printf("LIVE_LINK %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 2;
+    }
+    if (getenv("LITEV_TEST_PREPARE_BRIDGE"))
+    {
+        NetplayLiveCheckpoint checkpoint;
+        checkpoint.Epoch = 42;
+        std::atomic<bool> cancel{false};
+        const auto owner = std::this_thread::get_id();
+        auto waitPending = [](NetplayLivePrepareBridge& bridge) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (!bridge.HasPending() && std::chrono::steady_clock::now() < until)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return bridge.HasPending();
+        };
+        NetplayLivePrepareBridge success;
+        bool successResult = false;
+        std::string successError;
+        std::thread worker([&] {
+            successResult = success.Request(checkpoint, successError, cancel, 1000);
+        });
+        const bool queued = waitPending(success);
+        const bool serviced = success.Service([&](const NetplayLiveCheckpoint& request,
+                                                   std::string&) {
+            return &request == &checkpoint && request.Epoch == 42 &&
+                   std::this_thread::get_id() == owner;
+        });
+        worker.join();
+
+        NetplayLivePrepareBridge rejected;
+        bool rejectResult = true;
+        std::string rejectError;
+        std::thread rejectedWorker([&] {
+            rejectResult = rejected.Request(checkpoint, rejectError, cancel, 1000);
+        });
+        const bool rejectQueued = waitPending(rejected);
+        const bool rejectServiced = rejected.Service([](const NetplayLiveCheckpoint&,
+                                                        std::string& reason) {
+            reason = "replica mismatch";
+            return false;
+        });
+        rejectedWorker.join();
+
+        NetplayLivePrepareBridge cancelled;
+        bool cancelResult = true;
+        std::string cancelError;
+        std::thread cancelledWorker([&] {
+            cancelResult = cancelled.Request(checkpoint, cancelError, cancel, 1000);
+        });
+        const bool cancelQueued = waitPending(cancelled);
+        cancelled.Cancel();
+        cancelledWorker.join();
+
+        NetplayLivePrepareBridge timedOut;
+        std::string timeoutError;
+        const bool timeoutResult = timedOut.Request(checkpoint, timeoutError, cancel, 20);
+
+        NetplayLivePrepareBridge cancelledDuringLoad;
+        bool loadResult = true;
+        std::string loadError;
+        std::atomic<bool> loadCancel{false};
+        std::thread loadWorker([&] {
+            loadResult = cancelledDuringLoad.Request(checkpoint, loadError, loadCancel, 1000);
+        });
+        const bool loadQueued = waitPending(cancelledDuringLoad);
+        const bool loadServiced = cancelledDuringLoad.Service([&](const NetplayLiveCheckpoint&,
+                                                                   std::string&) {
+            loadCancel.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            return true;
+        });
+        loadWorker.join();
+        const bool ok = queued && serviced && successResult && successError.empty() &&
+                        rejectQueued && rejectServiced && !rejectResult &&
+                        rejectError == "replica mismatch" &&
+                        cancelQueued && !cancelResult && !cancelError.empty() &&
+                        !timeoutResult && timeoutError == "live replica prepare timed out" &&
+                        loadQueued && loadServiced && !loadResult && !loadError.empty();
+        printf("PREPARE_BRIDGE %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 2;
+    }
+    if (getenv("LITEV_TEST_HANDOFF_WIRE_AUTH"))
+    {
+        // An old Netplay sender can reuse the same player index and target IP.
+        // Its untagged input and hash must not enter a newly armed live cut.
+        // Also run with host id 15: Hosted Netplay's record server uses that
+        // input seat rather than its visible console seat 0.
+        const int hostPlayer = getenv("LITEV_TEST_HANDOFF_WIRE_AUTH_HOSTED") ? 15 : 0;
+        const int base = 22000 + (getpid() % 4000) * 5;
+        const auto address = [](int port) { return "127.0.0.1:" + std::to_string(port); };
+        NetplayInput host(hostPlayer, 3, base, {{1, address(base + 1)}});
+        NetplayInput peer(1, 3, base + 1, {{hostPlayer, address(base)}});
+        NetplayInput stale(1, 3, base + 2, {{hostPlayer, address(base)}});
+        NetplayInput wrongToken(1, 3, base + 5, {{hostPlayer, address(base)}});
+        std::array<u8, 16> token{};
+        for (int i = 0; i < 16; i++) token[i] = (u8)(i + 1);
+        std::array<u8, 16> wrong = token;
+        wrong[0] ^= 1;
+        if (!host.Ok() || !peer.Ok() || !stale.Ok() || !wrongToken.Ok() ||
+            !host.ArmHandoffSession(42, token, base + 3, {{1, address(base + 4)}}) ||
+            !peer.ArmHandoffSession(42, token, base + 4, {{hostPlayer, address(base + 3)}}) ||
+            !wrongToken.ArmHandoffSession(42, wrong, base + 6, {{hostPlayer, address(base + 3)}}))
+        { printf("HANDOFF_WIRE_AUTH FAIL: sockets\n"); return 2; }
+        // A correctly tagged packet is still premature until the separate
+        // frame-zero proof completes on this receiver.
+        peer.SendHash(59, 0xBEEF);
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        u64 prematureHash = 0;
+        const bool prematureRejected = !host.PeerHash(1, 59, prematureHash);
+        host.SubmitLocal(0, NetplayFrameInput{0xFFE, -1, -1});
+        peer.SubmitLocal(0, NetplayFrameInput{0xFFD, -1, -1});
+        bool hostProof = false, peerProof = false;
+        std::thread hostStart([&] { hostProof = host.WaitForHandoffPeerInput(3000); });
+        std::thread peerStart([&] { peerProof = peer.WaitForHandoffPeerInput(3000); });
+        hostStart.join();
+        peerStart.join();
+        if (!hostProof || !peerProof)
+        { printf("HANDOFF_WIRE_AUTH FAIL: startup proof\n"); return 2; }
+
+        stale.SendHash(60, 0xBAD);
+        stale.SubmitLocal(1, NetplayFrameInput{0xFF7, -1, -1});
+        wrongToken.SendHash(60, 0xBAD);
+        wrongToken.SubmitLocal(1, NetplayFrameInput{0xFF7, -1, -1});
+        std::atomic<bool> gotInput{false};
+        NetplayFrameInput received;
+        std::thread getter([&] {
+            received = host.Get(1, 4);
+            gotInput.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        u64 hash = 0;
+        const bool staleRejected = !gotInput.load(std::memory_order_acquire) &&
+                                   !host.PeerHash(1, 60, hash);
+        peer.SendHash(60, 0xA55A);
+        peer.SubmitLocal(1, NetplayFrameInput{0xFFB, -1, -1});
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!gotInput.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!gotInput.load(std::memory_order_acquire)) host.Abort();
+        getter.join();
+        bool validHash = false;
+        const auto hashUntil = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (!(validHash = host.PeerHash(1, 60, hash)) &&
+               std::chrono::steady_clock::now() < hashUntil)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool ok = prematureRejected && staleRejected && gotInput && received.Keys == 0xFFB &&
+                        validHash && hash == 0xA55A;
+        printf("HANDOFF_WIRE_AUTH %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 2;
+    }
+    if (getenv("LITEV_TEST_ROM_REHASH"))
+    {
+        // Same-size replacement: ordinary setup may reuse a hash, but a live
+        // handoff must rehash the current file before accepting a peer ROM.
+        char path[] = "/tmp/litev-romhash-XXXXXX";
+        int fd = mkstemp(path);
+        if (fd < 0) return 2;
+        u8 bytes[32]{};
+        memcpy(bytes, "TEST ROM    ABCD", 16);
+        bytes[31] = 1;
+        const bool firstWrite = write(fd, bytes, sizeof(bytes)) == sizeof(bytes);
+        close(fd);
+        const NetplayRom before = firstWrite ? NetplayDescribeRom(path) : NetplayRom{};
+        fd = open(path, O_WRONLY | O_TRUNC);
+        bytes[31] = 2;
+        const bool secondWrite = fd >= 0 && write(fd, bytes, sizeof(bytes)) == sizeof(bytes);
+        if (fd >= 0) close(fd);
+        const NetplayRom cached = NetplayDescribeRom(path);
+        const NetplayRom fresh = NetplayDescribeRom(path, true);
+        const NetplayRom after = NetplayDescribeRom(path);
+        unlink(path);
+        const bool ok = firstWrite && secondWrite && before.Size == sizeof(bytes) &&
+                        cached == before && fresh != before && after == fresh &&
+                        fresh == NetplayDescribeRomBytes(bytes, sizeof(bytes));
+        printf("ROM_REHASH %s\n", ok ? "PASS" : "FAIL");
+        return ok ? 0 : 2;
+    }
+#endif
 
     // --- Unit 1 oracle modes -------------------------------------------------
     if (opt.mode != RunMode::Benchmark)
@@ -526,6 +850,11 @@ int main(int argc, char** argv)
         fprintf(stderr, "error: cannot read ROM '%s'\n", opt.rom.c_str());
         return 1;
     }
+#ifdef LITEV_AMBIENT_LAN
+    NetplayRom acquiredCutRom;
+    if (getenv("LITEV_AMBIENT_CUT_XFER_PORT"))
+        acquiredCutRom = NetplayDescribeRomBytes(romdata.get(), romlen);
+#endif
 
     auto cart = NDSCart::ParseROM(std::move(romdata), romlen, nullptr, std::nullopt);
     if (!cart)
@@ -693,6 +1022,7 @@ int main(int argc, char** argv)
     // benchWindowEnd's RunFrame. The window covers [start,end] inclusive.
     const bool haveWindow = opt.benchWindowStart >= 0;
     std::chrono::steady_clock::time_point windowStart{}, windowEnd{};
+    timespec windowCpuStart{}, windowCpuEnd{};
 
 #if LITEV_PROFILE
     // Run totals: g_Frame is reset every frame, so accumulate each frame's counters
@@ -736,12 +1066,81 @@ int main(int argc, char** argv)
     auto lanNext = std::chrono::steady_clock::now();
 #ifdef LITEV_AMBIENT_LAN
     melonDS::AmbientLAN* ambient = nullptr;
+    // Test-only two-process cut probe. Ambient's reliable control channel and
+    // sequenced MP retirement fence coordinate the pause; this directory holds
+    // only the resulting diagnostic checkpoints.
+    const char* cutDir = getenv("LITEV_AMBIENT_CUT_DIR");
+    const char* cutRole = getenv("LITEV_AMBIENT_CUT_ROLE");
+    const int cutMinFrame = getenv("LITEV_AMBIENT_CUT_MIN_FRAME") ? atoi(getenv("LITEV_AMBIENT_CUT_MIN_FRAME")) : 0;
+    const u16 cutXferPort = getenv("LITEV_AMBIENT_CUT_XFER_PORT") ? (u16)atoi(getenv("LITEV_AMBIENT_CUT_XFER_PORT")) : 0;
+    const int cutSwapTrialFrames = getenv("LITEV_AMBIENT_CUT_SWAP_TRIAL_FRAMES") ?
+                                   atoi(getenv("LITEV_AMBIENT_CUT_SWAP_TRIAL_FRAMES")) : 0;
+    // Only the headless cut harness may impersonate an Android handoff build.
+    // Production builds still require their compile-time native fingerprint.
+    // LITEV_AMBIENT_CUT_TEST_BUILD overrides it (negative tests: a peer with other emulation options).
+    const char* cutBuildText = getenv("LITEV_AMBIENT_CUT_TEST_BUILD");
+    u64 cutTestBuild = NetplayHandoffCompat();
+    if (cutBuildText)
+    {
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = strtoull(cutBuildText, &end, 0);
+        if (!cutXferPort || errno || end == cutBuildText || *end || !parsed)
+        { fprintf(stderr, "CUTFENCE invalid test build fingerprint\n"); return 2; }
+        cutTestBuild = (u64)parsed;
+    }
+    const char* cutPeerIPText = getenv("LITEV_AMBIENT_CUT_PEER_IP");
+    const std::string cutPeerIP = cutPeerIPText ? cutPeerIPText : "192.168.18.3";
+    const bool cutExternalPeer = getenv("LITEV_AMBIENT_CUT_EXTERNAL_PEER") != nullptr;
+    if (cutExternalPeer)
+    {
+        in_addr peerAddress{};
+        if (!cutXferPort || !cutPeerIPText || !cutRole ||
+            strcmp(cutRole, "host") != 0 || cutSwapTrialFrames <= 0 ||
+            inet_pton(AF_INET, cutPeerIP.c_str(), &peerAddress) != 1 ||
+            !getenv("LITEV_NETPLAY"))
+        { fprintf(stderr, "CUTFENCE external peer needs host role, trial frames, port, IPv4 and Netplay configuration\n"); return 2; }
+    }
+    // LITEV_AMBIENT_CUT_FENCE_LOOP=N: N cut fences in one run (fast stress of the fence, no Netplay): each
+    // completed fence is aborted on purpose (by the host, after its peer saw it complete too), both
+    // reset and the game runs on LOOP_GAP frames (default 60) before the next offer. A summary line
+    // "CUTLOOP done ok=K fail=F" ends the run.
+    const int cutFenceLoop = getenv("LITEV_AMBIENT_CUT_FENCE_LOOP") ? atoi(getenv("LITEV_AMBIENT_CUT_FENCE_LOOP")) : 0;
+    const int cutLoopGap = getenv("LITEV_AMBIENT_CUT_LOOP_GAP") ? atoi(getenv("LITEV_AMBIENT_CUT_LOOP_GAP")) : 60;
+    int cutLoopOk = 0, cutLoopFail = 0, cutNextFrame = 0;
+    const bool cutRetryAfterAbort = cutFenceLoop || (getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT") &&
+                                    *getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT"));
+    const int cutRetries = cutFenceLoop ? cutFenceLoop - 1 : 1;   // attempts after the first
+    int cutAttempt = 0;
+    // milliseconds since this console froze for the cut (the CUTFENCE lines' t= field)
+    auto cutFreezeStart = std::chrono::steady_clock::now();
+    auto frozenMs = [&] { return (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - cutFreezeStart).count(); };
+    bool cutRetryReady = false;
+    bool cutResetDelayed = false;
+    bool cutOfferSent = false;
+    bool cutRomVerified = false;
+    std::unique_ptr<NetplayLiveLink> cutLink;   // the live handoff's TCP link, from the verified offer on
+    std::chrono::steady_clock::time_point cutBaselineAt;
+    std::array<u8, 16> cutOfferToken{};
+    NetplayRom cutOwnRom, cutPeerRom;
+    if (cutXferPort)
+    {
+        const char* peerRomPath = getenv("LITEV_AMBIENT_CUT_PEER_ROM");
+        if (!cutDir || !cutRole || !peerRomPath || !*peerRomPath)
+        { fprintf(stderr, "CUTFENCE transfer requires cut dir, role, and peer ROM path\n"); return 2; }
+        cutOwnRom = NetplayDescribeRom(opt.rom);
+        cutPeerRom = NetplayDescribeRom(peerRomPath);
+        if (!cutOwnRom.Size || !cutPeerRom.Size || cutOwnRom != acquiredCutRom)
+        { fprintf(stderr, "CUTFENCE transfer ROM description failed\n"); return 2; }
+    }
     if (!opt.ambient.empty())
     {
         melonDS::AmbientLAN::Config c;
         c.DeviceID = getenv("LITEV_AMBIENT_ID") ? strtoull(getenv("LITEV_AMBIENT_ID"), nullptr, 16)
                                                 : std::hash<std::string>()(opt.ambient) ^ ((u64)getpid() << 32);
         c.Name = opt.ambient;
+        c.RequireHandoffOffer = cutXferPort != 0;
+        c.BuildID = (u32)(cutTestBuild ^ (cutTestBuild >> 32));
         memcpy(c.GameCode, nds->NDSCartSlot.GetCart()->GetHeader().GameCode, 4);
         if (getenv("LITEV_AMBIENT_UPORT")) c.UnicastPort = (u16)atoi(getenv("LITEV_AMBIENT_UPORT"));
         if (getenv("LITEV_AMBIENT_PPORT")) c.PresencePort = (u16)atoi(getenv("LITEV_AMBIENT_PPORT"));   // (tests: a router that drops broadcast)
@@ -900,7 +1299,10 @@ int main(int argc, char** argv)
                 if ((int)pf == frame) { nds->ARM7Write32((u32)pa, (u32)pv); fprintf(stderr, "poke32 arm7 frame %d %08lx = %08lx\n", frame, pa, pv); }
             }
         if (haveWindow && frame == opt.benchWindowStart)
+        {
             windowStart = std::chrono::steady_clock::now();
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &windowCpuStart);
+        }
 
         LITE_PROFILE_RESET_FRAME();
         static const bool frameMs = getenv("LITEV_FRAME_MS") != nullptr;   // per-frame time + JIT compiles
@@ -1049,6 +1451,45 @@ int main(int argc, char** argv)
                     fflush(stdout);
                 }
             }
+            if (ambient && cutRetryAfterAbort && cutAttempt == 1 && !cutFenceLoop && cutRole &&
+                ambient->HandoffFenceAborted())
+            {
+                const char* slow = getenv("LITEV_AMBIENT_CUT_DELAY_RESET_ROLE");
+                if (slow && strcmp(slow, cutRole) == 0 && !cutResetDelayed)
+                {
+                    cutResetDelayed = true;
+                    printf("CUTFENCE %s delaying reset 250ms\n", cutRole);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                }
+            }
+            if (ambient && ambient->ResetHandoffFenceAfterAbort())
+            {
+                printf("CUTFENCE %s reset after mutual abort\n", cutRole ? cutRole : "peer");
+                if (cutRetryAfterAbort && cutAttempt >= 1 && cutAttempt <= cutRetries && cutDir && cutRole)
+                {
+                    cutRetryReady = true;
+                    cutNextFrame = frame + cutLoopGap;
+                    cutOfferSent = false;
+                    cutRomVerified = false;
+                    cutLink.reset();
+                    cutOfferToken = {};
+                    if (strcmp(cutRole, "host") == 0 &&
+                        getenv("LITEV_AMBIENT_CUT_STALE_REPLAY") &&
+                        *getenv("LITEV_AMBIENT_CUT_STALE_REPLAY"))
+                    {
+                        const bool injected = ambient->InjectClosedHandoffFenceForTest();
+                        printf("CUTFENCE host enqueued stale closed-epoch FENCE ok=%d\n", injected);
+                        if (!injected) return 2;
+                    }
+                }
+            }
+            if (ambient && getenv("LITEV_AMBIENT_CUT_SCAN"))
+            {
+                const int start = atoi(getenv("LITEV_AMBIENT_CUT_SCAN"));
+                if (frame >= start)
+                    printf("CUTSCAN f%d busy=%02x queued=%zu\n", frame,
+                           nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames());
+            }
             if (ambient && frame % 120 == 0)
             {
                 const auto st = ambient->GetStats();
@@ -1123,12 +1564,738 @@ int main(int argc, char** argv)
                 if (!period || now - lanNext > std::chrono::milliseconds(100)) lanNext = now;
                 std::this_thread::sleep_until(lanNext);
             }
+            if (ambient && cutDir && cutRole && (frame >= cutMinFrame || ambient->HasPeerHandoffFence()) && ambient->GetStats().Links)
+            {
+                const bool host = strcmp(cutRole, "host") == 0;
+                const std::string abort = std::string(cutDir) + "/abort";
+                auto exists = [](const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (!f) return false; fclose(f); return true; };
+                auto mark = [](const std::string& p) { FILE* f = fopen(p.c_str(), "wb"); if (!f) return false; fclose(f); return true; };
+                const bool retryOpen = cutRetryAfterAbort && cutAttempt >= 1 && cutAttempt <= cutRetries && cutRetryReady &&
+                                       frame >= cutNextFrame;
+                const bool eligible = (cutAttempt == 0 && !exists(abort)) || retryOpen;
+                // the live link with the offer (as the app opens it), this console's state as the
+                // baseline of the cut's delta
+                auto openCutLink = [&] {
+                    if (cutLink || !cutXferPort) return;
+                    cutLink = std::make_unique<NetplayLiveLink>(host ? 0 : 1, cutXferPort, cutPeerIP);
+                    std::vector<u8> base;
+                    if (SaveSavestate(*nds, "", &base)) cutLink->SendBaseline(std::move(base));
+                    cutBaselineAt = std::chrono::steady_clock::now();
+                };
+                // per process: a peer that already answered one run's offer must not see the next
+                // run's as the same one (the app keeps its answer per epoch)
+                static const u64 epochBase = 0x48414e0000000000ull | ((u64)getpid() << 16) | ((u64)time(nullptr) & 0xFF00);
+                const u64 nextEpoch = epochBase + (u64)cutAttempt + 1;
+                if (cutXferPort && eligible)
+                {
+                    if (host && !cutOfferSent)
+                    {
+                        std::random_device random;
+                        for (u8& byte : cutOfferToken) byte = (u8)random();
+                        if (ambient->ProposeHandoff(nextEpoch, cutOfferToken,
+                                                    melonDS::AmbientLAN::HandoffPlainNetplay))
+                        {
+                            cutOfferSent = true;
+                            printf("CUTFENCE host offered epoch=%llx\n", (unsigned long long)nextEpoch);
+                            fflush(stdout);
+                            openCutLink();
+                        }
+                    }
+                    else if (!host)
+                    {
+                        u64 offeredEpoch = 0;
+                        melonDS::AmbientLAN::HandoffMode offeredMode;
+                        if (ambient->IncomingHandoffOffer(offeredEpoch, offeredMode) &&
+                            offeredMode == melonDS::AmbientLAN::HandoffPlainNetplay &&
+                            ambient->RespondToHandoffOffer(offeredEpoch, true))
+                        {
+                            printf("CUTFENCE client accepted epoch=%llx\n", (unsigned long long)offeredEpoch);
+                            fflush(stdout);
+                            openCutLink();
+                        }
+                    }
+                }
+                const bool offerReady = !cutXferPort || !host ||
+                    ambient->HandoffOfferReady(nextEpoch, cutOfferToken,
+                                               melonDS::AmbientLAN::HandoffPlainNetplay);
+                bool romReady = !cutXferPort;
+                if (cutXferPort && eligible)
+                {
+                    melonDS::AmbientLAN::HandoffOfferStatus offer{};
+                    if (ambient->GetHandoffOfferStatus(offer) && offer.Accepted && (!host || offer.Epoch == nextEpoch))
+                    {
+                        if (!ambient->PublishHandoffRom(cutOwnRom))
+                        { fprintf(stderr, "CUTFENCE local ROM manifest failed\n"); return 2; }
+                        NetplayRom described;
+                        if (ambient->GetPeerHandoffRom(described))
+                        {
+                            if (described != cutPeerRom)
+                            { fprintf(stderr, "CUTFENCE peer ROM manifest differs\n"); return 2; }
+                            romReady = true;
+                            if (!cutRomVerified)
+                            {
+                                cutRomVerified = true;
+                                printf("CUTFENCE %s exact peer ROM verified before cut\n", cutRole);
+                                fflush(stdout);
+                            }
+                        }
+                    }
+                }
+                if (eligible && offerReady && romReady && (frame % 120) == 0)
+                {
+                    const auto ws = ambient->GetHandoffFenceStats();
+                    printf("CUTFENCE %s waiting f%d busy=%02x queued=%zu peerFence=%d (fence epoch=%llx aborted=%d compatible=%d)\n",
+                           cutRole, frame, nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames(), ambient->HasPeerHandoffFence(),
+                           (unsigned long long)ws.Epoch, ws.Aborted, ambient->HandoffBuildCompatible());
+                    fflush(stdout);
+                }
+                // Who freezes first is the game's MP role, not the handoff role: an MP client is
+                // inside an exchange at nearly every frame boundary while its host keeps issuing
+                // commands, so it waits for the peer's fence and then runs on to its own idle cut
+                // (the host's last ACK retires). Anyone else may start the fence when idle.
+                const bool mayStartFence = ambient->HasPeerHandoffFence() ||
+                    (cutXferPort ? !nds->Wifi.IsMPClientMode() : host);
+                // (models the player's answer: the app sends its baseline at the offer, seconds before;
+                // a peer app acks it only once it has read this side's ROM, up to ~10 s on an SD card)
+                const bool baselineReady = !cutLink || cutLink->BaselineAcked() || ambient->HasPeerHandoffFence() ||
+                    (cutBaselineAt != std::chrono::steady_clock::time_point{} &&
+                     std::chrono::steady_clock::now() - cutBaselineAt > std::chrono::seconds(20));
+                if (eligible && offerReady && romReady && mayStartFence && baselineReady &&
+                    nds->Wifi.HandoffBusyMask() == 0 && ambient->HandoffQueuedFrames() == 0)
+                {
+                    ++cutAttempt;
+                    cutRetryReady = false;
+                    melonDS::AmbientLAN::HandoffOfferStatus accepted{};
+                    const u64 epoch = ambient->HasPeerHandoffFence() ? ambient->PeerHandoffEpoch() :
+                        host ? epochBase + (u64)cutAttempt :
+                        ambient->GetHandoffOfferStatus(accepted) ? accepted.Epoch : 0;
+                    cutFreezeStart = std::chrono::steady_clock::now();   // (the game is frozen from here)
+                    printf("CUTFENCE %s attempt=%d holding f%d clock=%llu epoch=%llx\n", cutRole, cutAttempt,
+                           frame, (unsigned long long)nds->GetSysTimestamp(), (unsigned long long)epoch);
+                    fflush(stdout);
+                    std::array<u8, 16> token{};
+                    if (host && cutXferPort) token = cutOfferToken;
+                    else if (host) { std::random_device random; for (u8& byte : token) byte = (u8)random(); }
+                    if (!ambient->StartHandoffFence(epoch, token)) { mark(abort); fprintf(stderr, "CUTFENCE start failed\n"); return 2; }
+                    if (const char* inject = getenv("LITEV_AMBIENT_CUT_POSTFENCE_SEND"); inject && strcmp(inject, cutRole) == 0)
+                    {
+                        u8 packet[36] = {};
+                        ambient->SendCmd(0, packet, sizeof(packet), nds->GetSysTimestamp());
+                        printf("CUTFENCE %s injected post-fence MP send; aborted=%d\n", cutRole,
+                               ambient->HandoffFenceAborted());
+                        fflush(stdout);
+                    }
+                    // This console's state is final from its freeze: capture and send the checkpoint
+                    // now, while the fence completes (the checkpoint does not depend on it).
+                    std::vector<u8> earlyState;
+                    if (cutXferPort && cutLink && !getenv("LITEV_HANDOFF_WARM_CHECKPOINT") &&
+                        SaveSavestate(*nds, "", &earlyState, true))
+                    {
+                        NetplayLiveCheckpoint early;
+                        early.Epoch = epoch; early.Build = cutTestBuild; early.RawClock = nds->GetSysTimestamp();
+                        early.Frame = frame; early.Player = host ? 0 : 1; early.Rom = cutOwnRom;
+                        ambient->GetHandoffFenceToken(early.FenceToken);
+                        const Firmware& fw = nds->GetFirmware();
+                        early.Firmware.assign(fw.Buffer(), fw.Buffer() + fw.Length());
+                        early.State = earlyState;
+                        std::string sendError;
+                        if (!cutLink->SendCheckpoint(early, sendError))
+                            printf("CUTFENCE %s early checkpoint not sent: %s\n", cutRole, sendError.c_str());
+                    }
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+                    const char* why = "8 s deadline";
+                    while (!ambient->HandoffFenceComplete() && !ambient->HandoffFenceAborted() &&
+                           std::chrono::steady_clock::now() < deadline)
+                    {
+                        ambient->Process();
+                        if (ambient->HandoffFenceAborted()) why = ambient->GetStats().Links ? "peer aborted or link lost" : "no Ambient link";
+                        // A peer can have an MP packet in flight when our fence is sent.
+                        // Process() retires stale packets under Ambient's normal rules;
+                        // the READY and completion checks still require an empty queue
+                        // and full sequence-watermark retirement. Aborting on the first
+                        // transient queued packet races the peer's fence response.
+                        if (nds->Wifi.HandoffBusyMask() || !ambient->GetStats().Links)
+                        { why = nds->Wifi.HandoffBusyMask() ? "MP exchange busy" : "no Ambient link"; ambient->AbortHandoffFence(); break; }
+                        if (getenv("LITEV_AMBIENT_FENCE_TRACE"))
+                        {
+                            static auto lastTrace = std::chrono::steady_clock::now();
+                            if (std::chrono::steady_clock::now() - lastTrace > std::chrono::milliseconds(200))
+                            {
+                                lastTrace = std::chrono::steady_clock::now();
+                                const auto fs = ambient->GetHandoffFenceStats();
+                                printf("CUTFENCE %s t=%ldms fencing: local=%u retired=%u peer=%u peerRetired=%u ready=%d/%d queued=%zu peerFence=%d\n",
+                                       cutRole, frozenMs(), fs.LastSent, fs.RetiredThrough, fs.PeerLastSent, fs.PeerRetiredThrough,
+                                       fs.LocalReady, fs.PeerReady, ambient->HandoffQueuedFrames(), ambient->HasPeerHandoffFence());
+                            }
+                        }
+                        if (ambient->CanAcknowledgeHandoffFence())
+                        {
+                            if (const char* fail = getenv("LITEV_AMBIENT_CUT_INJECT_FAIL"); fail && strcmp(fail, cutRole) == 0)
+                            {
+                                printf("CUTFENCE %s injected failure before READY\n", cutRole);
+                                ambient->AbortHandoffFence();
+                                break;
+                            }
+                            ambient->AcknowledgeHandoffFence();
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                    if (!ambient->HandoffFenceComplete() || ambient->HandoffFenceAborted() ||
+                        nds->Wifi.HandoffBusyMask() || ambient->HandoffQueuedFrames())
+                    {
+                        const auto fs = ambient->GetHandoffFenceStats();
+                        printf("CUTFENCE %s abort f%d t=%ldms (%s) busy=%02x queued=%zu peerFence=%d ready=%d\n", cutRole, frame,
+                               frozenMs(), why, nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames(),
+                               ambient->HasPeerHandoffFence(), ambient->CanAcknowledgeHandoffFence());
+                        printf("CUTFENCE watermark local=%u retired=%u peer=%u peerRetired=%u ready=%d/%d aborted=%d\n",
+                               fs.LastSent, fs.RetiredThrough, fs.PeerLastSent, fs.PeerRetiredThrough,
+                               fs.LocalReady, fs.PeerReady, fs.Aborted);
+                        ambient->AbortHandoffFence();
+                        mark(abort);
+                        if (cutFenceLoop)
+                        {
+                            cutLoopFail++;
+                            printf("CUTLOOP fail attempt=%d (%s) local=%u retired=%u peer=%u\n", cutAttempt, why,
+                                   fs.LastSent, fs.RetiredThrough, fs.PeerLastSent);
+                            if (cutAttempt >= cutFenceLoop) printf("CUTLOOP done ok=%d fail=%d\n", cutLoopOk, cutLoopFail);
+                            fflush(stdout);
+                        }
+                    }
+                    else if (cutFenceLoop)
+                    {
+                        // the peer completes within a round trip of us: the host lets it see READY, then aborts
+                        // (the deliberate end of this loop step); the client waits for that abort
+                        cutLoopOk++;
+                        printf("CUTLOOP ok attempt=%d t=%ldms f%d\n", cutAttempt, frozenMs(), frame);
+                        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(host ? 300 : 5000);
+                        while (!ambient->HandoffFenceAborted() && std::chrono::steady_clock::now() < until)
+                        { ambient->Process(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+                        ambient->AbortHandoffFence();   // (both send one: the mutual reset needs both)
+                        cutLink.reset();
+                        if (cutAttempt >= cutFenceLoop)
+                        {
+                            printf("CUTLOOP done ok=%d fail=%d\n", cutLoopOk, cutLoopFail);
+                            fflush(stdout);
+                        }
+                    }
+                    else
+                    {
+                        // A real checkpoint exchange can keep both source
+                        // games frozen for longer than ordinary Ambient's
+                        // 10-second idle timeout. Pump only control traffic
+                        // and prove the fenced link survives that interval.
+                        if (const char* hold = getenv("LITEV_AMBIENT_CUT_FROZEN_MS"))
+                        {
+                            const int ms = std::clamp(atoi(hold), 0, 60000);
+                            const auto until = std::chrono::steady_clock::now() +
+                                               std::chrono::milliseconds(ms);
+                            while (std::chrono::steady_clock::now() < until)
+                            {
+                                ambient->Process();
+                                if (!ambient->GetStats().Links || ambient->HandoffFenceAborted() ||
+                                    !ambient->HandoffFenceComplete())
+                                { fprintf(stderr, "CUTFENCE fenced link expired during frozen hold\n"); return 2; }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                            }
+                            printf("CUTFENCE %s frozen link survived %d ms\n", cutRole, ms);
+                        }
+                        const auto fs = ambient->GetHandoffFenceStats();
+                        const std::string path = getenv("LITEV_AMBIENT_CUT_NO_DUMP") ? "" :
+                            std::string(cutDir) + (host ? "/host.mln" : "/client.mln");
+                        std::vector<u8> liveState;
+                        // The handoff checkpoint carries an empty JIT cache and empties this
+                        // console's too: every copy on every build starts from the same cache.
+                        // (LITEV_HANDOFF_WARM_CHECKPOINT=1: the old warm-JIT checkpoint, negative control)
+                        const bool coldCheckpoint = cutXferPort && !getenv("LITEV_HANDOFF_WARM_CHECKPOINT");
+                        if (!earlyState.empty())
+                        {
+                            liveState = std::move(earlyState);   // (captured at the freeze, already sent)
+                            if (!path.empty()) { FILE* f = fopen(path.c_str(), "wb"); if (f) { fwrite(liveState.data(), 1, liveState.size(), f); fclose(f); } }
+                        }
+                        else if (!SaveSavestate(*nds, path, cutXferPort ? &liveState : nullptr, coldCheckpoint)) { mark(abort); return 2; }
+                        printf("CUTFENCE %s t=%ldms saved f%d busy=%02x queued=%zu\n", cutRole, frozenMs(), frame,
+                               nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames());
+                        printf("CUTFENCE watermark local=%u retired=%u peer=%u peerRetired=%u ready=%d/%d aborted=%d\n",
+                               fs.LastSent, fs.RetiredThrough, fs.PeerLastSent, fs.PeerRetiredThrough,
+                               fs.LocalReady, fs.PeerReady, fs.Aborted);
+                        fflush(stdout);
+                        bool transferFailed = false;
+                        // A successful PREPARED vote must retain the actually loaded
+                        // replica, not merely prove that a temporary load once worked.
+                        // Keep userdata before NDS so cart/save teardown cannot use a
+                        // destroyed save-path context.
+                        std::unique_ptr<HeadlessHost::InstanceUserData> preparedUser;
+                        std::unique_ptr<NDS> preparedReplica;
+                        std::unique_ptr<HeadlessHost::InstanceUserData> preparedLocalUser;
+                        std::unique_ptr<NDS> preparedLocalReplica;
+                        NetplayLiveCheckpoint local, remote;
+                        auto prepareScratch = [&](const NetplayLiveCheckpoint& candidate,
+                                                  const std::string& romPath,
+                                                  std::unique_ptr<HeadlessHost::InstanceUserData>& user,
+                                                  std::unique_ptr<NDS>& instance,
+                                                  std::string& reason) {
+                            return PrepareScratch(candidate, romPath, opt.jit, user, instance, reason);
+                        };
+                        if (cutXferPort)
+                        {
+                            local.Epoch = epoch;
+                            local.Build = cutTestBuild;
+                            local.RawClock = nds->GetSysTimestamp();
+                            local.Frame = frame;
+                            local.Player = host ? 0 : 1;
+                            if (!ambient->GetHandoffFenceToken(local.FenceToken))
+                            { ambient->AbortHandoffFence(); mark(abort); return 2; }
+                            local.Rom = cutOwnRom;
+                            {
+                                const Firmware& fw = nds->GetFirmware();
+                                local.Firmware.assign(fw.Buffer(), fw.Buffer() + fw.Length());
+                            }
+                            local.State = std::move(liveState);
+                            std::string transferError;
+                            std::atomic<bool> transferDone{false};
+                            std::atomic<bool> transferCancel{false};
+                            bool transferOk = false;
+                            std::thread transfer([&] {
+                                const std::string address = cutPeerIP + ":" + std::to_string(cutXferPort);
+                                auto prepare = [&](const NetplayLiveCheckpoint& candidate, std::string& reason) {
+                                    const char* fail = getenv("LITEV_HANDOFF_XFER_PREPARE_FAIL");
+                                    if (fail && strcmp(fail, cutRole) == 0)
+                                    { reason = "injected post-transfer prepare failure"; return false; }
+                                    const char* peerRomPath = getenv("LITEV_AMBIENT_CUT_PEER_ROM");
+                                    return peerRomPath && prepareScratch(candidate, peerRomPath,
+                                                                         preparedUser, preparedReplica, reason);
+                                };
+                                (void)address;
+                                transferOk = cutLink && cutLink->ExchangeCheckpoints(local, cutPeerRom, prepare, transferCancel,
+                                                                                     remote, transferError);
+                                transferDone.store(true, std::memory_order_release);
+                            });
+                            // meanwhile, this console's own scratch copy (the proof's and the trial's)
+                            std::string localPrepError;
+                            bool localPrepared = false;
+                            while (!transferDone.load(std::memory_order_acquire))
+                            {
+                                ambient->Process();
+                                if (!localPrepared)
+                                {
+                                    localPrepared = true;
+                                    if (!prepareScratch(local, opt.rom, preparedLocalUser, preparedLocalReplica, localPrepError))
+                                    { preparedLocalReplica.reset(); preparedLocalUser.reset(); }
+                                    nds->JIT.JitEnableExecute();
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
+                            transfer.join();
+                            if (!transferOk || ambient->HandoffFenceAborted() || ambient->HandoffQueuedFrames())
+                            {
+                                preparedReplica.reset();
+                                preparedUser.reset();
+                                ambient->AbortHandoffFence();
+                                mark(abort);
+                                printf("CUTFENCE %s transfer abort: %s\n", cutRole, transferError.c_str());
+                                transferFailed = true;
+                            }
+                            else
+                            {
+                                const char* inject = getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE");
+                                std::string localError;
+                                if ((inject && std::string(inject) == std::string(cutRole) + ":localprepare") ||
+                                    (!preparedLocalReplica &&
+                                     !prepareScratch(local, opt.rom, preparedLocalUser, preparedLocalReplica, localError)))
+                                {
+                                    if (localError.empty())
+                                    { localError = "injected localprepare failure"; printf("CUTFENCE %s %s\n", cutRole, localError.c_str()); }
+                                    ambient->AbortHandoffFence();
+                                    mark(abort);
+                                    transferFailed = true;
+                                    printf("CUTFENCE %s local scratch abort: %s\n", cutRole, localError.c_str());
+                                }
+                            }
+                            if (!transferFailed)
+                            {
+                                if (!getenv("LITEV_AMBIENT_CUT_NO_DUMP"))
+                                {
+                                    const std::string remotePath = std::string(cutDir) + (host ? "/remote-client.mln" : "/remote-host.mln");
+                                    FILE* f = fopen(remotePath.c_str(), "wb");
+                                    if (!f || fwrite(remote.State.data(), 1, remote.State.size(), f) != remote.State.size())
+                                    { if (f) fclose(f); ambient->AbortHandoffFence(); mark(abort); return 2; }
+                                    fclose(f);
+                                    auto writeFirmware = [&](const std::string& fwPath, const std::vector<u8>& bytes) {
+                                        FILE* out = fopen(fwPath.c_str(), "wb");
+                                        if (!out) return false;
+                                        const bool wrote = fwrite(bytes.data(), 1, bytes.size(), out) == bytes.size();
+                                        fclose(out);
+                                        return wrote;
+                                    };
+                                    const std::string ownFwPath = std::string(cutDir) + (host ? "/host.fw" : "/client.fw");
+                                    const std::string peerFwPath = std::string(cutDir) + (host ? "/remote-client.fw" : "/remote-host.fw");
+                                    if (!writeFirmware(ownFwPath, local.Firmware) || !writeFirmware(peerFwPath, remote.Firmware))
+                                    { ambient->AbortHandoffFence(); mark(abort); return 2; }
+                                }
+                                Firmware peerFirmware(remote.Firmware.data(), (u32)remote.Firmware.size());
+                                const auto& peerMac = peerFirmware.GetHeader().MacAddr;
+                                printf("CUTFENCE %s t=%ldms transfer verified peer=%u frame=%u clock=%llu bytes=%zu\n",
+                                       cutRole, frozenMs(), remote.Player, remote.Frame,
+                                       (unsigned long long)remote.RawClock, remote.State.size());
+                                printf("CUTFENCE %s peer firmware=%zu MAC=%02x:%02x:%02x:%02x:%02x:%02x\n",
+                                       cutRole, remote.Firmware.size(), peerMac[0], peerMac[1], peerMac[2],
+                                       peerMac[3], peerMac[4], peerMac[5]);
+                            }
+                            fflush(stdout);
+                        }
+                        // The reversible pre-commit proof, as the app runs it: fresh copies of
+                        // both checkpoints run two Lockstep frames here and on the peer; the
+                        // live-start rendezvous below compares the four state hashes.
+                        std::array<u64, 4> proof{};
+                        if (!transferFailed && cutXferPort)
+                        {
+                            // the proof runs the two prepared copies (as the app does), which then load
+                            // their checkpoints again for the session
+                            std::string proofError;
+                            const int me = host ? 0 : 1;
+                            NDS* copies[2];
+                            HeadlessHost::InstanceUserData* users[2];
+                            copies[me] = preparedLocalReplica.get(); users[me] = preparedLocalUser.get();
+                            copies[1 - me] = preparedReplica.get(); users[1 - me] = preparedUser.get();
+                            bool proven = copies[0] && copies[1];
+                            if (proven)
+                            {
+                                // (headless MP callbacks route by the userdata's instance id)
+                                users[0]->instanceID = 0;
+                                users[1]->instanceID = 1;
+                                proven = NetplayRunLiveProof({copies[0], copies[1]},
+                                    {me == 0 ? local.RawClock : remote.RawClock, me == 1 ? local.RawClock : remote.RawClock},
+                                    [&](int p) { copies[p]->RunFrame(); }, proof, proofError);
+                                for (int p = 0; p < 2 && proven; p++)
+                                {
+                                    const NetplayLiveCheckpoint& c = p == me ? local : remote;
+                                    Savestate st((void*)c.State.data(), (u32)c.State.size(), false);
+                                    if (st.Error || !copies[p]->DoSavestate(&st) || st.Error || copies[p]->GetSysTimestamp() != c.RawClock)
+                                    { proven = false; proofError = "a proof copy did not load its checkpoint again"; }
+                                }
+                            }
+                            else proofError = "no prepared copies for the proof";
+                            nds->JIT.JitEnableExecute();   // (macOS: scratch JIT teardown left this thread writing)
+                            if (!proven)
+                            {
+                                ambient->AbortHandoffFence();
+                                mark(abort);
+                                transferFailed = true;
+                                printf("CUTFENCE %s proof abort: %s\n", cutRole, proofError.c_str());
+                            }
+                            else
+                                printf("CUTFENCE %s t=%ldms proof p0=%016llx/%016llx p1=%016llx/%016llx\n", cutRole, frozenMs(),
+                                       (unsigned long long)proof[0], (unsigned long long)proof[2],
+                                       (unsigned long long)proof[1], (unsigned long long)proof[3]);
+                            fflush(stdout);
+                        }
+                        // (the prepare votes travel with the checkpoints on the live link; the start
+                        // manifest below is the only step left: no Ambient PREPARED/ARMED/GO round trips)
+                        if (!transferFailed && cutXferPort)
+                        {
+                            const char* inject = getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE");
+                            if (inject && std::string(inject) == std::string(cutRole) + ":prepared" &&
+                                (!cutRetryAfterAbort || cutAttempt == 1))
+                            {
+                                printf("CUTFENCE %s injected prepared failure\n", cutRole);
+                                ambient->AbortHandoffFence();
+                                mark(abort);
+                                transferFailed = true;
+                                cutLink.reset();   // (the peer waits on the link: closing it ends that wait)
+                            }
+                        }
+                        if (!transferFailed && cutXferPort)
+                        {
+                            // GO is only a vote, not authority to run a frame: one peer
+                            // can receive GO while the sender fails immediately after.
+                            // Rendezvous over a second, checkpoint-bound connection while
+                            // both original Ambient consoles remain frozen and recoverable.
+                            std::atomic<bool> startDone{false};
+                            std::atomic<bool> startCancel{false};
+                            bool startOk = false;
+                            std::string startError;
+                            std::thread start([&] {
+                                startOk = cutLink && cutLink->ExchangeStart(local, remote, proof, startCancel, startError);
+                                startDone.store(true, std::memory_order_release);
+                            });
+                            while (!startDone.load(std::memory_order_acquire))
+                            {
+                                ambient->Process();
+                                if (ambient->HandoffFenceAborted() || !ambient->GetStats().Links ||
+                                    ambient->HandoffQueuedFrames()) startCancel.store(true, std::memory_order_release);
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
+                            start.join();
+                            if (!startOk || ambient->HandoffFenceAborted() || !ambient->GetStats().Links)
+                            {
+                                ambient->AbortHandoffFence();
+                                mark(abort);
+                                transferFailed = true;
+                                printf("CUTFENCE %s live-start abort: %s\n", cutRole, startError.c_str());
+                            }
+                            else printf("CUTFENCE %s t=%ldms live-start rendezvous agreed\n", cutRole, frozenMs());
+                            fflush(stdout);
+                        }
+                        if (!transferFailed && cutSwapTrialFrames > 0)
+                        {
+                            // Test-only reversible backend trial: keep the original Ambient
+                            // console and ENet host alive while independent scratch replicas
+                            // run a short Lockstep session, then restore Ambient without a
+                            // ROM restart or writing the owner's save.
+                            const u64 sourceClock = nds->GetSysTimestamp();
+                            const u64 sourceRAM = XXH3_64bits(nds->MainRAM, nds->MainRAMMask + 1);
+                            setenv("LITEV_MP_HANDOFF_PROBE", "1", 1);
+                            setenv("LITEV_MP_HANDOFF_STARTUP_GATE", "1", 1);
+                            char epochText[32], tokenText[33];
+                            snprintf(epochText, sizeof(epochText), "%llu", (unsigned long long)local.Epoch);
+                            for (int i = 0; i < 16; i++) snprintf(tokenText + i * 2, 3, "%02x", local.FenceToken[i]);
+                            setenv("LITEV_MP_HANDOFF_EPOCH", epochText, 1);
+                            setenv("LITEV_MP_HANDOFF_TOKEN", tokenText, 1);
+                            const int startPort = (int)cutXferPort + 50 + (cutExternalPeer ? 0 : (host ? 0 : 1));
+                            const int peerStartPort = (int)cutXferPort + 50 + (cutExternalPeer ? 0 : (host ? 1 : 0));
+                            const std::string startPortText = std::to_string(startPort);
+                            const std::string startPeerText =
+                                (cutExternalPeer ? cutPeerIP : "127.0.0.1") + ":" + std::to_string(peerStartPort);
+                            setenv("LITEV_MP_HANDOFF_START_PORT", startPortText.c_str(), 1);
+                            setenv("LITEV_MP_HANDOFF_START_PEER", startPeerText.c_str(), 1);
+                            if (getenv("LITEV_AMBIENT_CUT_STALE_FIRST_INPUT") &&
+                                *getenv("LITEV_AMBIENT_CUT_STALE_FIRST_INPUT"))
+                                setenv("LITEV_MP_INJECT_STALE_INPUT", "1", 1);
+                            liteds::TraceRunConfig trialCfg;
+                            const std::string peerRomPath = getenv("LITEV_AMBIENT_CUT_PEER_ROM");
+                            trialCfg.rom = host ? opt.rom : peerRomPath;
+                            trialCfg.roms = {host ? opt.rom : peerRomPath,
+                                             host ? peerRomPath : opt.rom};
+                            trialCfg.dataDir = opt.dataDir;
+                            trialCfg.jit = opt.jit;
+                            trialCfg.fixedRtcEpoch = opt.fixedRtc;
+                            auto savedAmbient = melonDS::MPInterface::Take();
+                            printf("CUTFENCE %s t=%ldms swap trial begin %d frames\n", cutRole, frozenMs(), cutSwapTrialFrames);
+                            fflush(stdout);
+                            std::atomic<bool> keepAmbient{true};
+                            std::thread ambientService([&] {
+                                while (keepAmbient.load(std::memory_order_acquire))
+                                { ambient->Process(); std::this_thread::sleep_for(std::chrono::milliseconds(2)); }
+                            });
+                            std::vector<liteds::PreparedMPConsole> replicas(2);
+                            auto& own = replicas[host ? 0 : 1];
+                            // LITEV_AMBIENT_CUT_LIVE_LOCAL=1: the console that kept running plays
+                            // on, as in the app (only the peer's console is a checkpoint copy).
+                            // There is no source left to roll back to: the process exits after.
+                            const bool liveLocal = getenv("LITEV_AMBIENT_CUT_LIVE_LOCAL") && *getenv("LITEV_AMBIENT_CUT_LIVE_LOCAL");
+                            if (liveLocal)
+                            {
+                                preparedLocalReplica.reset();
+                                preparedLocalUser.reset();
+                                nds->JIT.JitEnableExecute();
+                                own.udata = std::make_unique<HeadlessHost::InstanceUserData>();
+                                nds->UserData = own.udata.get();
+                                own.identity = nds.get();
+                                own.nds = std::move(nds);
+                            }
+                            else
+                            {
+                                own.identity = preparedLocalReplica.get();
+                                own.udata = std::move(preparedLocalUser);
+                                own.nds = std::move(preparedLocalReplica);
+                            }
+                            auto& other = replicas[host ? 1 : 0];
+                            other.identity = preparedReplica.get();
+                            other.udata = std::move(preparedUser);
+                            other.nds = std::move(preparedReplica);
+                            printf("CUTFENCE %s trial exact local=%p peer=%p\n", cutRole,
+                                   (void*)own.identity, (void*)other.identity);
+                            fflush(stdout);
+                            // LITEV_AMBIENT_CUT_TRIAL_SCRIPT: this player's input script for the trial
+                            std::vector<std::string> trialScripts(2);
+                            if (const char* ts = getenv("LITEV_AMBIENT_CUT_TRIAL_SCRIPT")) trialScripts[host ? 0 : 1] = ts;
+                            {   // (MPTest stamps the first Netplay frame against the freeze)
+                                const auto t0 = std::chrono::duration_cast<std::chrono::microseconds>(cutFreezeStart.time_since_epoch()).count();
+                                setenv("LITEV_CUT_T0_US", std::to_string(t0).c_str(), 1);
+                            }
+                            liteds::LiveExitResult ended;
+                            const int trialResult = liteds::MPTest(trialCfg, cutSwapTrialFrames, trialScripts, std::move(replicas),
+                                                                   liveLocal ? &ended : nullptr);
+                            keepAmbient.store(false, std::memory_order_release);
+                            ambientService.join();
+                            if (liveLocal && ended.EndsAfter >= 0)
+                            {
+                                // The return path (LITEV_NP_LIVE_EXIT): the session ended by itself. This
+                                // device's console - the very object that played on - plays on alone in
+                                // Ambient; the peer's copy is dropped (never saved). Its inputs: the ones
+                                // Netplay had already scheduled (the input delay), then live (the trial
+                                // script, same frame numbers). LITEV_AMBIENT_CUT_EXIT_FRAMES of them.
+                                const auto returned = std::chrono::steady_clock::now();
+                                const int me = host ? 0 : 1, F = ended.EndsAfter;
+                                auto& mine = ended.Consoles[me];
+                                // the reference: both consoles as they were after frame F, for the frames
+                                // an uninterrupted session would have run with the inputs already sent
+                                std::array<NetplayLiveCheckpoint, 2> atEnd;
+                                for (int k = 0; k < 2; k++)
+                                {
+                                    Savestate st;
+                                    ended.Consoles[k].nds->DoSavestate(&st);
+                                    atEnd[k].Player = (u8)k;
+                                    atEnd[k].State.assign((const u8*)st.Buffer(), (const u8*)st.Buffer() + st.Length());
+                                    const Firmware& fw = ended.Consoles[k].nds->GetFirmware();
+                                    atEnd[k].Firmware.assign(fw.Buffer(), fw.Buffer() + fw.Length());
+                                }
+                                const auto snapped = std::chrono::steady_clock::now();   // (test-only work ends)
+                                for (int k = 0; k < (int)ended.Consoles.size(); k++)
+                                    if (k != me) { ended.Consoles[k].nds.reset(); ended.Consoles[k].udata.reset(); }
+                                mine.nds->JIT.JitEnableExecute();
+                                mine.udata->instanceID = 0;
+                                melonDS::MPInterface::Take().reset();
+                                melonDS::MPInterface::Set(std::move(savedAmbient), melonDS::MPInterface_Ambient);
+                                ambient->EndCommittedHandoff();
+                                if (mine.nds->Wifi.IsPoweredOn()) melonDS::MPInterface::Get().Begin(0);
+                                liteds::InputScript& live = *ended.Scripts[me];   // (the trial's, as far as it got)
+                                const auto& sched = ended.Scheduled[me];
+                                const int exitFrames = getenv("LITEV_AMBIENT_CUT_EXIT_FRAMES") ? atoi(getenv("LITEV_AMBIENT_CUT_EXIT_FRAMES")) : 600;
+                                double pauseMs = 0, worstMs = 0;
+                                std::vector<u64> realHash;
+                                const u64 exchBefore = ambient->GetStats().Exchanges;
+                                auto pace = std::chrono::steady_clock::now();   // solo: 60 fps from the first frame (no catch-up)
+                                auto last = ended.StoppedAt[me];
+                                for (int f = F + 1; f <= F + exitFrames; f++)
+                                {
+                                    const auto start = std::chrono::steady_clock::now();
+                                    const double gap = std::chrono::duration<double, std::milli>(start - last).count();
+                                    if (f == F + 1)   // the pause without the test-only snapshot of both consoles
+                                        pauseMs = gap - std::chrono::duration<double, std::milli>(snapped - returned).count();
+                                    else worstMs = std::max(worstMs, gap);
+                                    const int i = f - F - 1;
+                                    NetplayFrameInput in;
+                                    if (i < (int)sched.size()) in = sched[i];
+                                    else
+                                    {
+                                        in.Keys = live.Loaded() ? live.KeyMaskForFrame(f) : 0xFFF;
+                                        int tx, ty;
+                                        if (live.HasTouch() && live.TouchForFrame(f, tx, ty)) { in.TouchX = tx; in.TouchY = ty; }
+                                    }
+                                    mine.nds->SetKeyMask(in.Keys);
+                                    if (in.TouchX >= 0) mine.nds->TouchScreen(in.TouchX, in.TouchY);
+                                    else mine.nds->ReleaseScreen();
+                                    mine.nds->RunFrame();
+                                    liteds::AudioTapDrain(*mine.nds, 2, f);
+                                    if (i < (int)sched.size()) realHash.push_back(NetplayLiveProofHash(*mine.nds));
+                                    if (live.HasProgram())   // closed-loop script steps see this frame's screens
+                                    {
+                                        void* top = nullptr; void* bot = nullptr;
+                                        if (mine.nds->GPU.GetFramebuffers(&top, &bot) && top && bot) live.OnFrame(f, (const u32*)top, (const u32*)bot);
+                                        else live.OnFrame(f, nullptr, nullptr);
+                                    }
+                                    // LITEV_AMBIENT_CUT_EXIT_DUMP=<every>: screens of the continuation (cut dir)
+                                    if (static const int every = getenv("LITEV_AMBIENT_CUT_EXIT_DUMP") ? atoi(getenv("LITEV_AMBIENT_CUT_EXIT_DUMP")) : 0;
+                                        every > 0 && (f - F) % every == 0)
+                                    {
+                                        void* top = nullptr; void* bot = nullptr;
+                                        if (mine.nds->GPU.GetFramebuffers(&top, &bot) && top && bot)
+                                            DumpPPM(std::string(cutDir) + "/exit-" + cutRole + "-f" + std::to_string(f) + ".ppm", (const u32*)top, (const u32*)bot);
+                                    }
+                                    ambient->Process();
+                                    pace += std::chrono::microseconds(16715);
+                                    std::this_thread::sleep_until(pace);
+                                    if (f <= F + 64)
+                                        printf("inst%d state f%d: sys=%llu ram=%016llx r9=%016llx\n", me, f,
+                                               (unsigned long long)mine.nds->GetSysTimestamp(),
+                                               (unsigned long long)XXH3_64bits(mine.nds->MainRAM, mine.nds->MainRAMMask + 1),
+                                               (unsigned long long)XXH3_64bits(mine.nds->ARM9.R, sizeof(mine.nds->ARM9.R)));
+                                    last = std::chrono::steady_clock::now();
+                                }
+                                // the uninterrupted run, in-process: both copies, the same link clocks
+                                int same = -1;
+                                const size_t n = std::min(ended.Scheduled[0].size(), ended.Scheduled[1].size());
+                                if (n)
+                                {
+                                    std::unique_ptr<HeadlessHost::InstanceUserData> ru[2];
+                                    std::unique_ptr<NDS> rn[2];
+                                    std::string err;
+                                    const char* peerRomPath = getenv("LITEV_AMBIENT_CUT_PEER_ROM");
+                                    const bool ok = PrepareScratch(atEnd[me], opt.rom, opt.jit, ru[me], rn[me], err) &&
+                                                    PrepareScratch(atEnd[1 - me], peerRomPath, opt.jit, ru[1 - me], rn[1 - me], err);
+                                    std::vector<u64> refHash;
+                                    if (ok)
+                                    {
+                                        ru[0]->instanceID = 0; ru[1]->instanceID = 1;
+                                        auto saved = melonDS::MPInterface::Take();
+                                        const std::array<u64, 2> origins {me == 0 ? local.RawClock : remote.RawClock,
+                                                                          me == 1 ? local.RawClock : remote.RawClock};
+                                        NetplayRunLockstepFrames({rn[0].get(), rn[1].get()}, origins, [&](int p, int f) {
+                                            const NetplayFrameInput in = f < (int)n ? ended.Scheduled[p][f] : NetplayFrameInput{};
+                                            rn[p]->SetKeyMask(in.Keys);
+                                            if (in.TouchX >= 0) rn[p]->TouchScreen(in.TouchX, in.TouchY); else rn[p]->ReleaseScreen();
+                                            rn[p]->RunFrame();
+                                        }, (int)n, refHash, err);
+                                        melonDS::MPInterface::Take().reset();
+                                        melonDS::MPInterface::Set(std::move(saved), melonDS::MPInterface_Ambient);
+                                        same = 0;
+                                        for (size_t f = 0; f < n && f < realHash.size(); f++) same += refHash[f * 2 + me] == realHash[f];
+                                    }
+                                    for (int k = 0; k < 2; k++) { rn[k].reset(); ru[k].reset(); }
+                                    mine.nds->JIT.JitEnableExecute();
+                                }
+                                printf("CUTFENCE %s live exit after f%d: back in Ambient, pause %.1f ms (worst later frame gap %.1f ms), "
+                                       "%zu scheduled inputs applied, then live; link=%u; frames after the exit equal to an "
+                                       "uninterrupted session: %d of %zu; Ambient exchanges after the exit: %llu\n", cutRole, F, pauseMs, worstMs, sched.size(),
+                                       ambient->GetStats().Links, same, n, (unsigned long long)(ambient->GetStats().Exchanges - exchBefore));
+                                fflush(stdout);
+                                return trialResult == 0 ? 0 : 2;
+                            }
+                            if (cutExternalPeer || liveLocal)
+                            {
+                                // The Android peer has committed. This bounded headless
+                                // participant must not roll its source back into Ambient.
+                                // Exit after the requested real cross-device Netplay frames.
+                                printf("CUTFENCE external peer trial %s frames=%d\n",
+                                       trialResult == 0 ? "pass" : "failed", cutSwapTrialFrames);
+                                fflush(stdout);
+                                return trialResult == 0 ? 0 : 2;
+                            }
+                            auto trialLink = melonDS::MPInterface::Take();
+                            trialLink.reset();
+                            melonDS::MPInterface::Set(std::move(savedAmbient), melonDS::MPInterface_Ambient);
+                            preparedReplica.reset();
+                            preparedUser.reset();
+                            // macOS MAP_JIT write protection is per-thread, not per-console.
+                            // Destroying the scratch JIT leaves this thread in write mode;
+                            // the paused source console will execute its own JIT on resume.
+                            nds->JIT.JitEnableExecute();
+                            const bool sourceIntact = nds->GetSysTimestamp() == sourceClock &&
+                                XXH3_64bits(nds->MainRAM, nds->MainRAMMask + 1) == sourceRAM;
+                            printf("CUTFENCE %s swap trial %s sourceIntact=%d link=%u\n", cutRole,
+                                   trialResult == 0 ? "pass" : "failed", sourceIntact, ambient->GetStats().Links);
+                            fflush(stdout);
+                            ambient->AbortHandoffFence();
+                            mark(abort);
+                            transferFailed = true; // trial deliberately rolls back to original Ambient
+                            const char* injected = getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE");
+                            const bool expectedAfterLiveAbort = injected && strcmp(injected, "host:afterlive") == 0;
+                            if ((!expectedAfterLiveAbort && trialResult != 0) ||
+                                !sourceIntact || !ambient->GetStats().Links) return 2;
+                        }
+                        preparedReplica.reset();
+                        preparedUser.reset();
+                        preparedLocalReplica.reset();
+                        preparedLocalUser.reset();
+                        nds->JIT.JitEnableExecute();
+                        if (!transferFailed) break;
+                    }
+                }
+            }
         }
 #endif
 
         if (haveWindow && frame == opt.benchWindowEnd)
+        {
             windowEnd = std::chrono::steady_clock::now();
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &windowCpuEnd);
+        }
 
+        // diagnostics LITEV_WIFI_TRACE=<every>: the Wi-Fi chip's MP state (live handoff exit rule)
+        if (static const int wt = getenv("LITEV_WIFI_TRACE") ? atoi(getenv("LITEV_WIFI_TRACE")) : 0; wt > 0 && frame % wt == 0)
+            printf("WIFISTATE f%d on=%d mp=%d client=%d exch=%u busy=%02x\n", frame, nds->Wifi.IsPoweredOn(), nds->Wifi.IsMultiplayer(),
+                   nds->Wifi.IsMPClientMode(), nds->Wifi.MPExchanges, nds->Wifi.HandoffBusyMask());
         if (opt.dumpSavestateFrame == frame && !opt.dumpSavestatePath.empty())
         {
             if (!SaveSavestate(*nds, opt.dumpSavestatePath))
@@ -1196,6 +2363,7 @@ int main(int argc, char** argv)
             XXH3_64bits_update(audioHashState, audioDrain.data(),
                                (size_t)got * 2 * sizeof(s16));
             if (wav) fwrite(audioDrain.data(), 4, (size_t)got, wav);
+            liteds::AudioTapWrite(0, frame, audioDrain.data(), got);
             audioSampleCount += (u64)got;
             if (got < 2048) break;
         }
@@ -1350,6 +2518,9 @@ int main(int argc, char** argv)
         printf("window_frames: %d\n", windowFrames);
         printf("window_wall_s: %.4f\n", windowSec);
         printf("window_fps:  %.2f\n", windowFps);
+        printf("window_emu_thread_cpu_s: %.6f\n",
+               (windowCpuEnd.tv_sec - windowCpuStart.tv_sec) +
+               (windowCpuEnd.tv_nsec - windowCpuStart.tv_nsec) * 1e-9);
     }
     printf("final_top:   %016llx\n", (unsigned long long)lastTopHash);
     printf("final_bot:   %016llx\n", (unsigned long long)lastBotHash);

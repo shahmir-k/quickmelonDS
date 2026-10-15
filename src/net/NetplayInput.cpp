@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "NetplayInput.h"
+#include <zlib.h>
 #include "../Platform.h"
 #include "../teakra/src/makedsp1/sha256.h"
 #if defined(__aarch64__)
@@ -102,6 +103,16 @@ struct WireHash
     u64 Hash;
 };
 
+// Ordinary lobby Netplay keeps its established wire format. A live handoff
+// appends this to every input/hash packet, so a delayed packet from an older
+// session at the same endpoint cannot enter the new timeline.
+struct HandoffWireAuth
+{
+    u64 Epoch;
+    u8 Token[16];
+};
+static_assert(sizeof(HandoffWireAuth) == 24);
+
 u64 NowUs()
 {
     return (u64)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -120,7 +131,7 @@ static sockaddr_in ParseAddr(const std::string& ipPort)
 }
 
 NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const std::vector<std::pair<int, std::string>>& peers, int latencyMs, const NetFaults& faults)
-    : Local(localPlayer), DelayFrames(delayFrames), Faults(faults), CurDelay(delayFrames)
+    : Local(localPlayer), DelayFrames(delayFrames), BindPort(bindPort), Faults(faults), CurDelay(delayFrames)
 {
     Faults.LatencyMs = latencyMs;
     for (int p = 0; p < kMaxPlayers; p++)
@@ -165,6 +176,11 @@ NetplayInput::NetplayInput(int localPlayer, int delayFrames, int bindPort, const
 NetplayInput::~NetplayInput()
 {
     Running = false;
+#ifdef LITEV_NP_LEAN_IO
+    // wake the receiver from its poll (up to the keepalive interval): a session ending under a
+    // running game (live exit) must not stall that game's thread for it
+    if (WakePipe[1] >= 0) { const u8 one = 1; (void)!write(WakePipe[1], &one, 1); }
+#endif
     if (Receiver.joinable()) Receiver.join();
     if (Socket >= 0) close(Socket);
 #ifdef LITEV_NP_LEAN_IO
@@ -239,6 +255,177 @@ void NetplayInput::SubmitLocal(int frame, const NetplayFrameInput& input)
     if (WakePipe[1] >= 0) { const u8 one = 1; if (write(WakePipe[1], &one, 1) == 1) return; }
 #endif
     Send();
+}
+
+bool NetplayInput::ArmHandoffSession(u64 epoch, const std::array<u8, 16>& token,
+                                     int localStartupPort,
+                                     const std::vector<std::pair<int, std::string>>& startupPeers)
+{
+    if (!epoch || token == std::array<u8, 16>{} || localStartupPort <= 0 || localStartupPort > 65535 ||
+        localStartupPort == BindPort || localStartupPort == BindPort + 2 ||
+        startupPeers.size() != Peers.size()) return false;
+    bool seen[kMaxPlayers]{};
+    u8 addresses[kMaxPlayers][16]{};
+    for (const auto& [player, address] : startupPeers)
+    {
+        if (!IsPeer(player) || seen[player]) return false;
+        seen[player] = true;
+        const sockaddr_in parsed = ParseAddr(address);
+        if (!parsed.sin_port || !parsed.sin_addr.s_addr) return false;
+        for (int prior : Peers)
+        {
+            if (prior == player || !seen[prior]) continue;
+            sockaddr_in old{};
+            memcpy(&old, addresses[prior], sizeof(old));
+            if (old.sin_addr.s_addr == parsed.sin_addr.s_addr && old.sin_port == parsed.sin_port)
+                return false;
+        }
+        memcpy(addresses[player], &parsed, sizeof(parsed));
+    }
+    for (int peer : Peers)
+    {
+        if (!seen[peer]) return false;
+    }
+    std::lock_guard<std::mutex> lk(Lock);
+    HandoffStartPort = localStartupPort;
+    HandoffEpoch = epoch;
+    HandoffToken = token;
+    HandoffProofComplete = false;
+    memcpy(HandoffStartAddr, addresses, sizeof(addresses));
+    for (int peer : Peers)
+    {
+        Inputs[peer].clear();
+        PeerHashes[peer].clear();
+        LastPeerUs[peer] = 0;
+        RemoteUpTo[peer] = PeerAck[peer] = DelayFrames - 1;
+    }
+    return true;
+}
+
+bool NetplayInput::WaitForHandoffPeerInput(int timeoutMs)
+{
+    if (!HandoffEpoch || timeoutMs <= 0) return false;
+#pragma pack(push, 1)
+    struct Proof
+    {
+        u32 Magic;
+        u8 Player;
+        u8 Ack;
+        u8 Reserved[2];
+        u64 Epoch;
+        u8 Token[16];
+        u32 Keys;
+        s16 TouchX, TouchY;
+    };
+#pragma pack(pop)
+    Proof mine{};
+    mine.Magic = 0x3150484e; // NHP1: handoff first input proof
+    mine.Player = (u8)Local;
+    mine.Epoch = HandoffEpoch;
+    memcpy(mine.Token, HandoffToken.data(), 16);
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        auto it = Inputs[Local].find(DelayFrames);
+        if (it == Inputs[Local].end()) return false;
+        mine.Keys = it->second.Keys;
+        mine.TouchX = it->second.TouchX;
+        mine.TouchY = it->second.TouchY;
+    }
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    local.sin_port = htons((u16)HandoffStartPort);
+    if (bind(fd, (sockaddr*)&local, sizeof(local)) != 0) { close(fd); return false; }
+    bool proven[kMaxPlayers]{};
+    bool peerAcked[kMaxPlayers]{};
+    int ackSends = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    bool injectedStale = false;
+    while (Running && std::chrono::steady_clock::now() < deadline)
+    {
+        bool haveAll = true;
+        for (int peer : Peers) haveAll &= proven[peer];
+        mine.Ack = haveAll ? 1 : 0;
+        for (int peer : Peers)
+        {
+            sockaddr_in target{};
+            memcpy(&target, HandoffStartAddr[peer], sizeof(target));
+            sendto(fd, &mine, sizeof(mine), 0, (sockaddr*)&target, sizeof(target));
+        }
+        if (haveAll) ackSends++;
+        if (!injectedStale && getenv("LITEV_MP_INJECT_STALE_INPUT"))
+        {
+            injectedStale = true;
+            int stale = socket(AF_INET, SOCK_DGRAM, 0);
+            if (stale >= 0)
+            {
+                Proof bad = mine;
+                bad.Player = (u8)Peers.front();
+                bad.Token[0] ^= 1;
+                sockaddr_in target{}; target.sin_family = AF_INET;
+                target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                target.sin_port = htons((u16)HandoffStartPort);
+                sendto(stale, &bad, sizeof(bad), 0, (sockaddr*)&target, sizeof(target));
+                // A correct public token from an unrelated source port must
+                // also be rejected; token equality alone is not the gate.
+                Proof wrongEndpoint = mine;
+                wrongEndpoint.Player = (u8)Peers.front();
+                sendto(stale, &wrongEndpoint, sizeof(wrongEndpoint), 0, (sockaddr*)&target, sizeof(target));
+                close(stale);
+                fprintf(stderr, "handoff injected stale and wrong-endpoint frame-0 proofs\n");
+            }
+        }
+        pollfd p{fd, POLLIN, 0};
+        if (poll(&p, 1, 50) > 0 && (p.revents & POLLIN))
+        {
+            Proof incoming{};
+            sockaddr_in from{}; socklen_t fromSize = sizeof(from);
+            const ssize_t n = recvfrom(fd, &incoming, sizeof(incoming), 0, (sockaddr*)&from, &fromSize);
+            if (n == sizeof(incoming) && incoming.Magic == mine.Magic &&
+                incoming.Player < kMaxPlayers && PeerSet[incoming.Player])
+            {
+                sockaddr_in expected{};
+                memcpy(&expected, HandoffStartAddr[incoming.Player], sizeof(expected));
+                const bool valid = from.sin_family == AF_INET &&
+                    from.sin_addr.s_addr == expected.sin_addr.s_addr &&
+                    from.sin_port == expected.sin_port &&
+                    incoming.Epoch == HandoffEpoch &&
+                    memcmp(incoming.Token, HandoffToken.data(), 16) == 0;
+                if (valid)
+                {
+                    const int peer = incoming.Player;
+                    LastPeerUs[peer] = NowUs();
+                    if (!proven[peer])
+                    {
+                        std::lock_guard<std::mutex> lk(Lock);
+                        Inputs[peer].clear();
+                        Inputs[peer].emplace(DelayFrames, NetplayFrameInput{incoming.Keys, incoming.TouchX, incoming.TouchY});
+                        RemoteUpTo[peer] = DelayFrames;
+                        Changed.notify_all();
+                    }
+                    proven[peer] = true;
+                    peerAcked[peer] |= incoming.Ack == 1;
+                }
+                else if (getenv("LITEV_MP_INJECT_STALE_INPUT"))
+                    fprintf(stderr, "handoff rejected stale frame-0 proof\n");
+            }
+        }
+        bool all = ackSends >= 3;
+        for (int peer : Peers) all &= proven[peer] && peerAcked[peer];
+        if (all)
+        {
+            {
+                std::lock_guard<std::mutex> lk(Lock);
+                HandoffProofComplete = true;
+            }
+            close(fd);
+            return true;
+        }
+    }
+    close(fd);
+    return false;
 }
 
 #ifdef LITEV_NP_QUIET_HB
@@ -316,6 +503,14 @@ void NetplayInput::Send(bool all)
                 memcpy(p, &e, sizeof(e));
             }
 #endif
+            if (HandoffEpoch)
+            {
+                HandoffWireAuth auth {HandoffEpoch, {}};
+                memcpy(auth.Token, HandoffToken.data(), sizeof(auth.Token));
+                const size_t at = packet.size();
+                packet.resize(at + sizeof(auth));
+                memcpy(packet.data() + at, &auth, sizeof(auth));
+            }
         }
         sendto(Socket, packet.data(), packet.size(), 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
     }
@@ -409,8 +604,21 @@ int NetplayInput::SpeedAt(int frame, u32* requesters, int* inputFrame)
 void NetplayInput::SendHash(int frame, u64 hash)
 {
     WireHash h {kHashMagic, (u8)Local, frame, hash};
+    u8 packet[sizeof(h) + sizeof(HandoffWireAuth)];
+    memcpy(packet, &h, sizeof(h));
+    size_t length = sizeof(h);
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        if (HandoffEpoch)
+        {
+            HandoffWireAuth auth {HandoffEpoch, {}};
+            memcpy(auth.Token, HandoffToken.data(), sizeof(auth.Token));
+            memcpy(packet + length, &auth, sizeof(auth));
+            length += sizeof(auth);
+        }
+    }
     for (int peer : Peers)
-        sendto(Socket, &h, sizeof(h), 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
+        sendto(Socket, packet, length, 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
 }
 
 bool NetplayInput::PeerHash(int player, int frame, u64& hash)
@@ -524,7 +732,6 @@ void NetplayInput::ReceiveLoop()
         for (ssize_t len; (len = recv(Socket, buf, sizeof(buf), MSG_DONTWAIT)) > 0;)
         {
             now = NowUs();
-            if (len > 4 && IsPeer(buf[4])) LastPeerUs[buf[4]] = now; // both packet kinds: magic, player
             u64 due;
             if (len < (ssize_t)sizeof(WireHeader)) continue;
             if (!faults) Receive(buf, len, now);    // no copy
@@ -550,7 +757,6 @@ void NetplayInput::ReceiveLoop()
 
         ssize_t len = recv(Socket, buf, sizeof(buf), 0);
         u64 now = NowUs();
-        if (len > 4 && IsPeer(buf[4])) LastPeerUs[buf[4]] = now; // both packet kinds: magic, player
         u64 due;
         if (len >= (ssize_t)sizeof(WireHeader) && Faults.Deliver(now, due))
             pending.emplace(due, std::vector<u8>(buf, buf + len));
@@ -569,14 +775,25 @@ void NetplayInput::ReceiveLoop()
 void NetplayInput::Receive(const u8* data, size_t size, u64 now)
 {
     WireHash wh;
-    if (size == sizeof(WireHash) && (memcpy(&wh, data, sizeof(wh)), wh.Magic == kHashMagic))
+    if (size >= sizeof(WireHash) && (memcpy(&wh, data, sizeof(wh)), wh.Magic == kHashMagic))
     {
         if (IsPeer(wh.Player))
         {
             std::lock_guard<std::mutex> lk(Lock);
+            if (HandoffEpoch)
+            {
+                HandoffWireAuth auth{};
+                if (size != sizeof(wh) + sizeof(auth)) return;
+                memcpy(&auth, data + sizeof(wh), sizeof(auth));
+                if (auth.Epoch != HandoffEpoch ||
+                    memcmp(auth.Token, HandoffToken.data(), sizeof(auth.Token))) return;
+                if (!HandoffProofComplete) return;
+            }
+            else if (size != sizeof(wh)) return;
             auto& hashes = PeerHashes[wh.Player];
             hashes[wh.Frame] = wh.Hash;
             while (hashes.size() > 64) hashes.erase(hashes.begin());
+            LastPeerUs[wh.Player] = now;
         }
         return;
     }
@@ -586,7 +803,18 @@ void NetplayInput::Receive(const u8* data, size_t size, u64 now)
         size >= sizeof(header) + header.Count * sizeof(WireEntry))
     {
         std::lock_guard<std::mutex> lk(Lock);
+        if (HandoffEpoch)
+        {
+            HandoffWireAuth auth{};
+            const size_t payload = sizeof(header) + header.Count * sizeof(WireEntry);
+            if (size != payload + sizeof(auth)) return;
+            memcpy(&auth, data + payload, sizeof(auth));
+            if (auth.Epoch != HandoffEpoch ||
+                memcmp(auth.Token, HandoffToken.data(), sizeof(auth.Token))) return;
+            if (!HandoffProofComplete) return;
+        }
         int from = header.Player;
+        LastPeerUs[from] = now;
         auto& inputs = Inputs[from];
         const size_t had = inputs.size();
         const u8* p = data + sizeof(header);
@@ -761,10 +989,21 @@ std::string NetplayRom::Name() const
     return line;
 }
 
-NetplayRom NetplayDescribeRom(const std::string& path)
+NetplayRom NetplayDescribeRomBytes(const u8* bytes, u64 size)
 {
-    // ponytail: keyed by path + size, so a file replaced in place by one of the same size keeps
-    // its old hash until the app restarts; add the mtime if that ever happens
+    NetplayRom rom;
+    if (!bytes || size < 16 || size > (512u << 20)) return rom;
+    Sha256 sha;
+    sha.Add(bytes, static_cast<size_t>(size));
+    sha.Get(rom.Sha);
+    rom.Size = size;
+    memcpy(rom.Title, bytes, sizeof(rom.Title));
+    memcpy(rom.GameCode, bytes + 12, sizeof(rom.GameCode));
+    return rom;
+}
+
+NetplayRom NetplayDescribeRom(const std::string& path, bool fresh)
+{
     static std::mutex lock;
     static std::map<std::pair<std::string, u64>, NetplayRom> known;
     NetplayRom rom;
@@ -776,7 +1015,7 @@ NetplayRom NetplayDescribeRom(const std::string& path)
     {
         std::lock_guard<std::mutex> lk(lock);
         auto it = known.find({path, size});
-        if (it != known.end()) rom = it->second;
+        if (!fresh && it != known.end()) rom = it->second;
         else
         {
             Sha256 sha;
@@ -798,13 +1037,14 @@ NetplayRom NetplayDescribeRom(const std::string& path)
                 memcpy(rom.GameCode, head + 12, 4);
                 known[{path, size}] = rom;
             }
+            else if (fresh) known.erase({path, size});
         }
     }
     Platform::CloseFile(f);
     return rom;
 }
 
-std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths)
+std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths, bool fresh)
 {
     for (const std::string& path : paths)
     {
@@ -814,7 +1054,7 @@ std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>
         u64 size;
         bool maybe = RomHead(f, size, head) && size == rom.Size && !memcmp(head + 12, rom.GameCode, 4);
         Platform::CloseFile(f);
-        if (maybe && NetplayDescribeRom(path) == rom) return path;
+        if (maybe && NetplayDescribeRom(path, fresh) == rom) return path;
     }
     return "";
 }
@@ -1572,6 +1812,623 @@ bool NetplayHandshake(NetplaySetup& s)
     gCancel = false;
     SetXfer(NetplayXferStatus::Idle);
     return s.Player == 0 && !s.Join ? HostHandshake(s) : GuestHandshake(s);
+}
+
+bool NetplayLivePrepareBridge::Request(const NetplayLiveCheckpoint& checkpoint,
+                                       std::string& error, const std::atomic<bool>& cancel,
+                                       int timeoutMs)
+{
+    error.clear();
+    std::unique_lock<std::mutex> lock(Lock);
+    if (Stopped || Pending || timeoutMs <= 0 || cancel.load(std::memory_order_acquire))
+    { error = "live replica prepare unavailable"; return false; }
+    Pending = &checkpoint;
+    Started = Finished = Success = false;
+    ResultError.clear();
+    Changed.notify_all();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    bool abandoned = false;
+    while (!Finished)
+    {
+        const bool cancelled = Stopped || cancel.load(std::memory_order_acquire);
+        const bool expired = std::chrono::steady_clock::now() >= deadline;
+        if (cancelled || expired)
+        {
+            abandoned = true;
+            error = cancelled ? "live replica prepare cancelled" : "live replica prepare timed out";
+            if (!Started)
+            {
+                Finished = true;
+                break;
+            }
+            // The owner thread is using checkpoint now. Do not let the worker
+            // return and destroy it until that synchronous load has finished.
+        }
+        Changed.wait_for(lock, std::chrono::milliseconds(10));
+    }
+    const bool ok = Success && !abandoned && !Stopped &&
+                    !cancel.load(std::memory_order_acquire);
+    if (!abandoned) error = ResultError;
+    if (!ok && error.empty()) error = "live replica prepare failed";
+    Pending = nullptr;
+    Started = Finished = Success = false;
+    ResultError.clear();
+    return ok;
+}
+
+bool NetplayLivePrepareBridge::Service(const NetplayLivePrepare& prepare)
+{
+    const NetplayLiveCheckpoint* checkpoint = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(Lock);
+        if (!Pending || Started || Finished) return false;
+        Started = true;
+        checkpoint = Pending;
+    }
+    std::string error;
+    const bool ok = prepare && prepare(*checkpoint, error);
+    {
+        std::lock_guard<std::mutex> lock(Lock);
+        Success = ok;
+        ResultError = ok ? std::string{} :
+            (error.empty() ? "live replica prepare failed" : std::move(error));
+        Finished = true;
+    }
+    Changed.notify_all();
+    return true;
+}
+
+bool NetplayLivePrepareBridge::HasPending() const
+{
+    std::lock_guard<std::mutex> lock(Lock);
+    return Pending && !Started && !Finished;
+}
+
+void NetplayLivePrepareBridge::Cancel()
+{
+    std::lock_guard<std::mutex> lock(Lock);
+    Stopped = true;
+    if (Pending && !Started)
+    {
+        ResultError = "live replica prepare cancelled";
+        Finished = true;
+    }
+    Changed.notify_all();
+}
+
+NetplayLiveExit::NetplayLiveExit(int consoles, int quietFrames, int slack)
+    : Consoles(std::clamp(consoles, 1, 16)), QuietFrames(quietFrames), Slack(std::clamp(slack, 1, kRing / 4))
+{
+    Done.fill(-1);
+}
+
+bool NetplayLiveExit::EndFrame(int console, int frame, u32 exchanges)
+{
+    std::unique_lock<std::mutex> lk(Lock);
+    if (frame == 0 || exchanges != Last[console]) Streak[console] = 0;
+    else Streak[console]++;
+    Last[console] = exchanges;
+    StreakAt[console][frame % kRing] = Streak[console];
+    Done[console] = frame;
+    Changed.notify_all();
+    const int decided = frame - Slack;   // the frame decided now
+    if (decided < 0) return false;
+    if (EndAfter.load() >= 0) return frame >= EndAfter.load();
+    bool quiet = true;
+    for (int c = 0; c < Consoles && quiet; c++)
+    {
+        // (bounded: the others are within a few frames, see the class comment)
+        if (!Changed.wait_for(lk, std::chrono::seconds(2), [&] { return Cancelled || Done[c] >= decided; }))
+        {
+            Platform::Log(Platform::LogLevel::Warn, "NetplayLiveExit: console %d at frame %d still waits for console %d (done %d) to reach %d\n",
+                          console, frame, c, Done[c], decided);
+            Changed.wait(lk, [&] { return Cancelled || Done[c] >= decided; });
+        }
+        if (Cancelled) return false;
+        quiet = StreakAt[c][decided % kRing] >= QuietFrames;
+    }
+    if (!quiet) return false;
+    int expected = -1;
+    EndAfter.compare_exchange_strong(expected, frame);
+    return true;
+}
+
+void NetplayLiveExit::Cancel()
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    Cancelled = true;
+    Changed.notify_all();
+}
+
+// tests: LITEV_HANDOFF_SIM_RTT_MS models a slow link on the handoff's TCP messages (sender side):
+// a message of n bytes arrives half a round trip later, after the TCP slow-start rounds its size
+// needs (initial window 10 x 1460 B, doubling per round trip, per connection) and n / 10 MB/s.
+struct SimTcp
+{
+    double HalfRttMs = getenv("LITEV_HANDOFF_SIM_RTT_MS") ? atof(getenv("LITEV_HANDOFF_SIM_RTT_MS")) / 2 : 0;
+    double Window = 14600;
+    void Connect() const { if (HalfRttMs) usleep((useconds_t)(HalfRttMs * 2000)); }   // SYN, SYN-ACK
+    void Send(size_t n)
+    {
+        if (!HalfRttMs) return;
+        int rounds = 0;
+        for (double sent = Window; sent < n; sent += Window) { Window *= 2; rounds++; }
+        usleep((useconds_t)((HalfRttMs + rounds * HalfRttMs * 2 + n / 10000.0) * 1000));
+    }
+};
+
+u64 NetplayHandoffCompat()
+{
+    return LITEV_HANDOFF_COMPAT;
+}
+
+// ---- the live handoff link (NetplayLiveLink, NetplayInput.h) ----
+
+std::vector<u8> NetplayLiveDelta(const std::vector<u8>& state, const std::vector<u8>& base)
+{
+    // Savestate sections (16-byte headers: tag, length, ...) matched by position, tag and length:
+    // their contents XORed with the base's (unchanged bytes become zero: zlib folds them). The same
+    // call with the same base undoes it; the headers stay as they are.
+    std::vector<u8> out = state;
+    size_t a = 16, b = 16;
+    while (a + 16 <= out.size() && b + 16 <= base.size())
+    {
+        u32 la = 0, lb = 0;
+        memcpy(&la, &out[a + 4], 4);
+        memcpy(&lb, &base[b + 4], 4);
+        if (la < 16 || lb < 16 || la > out.size() - a || lb > base.size() - b) break;
+        if (la == lb && !memcmp(&out[a], &base[b], 4))
+            for (size_t i = 16; i < la; i++) out[a + i] ^= base[b + i];
+        a += la; b += lb;
+    }
+    return out;
+}
+
+namespace
+{
+#pragma pack(push, 1)
+struct LiveCheckpointHeader
+{
+    u32 Magic;
+    u16 Version;
+    u8 Player, Reserved;
+    u64 Epoch, Build, RawClock, RomSize;
+    u32 Frame, StateSize, FirmwareSize, PackedSize, BaseId;
+    u8 FenceToken[16];
+    u8 RomSha[32], StateSha[32], FirmwareSha[32];
+};
+struct LiveReadyVote { u8 Ok, Length; char Reason[126]; };
+struct LiveStartManifest
+{
+    u32 Magic;
+    u8 Player;
+    u8 Reserved[3];
+    u64 Epoch, Build;
+    u8 Token[16], State0[32], State1[32], Firmware0[32], Firmware1[32];
+    u64 TrialHashes[4]; // player 0/1 after each of two disposable Lockstep frames
+};
+#pragma pack(pop)
+constexpr u32 kLiveMagic = 0x33434C4E;   // "NLC3": the live link's checkpoint
+constexpr u16 kLiveVersion = 5;          // 5: one link, baselines and deltas, start manifest on the link
+constexpr u32 kMaxLiveState = 64u << 20, kMaxLiveFirmware = 1u << 20;
+
+LiveStartManifest MakeLiveStart(const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
+                                const std::array<u64, 4>& trialHashes)
+{
+    LiveStartManifest m{};
+    m.Magic = 0x33534C4E; // NLS3
+    m.Player = local.Player;
+    m.Epoch = local.Epoch;
+    m.Build = local.Build;
+    memcpy(m.Token, local.FenceToken.data(), 16);
+    const auto& p0 = local.Player == 0 ? local : peer;
+    const auto& p1 = local.Player == 1 ? local : peer;
+    Sha256 a, b, fa, fb;
+    a.Add(p0.State.data(), p0.State.size());
+    b.Add(p1.State.data(), p1.State.size());
+    fa.Add(p0.Firmware.data(), p0.Firmware.size());
+    fb.Add(p1.Firmware.data(), p1.Firmware.size());
+    a.Get(m.State0); b.Get(m.State1);
+    fa.Get(m.Firmware0); fb.Get(m.Firmware1);
+    memcpy(m.TrialHashes, trialHashes.data(), sizeof(m.TrialHashes));
+    return m;
+}
+}
+
+NetplayLiveLink::NetplayLiveLink(int player, u16 port, const std::string& peerIPv4)
+    : Player(player), Port(port), PeerIPv4(peerIPv4)
+{
+    Worker = std::thread([this] { Run(); });
+}
+
+NetplayLiveLink::~NetplayLiveLink() { Close(); }
+
+void NetplayLiveLink::Close()
+{
+    Stop.store(true);
+    const int fd = Fd.exchange(-1);
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    { std::lock_guard<std::mutex> lk(Lock); Broken = true; Changed.notify_all(); }
+    if (Worker.joinable()) Worker.join();
+    if (Sender.joinable()) Sender.join();
+    if (fd >= 0) close(fd);
+}
+
+void NetplayLiveLink::HoldBaselineAck(bool hold)
+{
+    u32 id;
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        AckHeld = hold;
+        if (hold || !PeerBaseId || PeerBaseAcked == PeerBaseId) return;
+        id = PeerBaseAcked = PeerBaseId;
+    }
+    std::vector<u8> ack(4);
+    memcpy(ack.data(), &id, 4);
+    Send(MsgBaseAck, ack);
+}
+
+void NetplayLiveLink::SendBaseline(std::vector<u8> state)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    PendingBase = std::move(state);
+    Changed.notify_all();
+}
+
+bool NetplayLiveLink::Send(u32 type, std::vector<u8> payload)
+{
+    std::lock_guard<std::mutex> lk(Lock);
+    if (Broken || Fd.load() < 0) return false;
+    Outbox.emplace_back(type, std::move(payload));
+    Changed.notify_all();
+    return true;
+}
+
+void NetplayLiveLink::RunSender()
+{
+    SimTcp sim;   // (tests, LITEV_HANDOFF_SIM_RTT_MS)
+    for (;;)
+    {
+        std::pair<u32, std::vector<u8>> item;
+        {
+            std::unique_lock<std::mutex> lk(Lock);
+            Changed.wait_for(lk, std::chrono::milliseconds(20), [&] { return Broken || !Outbox.empty() || !PendingBase.empty() ||
+                                                                             PendingCheckpoint; });
+            if (Broken || Stop.load()) return;
+            if (!PendingBase.empty())
+            {
+                // a baseline: compressed here (the sender's thread), then sent like any message
+                std::vector<u8> base = std::move(PendingBase);
+                PendingBase.clear();
+                const u32 id = ++OwnBaseId;
+                lk.unlock();
+                uLongf n = compressBound((uLong)base.size());
+                std::vector<u8> packed(8 + n);
+                const u32 raw = (u32)base.size();
+                memcpy(&packed[0], &id, 4);
+                memcpy(&packed[4], &raw, 4);
+                if (compress2(packed.data() + 8, &n, base.data(), (uLong)base.size(), 1) != Z_OK) continue;
+                packed.resize(8 + n);
+                lk.lock();
+                OwnBase = std::move(base);
+                item = {MsgBase, std::move(packed)};
+            }
+            else if (PendingCheckpoint)
+            {
+                // (OwnBase is written only by this thread)
+                std::unique_ptr<NetplayLiveCheckpoint> local = std::move(PendingCheckpoint);
+                const u32 baseId = OwnBaseId && OwnBaseAcked == OwnBaseId ? OwnBaseId : 0;
+                lk.unlock();
+                std::vector<u8> msg = PackCheckpoint(*local, baseId);
+                lk.lock();
+                if (msg.empty()) { Broken = true; Changed.notify_all(); return; }
+                item = {MsgCheckpoint, std::move(msg)};
+            }
+            else if (!Outbox.empty())
+            {
+                item = std::move(Outbox.front());
+                Outbox.pop_front();
+            }
+            else continue;
+        }
+        const int fd = Fd.load();
+        sim.Send(item.second.size() + 8);
+        const u32 head[2] = {item.first, (u32)item.second.size()};
+        if (fd < 0 || !SendAll(fd, head, sizeof(head)) ||
+            (!item.second.empty() && !SendAll(fd, item.second.data(), item.second.size())))
+        {
+            std::lock_guard<std::mutex> lk(Lock);
+            Broken = true;
+            Changed.notify_all();
+            return;
+        }
+    }
+}
+
+bool NetplayLiveLink::Wait(u32 type, std::vector<u8>& payload, std::atomic<bool>& cancel, int timeoutMs)
+{
+    std::unique_lock<std::mutex> lk(Lock);
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (!Inbox.count(type))
+    {
+        if (Broken || cancel.load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= until) return false;
+        Changed.wait_for(lk, std::chrono::milliseconds(20));
+    }
+    payload = std::move(Inbox[type]);
+    Inbox.erase(type);
+    return true;
+}
+
+void NetplayLiveLink::Run()
+{
+    // connect: player 0 accepts only the expected peer, player 1 connects (both retry until Close)
+    int fd = -1;
+    in_addr expected{};
+    inet_pton(AF_INET, PeerIPv4.c_str(), &expected);
+    if (Player == 0)
+    {
+        int ls = socket(AF_INET, SOCK_STREAM, 0);
+        int one = 1;
+        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_ANY); a.sin_port = htons(Port);
+        if (ls < 0 || bind(ls, (sockaddr*)&a, sizeof(a)) != 0 || listen(ls, 1) != 0)
+        { if (ls >= 0) close(ls); std::lock_guard<std::mutex> lk(Lock); Broken = true; Changed.notify_all(); return; }
+        while (fd < 0 && !Stop.load())
+        {
+            pollfd p{ls, POLLIN, 0};
+            if (poll(&p, 1, 50) <= 0) continue;
+            sockaddr_in from{}; socklen_t len = sizeof(from);
+            const int c = accept(ls, (sockaddr*)&from, &len);
+            if (c >= 0 && from.sin_addr.s_addr == expected.s_addr) fd = c;
+            else if (c >= 0) close(c);
+        }
+        close(ls);
+    }
+    else
+    {
+        const sockaddr_in a = ParseAddr(PeerIPv4 + ":" + std::to_string(Port));
+        while (fd < 0 && !Stop.load())
+        {
+            const int s = socket(AF_INET, SOCK_STREAM, 0);
+            if (s >= 0 && connect(s, (const sockaddr*)&a, sizeof(a)) == 0) { fd = s; SimTcp().Connect(); break; }
+            if (s >= 0) close(s);
+            for (int i = 0; i < 10 && !Stop.load(); i++) usleep(10000);
+        }
+    }
+    if (fd < 0) return;
+    SetupSocket(fd, 1);
+    Fd.store(fd);
+    Sender = std::thread([this] { RunSender(); });
+    std::vector<u8> buf;
+    u8 chunk[65536];
+    while (!Stop.load())
+    {
+        pollfd p{fd, POLLIN, 0};
+        if (poll(&p, 1, 20) <= 0) continue;
+        const ssize_t got = recv(fd, chunk, sizeof(chunk), 0);
+        if (got <= 0) break;
+        buf.insert(buf.end(), chunk, chunk + got);
+        while (buf.size() >= 8)
+        {
+            u32 type = 0, length = 0;
+            memcpy(&type, &buf[0], 4);
+            memcpy(&length, &buf[4], 4);
+            if (length > (96u << 20)) { buf.clear(); Stop.store(true); break; }
+            if (buf.size() < 8 + (size_t)length) break;
+            std::vector<u8> msg(buf.begin() + 8, buf.begin() + 8 + length);
+            buf.erase(buf.begin(), buf.begin() + 8 + length);
+            if (type == MsgBase && msg.size() >= 8)
+            {
+                u32 id = 0, raw = 0;
+                memcpy(&id, &msg[0], 4);
+                memcpy(&raw, &msg[4], 4);
+                std::vector<u8> state(std::min<u32>(raw, kMaxLiveState));
+                uLongf n = (uLongf)state.size();
+                if (uncompress(state.data(), &n, msg.data() + 8, (uLong)msg.size() - 8) == Z_OK && n == state.size())
+                {
+                    bool held;
+                    { std::lock_guard<std::mutex> lk(Lock); PeerBase = std::move(state); PeerBaseId = id; held = AckHeld;
+                      if (!held) PeerBaseAcked = id; }
+                    std::vector<u8> ack(4);
+                    memcpy(ack.data(), &id, 4);
+                    if (!held) Send(MsgBaseAck, ack);
+                }
+            }
+            else if (type == MsgBaseAck && msg.size() == 4)
+            {
+                std::lock_guard<std::mutex> lk(Lock);
+                memcpy(&OwnBaseAcked, msg.data(), 4);
+            }
+            else
+            {
+                std::lock_guard<std::mutex> lk(Lock);
+                Inbox[type] = std::move(msg);
+                Changed.notify_all();
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lk(Lock);
+    Broken = true;
+    Changed.notify_all();
+}
+
+bool NetplayLiveLink::SendCheckpoint(const NetplayLiveCheckpoint& local, std::string& error)
+{
+    if (local.Player > 1 || (int)local.Player != Player || !local.Epoch || !local.Build || !local.Rom.Size ||
+        local.FenceToken == std::array<u8, 16>{} || local.State.empty() ||
+        local.State.size() > kMaxLiveState || local.Firmware.empty() || local.Firmware.size() > kMaxLiveFirmware)
+    { error = "invalid live checkpoint manifest"; return false; }
+    if (!Connected()) { error = "live link: peer not connected"; return false; }
+    // delta, compression and digests on the sender's thread (~0.4 s of the RG DS freeze when here)
+    std::lock_guard<std::mutex> lk(Lock);
+    if (SentEpoch == local.Epoch && SentClock == local.RawClock) return true;
+    if (Broken) { error = "checkpoint send interrupted"; return false; }
+    PendingCheckpoint = std::make_unique<NetplayLiveCheckpoint>(local);
+    SentEpoch = local.Epoch;
+    SentClock = local.RawClock;
+    Changed.notify_all();
+    return true;
+}
+
+// (the sender's thread) this side's checkpoint, as a delta against the baseline the peer acknowledged
+std::vector<u8> NetplayLiveLink::PackCheckpoint(const NetplayLiveCheckpoint& local, u32 baseId)
+{
+    const std::vector<u8> body = baseId ? NetplayLiveDelta(local.State, OwnBase) : local.State;
+    uLongf packedLength = compressBound((uLong)body.size());
+    LiveCheckpointHeader h{};
+    std::vector<u8> msg(sizeof(h) + local.Firmware.size() + packedLength);
+    if (compress2(msg.data() + sizeof(h) + local.Firmware.size(), &packedLength, body.data(), (uLong)body.size(), 1) != Z_OK)
+        return {};
+    msg.resize(sizeof(h) + local.Firmware.size() + packedLength);
+    Platform::Log(Platform::LogLevel::Info, "live link: checkpoint %zu bytes sent as %lu (%s)\n", local.State.size(),
+                  (unsigned long)packedLength, baseId ? "delta against the baseline" : "whole: no acknowledged baseline");
+    h.Magic = kLiveMagic; h.Version = kLiveVersion; h.Player = local.Player;
+    h.Epoch = local.Epoch; h.Build = local.Build; h.RawClock = local.RawClock;
+    h.RomSize = local.Rom.Size; h.Frame = local.Frame; h.StateSize = (u32)local.State.size();
+    h.FirmwareSize = (u32)local.Firmware.size(); h.PackedSize = (u32)packedLength; h.BaseId = baseId;
+    memcpy(h.FenceToken, local.FenceToken.data(), 16);
+    memcpy(h.RomSha, local.Rom.Sha, 32);
+    { Sha256 sha; sha.Add(local.State.data(), local.State.size()); sha.Get(h.StateSha); }
+    { Sha256 sha; sha.Add(local.Firmware.data(), local.Firmware.size()); sha.Get(h.FirmwareSha); }
+    memcpy(msg.data(), &h, sizeof(h));
+    memcpy(msg.data() + sizeof(h), local.Firmware.data(), local.Firmware.size());
+    // (a flip mid-stream can decode to the same bytes: the XOR delta is mostly zero runs; the trailer never does)
+    if (getenv("LITEV_HANDOFF_XFER_CORRUPT")) msg.back() ^= 1;
+    return msg;
+}
+
+bool NetplayLiveLink::ExchangeCheckpoints(const NetplayLiveCheckpoint& local, const NetplayRom& expectedPeerRom,
+                                          NetplayLivePrepare preparePeer, std::atomic<bool>& cancel,
+                                          NetplayLiveCheckpoint& peer, std::string& error)
+{
+    error.clear();
+    peer = NetplayLiveCheckpoint{};
+    if (local.Player > 1 || (int)local.Player != Player || !local.Epoch || !local.Build || !local.Rom.Size ||
+        !expectedPeerRom.Size || local.FenceToken == std::array<u8, 16>{} || local.State.empty() ||
+        local.State.size() > kMaxLiveState || local.Firmware.empty() || local.Firmware.size() > kMaxLiveFirmware)
+    { error = "invalid live checkpoint manifest"; return false; }
+    // wait for the connection (normally open since the offer)
+    for (int i = 0; i < 1500 && !Connected() && !cancel.load(); i++) usleep(10000);
+    if (!Connected()) { error = "live link: peer not connected"; return false; }
+
+    if (!SendCheckpoint(local, error)) return false;
+    std::vector<u8> in;
+    const bool got = Wait(MsgCheckpoint, in, cancel, 15000);
+    if (!got) { error = "checkpoint from the peer interrupted or timed out"; return false; }
+    // a checkpoint this side cannot take: a no vote with the reason, so the peer reports it too
+    auto reject = [&](const std::string& reason) {
+        error = "this device rejected the peer checkpoint: " + reason;
+        LiveReadyVote no{};
+        no.Length = (u8)std::min(reason.size(), sizeof(no.Reason));
+        memcpy(no.Reason, reason.data(), no.Length);
+        std::vector<u8> vote(sizeof(no));
+        memcpy(vote.data(), &no, sizeof(no));
+        Send(MsgReady, vote);
+        return false;
+    };
+
+    LiveCheckpointHeader ph{};
+    if (in.size() < sizeof(ph)) { return reject("checkpoint header: truncated"); }
+    memcpy(&ph, in.data(), sizeof(ph));
+    char why[200] = "";
+    if (ph.Magic != kLiveMagic || ph.Version != kLiveVersion)
+        snprintf(why, sizeof(why), "handoff protocol differs (peer v%u, local v%u)", ph.Magic == kLiveMagic ? ph.Version : 0, kLiveVersion);
+    else if (ph.Build != local.Build)
+        snprintf(why, sizeof(why), "emulation build compatibility differs (peer %016llx, local %016llx: "
+                 "handoff protocol or emulation LITEV options)", (unsigned long long)ph.Build, (unsigned long long)local.Build);
+    else if (ph.Player == local.Player || ph.Player > 1) snprintf(why, sizeof(why), "peer player %u invalid", ph.Player);
+    else if (ph.Epoch != local.Epoch) snprintf(why, sizeof(why), "peer cut epoch differs");
+    else if (memcmp(ph.FenceToken, local.FenceToken.data(), 16)) snprintf(why, sizeof(why), "peer cut token differs");
+    else if (ph.RomSize != expectedPeerRom.Size || memcmp(ph.RomSha, expectedPeerRom.Sha, 32)) snprintf(why, sizeof(why), "peer ROM differs from its roster entry");
+    else if (!ph.StateSize || ph.StateSize > kMaxLiveState || !ph.FirmwareSize || ph.FirmwareSize > kMaxLiveFirmware ||
+             in.size() != sizeof(ph) + (size_t)ph.FirmwareSize + ph.PackedSize)
+        snprintf(why, sizeof(why), "peer checkpoint size invalid (state %u, firmware %u)", ph.StateSize, ph.FirmwareSize);
+    std::vector<u8> peerBase;
+    if (!why[0] && ph.BaseId)
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        if (ph.BaseId != PeerBaseId) snprintf(why, sizeof(why), "peer checkpoint is a delta against baseline %u, this side holds %u", ph.BaseId, PeerBaseId);
+        else peerBase = PeerBase;
+    }
+    if (why[0]) { return reject(std::string("checkpoint header: ") + why); }
+    std::vector<u8> firmware(in.begin() + sizeof(ph), in.begin() + sizeof(ph) + ph.FirmwareSize);
+    {
+        Sha256 sha; sha.Add(firmware.data(), firmware.size());
+        u8 d[32]; sha.Get(d);
+        if (memcmp(d, ph.FirmwareSha, 32)) { return reject("checkpoint firmware SHA-256 mismatch"); }
+    }
+    std::vector<u8> state(ph.StateSize);
+    uLongf unpacked = (uLongf)state.size();
+    if (uncompress(state.data(), &unpacked, in.data() + sizeof(ph) + ph.FirmwareSize, ph.PackedSize) != Z_OK || unpacked != state.size())
+    { return reject("checkpoint body does not decompress"); }
+    if (ph.BaseId) state = NetplayLiveDelta(state, peerBase);
+    {
+        Sha256 sha; sha.Add(state.data(), state.size());
+        u8 d[32]; sha.Get(d);
+        if (memcmp(d, ph.StateSha, 32)) { return reject("checkpoint SHA-256 mismatch"); }
+    }
+    peer.Epoch = ph.Epoch; peer.Build = ph.Build; peer.RawClock = ph.RawClock;
+    peer.Frame = ph.Frame; peer.Player = ph.Player; peer.Rom = expectedPeerRom;
+    peer.FenceToken = local.FenceToken;
+    peer.Firmware = std::move(firmware);
+    peer.State = std::move(state);
+
+    // the prepare votes, each with its reason
+    std::string reason;
+    LiveReadyVote mine{};
+    mine.Ok = !preparePeer || preparePeer(peer, reason) ? 1 : 0;
+    if (!mine.Ok && reason.empty()) reason = "unspecified";
+    mine.Length = (u8)std::min(reason.size(), sizeof(mine.Reason));
+    memcpy(mine.Reason, reason.data(), mine.Length);
+    std::vector<u8> vote(sizeof(mine)), theirs;
+    memcpy(vote.data(), &mine, sizeof(mine));
+    const bool voted = Send(MsgReady, vote) && Wait(MsgReady, theirs, cancel, 20000) && theirs.size() == sizeof(LiveReadyVote);
+    LiveReadyVote other{};
+    if (voted) memcpy(&other, theirs.data(), sizeof(other));
+    if (!mine.Ok) error = "this device rejected the peer checkpoint: " + reason;
+    else if (!voted) error = "checkpoint preparation vote from the peer was lost";
+    else if (other.Ok != 1)
+        error = "the peer rejected our checkpoint: " + std::string(other.Reason, std::min<size_t>(other.Length, sizeof(other.Reason)));
+    if (error.empty()) return true;
+    peer = NetplayLiveCheckpoint{};
+    return false;
+}
+
+bool NetplayLiveLink::ExchangeStart(const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
+                                    const std::array<u64, 4>& trialHashes, std::atomic<bool>& cancel, std::string& error)
+{
+    error.clear();
+    if (local.Player > 1 || peer.Player != 1 - local.Player || !local.Epoch || local.Epoch != peer.Epoch ||
+        local.Build != peer.Build || local.FenceToken != peer.FenceToken || local.State.empty() || peer.State.empty())
+    { error = "live-start checkpoint pair mismatch"; return false; }
+    const LiveStartManifest mine = MakeLiveStart(local, peer, trialHashes);
+    std::vector<u8> out(sizeof(mine)), in;
+    memcpy(out.data(), &mine, sizeof(mine));
+    if (!Send(MsgStart, out) || !Wait(MsgStart, in, cancel, 8000) || in.size() != sizeof(mine))
+    { error = "live-start rendezvous interrupted"; return false; }
+    LiveStartManifest other{};
+    memcpy(&other, in.data(), sizeof(other));
+    if (local.Player == 0 && getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE") &&
+        strcmp(getenv("LITEV_HANDOFF_PROBE_FAIL_PHASE"), "host:afterlive") == 0)
+    { error = "injected afterlive failure"; return false; }
+    if (other.Player != peer.Player) { error = "live-start player mismatch"; return false; }
+    other.Player = local.Player;
+    if (memcmp(&other, &mine, sizeof(mine)) != 0)
+    {
+        const char* field =
+            other.Magic != mine.Magic ? "magic" :
+            other.Epoch != mine.Epoch ? "epoch" :
+            other.Build != mine.Build ? "build" :
+            memcmp(other.Token, mine.Token, sizeof(mine.Token)) ? "token" :
+            memcmp(other.State0, mine.State0, sizeof(mine.State0)) ? "player 0 state" :
+            memcmp(other.State1, mine.State1, sizeof(mine.State1)) ? "player 1 state" :
+            memcmp(other.Firmware0, mine.Firmware0, sizeof(mine.Firmware0)) ? "player 0 firmware" :
+            memcmp(other.Firmware1, mine.Firmware1, sizeof(mine.Firmware1)) ? "player 1 firmware" :
+            memcmp(other.TrialHashes, mine.TrialHashes, sizeof(mine.TrialHashes)) ? "pre-commit frame proof" : "unknown";
+        error = std::string("live-start checkpoint manifest mismatch: ") + field;
+        return false;
+    }
+    return true;
 }
 
 NetplayXferStatus NetplayGetXferStatus()

@@ -467,7 +467,7 @@ void WriteSecureArea(CartCommon& cart, u32 off, const u8* area)
 }
 }
 
-std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len)
+std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len, bool allowCached)
 {
     Platform::FileHandle* f = Platform::OpenFile(path, Platform::FileMode::Read);
     if (!f) return nullptr;
@@ -483,7 +483,7 @@ std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len)
     for (auto it = SharedROMs.begin(); it != SharedROMs.end();)
         it = it->second.buf.expired() ? SharedROMs.erase(it) : std::next(it);
 
-    auto it = SharedROMs.find(key);
+    auto it = allowCached ? SharedROMs.find(key) : SharedROMs.end();
     if (it != SharedROMs.end())
     {
         if (auto buf = it->second.buf.lock()) { Platform::CloseFile(f); return buf; }
@@ -501,7 +501,7 @@ std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len)
 
     std::shared_ptr<const u8[]> buf(std::move(data));
 #ifdef LITEV_ROM_SHARE
-    SharedROMs[key] = {buf.get(), buf};
+    if (allowCached) SharedROMs[key] = {buf.get(), buf};
 #endif
     return buf;
 }

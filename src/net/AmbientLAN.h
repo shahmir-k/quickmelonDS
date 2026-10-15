@@ -21,9 +21,11 @@
 #ifdef LITEV_AMBIENT_LAN
 
 #include <atomic>
+#include <array>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <set>
 #include <string>
 #include <thread>
@@ -34,6 +36,7 @@
 #include "types.h"
 #include "MPInterface.h"
 #include "AmbientSlowdown.h"
+#include "NetplayInput.h"
 
 namespace melonDS
 {
@@ -49,6 +52,8 @@ public:
         std::string Name;           // shown to others (<= 32 bytes)
         char GameCode[4] = {};
         u32 BuildID = 0;
+        bool AllowHandoff = true;
+        bool RequireHandoffOffer = false; // Android requires explicit peer consent before any cut fence
         int Vis = Vis_Everyone;
         u16 PresencePort = 7065;    // subnet broadcast (shared, SO_REUSEPORT)
         u16 UnicastPort = 0;        // this device's presence socket (0 = any; the app advertises it over NSD)
@@ -123,6 +128,61 @@ public:
     enum Verdict { Verdict_Unknown = 0, Verdict_LanOk = 1, Verdict_LanBad = 2 };
     Verdict PeerVerdict(u64 id);
     Verdict SessionVerdict() const { return (Verdict)StVerdict.load(); }
+    // Emulator-thread-only diagnostic: MP frames already admitted locally or buffered while a link opens.
+    size_t HandoffQueuedFrames() const;
+    // Compatibility gate only: presence is unauthenticated. The checkpoint
+    // exchange must still verify its full native build identity and peer.
+    bool HandoffBuildCompatible() const;
+    // The address of the sole *connected* ENet peer, not a presence-advertised
+    // address. Bind the checkpoint and startup sockets to this IPv4 peer.
+    bool HandoffPeerIPv4(std::string& address) const;
+    enum HandoffMode { HandoffPlainNetplay = 1, HandoffHostedNetplay = 2 };
+    // Two-player, reliable peer consent before the first frozen frame. All methods
+    // are emulator-thread-only, just like the fence API below. The offer epoch
+    // increases for every new attempt on this live link; the token is random.
+    bool ProposeHandoff(u64 epoch, const std::array<u8, 16>& token, HandoffMode mode);
+    bool IncomingHandoffOffer(u64& epoch, HandoffMode& mode) const;
+    bool RespondToHandoffOffer(u64 epoch, bool accept);
+    bool HandoffOfferReady(u64 epoch, const std::array<u8, 16>& token, HandoffMode mode) const;
+    struct HandoffOfferStatus { u64 Epoch; u64 PeerID; HandoffMode Mode; bool Outgoing, Accepted; };
+    bool GetHandoffOfferStatus(HandoffOfferStatus& status) const;
+    bool PublishHandoffRom(const NetplayRom& rom);
+    bool GetPeerHandoffRom(NetplayRom& rom) const;
+    void CancelHandoffOffer();
+    // Emulator-thread-only, two-peer cut fence. Call after the host stops issuing
+    // MP commands; the client may keep running until it reaches its own idle cut.
+    // A received FENCE is not READY: unsequenced MP packets must first retire.
+    // The offering host must choose a nonzero epoch strictly greater than
+    // every earlier offer on this live link (reconnect resets the counter).
+    bool StartHandoffFence(u64 epoch, const std::array<u8, 16>& token = {});
+    const char* FenceStartFailure = "";   // why the last StartHandoffFence failed
+    bool GetHandoffFenceToken(std::array<u8, 16>& token) const;
+    // After a committed handoff's Netplay session ended (every device leaves at the same frame):
+    // the link's fence and offer are over on both sides, with no message needed.
+    void EndCommittedHandoff();
+    bool HasPeerHandoffFence() const;
+    u64 PeerHandoffEpoch() const;
+    bool CanAcknowledgeHandoffFence() const;
+    bool AcknowledgeHandoffFence();
+    bool HandoffFenceComplete() const;
+    bool HandoffFenceAborted() const;
+    // Provisional transition votes. GO alone MUST NOT start a Lockstep frame;
+    // a checkpoint-bound startup rendezvous and peer-input gate still follow.
+    // None of these votes is durable commit.
+    bool AcknowledgeHandoffPrepared();
+    bool HandoffPreparedComplete() const;
+    bool AcknowledgeHandoffArmed();
+    bool HandoffArmedComplete() const;
+    bool AcknowledgeHandoffGo();
+    bool HandoffGoComplete() const;
+    void AbortHandoffFence();
+    // A failed offer may be retried only after ABORT and RESET_DONE cross on
+    // the ordered reliable control channel in both directions. The receiver
+    // finalizes reset while processing RESET_DONE, before a later new FENCE.
+    bool ResetHandoffFenceAfterAbort();
+    bool InjectClosedHandoffFenceForTest(); // diagnostic replay of the last aborted FENCE
+    struct HandoffFenceStats { u64 Epoch; u32 LastSent, PeerLastSent, RetiredThrough, PeerRetiredThrough; bool LocalReady, PeerReady, Aborted; };
+    HandoffFenceStats GetHandoffFenceStats() const;
 
     void Process() override;
     void Begin(int inst) override;
@@ -161,6 +221,14 @@ public:
     };
 
 private:
+    mutable u32 LoggedBuildMismatch = 0;
+    // tests: LITEV_HANDOFF_SIM_RTT_MS delivers handoff control messages half that later
+    struct Link;
+    struct DelayedControl { u64 DueUs; int Slot; u64 ID; std::vector<u8> Bytes; };
+    void ReceiveControl(Link& l, const u8* d, size_t length);
+    void DeliverDelayedControls();
+    std::vector<DelayedControl> DelayedControls;
+    u64 SimHalfRttUs = 0;   // (HandoffBuildCompatible: the peer BuildID last reported)
     struct Link
     {
         u64 ID = 0;
@@ -170,6 +238,30 @@ private:
         u8 MAC[6] = {};
         u32 ActiveMs = 0, CloseAtMs = 0;
         std::vector<std::vector<u8>> Pending;   // frames sent while connecting
+        u32 TxSeq = 0, RetiredThrough = 0;
+        std::map<u32, u32> RetiredBeyond;   // retired out of order: seq -> when (ms)
+        u32 GapSinceMs = 0, LastMPMs = 0;
+        u32 LocalFenceMs = 0, PeerFenceMs = 0, DropThroughSeq = 0;
+        u32 ClosedDropThroughSeq = 0;   // DropThroughSeq of the last closed fence (late arrivals of a rollback)
+        std::vector<u8> LastMP;   // the last MP frame sent here (header + body): sent again, reliably, with our fence
+        std::set<u32> SeenMP;     // MP sequence numbers received lately (that resend is taken only once)
+        bool SequenceOverflow = false;
+        u64 FenceEpoch = 0;
+        // Retry epochs on one link must increase. Any delayed control from a
+        // prior failed offer is then rejected without a bounded replay cache.
+        u64 LastClosedFenceEpoch = 0;
+        std::array<u8, 16> LastClosedFenceToken{}; // test replay only
+        u64 OfferEpoch = 0, LastClosedOfferEpoch = 0;
+        std::array<u8, 16> OfferToken{};
+        u32 OfferMode = 0;
+        bool LocalOffered = false, PeerOffered = false, LocalOfferAccepted = false, PeerOfferAccepted = false;
+        NetplayRom LocalOfferRom, PeerOfferRom;
+        std::array<u8, 16> FenceToken{};
+        u32 FenceLastSent = 0, PeerLastSent = 0, PeerRetiredThrough = 0;
+        bool LocalFence = false, PeerFence = false, LocalReady = false, PeerReady = false;
+        bool LocalPrepared = false, PeerPrepared = false, LocalArmed = false, PeerArmed = false, LocalGo = false, PeerGo = false;
+        bool FenceAbort = false, AbortSent = false, PeerAbort = false;
+        bool LocalResetDone = false, PeerResetDone = false, ResetCompleted = false;
     };
     struct QueuedPacket
     {
@@ -215,6 +307,21 @@ private:
     u64 LastHostID = 0;             // the device whose CMD came last (RecvHostPacket: -1 once it is gone)
     bool LastHostSet = false;
     std::deque<QueuedPacket> RX;
+    Link* PacketLink(const QueuedPacket& q) const;
+    void DestroyRX(const QueuedPacket& q);
+    void RetireMP(const QueuedPacket& q);
+    void SettleMPGaps(Link& link, u32 now);
+    void SettleHandoffMP(Link& link, u32 now);
+    void SendFenceControl(Link& link, u32 type, u64 epoch, u32 mark);
+    bool SendOfferControl(Link& link, u32 type, u64 epoch, u32 mark,
+                          const std::array<u8, 16>& token);
+    void ReceiveHandoffControl(Link& link, u32 type, u64 epoch, u32 mark,
+                               const std::array<u8, 16>& token);
+    void ReceiveHandoffRom(Link& link, const u8* bytes, size_t length);
+    void CloseHandoffOffer(Link& link);
+    void CompleteHandoffReset(Link& link);
+    Link* HandoffLink();
+    const Link* HandoffLink() const;
     std::shared_ptr<const std::vector<Peer>> View;
     u32 ViewMs = 0;
     std::set<u32> OwnGGIDs;
@@ -276,6 +383,7 @@ private:
     void DropQueuedForSlot(int slot);
     u32 UpMask() const;
     friend struct AmbientLANQueueTestAccess;
+    friend struct AmbientLANOfferTestAccess;
 };
 
 }

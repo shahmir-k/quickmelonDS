@@ -9,6 +9,7 @@ add_library(net-utils STATIC
     LockstepMP.cpp
     Fiber.cpp
     NetplayInput.cpp
+    NetplayLiveProof.cpp
     ../teakra/src/makedsp1/sha256.cpp
     LAN.cpp
     AmbientLAN.cpp
@@ -53,3 +54,5 @@ endif()
 if (TARGET core)
     target_compile_definitions(net-utils PRIVATE $<TARGET_PROPERTY:core,INTERFACE_COMPILE_DEFINITIONS>)
 endif()
+# zlib: live handoff checkpoints cross compressed (NetplayExchangeLiveCheckpoints)
+target_link_libraries(net-utils PUBLIC z)

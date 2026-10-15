@@ -5014,19 +5014,20 @@ void BlockGone(melonDS::NDS& nds, const void* block)
 void DoSavestate(melonDS::NDS& nds, melonDS::Savestate* f)
 {
     melonDS::ARMv5* c = &nds.ARM9;
-    if (!f->Saving)
+    const bool cold = f->Saving && f->ColdCaches;   // (Savestate::ColdCaches: reset here as a loader does, save none)
+    if (!f->Saving || cold)
     {
         // as a new console (host caches and stats start empty), then what the saving one had
         Own(nds) = State{};                     // (in place)
         c->A9HLEState = nullptr;
         c->A9HLEGuard = c->A9HLEGuardDma = nullptr;     // (the JIT's section sets them again with its blocks)
         c->A9HLEDefer = false;
-        if (!f->HasSection("A9HL")) return;     // an older state: as a new console
+        if (!f->Saving && !f->HasSection("A9HL")) return;     // an older state: as a new console
     }
     f->Section("A9HL");
-    // (only this build's layout and hooks: another build's state loads as a new console)
+    // (only this build's layout and hooks: another build's state loads as a new console; 0: saved cold)
     static const u64 build = [] { u64 h = 0xcbf29ce484222325ull; for (char ch : __DATE__ " " __TIME__) h = (h ^ (u8)ch) * 0x100000001b3ull; return h; }();
-    u64 b = build;
+    u64 b = cold ? 0 : build;
     f->Var64(&b);
     if (b != build) return;
     u8 defer = c->A9HLEDefer;

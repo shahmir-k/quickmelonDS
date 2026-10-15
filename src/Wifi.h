@@ -174,6 +174,27 @@ public:
 
     const u8* GetMAC() const;
     const u8* GetBSSID() const;
+    bool IsPoweredOn() const { return PowerOn; }
+    bool IsMultiplayer() const { return IsMP; }
+    bool IsMPClientMode() const { return IsMP && IsMPClient; }   // (live handoff: who may freeze first)
+    // MP exchanges taken part in: CMDs sent as a host, CMDs received as a client. Host-side state,
+    // not in savestates: compare its changes, not its value (live handoff exit rule, NetplayLiveExit)
+    u32 MPExchanges = 0;
+    // Live-link migration may snapshot only after all chip-side transfers have completed.
+    // A nonzero mask is a reason to defer the checkpoint to a later emulated boundary.
+    u32 HandoffBusyMask() const
+    {
+        u32 mask = 0;
+        if (ComStatus) mask |= 1u << 0;        // TX or RX in progress
+        if (IO[W_TXBusy >> 1]) mask |= 1u << 1;
+        if (MPRepliesPending) mask |= 1u << 2;
+        if (RXTimestamp) mask |= 1u << 3;      // host frame scheduled for client RX
+        if (MPInExchange) mask |= 1u << 4;     // client CMD without matching ACK
+#ifdef LITEV_LAN_EARLY_REPLY
+        if (EarlyReplyLen >= 0) mask |= 1u << 5;
+#endif
+        return mask;
+    }
 
 #ifdef LITEV_A7_NATIVE_WM
     // the native ARM7 WM driver's per-console state (WMNative.cpp), created on demand; it drives this chip through the

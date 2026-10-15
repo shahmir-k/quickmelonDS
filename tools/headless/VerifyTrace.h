@@ -13,8 +13,14 @@
 #pragma once
 
 #include <string>
+#include <chrono>
 #include <vector>
+#include <memory>
 #include "types.h"
+#include "net/NetplayInput.h"
+
+namespace melonDS { class NDS; }
+namespace HeadlessHost { struct InstanceUserData; }
 
 namespace liteds
 {
@@ -59,7 +65,34 @@ int VerifyInterpConverge(const TraceRunConfig& cfg, int frames);
 // shared LocalMP + health metrics. Returns 0 iff both instances complete all
 // frames without a crash.
 // LITEV_MP_PLAYERS=N (default 2) runs N instances; scripts[k] = instance k's input script.
-int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts);
+// Test-only ownership transfer: these exact, already-loaded scratch objects
+// become the Lockstep consoles. The original Ambient NDS is never passed in.
+struct PreparedMPConsole
+{
+    std::unique_ptr<HeadlessHost::InstanceUserData> udata;
+    std::unique_ptr<melonDS::NDS> nds;
+    melonDS::NDS* identity = nullptr;
+};
+// LITEV_NP_LIVE_EXIT=<quiet frames> with prepared consoles: the session ends by itself
+// (NetplayLiveExit); the consoles, the end frame and each console's already scheduled Netplay
+// inputs (the frames after the end, up to the input delay) come back in *ended.
+// LITEV_AUDIO_TAP=<file>: this process's own console's audio, one record per frame
+// ([u32 phase][u32 frame][u32 stereo samples][samples as s16 pairs]); phase 0 = before a live
+// handoff cut (Ambient), 1 = Netplay, 2 = after the session ended (tools/headless/audio_continuity.py).
+void AudioTapWrite(int phase, int frame, const melonDS::s16* samples, int pairs);
+void AudioTapDrain(melonDS::NDS& nds, int phase, int frame);
+
+class InputScript;
+struct LiveExitResult
+{
+    int EndsAfter = -1;
+    std::vector<PreparedMPConsole> Consoles;
+    std::vector<std::vector<melonDS::NetplayFrameInput>> Scheduled;   // [console][i] = input of frame EndsAfter+1+i
+    std::vector<std::chrono::steady_clock::time_point> StoppedAt;   // when each console's last frame ended
+    std::vector<std::shared_ptr<InputScript>> Scripts;   // each console's script, as far as it got
+};
+int MPTest(const TraceRunConfig& cfg, int frames, const std::vector<std::string>& scripts,
+           std::vector<PreparedMPConsole> prepared = {}, LiveExitResult* ended = nullptr);
 
 // --replay-console K: Hosted Netplay replica of --mp-test's console K (scripts[K] = its input),
 // its link served from the records in logDir (LITEV_MP_RECORD) or, logDir empty, from a server

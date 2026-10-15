@@ -310,6 +310,20 @@ void LockstepMP::TxNote(int inst, u32 type, const u8* data, int len, u64 timesta
     TxH[inst] = XXH3_64bits_withSeed(data, len, h);
     TxD[inst] = XXH3_64bits_withSeed(data, len, XXH3_64bits_withSeed(head, 8, TxD[inst]));
     TxN[inst]++;
+    if (getenv("LITEV_MP_TXMEM") && TxMemory[inst].size() < 8192)
+    {
+        TxMemory[inst].push_back({type, (u32)len, head[2], timestamp, XXH3_64bits(data, len)});
+        if (TxN[inst] <= 4 && Console[inst])
+        {
+            NDS& nd = *const_cast<NDS*>(Console[inst]);
+            TxMemory[inst].push_back({101, TxN[inst], head[2], 0,
+                XXH3_64bits(nd.MainRAM, nd.MainRAMMask + 1)});
+            TxMemory[inst].push_back({102, TxN[inst], head[2], 0,
+                XXH3_64bits(nd.Wifi.RAMPtr(), 0x2000)});
+            if (TxN[inst] == 2)
+                TxWifiMemory[inst].emplace_back(nd.Wifi.RAMPtr(), nd.Wifi.RAMPtr() + 0x2000);
+        }
+    }
     static const char* txlog = getenv("LITEV_MP_TXLOG");   // diagnostics: every sent frame, per console
     if (txlog)
     {
@@ -319,6 +333,31 @@ void LockstepMP::TxNote(int inst, u32 type, const u8* data, int len, u64 timesta
                              (unsigned long long)timestamp, (unsigned long long)XXH3_64bits(data, len));
         // CMD: reply time, client mask; ACK: cmd count, clients that failed (both at 0xC+0x18/0x1A)
         if (f[inst] && len >= 0x28 && (type == 1 || type == 3)) fprintf(f[inst], "  w %04x %04x\n", *(const u16*)&data[0x24], *(const u16*)&data[0x26]);
+    }
+}
+
+void LockstepMP::DumpTxMemory(const char* dir) const
+{
+    for (int inst = 0; inst < kMaxInst; inst++)
+    {
+        if (TxMemory[inst].empty()) continue;
+        char path[512];
+        snprintf(path, sizeof(path), "%s/tx%d.txt", dir, inst);
+        FILE* f = fopen(path, "w");
+        if (!f) continue;
+        for (const auto& r : TxMemory[inst])
+            fprintf(f, "t%u len %u now %llu ts %llu data %016llx\n", r.Type, r.Length,
+                    (unsigned long long)r.Time, (unsigned long long)r.Timestamp,
+                    (unsigned long long)r.DataHash);
+        fclose(f);
+        for (size_t i = 0; i < TxWifiMemory[inst].size(); i++)
+        {
+            snprintf(path, sizeof(path), "%s/wifi%d-pkt%zu.bin", dir, inst, i + 1);
+            f = fopen(path, "wb");
+            if (!f) continue;
+            fwrite(TxWifiMemory[inst][i].data(), 1, 0x2000, f);
+            fclose(f);
+        }
     }
 }
 
@@ -692,6 +731,8 @@ u16 LockstepMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
             }
             if (blocked && St.On > 0) WS[inst].Ns[2] += NowNs() - St.Enter;
             if (blocked) TLog(inst, "U");
+            if (getenv("LITEV_MP_TXMEM") && TxMemory[inst].size() < 8192)
+                TxMemory[inst].push_back({100u | ((u32)aidmask << 16), (u32)ret, Now(inst), timestamp, replied});
             Log(inst, "RecvReplies", ret, replied); stats(); return ret;
         }
 

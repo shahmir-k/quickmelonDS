@@ -96,6 +96,9 @@ public:
     /// (see AcquireSharedROM) first takes a private copy (copy-on-write).
     u8* GetWritableROM();
     [[nodiscard]] u32 GetROMLength() const { return ROMLength; }
+    /// The buffer behind GetROM(), for another console to run the same bytes (read-only: such a
+    /// console must not rewrite its secure area, i.e. the bytes must be this cart's as inserted).
+    [[nodiscard]] std::shared_ptr<const u8[]> GetROMOwner() const { return ROMOwner; }
 
 protected:
     u32 ROMRead32();

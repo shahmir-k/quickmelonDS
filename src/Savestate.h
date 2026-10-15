@@ -48,6 +48,12 @@ public:
     bool Error;
 
     bool Saving;
+    // Saving only: the host-side caches that a loader from another build discards (the JIT block
+    // profiles, the ARM7/ARM9 HLE discoveries; their sections are build-stamped) are first reset
+    // on this console exactly as a loader resets them, then saved empty and build-independent.
+    // Live handoff checkpoints: the console that keeps running and every copy loaded from the
+    // state, on any build with the same emulation options, then continue identically.
+    bool ColdCaches = false;
 
     u32 CurSection;
 

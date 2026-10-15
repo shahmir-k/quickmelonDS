@@ -1019,6 +1019,7 @@ void Wifi::TXSendFrame(const TXSlot* slot, int num)
         MPT.tCmdSent = MPNowUs();
         if (MPT.tAckSent) { MPT.hostSegSum += MPT.tCmdSent - MPT.tAckSent; MPT.nHostSeg++; MPT.tAckSent = 0; }
 #endif
+        MPExchanges++;
         Platform::MP_SendCmd(TXBuffer, 12+len, USTimestamp, NDS.UserData);
         break;
 
@@ -2308,6 +2309,7 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
             // include the MP reply time window
             NextSync += 112 + ((clienttime + 10) * NumClients(clientmask));
             MPInExchange = true;
+            MPExchanges++;
         }
         else if (MACEqual(&RXBuffer[12 + 4], MPAckMAC))
         {

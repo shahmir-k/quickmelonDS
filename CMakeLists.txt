@@ -1893,7 +1893,32 @@ endif()
 # Applied on `core` in src/CMakeLists.txt. Default OFF.
 option(LITEV_GXFIFO_THREADED "DraStic #3: batched GXFIFO threaded-code interpreter (no call/ret per GX command)" OFF)
 
+# --- Live Ambient -> Netplay handoff compatibility (LITEV_HANDOFF_COMPAT, NetplayHandoffCompat()) ---
+# Two consoles can swap live checkpoints only when they emulate identically: the same handoff
+# protocol and the same emulation-affecting LITEV options. Not the same binary: the checkpoint's
+# JIT cache is empty (Savestate::ColdJit), so build stamps, renderer/host tuning and diagnostics
+# do not matter. Every enabled LITEV option counts except the host-only ones below; a Mac build
+# made from the app's -DLITEV_* list therefore matches the APK. Bump the protocol string when the
+# handoff wire format or its savestate contents change.
+set(LITEV_HANDOFF_PROTOCOL "sereneds-live-handoff-v2")
+set(_host_only "^LITEV_(HEADLESS.*|PROFILE|SOFTPROF|.*STATS|JIT_PERFMAP|JIT_PATCHLOG|HLE_DIAG|A7PROF|SHADOW_ASSERT|IDLE_CENSUS|SLOWMEM_HIST|HOT_ORDER|PGO_.*|THINLTO|MTUNE_.*|SPLIT_FUNCS|PIN_RENDER|TOPO_PIN|NETPLAY_HEADLESS)$")
+get_cmake_property(_cache_vars CACHE_VARIABLES)
+list(SORT _cache_vars)
+set(_handoff_text "${LITEV_HANDOFF_PROTOCOL}\n")
+foreach(_v IN LISTS _cache_vars)
+    get_property(_t CACHE ${_v} PROPERTY TYPE)
+    if(_v MATCHES "^LITEV_" AND _t STREQUAL "BOOL" AND ${_v} AND NOT _v MATCHES "${_host_only}")
+        string(APPEND _handoff_text "${_v}\n")
+    endif()
+endforeach()
+string(SHA256 _handoff_digest "${_handoff_text}")
+string(SUBSTRING "${_handoff_digest}" 0 16 _handoff_hex)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/litev_handoff_compat.txt" "${_handoff_text}")
+message(STATUS "Live handoff compatibility: ${_handoff_hex} (options in ${CMAKE_CURRENT_BINARY_DIR}/litev_handoff_compat.txt)")
+
 add_subdirectory(src)
+# (net-utils takes core's interface definitions, so NetplayInput.cpp sees it in every build)
+target_compile_definitions(core INTERFACE LITEV_HANDOFF_COMPAT=0x${_handoff_hex}ULL)
 
 # --- liteDS-v2 core-fix: export LITEV_* configuration as a PUBLIC usage requirement ---
 # The LITEV_* feature macros above are set with add_compile_definitions(), which is

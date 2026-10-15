@@ -267,7 +267,10 @@ std::unique_ptr<CartCommon> ParseROM(std::shared_ptr<const u8[]> romdata, u32 ro
 /// Pass the result to ParseROM. Carts that patch their ROM take a private copy first.
 /// @param len Receives the file length (the \c romlen to give ParseROM).
 /// @returns nullptr if the file can't be read.
-std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len);
+/// With allowCached=false, read an independent buffer. Live handoff staging
+/// needs the original file bytes, not a shared cart whose secure area was
+/// already re-encrypted by another console.
+std::shared_ptr<const u8[]> AcquireSharedROM(const std::string& path, u32& len, bool allowCached = true);
 /// True if \c rom is a buffer handed out by AcquireSharedROM that is still alive.
 bool IsSharedROM(const u8* rom);
 }

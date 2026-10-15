@@ -20,12 +20,14 @@
 #define NETPLAYINPUT_H
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <string>
@@ -157,9 +159,25 @@ public:
     void SetFramePeriodUs(int us) { FramePeriodUs = std::max(us, 500); }
 #endif
     int LocalPlayer() const { return Local; }
+    // an input already here for that applied frame (never waits): e.g. this device's own inputs,
+    // scheduled `delay` frames ahead, when a session ends
+    bool HasInput(int player, int frame)
+    {
+        std::lock_guard<std::mutex> lk(Lock);
+        return player >= 0 && player < kMaxPlayers && Inputs[player].count(frame) != 0;
+    }
 
     // The local player's input sampled at `frame` (applied at frame + Delay everywhere).
     void SubmitLocal(int frame, const NetplayFrameInput& input);
+    // Handoff-only frame-zero proof over a separate UDP startup port. Later
+    // input/hash packets carry the epoch+token too, rejecting old-session
+    // datagrams at a reused endpoint. This is not active-LAN authentication.
+    bool ArmHandoffSession(u64 epoch, const std::array<u8, 16>& token,
+                           int localStartupPort,
+                           const std::vector<std::pair<int, std::string>>& startupPeers);
+    // After SubmitLocal(0), wait until every expected peer proves its real
+    // frame-0 input, epoch and token. No frame may run until this succeeds.
+    bool WaitForHandoffPeerInput(int timeoutMs);
 
     // The input of `player` for emulated frame `frame`; blocks until known (or Abort(), or the
     // player is dropped).
@@ -204,7 +222,12 @@ private:
 #endif
     static constexpr int kResendMs = 10;
 
-    int Local, DelayFrames;
+    int Local, DelayFrames, BindPort;
+    int HandoffStartPort = 0;
+    u8 HandoffStartAddr[kMaxPlayers][16] {};
+    u64 HandoffEpoch = 0;
+    std::array<u8, 16> HandoffToken{};
+    bool HandoffProofComplete = false; // Lock: normal packets wait for frame-zero peer proof
     NetFaults Faults;
     int Socket = -1;
     std::vector<int> Peers;                 // the other players
@@ -283,11 +306,16 @@ struct NetplayRom
     std::string Name() const;   // for logs: game code, title, hash, size
 };
 // The ROM at `path` (Platform::OpenFile: a file or, on Android, a document URI). The whole file is
-// hashed once per path and size in this process, then remembered.
-NetplayRom NetplayDescribeRom(const std::string& path);
+// hashed once per path and size in this process, then remembered. Set fresh for
+// a live handoff: a same-size replacement at a SAF URI must not reuse that hash.
+NetplayRom NetplayDescribeRom(const std::string& path, bool fresh = false);
+// Exact bytes acquired by a console, before its cartridge secure area can be
+// re-encrypted in memory. This identity must be used for live checkpoints.
+NetplayRom NetplayDescribeRomBytes(const u8* bytes, u64 size);
 // The first of `paths` that holds `rom`, "" = none. Size and game code filter first, so only
 // candidates that pass are hashed.
-std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths);
+std::string NetplayFindRom(const NetplayRom& rom, const std::vector<std::string>& paths,
+                           bool fresh = false);
 
 // ROM transfer during session setup, for the UI: what is happening, the consent question, cancel.
 struct NetplayXferStatus
@@ -354,6 +382,172 @@ struct NetplaySetup
     std::string Log;            // what happened (errors included), one line per event
 };
 bool NetplayHandshake(NetplaySetup& s);
+
+// A fenced, already-running Ambient session contributes one exact console
+// savestate per player. This exchange is deliberately separate from the
+// start-from-ROM Netplay handshake: callers keep both original emulators and
+// their Ambient links alive until replica load and a later commit succeed.
+struct NetplayLiveCheckpoint
+{
+    u64 Epoch = 0;
+    u64 Build = 0;                 // NetplayHandoffCompat(): protocol + emulation-affecting options
+    u64 RawClock = 0;
+    u32 Frame = 0;
+    u8 Player = 0;
+    std::array<u8, 16> FenceToken{};
+    NetplayRom Rom;
+    std::vector<u8> Firmware;          // source console's complete SPI firmware (not in NDS savestate)
+    std::vector<u8> State;
+};
+
+// player 0 listens on tcpPort; player 1 connects to hostAddress (ip:tcpPort).
+// The expected peer ROM comes from the already-validated Netplay roster.
+// Synchronous: call on a worker while the emulator thread keeps Ambient
+// Process() serviced. preparePeer must verify/load the remote state into an
+// isolated scratch replica; neither side reports success until both vote ready.
+using NetplayLivePrepare = std::function<bool(const NetplayLiveCheckpoint&, std::string&)>;
+// The checkpoint transport runs on a network worker, but a frontend may need
+// to construct its replica on the emulator/GL thread. Give Request() to the
+// transport's preparePeer callback and poll Service() on that owner thread
+// while continuing to Process() the frozen Ambient link. One request at a
+// time; cancel and join the worker before destroying the bridge.
+class NetplayLivePrepareBridge
+{
+public:
+    NetplayLivePrepareBridge() = default;
+    NetplayLivePrepareBridge(const NetplayLivePrepareBridge&) = delete;
+    NetplayLivePrepareBridge& operator=(const NetplayLivePrepareBridge&) = delete;
+
+    bool Request(const NetplayLiveCheckpoint& checkpoint, std::string& error,
+                 const std::atomic<bool>& cancel, int timeoutMs = 10000);
+    // Returns true if a request was serviced (including a failed prepare).
+    bool Service(const NetplayLivePrepare& prepare);
+    bool HasPending() const;
+    void Cancel();
+
+private:
+    mutable std::mutex Lock;
+    std::condition_variable Changed;
+    const NetplayLiveCheckpoint* Pending = nullptr; // worker keeps it alive until Service returns
+    bool Started = false;
+    bool Finished = false;
+    bool Success = false;
+    bool Stopped = false;
+    std::string ResultError;
+};
+
+// The live handoff compatibility id: the same handoff protocol and emulation-affecting LITEV
+// options (CMakeLists.txt, LITEV_HANDOFF_COMPAT), not the same binary: checkpoints carry an empty
+// JIT and HLE caches (Savestate::ColdCaches). Use it for NetplayLiveCheckpoint::Build and Ambient's BuildID.
+u64 NetplayHandoffCompat();
+
+// The reversible pre-commit proof: the two consoles freshly loaded from the checkpoint pair run
+// two Lockstep frames with neutral input against a temporary backend (the installed MPInterface
+// is restored after). hashes[frame * 2 + player] = NetplayLiveProofHash after each frame. Every
+// peer runs it on its own copies; NetplayAwaitLiveStart starts only when all four hashes agree.
+// runFrame(player) runs one frame of consoles[player] (the frontend's headless frame).
+u64 NetplayLiveProofHash(NDS& nds);
+bool NetplayRunLiveProof(const std::array<NDS*, 2>& consoles, const std::array<u64, 2>& rawClocks,
+                         const std::function<void(int)>& runFrame,
+                         std::array<u64, 4>& hashes, std::string& error);
+// The proof's engine: `frames` Lockstep frames of the two consoles (link clocks mapped from
+// rawClocks, as a live session maps them), runFrame(player, frame) applies that frame's input and
+// runs it; hashes[frame * 2 + player] = NetplayLiveProofHash after each.
+bool NetplayRunLockstepFrames(const std::array<NDS*, 2>& consoles, const std::array<u64, 2>& rawClocks,
+                              const std::function<void(int, int)>& runFrame, int frames,
+                              std::vector<u64>& hashes, std::string& error);
+
+// The game-driven end of a live (handed-off) Netplay session, the same on every device: every
+// device runs every console, so each evaluates the same rule on the same emulated frames. A
+// console is quiet after QuietFrames frames without an MP exchange (Wifi::MPExchanges); when
+// every console is quiet at frame f, the session ends after frame f + Slack on every device. The
+// decision for frame f is taken Slack frames later, by which time every other console has
+// published frame f (consoles of one session stay within a few frames of each other: waiting for
+// one never waits on this console's own clock). Each console's thread calls EndFrame after each
+// frame (0 = the first session frame) and stops when it returns true.
+class NetplayLiveExit
+{
+public:
+    explicit NetplayLiveExit(int consoles = 2, int quietFrames = 120, int slack = 30);
+    bool EndFrame(int console, int frame, u32 exchanges);
+    int EndsAfter() const { return EndAfter.load(); }   // -1: not yet
+    void Cancel();
+private:
+    static constexpr int kRing = 1024;
+    const int Consoles, QuietFrames, Slack;
+    std::mutex Lock;
+    std::condition_variable Changed;
+    bool Cancelled = false;
+    std::array<int, 16> Done{}, Streak{};
+    std::array<u32, 16> Last{};
+    std::array<std::array<int, kRing>, 16> StreakAt{};
+    std::atomic<int> EndAfter{-1};
+};
+
+// The live handoff's one TCP connection, from the offer to the commit (player 0 accepts the
+// expected peer, player 1 connects; a worker owns it). Ahead of the cut each side sends its state as
+// a baseline; at the cut the checkpoints cross both ways at once, each as a delta against the
+// baseline the other side holds (section-wise XOR, zlib), then the prepare votes (with reasons),
+// then after the reversible proof the start manifests: one round trip each, no new connection.
+// (It replaced a TCP connection per step and the Ambient PREPARED/ARMED/GO votes: the RG DS cut
+// froze 5-8 s, most of it transfers, slow start and round trips.)
+class NetplayLiveLink
+{
+public:
+    NetplayLiveLink(int player, u16 port, const std::string& peerIPv4);
+    ~NetplayLiveLink();
+    NetplayLiveLink(const NetplayLiveLink&) = delete;
+    NetplayLiveLink& operator=(const NetplayLiveLink&) = delete;
+    bool Connected() const { return Fd.load() >= 0; }
+    // the peer holds this side's latest baseline (the cut's checkpoint will be a delta)
+    bool BaselineAcked() { std::lock_guard<std::mutex> lk(Lock); return OwnBaseId && OwnBaseAcked == OwnBaseId; }
+    // ahead of the cut, any thread: this console's state, the base of the cut's delta (sent by the worker)
+    void SendBaseline(std::vector<u8> state);
+    // The baseline ack also says "ready for the cut": a side that still has to find and read the
+    // peer's ROM holds it (HoldBaselineAck(true) right after construction) and releases it once
+    // ready, so the peer does not fence into a side that cannot stage its checkpoint yet.
+    void HoldBaselineAck(bool hold);
+    // the cut, as soon as this console is frozen (before the fence completes: its state is final
+    // at the freeze); ExchangeCheckpoints with the same checkpoint then sends nothing more
+    bool SendCheckpoint(const NetplayLiveCheckpoint& local, std::string& error);
+    // the cut (synchronous; keep the frozen Ambient link serviced meanwhile). preparePeer loads the
+    // peer's checkpoint into a replica; both votes, with reasons, end it.
+    bool ExchangeCheckpoints(const NetplayLiveCheckpoint& local, const NetplayRom& expectedPeerRom,
+                             NetplayLivePrepare preparePeer, std::atomic<bool>& cancel,
+                             NetplayLiveCheckpoint& peer, std::string& error);
+    // after the proof: both sides start only with the same checkpoint pair and proof hashes. A
+    // startup gate, not a durable commit: a peer that vanishes right after it is an in-doubt case.
+    bool ExchangeStart(const NetplayLiveCheckpoint& local, const NetplayLiveCheckpoint& peer,
+                       const std::array<u64, 4>& trialHashes, std::atomic<bool>& cancel, std::string& error);
+    void Close();
+private:
+    enum : u32 { MsgBase = 1, MsgBaseAck, MsgCheckpoint, MsgReady, MsgStart };
+    bool Send(u32 type, std::vector<u8> payload);   // queued for the sender thread
+    bool Wait(u32 type, std::vector<u8>& payload, std::atomic<bool>& cancel, int timeoutMs);
+    void Run();
+    void RunSender();
+    std::vector<u8> PackCheckpoint(const NetplayLiveCheckpoint& local, u32 baseId);
+    const int Player;
+    const u16 Port;
+    const std::string PeerIPv4;
+    std::atomic<int> Fd{-1};
+    std::atomic<bool> Stop{false};
+    std::thread Worker, Sender;   // the reader never sends: both sides sending big messages at
+                                  // once while neither reads would deadlock on the TCP buffers
+    std::deque<std::pair<u32, std::vector<u8>>> Outbox;
+    std::mutex Lock;
+    std::condition_variable Changed;
+    std::map<u32, std::vector<u8>> Inbox;        // latest message of each type
+    std::vector<u8> PendingBase;                 // a baseline to send once connected
+    std::unique_ptr<NetplayLiveCheckpoint> PendingCheckpoint;   // packed and sent by the sender thread
+    std::vector<u8> OwnBase, PeerBase;           // what each side holds as the other's delta base
+    u32 OwnBaseId = 0, OwnBaseAcked = 0, PeerBaseId = 0, PeerBaseAcked = 0;
+    bool AckHeld = false;
+    u64 SentEpoch = 0, SentClock = 0;          // the checkpoint already sent (SendCheckpoint)
+    bool Broken = false;
+};
+// (exposed for its self-check, LITEV_TEST_LIVE_DELTA in the headless harness)
+std::vector<u8> NetplayLiveDelta(const std::vector<u8>& state, const std::vector<u8>& base);
 
 }
 
