@@ -1450,7 +1450,7 @@ bool GuestHandshake(NetplaySetup& s)
     u32 magic = 0;
     u8 delay = 0, count = 0;
     ok = ok && RecvVal(fd, magic) && magic == kSetupMagic && RecvVal(fd, delay)
-            && RecvVal(fd, count) && delay >= 1 && delay <= 8;
+            && RecvVal(fd, count) && delay >= 1 && delay <= NetplayInput::kMaxDelay;
     std::string hostIp = s.Host.substr(0, s.Host.rfind(':'));
     bool self = false;
     std::map<std::string, Incoming> incoming;   // the games this device lacks, by SHA-256
