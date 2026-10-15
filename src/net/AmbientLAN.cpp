@@ -159,6 +159,14 @@ const bool kFenceTrace = getenv("LITEV_AMBIENT_FENCE_TRACE") != nullptr;
 // (tests) LITEV_AMBIENT_LOSS_PCT=<p>: each sent MP frame is lost with probability p% (Wi-Fi), after it took its
 // sequence number, as a real loss does
 const double kTestLossPct = getenv("LITEV_AMBIENT_LOSS_PCT") ? atof(getenv("LITEV_AMBIENT_LOSS_PCT")) : 0;
+// (tests) LITEV_AMBIENT_WIRE_LOSS_PCT=<p>: each UDP datagram the link socket receives is lost with probability p% (Wi-Fi as
+// ENet sees it: MP frames, acks, resends, the connect handshake, control); unlike LOSS_PCT, ENet resends what is reliable
+const double kWireLossPct = getenv("LITEV_AMBIENT_WIRE_LOSS_PCT") ? atof(getenv("LITEV_AMBIENT_WIRE_LOSS_PCT")) : 0;
+int WireLoss(ENetHost*, ENetEvent*)
+{
+    static std::mt19937 r(std::random_device{}());
+    return std::uniform_real_distribution<double>(0, 100)(r) < kWireLossPct ? 1 : 0;
+}
 const u32 kTestDropMPSeq = getenv("LITEV_AMBIENT_DROP_MP_SEQ") ?
     (u32)strtoul(getenv("LITEV_AMBIENT_DROP_MP_SEQ"), nullptr, 10) : 0;
 void Trace(const char* what, int slot, u32 type, const u8* d, int len, u64 timestamp)
@@ -211,6 +219,7 @@ AmbientLAN::AmbientLAN(const Config& cfg) : Cfg(cfg), Vis(cfg.Vis)
         Host = enet_host_create(&a, 16, 2, 0, 0);
         if (Host) LinkPort = a.port;
     }
+    if (Host && kWireLossPct > 0) Host->intercept = WireLoss;
     BcastSock = OpenUdp(Cfg.PresencePort, true);
     UniSock = OpenUdp(Cfg.UnicastPort, false);
     if (!Host || UniSock < 0)
@@ -1677,7 +1686,9 @@ void AmbientLAN::Pump(int type, int waitMs)
                         RX.push_back(q);
                         return;
                     }
-                    const u64 hold = Sim().Hold(NowUs());
+                    u64 hold = Sim().Hold(NowUs());
+                    // (a reliable frame lost is resent: one round trip later)
+                    if (hold == ~0ull && (ev.packet->flags & ENET_PACKET_FLAG_RELIABLE)) hold = (u64)(Sim().RttMs(NowUs()) * 1500);
                     if (hold == ~0ull) enet_packet_destroy(ev.packet);
                     else Delayed.push_back({NowUs() + hold, q});
                 }
