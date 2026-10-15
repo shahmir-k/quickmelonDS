@@ -164,7 +164,7 @@ u16 RecordMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
     // the link writes each reply to its client's 1 KB slot, as far as the reply goes: compare the
     // slots with what they held before to record exactly the bytes written (what follows them is
     // the same on the replica)
-    memcpy(Before, data, sizeof(Before));
+    memcpy(Before[inst], data, sizeof(Before[inst]));
     u16 r = Inner->RecvReplies(inst, data, timestamp, aidmask);
     std::vector<u8> slots;  // per reply: u8 aid, u16 length, bytes
     for (int aid = 1; aid < 16; aid++)
@@ -172,7 +172,7 @@ u16 RecordMP::RecvReplies(int inst, u8* data, u64 timestamp, u16 aidmask)
         if (!(r & (1 << aid))) continue;
         const u8* slot = &data[(aid - 1) * 1024];
         int len = 1024;
-        while (len > 0 && slot[len - 1] == Before[(aid - 1) * 1024 + len - 1]) len--;
+        while (len > 0 && slot[len - 1] == Before[inst][(aid - 1) * 1024 + len - 1]) len--;
         Append(slots, (u8)aid);
         Append(slots, (u16)len);
         slots.insert(slots.end(), slot, slot + len);

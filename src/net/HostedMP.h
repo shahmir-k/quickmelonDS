@@ -120,7 +120,7 @@ private:
     std::function<u64()> Clock[LockstepMP::kMaxInst];
     HostedCalls Calls[LockstepMP::kMaxInst];
     std::vector<u8> Out[LockstepMP::kMaxInst];
-    u8 Before[15 * 1024];   // RecvReplies: the reply slots before the call
+    u8 Before[LockstepMP::kMaxInst][15 * 1024];   // RecvReplies: each console's reply slots before its call
 
     u64 Now(int inst) const { return Clock[inst] ? Clock[inst]() : 0; }
 #ifdef LITEV_WIFI_EVT
