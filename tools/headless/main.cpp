@@ -573,6 +573,7 @@ struct MultiCut
     std::vector<std::string> RomPaths;      // by player
     std::vector<std::unique_ptr<NetplayLiveLink>> Links;   // by player (none for Me)
     std::chrono::steady_clock::time_point BaselineAt, FreezeAt;
+    std::vector<u64> CutClocks;             // every console's raw clock at the cut (the link clock origins)
     long Ms() const { return (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - FreezeAt).count(); }
 };
 
@@ -752,6 +753,7 @@ static int MultiCutFrame(MultiCut& mc, std::unique_ptr<NDS>& nds, AmbientLAN* am
     std::vector<NDS*> proofConsoles(mc.N);
     std::vector<u64> clocks(mc.N), proof;
     for (int p = 0; p < mc.N; p++) { proofConsoles[p] = copies[p].get(); clocks[p] = got[p].RawClock; users[p]->instanceID = p; }
+    mc.CutClocks = clocks;
     std::string proofError;
     bool proven = NetplayRunLiveProofN(proofConsoles, clocks, [&](int p) { copies[p]->RunFrame(); }, proof, proofError);
     for (int p = 0; p < mc.N && proven; p++)
@@ -848,6 +850,22 @@ static int MultiCutFrame(MultiCut& mc, std::unique_ptr<NDS>& nds, AmbientLAN* am
     const auto returned = std::chrono::steady_clock::now();
     const int F = ended.EndsAfter;
     auto& mine = ended.Consoles[mc.Me];
+    // the whole session ended: every console's state now, for the uninterrupted-session reference below
+    std::vector<NetplayLiveCheckpoint> atEnd;
+    if (!ended.Partial)
+        for (int k = 0; k < mc.N; k++)
+        {
+            Savestate st;
+            ended.Consoles[k].nds->DoSavestate(&st);
+            NetplayLiveCheckpoint c;
+            c.Player = (u8)k;
+            c.State.assign((const u8*)st.Buffer(), (const u8*)st.Buffer() + st.Length());
+            const Firmware& fw = ended.Consoles[k].nds->GetFirmware();
+            c.Firmware.assign(fw.Buffer(), fw.Buffer() + fw.Length());
+            atEnd.push_back(std::move(c));
+        }
+    const auto snapped = std::chrono::steady_clock::now();
+    std::vector<u64> realHash;
     mine.nds->DetachMPLink();
     std::vector<liteds::PreparedMPConsole> dropped;
     for (int k = 0; k < (int)ended.Consoles.size(); k++) if (k != mc.Me) dropped.push_back(std::move(ended.Consoles[k]));
@@ -868,7 +886,7 @@ static int MultiCutFrame(MultiCut& mc, std::unique_ptr<NDS>& nds, AmbientLAN* am
     {
         const auto start = std::chrono::steady_clock::now();
         const double gap = std::chrono::duration<double, std::milli>(start - last).count();
-        if (f == F + 1) pauseMs = gap; else worstMs = std::max(worstMs, gap);
+        if (f == F + 1) pauseMs = gap - std::chrono::duration<double, std::milli>(snapped - returned).count(); else worstMs = std::max(worstMs, gap);
         const int i = f - F - 1;
         NetplayFrameInput in;
         if (i < (int)sched.size()) in = sched[i];
@@ -882,6 +900,7 @@ static int MultiCutFrame(MultiCut& mc, std::unique_ptr<NDS>& nds, AmbientLAN* am
         if (in.TouchX >= 0) mine.nds->TouchScreen(in.TouchX, in.TouchY); else mine.nds->ReleaseScreen();
         mine.nds->RunFrame();
         liteds::AudioTapDrain(*mine.nds, 2, f);
+        if (i < (int)sched.size()) realHash.push_back(NetplayLiveProofHash(*mine.nds));
         if (live.HasProgram())
         {
             void* top = nullptr; void* bot = nullptr;
@@ -902,10 +921,51 @@ static int MultiCutFrame(MultiCut& mc, std::unique_ptr<NDS>& nds, AmbientLAN* am
     }
     dropper.join();
     if (ended.Linger.joinable()) ended.Linger.join();
+    // the whole session ended: the frames after it equal an uninterrupted session's (the consoles still in it, from their
+    // end states, in-process, with the inputs already scheduled)
+    int same = -1;
+    size_t n = SIZE_MAX;
+    std::vector<int> in;    // the consoles in the session at its end (one that left before has nothing scheduled)
+    for (int k = 0; k < (int)ended.Scheduled.size(); k++) if (!ended.Scheduled[k].empty()) { in.push_back(k); n = std::min(n, ended.Scheduled[k].size()); }
+    const int meIn = (int)(std::find(in.begin(), in.end(), mc.Me) - in.begin());
+    if (!ended.Partial && in.size() >= 2 && meIn < (int)in.size())
+    {
+        const int m = (int)in.size();
+        std::vector<std::unique_ptr<HeadlessHost::InstanceUserData>> ru(m);
+        std::vector<std::unique_ptr<NDS>> rn(m);
+        std::vector<NDS*> rp(m);
+        std::vector<u64> origins(m);
+        std::string err;
+        bool ok = true;
+        for (int i = 0; i < m && ok; i++)
+        {
+            const int k = in[i];
+            ok = PrepareScratch(atEnd[k], mc.RomPaths[k], opt.jit, ru[i], rn[i], err);
+            if (ok) { ru[i]->instanceID = i; rp[i] = rn[i].get(); origins[i] = mc.CutClocks[k]; }
+        }
+        std::vector<u64> refHash;
+        if (ok)
+        {
+            auto saved = MPInterface::Take();
+            NetplayRunLockstepFramesN(rp, origins, [&](int i, int f) {
+                const NetplayFrameInput fin = f < (int)n ? ended.Scheduled[in[i]][f] : NetplayFrameInput{};
+                rn[i]->SetKeyMask(fin.Keys & 0xFFF);
+                if (fin.TouchX >= 0) rn[i]->TouchScreen(fin.TouchX, fin.TouchY); else rn[i]->ReleaseScreen();
+                rn[i]->RunFrame();
+            }, (int)n, refHash, err);
+            MPInterface::Take().reset();
+            MPInterface::Set(std::move(saved), MPInterface_Ambient);
+            same = 0;
+            for (size_t f = 0; f < n && f < realHash.size(); f++) same += refHash[f * m + meIn] == realHash[f];
+        }
+        for (int i = 0; i < m; i++) { rn[i].reset(); ru[i].reset(); }
+        if (mine.nds) mine.nds->JIT.JitEnableExecute();
+    }
+    printf("CUTMULTI %s frames after the exit equal to an uninterrupted session: %d of %zu\n", role, same, n == SIZE_MAX ? (size_t)0 : n);
     printf("CUTMULTI %s live exit after f%d (%s): back in Ambient, pause %.1f ms (worst later frame gap %.1f ms), "
-           "%zu scheduled inputs applied (frames %d..%d), then live; links=%u; Ambient exchanges after the exit: %llu\n",
+           "%zu scheduled inputs applied (frames %d..%d), then live; links=%u; Ambient exchanges after the exit: %llu; speed %d (0 = 1x)\n",
            role, F, ended.Partial ? "this device alone" : "the whole session ended", pauseMs, worstMs, sched.size(), F + 1, F + (int)sched.size(),
-           ambient->GetStats().Links, (unsigned long long)(ambient->GetStats().Exchanges - exchBefore));
+           ambient->GetStats().Links, (unsigned long long)(ambient->GetStats().Exchanges - exchBefore), ambient->HasLinks() ? ambient->Speed() : 0);
     fflush(stdout);
     return trial == 0 || ended.Partial ? 0 : 2;
 }
