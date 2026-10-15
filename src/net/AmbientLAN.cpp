@@ -1,3 +1,4 @@
+#include <random>
 // LITEV_AMBIENT_LAN: lobby-free local wireless (see AmbientLAN.h)
 #ifdef LITEV_AMBIENT_LAN
 
@@ -111,6 +112,9 @@ u32 BeaconHash(const u8* d, int len)
 const bool kTrace = getenv("LITEV_AMBIENT_TRACE") != nullptr;
 const bool kWaitTrace = getenv("LITEV_AMBIENT_WAIT_TRACE") != nullptr;
 const bool kFenceTrace = getenv("LITEV_AMBIENT_FENCE_TRACE") != nullptr;
+// (tests) LITEV_AMBIENT_LOSS_PCT=<p>: each sent MP frame is lost with probability p% (Wi-Fi), after it took its
+// sequence number, as a real loss does
+const double kTestLossPct = getenv("LITEV_AMBIENT_LOSS_PCT") ? atof(getenv("LITEV_AMBIENT_LOSS_PCT")) : 0;
 const u32 kTestDropMPSeq = getenv("LITEV_AMBIENT_DROP_MP_SEQ") ?
     (u32)strtoul(getenv("LITEV_AMBIENT_DROP_MP_SEQ"), nullptr, 10) : 0;
 void Trace(const char* what, int slot, u32 type, const u8* d, int len, u64 timestamp)
@@ -583,7 +587,7 @@ void AmbientLAN::SendTo(u32 slots, u32 type, const u8* data, int len, u64 timest
     {
         if (!(slots & (1u << s)) || !Links[s].P) continue;
         Link& l = Links[s];
-        if (l.LocalFence) l.FenceAbort = true; // watermark cannot omit a post-fence MP send
+        if (l.LocalFence) { if (kFenceTrace) fprintf(stderr, "AMBFENCE abort: MP send after own fence\n"); l.FenceAbort = true; } // watermark cannot omit a post-fence MP send
         if (!l.Up)
         {
             if (type == 0 && l.Pending.size() < 64)
@@ -606,13 +610,21 @@ void AmbientLAN::SendTo(u32 slots, u32 type, const u8* data, int len, u64 timest
             fprintf(stderr, "AMBFENCE tx seq=%u type=%u len=%d\n", h.SenderID, type, len);
         memcpy(pkt->data, &h, sizeof(h));
         memcpy(pkt->data + sizeof(h), data, len);
+        l.LastMP.assign(pkt->data, pkt->data + pkt->dataLength);
+        static std::mt19937 lossRandom(std::random_device{}());
+        if (kTestLossPct > 0 && std::uniform_real_distribution<double>(0, 100)(lossRandom) < kTestLossPct)
+        { enet_packet_destroy(pkt); continue; }
         if (kTestDropMPSeq && h.SenderID == kTestDropMPSeq)
         {
             if (kFenceTrace) fprintf(stderr, "AMBFENCE test dropped MP seq=%u\n", h.SenderID);
             enet_packet_destroy(pkt);
             continue;
         }
-        if (enet_peer_send(l.P, Chan_MP, pkt) != 0) { enet_packet_destroy(pkt); l.SequenceOverflow = true; continue; }
+        if (enet_peer_send(l.P, Chan_MP, pkt) != 0)
+        {
+            if (kFenceTrace) fprintf(stderr, "AMBFENCE overflow: MP send failed seq=%u\n", h.SenderID);
+            enet_packet_destroy(pkt); l.SequenceOverflow = true; continue;
+        }
         StLinkTx++;
         if (kTrace) Trace("tx", s, type, data, len, timestamp);
         sent = true;
@@ -839,7 +851,10 @@ void AmbientLAN::RetireMP(const QueuedPacket& q)
         if (!l->GapSinceMs) l->GapSinceMs = NowMs();
     }
     else
+    {
+        if (kFenceTrace) fprintf(stderr, "AMBFENCE overflow: retired seq=%u through=%u\n", seq, l->RetiredThrough);
         l->SequenceOverflow = true;   // no silent handoff after a large missing range
+    }
 }
 
 void AmbientLAN::SettleMPGaps(Link& l, u32 now)
@@ -850,7 +865,7 @@ void AmbientLAN::SettleMPGaps(Link& l, u32 now)
     // fall ~1000 packets behind on Wi-Fi with a loss every second, and a fence mark more than 1024
     // ahead then tripped SequenceOverflow ("cannot start Ambient cut fence", r8b-mac).
     u32 through = 0;
-    for (const auto& [seq, ms] : l.RetiredBeyond) if (now - ms >= kMPGapExpireMs) through = seq;
+    for (const auto& [seq, ms] : l.RetiredBeyond) if ((s32)(now - ms) >= (s32)kMPGapExpireMs) through = seq;   // (ms can be after now)
     if (!through) return;
     if (kFenceTrace)
         fprintf(stderr, "AMBFENCE expired MP gaps %u..%u\n", l.RetiredThrough + 1, through);
@@ -871,7 +886,10 @@ void AmbientLAN::SettleHandoffMP(Link& l, u32 now)
     // Late arrivals are dropped at admission (DropThroughSeq), also across a rollback.
     (void)now;
     if (l.PeerLastSent - l.RetiredThrough > 4096)
-    { l.SequenceOverflow = true; return; }
+    {
+        if (kFenceTrace) fprintf(stderr, "AMBFENCE overflow: settle peer mark=%u through=%u\n", l.PeerLastSent, l.RetiredThrough);
+        l.SequenceOverflow = true; return;
+    }
     const int slot = (int)(&l - Links);
     for (auto it = RX.begin(); it != RX.end(); )
     {
@@ -893,6 +911,7 @@ void AmbientLAN::SettleHandoffMP(Link& l, u32 now)
 
 void AmbientLAN::SendFenceControl(Link& l, u32 type, u64 epoch, u32 mark)
 {
+    if (kFenceTrace) fprintf(stderr, "AMBFENCE send type=%u epoch=%llx mark=%u up=%d\n", type, (unsigned long long)epoch, mark, l.P && l.Up);
     if (!Host || !l.P || !l.Up) return;
     std::vector<u8> v;
     P32(v, kHandoffCtl); P32(v, type); P64(v, epoch); P32(v, mark);
@@ -946,6 +965,13 @@ bool AmbientLAN::StartHandoffFence(u64 epoch, const std::array<u8, 16>& token)
     l->LocalFence = true;
     l->LocalFenceMs = NowMs();
     FencedLinkTimeout(l->P, true);
+    // Our last MP frame again, reliably. We fence idle, so it ends our side's last exchange (a host's
+    // ACK): lost on Wi-Fi, the peer would wait for it while we are frozen and never reach its own idle
+    // cut (an MP client in its exchange). Only the last one: an older lost frame (a CMD) delivered now
+    // would start an exchange nobody finishes. The peer takes it only once (Admit).
+    if (!l->LastMP.empty() && Host && l->P && l->Up)
+        if (ENetPacket* again = enet_packet_create(l->LastMP.data(), l->LastMP.size(), ENET_PACKET_FLAG_RELIABLE))
+            if (enet_peer_send(l->P, Chan_MP, again) != 0) enet_packet_destroy(again);
     SendFenceControl(*l, HandoffFence, epoch, l->FenceLastSent);
     return !l->FenceAbort;
 }
@@ -1082,6 +1108,7 @@ void AmbientLAN::CompleteHandoffReset(Link& l)
         l.LastClosedFenceToken = l.FenceToken;
     }
     l.FenceEpoch = 0;
+    l.ClosedDropThroughSeq = std::max(l.ClosedDropThroughSeq, l.DropThroughSeq);
     FencedLinkTimeout(l.P, false);
     l.ActiveMs = NowMs(); // give a rolled-back source its normal idle grace period
     l.FenceToken = {};
@@ -1162,9 +1189,19 @@ void AmbientLAN::ReceiveHandoffControl(Link& l, u32 type, u64 epoch, u32 mark,
     {
         // A link by itself is never consent to freeze the game. Ignore a
         // premature/mismatched fence; the sender will time out and abort.
+        if (kFenceTrace)
+            fprintf(stderr, "AMBFENCE ignored fence epoch=%llx: offer epoch=%llx token %s mode=%u accepted local=%d peer=%d offered local=%d peer=%d\n",
+                    (unsigned long long)epoch, (unsigned long long)l.OfferEpoch, l.OfferToken == token ? "same" : "differs",
+                    l.OfferMode, l.LocalOfferAccepted, l.PeerOfferAccepted, l.LocalOffered, l.PeerOffered);
     }
     else if (!epoch || token == std::array<u8, 16>{} ||
-             (l.FenceEpoch && (l.FenceEpoch != epoch || l.FenceToken != token))) l.FenceAbort = true;
+             (l.FenceEpoch && (l.FenceEpoch != epoch || l.FenceToken != token)))
+    {
+        if (kFenceTrace)
+            fprintf(stderr, "AMBFENCE control type=%u epoch=%llx aborts: fence epoch=%llx token %s\n", type,
+                    (unsigned long long)epoch, (unsigned long long)l.FenceEpoch, l.FenceToken == token ? "same" : "differs");
+        l.FenceAbort = true;
+    }
     else if (type == HandoffFence)
     {
         l.FenceEpoch = epoch;
@@ -1212,8 +1249,16 @@ bool AmbientLAN::Admit(ENetEvent& ev)
     const int s = (int)(l - Links);
     if (ParentSlot >= 0 && s != ParentSlot) return false;
     l->LastMPMs = NowMs();
-    if (h->SenderID && h->SenderID <= l->DropThroughSeq &&
-        (l->LocalFence || l->LastClosedFenceEpoch)) return false;
+    // late arrivals: after our fence, everything up to the peer's mark is settled; after a closed
+    // fence (rollback), everything up to that fence's mark. (Not the current peer mark before our own
+    // fence: its frames that arrive after its fence control are still to be consumed.)
+    if (h->SenderID && ((l->LocalFence && h->SenderID <= l->DropThroughSeq) || h->SenderID <= l->ClosedDropThroughSeq))
+        return false;
+    if (h->SenderID)
+    {
+        if (!l->SeenMP.insert(h->SenderID).second) return false;   // (the resend at the peer's fence)
+        while (l->SeenMP.size() > 4096) l->SeenMP.erase(l->SeenMP.begin());
+    }
     const u8* f = ev.packet->data + sizeof(MPPacketHeader) + 12;
     if (f[0] != 0x80) l->ActiveMs = NowMs();
     if (!(f[10] & 1)) memcpy(l->MAC, f + 10, 6);     // (the sender's own MAC)
@@ -1315,6 +1360,10 @@ void AmbientLAN::ReceiveControl(Link& l, const u8* d, size_t length)
         const u32 mark = G32(d + 16);
         std::array<u8, 16> token{};
         memcpy(token.data(), d + 20, token.size());
+        if (kFenceTrace && type <= 9)
+            fprintf(stderr, "AMBFENCE recv type=%u epoch=%llx mark=%u (fence epoch=%llx closed=%llx offer=%llx)\n", type,
+                    (unsigned long long)epoch, mark, (unsigned long long)l.FenceEpoch,
+                    (unsigned long long)l.LastClosedFenceEpoch, (unsigned long long)l.OfferEpoch);
         ReceiveHandoffControl(l, type, epoch, mark, token);
     }
 }

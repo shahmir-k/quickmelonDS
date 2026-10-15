@@ -198,6 +198,9 @@ private:
         std::map<u32, u32> RetiredBeyond;   // retired out of order: seq -> when (ms)
         u32 GapSinceMs = 0, LastMPMs = 0;
         u32 LocalFenceMs = 0, PeerFenceMs = 0, DropThroughSeq = 0;
+        u32 ClosedDropThroughSeq = 0;   // DropThroughSeq of the last closed fence (late arrivals of a rollback)
+        std::vector<u8> LastMP;   // the last MP frame sent here (header + body): sent again, reliably, with our fence
+        std::set<u32> SeenMP;     // MP sequence numbers received lately (that resend is taken only once)
         bool SequenceOverflow = false;
         u64 FenceEpoch = 0;
         // Retry epochs on one link must increase. Any delayed control from a

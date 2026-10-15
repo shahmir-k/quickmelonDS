@@ -1098,8 +1098,16 @@ int main(int argc, char** argv)
             !getenv("LITEV_NETPLAY"))
         { fprintf(stderr, "CUTFENCE external peer needs host role, trial frames, port, IPv4 and Netplay configuration\n"); return 2; }
     }
-    const bool cutRetryAfterAbort = getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT") &&
-                                    *getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT");
+    // LITEV_AMBIENT_CUT_FENCE_LOOP=N: N cut fences in one run (fast stress of the fence, no Netplay): each
+    // completed fence is aborted on purpose (by the host, after its peer saw it complete too), both
+    // reset and the game runs on LOOP_GAP frames (default 60) before the next offer. A summary line
+    // "CUTLOOP done ok=K fail=F" ends the run.
+    const int cutFenceLoop = getenv("LITEV_AMBIENT_CUT_FENCE_LOOP") ? atoi(getenv("LITEV_AMBIENT_CUT_FENCE_LOOP")) : 0;
+    const int cutLoopGap = getenv("LITEV_AMBIENT_CUT_LOOP_GAP") ? atoi(getenv("LITEV_AMBIENT_CUT_LOOP_GAP")) : 60;
+    int cutLoopOk = 0, cutLoopFail = 0, cutNextFrame = 0;
+    const bool cutRetryAfterAbort = cutFenceLoop || (getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT") &&
+                                    *getenv("LITEV_AMBIENT_CUT_RETRY_AFTER_ABORT"));
+    const int cutRetries = cutFenceLoop ? cutFenceLoop - 1 : 1;   // attempts after the first
     int cutAttempt = 0;
     // milliseconds since this console froze for the cut (the CUTFENCE lines' t= field)
     auto cutFreezeStart = std::chrono::steady_clock::now();
@@ -1404,7 +1412,7 @@ int main(int argc, char** argv)
         {
             melonDS::MPInterface::Get().Process();
 #ifdef LITEV_AMBIENT_LAN
-            if (ambient && cutRetryAfterAbort && cutAttempt == 1 && cutRole &&
+            if (ambient && cutRetryAfterAbort && cutAttempt == 1 && !cutFenceLoop && cutRole &&
                 ambient->HandoffFenceAborted())
             {
                 const char* slow = getenv("LITEV_AMBIENT_CUT_DELAY_RESET_ROLE");
@@ -1418,9 +1426,10 @@ int main(int argc, char** argv)
             if (ambient && ambient->ResetHandoffFenceAfterAbort())
             {
                 printf("CUTFENCE %s reset after mutual abort\n", cutRole ? cutRole : "peer");
-                if (cutRetryAfterAbort && cutAttempt == 1 && cutDir && cutRole)
+                if (cutRetryAfterAbort && cutAttempt >= 1 && cutAttempt <= cutRetries && cutDir && cutRole)
                 {
                     cutRetryReady = true;
+                    cutNextFrame = frame + cutLoopGap;
                     cutOfferSent = false;
                     cutRomVerified = false;
                     cutLink.reset();
@@ -1478,7 +1487,8 @@ int main(int argc, char** argv)
                 const std::string abort = std::string(cutDir) + "/abort";
                 auto exists = [](const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (!f) return false; fclose(f); return true; };
                 auto mark = [](const std::string& p) { FILE* f = fopen(p.c_str(), "wb"); if (!f) return false; fclose(f); return true; };
-                const bool retryOpen = cutRetryAfterAbort && cutAttempt == 1 && cutRetryReady;
+                const bool retryOpen = cutRetryAfterAbort && cutAttempt >= 1 && cutAttempt <= cutRetries && cutRetryReady &&
+                                       frame >= cutNextFrame;
                 const bool eligible = (cutAttempt == 0 && !exists(abort)) || retryOpen;
                 // the live link with the offer (as the app opens it), this console's state as the
                 // baseline of the cut's delta
@@ -1549,8 +1559,13 @@ int main(int argc, char** argv)
                     }
                 }
                 if (eligible && offerReady && romReady && (frame % 120) == 0)
-                    printf("CUTFENCE %s waiting f%d busy=%02x queued=%zu peerFence=%d\n", cutRole, frame,
-                           nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames(), ambient->HasPeerHandoffFence());
+                {
+                    const auto ws = ambient->GetHandoffFenceStats();
+                    printf("CUTFENCE %s waiting f%d busy=%02x queued=%zu peerFence=%d (fence epoch=%llx aborted=%d compatible=%d)\n",
+                           cutRole, frame, nds->Wifi.HandoffBusyMask(), ambient->HandoffQueuedFrames(), ambient->HasPeerHandoffFence(),
+                           (unsigned long long)ws.Epoch, ws.Aborted, ambient->HandoffBuildCompatible());
+                    fflush(stdout);
+                }
                 // Who freezes first is the game's MP role, not the handoff role: an MP client is
                 // inside an exchange at nearly every frame boundary while its host keeps issuing
                 // commands, so it waits for the peer's fence and then runs on to its own idle cut
@@ -1566,6 +1581,7 @@ int main(int argc, char** argv)
                     nds->Wifi.HandoffBusyMask() == 0 && ambient->HandoffQueuedFrames() == 0)
                 {
                     ++cutAttempt;
+                    cutRetryReady = false;
                     melonDS::AmbientLAN::HandoffOfferStatus accepted{};
                     const u64 epoch = ambient->HasPeerHandoffFence() ? ambient->PeerHandoffEpoch() :
                         host ? epochBase + (u64)cutAttempt :
@@ -1653,6 +1669,31 @@ int main(int argc, char** argv)
                                fs.LocalReady, fs.PeerReady, fs.Aborted);
                         ambient->AbortHandoffFence();
                         mark(abort);
+                        if (cutFenceLoop)
+                        {
+                            cutLoopFail++;
+                            printf("CUTLOOP fail attempt=%d (%s) local=%u retired=%u peer=%u\n", cutAttempt, why,
+                                   fs.LastSent, fs.RetiredThrough, fs.PeerLastSent);
+                            if (cutAttempt >= cutFenceLoop) printf("CUTLOOP done ok=%d fail=%d\n", cutLoopOk, cutLoopFail);
+                            fflush(stdout);
+                        }
+                    }
+                    else if (cutFenceLoop)
+                    {
+                        // the peer completes within a round trip of us: the host lets it see READY, then aborts
+                        // (the deliberate end of this loop step); the client waits for that abort
+                        cutLoopOk++;
+                        printf("CUTLOOP ok attempt=%d t=%ldms f%d\n", cutAttempt, frozenMs(), frame);
+                        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(host ? 300 : 5000);
+                        while (!ambient->HandoffFenceAborted() && std::chrono::steady_clock::now() < until)
+                        { ambient->Process(); std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+                        ambient->AbortHandoffFence();   // (both send one: the mutual reset needs both)
+                        cutLink.reset();
+                        if (cutAttempt >= cutFenceLoop)
+                        {
+                            printf("CUTLOOP done ok=%d fail=%d\n", cutLoopOk, cutLoopFail);
+                            fflush(stdout);
+                        }
                     }
                     else
                     {
