@@ -132,6 +132,11 @@ bool BeaconGGID(const u8* d, int len, u32& ggid)
     return true;
 }
 bool IsBeacon(const u8* d, int len) { return len >= 12 + 36 && d[12] == 0x80; }
+// a management frame other than a beacon (auth / assoc / deauth ...), d = DS TX header + 802.11 frame. On air the chip
+// resends a unicast frame until it is acked (the MAC's retry count); the WM sends each handshake frame once and gives the
+// join up 2 s later. So over a link they go reliably (ENet resends a lost one), as the air would: one lost frame of the
+// auth / assoc handshake must not end a talk.
+bool MgmtFrame(u32 type, const u8* d) { return type == 0 && (d[12] & 0x0C) == 0 && d[12] != 0x80; }
 // a beacon's hash without the fields that change every beacon (TX header status, sequence, TSF, DTIM count, the
 // Nintendo IE's active zone / V-count)
 u32 BeaconHash(const u8* d, int len)
@@ -159,6 +164,14 @@ const bool kFenceTrace = getenv("LITEV_AMBIENT_FENCE_TRACE") != nullptr;
 // (tests) LITEV_AMBIENT_LOSS_PCT=<p>: each sent MP frame is lost with probability p% (Wi-Fi), after it took its
 // sequence number, as a real loss does
 const double kTestLossPct = getenv("LITEV_AMBIENT_LOSS_PCT") ? atof(getenv("LITEV_AMBIENT_LOSS_PCT")) : 0;
+// (tests) LITEV_AMBIENT_WIRE_LOSS_PCT=<p>: each UDP datagram the link socket receives is lost with probability p% (Wi-Fi as
+// ENet sees it: MP frames, acks, resends, the connect handshake, control); unlike LOSS_PCT, ENet resends what is reliable
+const double kWireLossPct = getenv("LITEV_AMBIENT_WIRE_LOSS_PCT") ? atof(getenv("LITEV_AMBIENT_WIRE_LOSS_PCT")) : 0;
+int WireLoss(ENetHost*, ENetEvent*)
+{
+    static std::mt19937 r(std::random_device{}());
+    return std::uniform_real_distribution<double>(0, 100)(r) < kWireLossPct ? 1 : 0;
+}
 const u32 kTestDropMPSeq = getenv("LITEV_AMBIENT_DROP_MP_SEQ") ?
     (u32)strtoul(getenv("LITEV_AMBIENT_DROP_MP_SEQ"), nullptr, 10) : 0;
 void Trace(const char* what, int slot, u32 type, const u8* d, int len, u64 timestamp)
@@ -211,6 +224,7 @@ AmbientLAN::AmbientLAN(const Config& cfg) : Cfg(cfg), Vis(cfg.Vis)
         Host = enet_host_create(&a, 16, 2, 0, 0);
         if (Host) LinkPort = a.port;
     }
+    if (Host && kWireLossPct > 0) Host->intercept = WireLoss;
     BcastSock = OpenUdp(Cfg.PresencePort, true);
     UniSock = OpenUdp(Cfg.UnicastPort, false);
     if (!Host || UniSock < 0)
@@ -580,7 +594,7 @@ AmbientLAN::Stats AmbientLAN::GetStats()
     s.EmuUs = EmuBaseUs; s.PredFpsX100 = StPredFps; s.Verdict = StVerdict;
     s.LastFrameBlockedUs = StLastBlocked; s.LastFrameExchanges = StLastExch; s.Links = StLinks; s.Nearby = StNearby; s.MaxRttMs = StMaxRtt;
     s.SlowFpsX100 = StSlowFps; s.SlowWaitUsPerFrame = StSlowWait;
-    s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending;
+    s.SlowExchangesPerFrameX100 = StSlowExch; s.SlowdownPending = StSlowPending; s.AutoSwitchOk = StAutoOk;
     return s;
 }
 
@@ -717,15 +731,20 @@ int AmbientLAN::OpenLink(const Peer& p)
     ENetAddress a; a.host = p.IP; a.port = p.LinkPort;
     ENetPeer* e = enet_host_connect(Host, &a, 2, (u32)Cfg.DeviceID);
     if (!e) return -1;
+    // ENet resends a lost connect after its default 500 ms round trip (x2 each time): from the presence round trip
+    // instead (its first ack sets the real one), so a lost connect does not use up the WM's 2 s auth wait
+    e->roundTripTime = std::max<u32>(p.RttUs() / 1000, 20);
+    e->roundTripTimeVariance = e->roundTripTime / 2;
     Link& l = Links[s];
     l = Link();
     l.ID = p.ID; l.Generation = ++NextLinkGeneration; l.P = e; memcpy(l.MAC, p.MAC, 6); l.ActiveMs = NowMs();
     e->data = &l;
     enet_peer_timeout(e, 0, 5000, 5000);
     StOpened++;
+    l.OpenVerdict = PeerVerdict(p.ID);
     LinksChanged(true);
     Platform::Log(Platform::LogLevel::Info, "Ambient: link %d -> %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p.ID, p.Name.c_str(),
-                  (int)PeerVerdict(p.ID), EmuBaseUs / 1000.0);
+                  l.OpenVerdict, EmuBaseUs / 1000.0);
     return s;
 }
 
@@ -779,7 +798,8 @@ void AmbientLAN::SendTo(u32 slots, u32 type, const u8* data, int len, u64 timest
         }
         // SenderID is unused by Ambient (manual LAN uses it for player id).
         // A separate packet per recipient gives each link a contiguous watermark.
-        ENetPacket* pkt = enet_packet_create(nullptr, sizeof(MPPacketHeader) + len, ENET_PACKET_FLAG_UNSEQUENCED);
+        const bool mg = MgmtFrame(type, data);
+        ENetPacket* pkt = enet_packet_create(nullptr, sizeof(MPPacketHeader) + len, mg ? ENET_PACKET_FLAG_RELIABLE : ENET_PACKET_FLAG_UNSEQUENCED);
         if (!pkt) continue;
         MPPacketHeader h = {kNifi, ++l.TxSeq, type, (u32)len, timestamp};
         if (kFenceTrace && h.SenderID <= 8)
@@ -788,7 +808,7 @@ void AmbientLAN::SendTo(u32 slots, u32 type, const u8* data, int len, u64 timest
         memcpy(pkt->data + sizeof(h), data, len);
         l.LastMP.assign(pkt->data, pkt->data + pkt->dataLength);
         static std::mt19937 lossRandom(std::random_device{}());
-        if (kTestLossPct > 0 && std::uniform_real_distribution<double>(0, 100)(lossRandom) < kTestLossPct)
+        if (!mg && kTestLossPct > 0 && std::uniform_real_distribution<double>(0, 100)(lossRandom) < kTestLossPct)   // (a reliable one is resent)
         { enet_packet_destroy(pkt); continue; }
         if (kTestDropMPSeq && h.SenderID == kTestDropMPSeq)
         {
@@ -1357,6 +1377,9 @@ void AmbientLAN::ReceiveHandoffControl(Link& l, u32 type, u64 epoch, u32 mark,
         if (!HandoffBuildCompatible() || !epoch || token == std::array<u8, 16>{} ||
             (mark != HandoffPlainNetplay && mark != HandoffHostedNetplay) || l.FenceEpoch ||
             epoch <= std::max(l.LastClosedOfferEpoch, l.LastClosedFenceEpoch)) return;
+        // a device with other links (the host of a 3-4 player session) cannot switch: say no at once (a child of
+        // that session sees only its own link and would wait on its offer)
+        if (HandoffLink() != &l) { SendOfferControl(l, HandoffDecline, epoch, 0, token); return; }
         if (l.OfferEpoch)
         {
             // Concurrent offers fail closed. Both users can retry once the
@@ -1487,7 +1510,8 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
             l->Up = true;
             for (auto& f : l->Pending)
             {
-                ENetPacket* p = enet_packet_create(f.data(), f.size(), ENET_PACKET_FLAG_UNSEQUENCED);
+                const bool mg = MgmtFrame(((const MPPacketHeader*)f.data())->Type, f.data() + sizeof(MPPacketHeader));
+                ENetPacket* p = enet_packet_create(f.data(), f.size(), mg ? ENET_PACKET_FLAG_RELIABLE : ENET_PACKET_FLAG_UNSEQUENCED);
                 enet_peer_send(ev.peer, Chan_MP, p);
                 StLinkTx++;
             }
@@ -1512,9 +1536,10 @@ void AmbientLAN::OnEvent(ENetEvent& ev)
         n.ID = p->ID; n.Generation = ++NextLinkGeneration; n.P = ev.peer; n.Up = true; memcpy(n.MAC, p->MAC, 6); n.ActiveMs = NowMs();
         ev.peer->data = &n;
         enet_peer_timeout(ev.peer, 0, 5000, 5000);
+        n.OpenVerdict = PeerVerdict(p->ID);
         LinksChanged(true);
         Platform::Log(Platform::LogLevel::Info, "Ambient: link %d <- %016llx (%s), verdict %d (emulation %.1f ms)\n", s, (unsigned long long)p->ID, p->Name.c_str(),
-                      (int)PeerVerdict(p->ID), EmuBaseUs / 1000.0);
+                      n.OpenVerdict, EmuBaseUs / 1000.0);
         break;
     }
     case ENET_EVENT_TYPE_DISCONNECT:
@@ -1618,8 +1643,7 @@ void AmbientLAN::Pump(int type, int waitMs)
         // stale after a frame (LAN.cpp), but a management frame (auth / assoc / deauth) waits for the chip up to 1 s: a
         // parent's chip only listens around its beacons, and a child here does not send right after a real beacon
         // (it heard a synthesized one), so its auth request arrives while the parent dozes
-        const u8 fc = p->data[sizeof(MPPacketHeader) + 12];
-        const u32 keep = (h->Type == 0 && (fc & 0x0C) == 0 && fc != 0x80) ? 1000 : 16;
+        const u32 keep = MgmtFrame(h->Type, p->data + sizeof(MPPacketHeader)) ? 1000 : 16;
         if (h->Magic > now || now - h->Magic > keep)
         {
             if (kWaitTrace)
@@ -1677,7 +1701,9 @@ void AmbientLAN::Pump(int type, int waitMs)
                         RX.push_back(q);
                         return;
                     }
-                    const u64 hold = Sim().Hold(NowUs());
+                    u64 hold = Sim().Hold(NowUs());
+                    // (a reliable frame lost is resent: one round trip later)
+                    if (hold == ~0ull && (ev.packet->flags & ENET_PACKET_FLAG_RELIABLE)) hold = (u64)(Sim().RttMs(NowUs()) * 1500);
                     if (hold == ~0ull) enet_packet_destroy(ev.packet);
                     else Delayed.push_back({NowUs() + hold, q});
                 }
@@ -1877,6 +1903,17 @@ AmbientLAN::Verdict AmbientLAN::PeerVerdict(u64 id)
     return Verdict_Unknown;
 }
 
+bool AmbientLAN::AutoHandoffDue()
+{
+    const Link* l = HandoffLink();
+    const bool bad = l && HandoffBuildCompatible() && !l->OfferEpoch && !l->FenceEpoch && !l->LastClosedOfferEpoch &&
+        !l->LastClosedFenceEpoch && ((StVerdict == Verdict_LanBad && StAutoOk) || (l->OpenVerdict == Verdict_LanBad && FirstExchUs));
+    if (!bad) { AutoDueUs = 0; return false; }
+    const u64 now = NowUs();
+    if (!AutoDueUs) AutoDueUs = now;
+    return ParentSlot < 0 || now - AutoDueUs >= 2000000;
+}
+
 // once a frame (Process): the emulation time and the session verdict (AmbientLAN.h)
 void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
 {
@@ -1902,7 +1939,7 @@ void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
     if (!UpMask())
     {
         if (StVerdict) Platform::Log(Platform::LogLevel::Info, "Ambient: session verdict cleared (no links)\n");
-        StVerdict = Verdict_Unknown; StPredFps = 0;
+        StVerdict = Verdict_Unknown; StPredFps = 0; StAutoOk = false;
         FirstExchUs = VT0 = 0; VFrames = VExch = VRunN = VBad = VWeak = VOk = 0; VExchFrames = 0; VRunUs = 0; VerdictDismissed = false;
         return;
     }
@@ -1942,6 +1979,8 @@ void AmbientLAN::Judge(u32 frameBlocked, u32 frameExchanges)
                           v == Verdict_LanBad ? "LAN_BAD" : "LAN_OK", pred, frame / 1000.0, (double)VExch / VFrames, rtt / 1000.0, EmuBaseUs / 1000.0);
             StVerdict = v;
         }
+        const Link* hl = HandoffLink();
+        StAutoOk = v == Verdict_LanBad && (VBad >= 2 || pred < 40.0 || (hl && hl->OpenVerdict == Verdict_LanBad));
     }
     VT0 = now; VFrames = VExch = VRunN = 0; VRunUs = 0; VStallAt = stalls;
 }

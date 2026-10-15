@@ -74,6 +74,7 @@ public:
         int Verdict;                // SessionVerdict
         u32 SlowFpsX100, SlowWaitUsPerFrame, SlowExchangesPerFrameX100;
         bool SlowdownPending;
+        bool AutoSwitchOk;          // a LAN_BAD the automatic switch acts on (AutoHandoffDue)
     };
 
     explicit AmbientLAN(const Config& cfg);
@@ -136,6 +137,15 @@ public:
     enum Verdict { Verdict_Unknown = 0, Verdict_LanOk = 1, Verdict_LanBad = 2 };
     Verdict PeerVerdict(u64 id);
     Verdict SessionVerdict() const { return (Verdict)StVerdict.load(); }
+    // The automatic Netplay switch (emulator thread; the app's default, its "Ask before switching" turns it off): true
+    // when this two-player session should be offered the live handoff now. LAN_BAD at link open (PeerVerdict then):
+    // as soon as the join is done (the first MP exchange: both at 1x, a link opening is normal speed for the group);
+    // SessionVerdict LAN_BAD later: at once (it is burst-proof, never fast-forward) when the link rule says it (the
+    // network alone does not fit one exchange a frame) or the session runs under 40 fps; a LAN_BAD of 40-50 fps on a
+    // fast network (e.g. Pokémon's 2 exchanges a frame at a 4-6 ms round trip: 48 fps) only raises the prompt. The game's MP host offers; a child
+    // only 2 s later (no offer came: the host asks first). Never twice on a link (a declined or failed switch stays on
+    // LAN; no automatic way back to LAN), never with an offer or a fence open.
+    bool AutoHandoffDue();
     // Emulator-thread-only diagnostic: MP frames already admitted locally or buffered while a link opens.
     size_t HandoffQueuedFrames() const;
     // Compatibility gate only: presence is unauthenticated. The checkpoint
@@ -249,6 +259,7 @@ private:
         u32 TxSeq = 0, RetiredThrough = 0;
         std::map<u32, u32> RetiredBeyond;   // retired out of order: seq -> when (ms)
         u32 GapSinceMs = 0, LastMPMs = 0;
+        int OpenVerdict = 0;        // PeerVerdict when the link opened
         u32 LocalFenceMs = 0, PeerFenceMs = 0, DropThroughSeq = 0;
         u32 ClosedDropThroughSeq = 0;   // DropThroughSeq of the last closed fence (late arrivals of a rollback)
         std::vector<u8> LastMP;   // the last MP frame sent here (header + body): sent again, reliably, with our fence
@@ -348,7 +359,9 @@ private:
     u64 EmT0 = 0, EmSum = 0;
     u32 EmN = 0, EmPos = 0, EmRing[4] = {};
     bool VerdictDismissed = false;
+    u64 AutoDueUs = 0;              // AutoHandoffDue: since when
     std::atomic<int> StVerdict{0};
+    std::atomic<bool> StAutoOk{false};      // (Stats::AutoSwitchOk)
     std::atomic<u32> StPredFps{0};
     int LinkWaitMs() const;
     static bool LinkRule(u32 emuUs, u32 rttUs);
