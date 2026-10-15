@@ -137,6 +137,17 @@ private:
     void CapKick(int pbo);
     void CapConvert(const u8* src, u32* dst);
 #endif
+#ifdef LITEV_PRESENT_SAME
+    // LITEV_PRESENT_SAME: per screen (0 = top, 1 = bottom), a number that changes whenever the
+    // merged picture of that screen can differ from the previous merge's (set by MergeSlot, read
+    // by the frontend after the merge: a display showing only unchanged screens skips its redraw)
+    u32 MergedSerial[2] {};
+    std::vector<u32> LastDesc[2];
+    int LastScale = 0;
+public:
+    u32 ScreenSerial(int s) const { return MergedSerial[s]; }
+private:
+#endif
     // emu-thread CPU time per 60 frames (logged as LITEV_HYB)
     double ProfGL3D = 0, ProfWait = 0, ProfMerge = 0, ProfUpload = 0, ProfSync = 0, ProfDraw = 0, ProfReadback = 0;
     int ProfFrames = 0;

@@ -708,6 +708,38 @@ void HybridRenderer::MergeSlot(GLuint fbo, int single, int bottomY, int fb, int 
 {
     const double t0 = HybNowMs();
 
+#ifdef LITEV_PRESENT_SAME
+    // A screen without 3D merges from its descriptors alone (plane 1 + the control column; the
+    // 3D/edge textures are only read for descriptors that carry 3D): equal descriptors at the
+    // same scale give the same pixels. Exact compare against the last merge's copy, no hash.
+    // A screen with 3D always counts as changed. debug.litev.presentsame=0: every merge changes.
+    {
+        static const bool on = OpenGL::Prop("presentsame", 1) != 0;
+        for (int s = 0; s < 2; s++)
+        {
+            bool same = on && !HybHas3D[fb][s] && Scale == LastScale && !LastDesc[s].empty();
+            const u32* src = HybFB[fb] + s * 192 * HybStride;
+            std::vector<u32>& last = LastDesc[s];
+            if (!HybHas3D[fb][s])
+            {
+                if (last.empty()) last.resize(192 * 257);
+                for (int y = 0; y < 192; y++)
+                {
+                    const u32* ln = src + y * HybStride;
+                    u32* dl = last.data() + y * 257;
+                    if (same && memcmp(dl, ln, 256 * 4) == 0 && dl[256] == ln[512]) continue;
+                    same = false;
+                    memcpy(dl, ln, 256 * 4);
+                    dl[256] = ln[512];
+                }
+            }
+            else last.clear();
+            if (!same) MergedSerial[s]++;
+        }
+        LastScale = Scale;
+    }
+#endif
+
     // the descriptors were copied into DescPBO[fb] by the 2D thread (HybridStage):
     // unmap and let the GPU copy them into this slot's texture
     if (HybMap[fb])

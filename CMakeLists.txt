@@ -1257,6 +1257,10 @@ endif()
 
 # Hybrid renderer: a screen with no 3D is merged at 1x and blitted up to Nx (same pixels; at 3x
 # the 2D-only screen's per-pixel merge was ~2 ms of GPU a frame). Runtime: debug.litev.hybmerge1x=0 off.
+option(LITEV_PRESENT_SAME "Hybrid: per-screen serial of the merged picture (unchanged 2D-only screen keeps its serial) for the frontend's present skip" OFF)
+if (LITEV_PRESENT_SAME)
+    add_compile_definitions(LITEV_PRESENT_SAME=1)
+endif()
 option(LITEV_HYB_MERGE_1X_2D "Hybrid: merge 2D-only screens at 1x, then blit up" OFF)
 if (LITEV_HYB_MERGE_1X_2D)
     add_compile_definitions(LITEV_HYB_MERGE_1X_2D=1)
