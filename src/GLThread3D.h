@@ -30,6 +30,20 @@ namespace melonDS
 // Each finished render leaves a fence; the emu context waits on it (GPU-side) before
 // sampling that colour buffer. Without EGL (desktop builds) or if the shared context
 // cannot be made, everything runs inline on the caller's thread as before.
+// LITEV_GL3D_PRIO: the hybrid's GL 3D thread one step above the other render threads (present,
+// 2D, Mali backend: nice -10). Cores 0-2 are ~98% busy in the uncapped PW town at 3x and the job
+// waited ~4 ms/frame runnable, which the emu thread then waits for at the next VCount 215
+// (gl-queued). debug.litev.gl3dnice=<n> overrides (-10 = off).
+inline int HybGL3DNice()
+{
+#if defined(LITEV_GL3D_PRIO) && defined(__ANDROID__)
+    char b[PROP_VALUE_MAX] = {};
+    return __system_property_get("debug.litev.gl3dnice", b) > 0 ? atoi(b) : -15;
+#else
+    return -10;
+#endif
+}
+
 class GLThread3D : public Renderer3D, public GLWorker
 {
 public:
@@ -37,7 +51,7 @@ public:
     GLThread3D(melonDS::GPU3D& gpu3D, GLRenderer* parent = nullptr, const char* name = "hyb-gl3d")
         : Renderer3D(gpu3D), Parent(parent)
     {
-        StartThread(name);
+        StartThread(name, Parent ? -10 : HybGL3DNice());
         Run([this, &gpu3D] { GL = std::make_unique<GLRenderer3D>(gpu3D, Parent); }, true);
 #ifdef LITEV_HYB_TEXSTAGE
         if (Threaded && !Parent) GL->EnableTexStaging();

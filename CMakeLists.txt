@@ -1246,6 +1246,10 @@ endif()
 
 # Hybrid renderer, with LITEV_HYB_CAPTURE_ASYNC: finish each capture read (wait, map, copy, convert)
 # on the GL 3D thread instead of the emu thread. Runtime: debug.litev.capoff=0 off.
+option(LITEV_GL3D_PRIO "Hybrid: GL 3D thread at nice -15 (debug.litev.gl3dnice), above the other render threads" OFF)
+if (LITEV_GL3D_PRIO)
+    add_compile_definitions(LITEV_GL3D_PRIO=1)
+endif()
 option(LITEV_HYB_CAPTURE_OFFTHREAD "Hybrid: capture readback finished on the GL 3D thread" OFF)
 if (LITEV_HYB_CAPTURE_OFFTHREAD)
     add_compile_definitions(LITEV_HYB_CAPTURE_OFFTHREAD=1)
