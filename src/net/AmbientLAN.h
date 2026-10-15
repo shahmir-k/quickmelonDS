@@ -91,6 +91,8 @@ public:
     void AddPeerAddress(u32 ipNetOrder, u16 port);
     void SetVisibility(int vis);
     void SetForeground(bool fg) { Foreground = fg; }
+    // one line of state for diagnosis: stats, Wi-Fi/parent/host state, every link, the nearby table
+    std::string DebugLine();
     // nearby devices: "id \t name \t game \t ip:port \t ggid \t build \t linked \t rtt_us \t jitter_us \t loss_%"
     std::vector<std::string> NearbyRows();
     Stats GetStats();
@@ -164,7 +166,7 @@ public:
     const char* FenceStartFailure = "";   // why the last StartHandoffFence failed
     bool GetHandoffFenceToken(std::array<u8, 16>& token) const;
     // After a committed handoff's Netplay session ended (every device leaves at the same frame):
-    // the link's fence and offer are over on both sides, with no message needed.
+    // the session's links close (fence and offer with them); discovery resumes at once.
     void EndCommittedHandoff();
     bool HasPeerHandoffFence() const;
     u64 PeerHandoffEpoch() const;
