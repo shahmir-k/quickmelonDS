@@ -408,7 +408,12 @@ int NetplayInput::SpeedAt(int frame, u32* requesters, int* inputFrame)
 
 void NetplayInput::SendHash(int frame, u64 hash)
 {
-    WireHash h {kHashMagic, (u8)Local, frame, hash};
+    WireHash h;
+    memset(&h, 0, sizeof(h));       // zero the padding bytes so they never carry stack garbage
+    h.Magic = kHashMagic;
+    h.Player = (u8)Local;
+    h.Frame = frame;
+    h.Hash = hash;
     for (int peer : Peers)
         sendto(Socket, &h, sizeof(h), 0, (sockaddr*)PeerAddr[peer], sizeof(sockaddr_in));
 }
