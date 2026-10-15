@@ -2164,11 +2164,14 @@ int main(int argc, char** argv)
                                 // the session's link lets go of every console first (its hooks on ours would call into
                                 // the freed link the next time the game does MP)
                                 mine.nds->DetachMPLink();
+                                // the other consoles and the Netplay link are released on a worker, as the app does (their
+                                // destructors are tens of ms under load; nothing there touches this console)
+                                std::vector<std::decay_t<decltype(ended.Consoles[0])>> dropped;
                                 for (int k = 0; k < (int)ended.Consoles.size(); k++)
-                                    if (k != me) { ended.Consoles[k].nds.reset(); ended.Consoles[k].udata.reset(); }
+                                    if (k != me) dropped.push_back(std::move(ended.Consoles[k]));
+                                std::thread dropper([d = std::move(dropped), l = melonDS::MPInterface::Take()]() mutable { d.clear(); l.reset(); });
                                 mine.nds->JIT.JitEnableExecute();
                                 mine.udata->instanceID = 0;
-                                melonDS::MPInterface::Take().reset();
                                 melonDS::MPInterface::Set(std::move(savedAmbient), melonDS::MPInterface_Ambient);
                                 ambient->EndCommittedHandoff();
                                 if (mine.nds->Wifi.IsPoweredOn()) melonDS::MPInterface::Get().Begin(0);
@@ -2232,6 +2235,7 @@ int main(int argc, char** argv)
                                                (unsigned long long)XXH3_64bits(mine.nds->ARM9.R, sizeof(mine.nds->ARM9.R)));
                                     last = std::chrono::steady_clock::now();
                                 }
+                                dropper.join();
                                 // the uninterrupted run, in-process: both copies, the same link clocks
                                 int same = -1;
                                 const size_t n = std::min(ended.Scheduled[0].size(), ended.Scheduled[1].size());
