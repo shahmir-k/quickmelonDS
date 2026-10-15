@@ -509,8 +509,13 @@ void SoftRenderer2D::DrawScanlineBGMode7(u32 line)
 void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
 {
 #ifdef S2D_PLANES
-    // the hybrid's 3D descriptor lines keep the layer-push path (Under3D bookkeeping)
+    // the hybrid's 3D descriptor lines keep the layer-push path (Under3D bookkeeping), unless
+    // LITEV_HYB_PLANES (the select keeps it)
+#ifdef LITEV_HYB_PLANES
+    if (CurPalConv && (HybPlanes || !(HybridDesc && !GPU2D.Num && (GPU2D.DispCnt & 0x8))))
+#else
     if (CurPalConv && !(HybridDesc && !GPU2D.Num && (GPU2D.DispCnt & 0x8)))
+#endif
     {
         DrawScanlinePlanes(line, dst);
         return;
@@ -779,6 +784,14 @@ void S2DResolve(const u16* v, const u8* tid, const u32* const* tab, const u32* f
 }
 }
 
+#ifdef LITEV_HYB_PLANES
+// hybrid descriptor lines: the 3D placeholder is "opaque" everywhere (its window decides) and
+// resolves to the record 0x40000000 (colour 0)
+alignas(16) static const u32 S2DHybZero[256] = {};
+alignas(16) static const struct S2DHybOpaqueT { u32 v[256]; S2DHybOpaqueT() { for (u32& x : v) x = 0xFF000000; } } S2DHybOpaqueInit;
+static const u32* const S2DHybOpaque3D = S2DHybOpaqueInit.v;
+#endif
+
 #define S2D_SEL(fn, ...) (second ? (win ? fn<true, true>(__VA_ARGS__) : fn<true, false>(__VA_ARGS__)) \
                                  : (win ? fn<false, true>(__VA_ARGS__) : fn<false, false>(__VA_ARGS__)))
 
@@ -800,6 +813,15 @@ void SoftRenderer2D::DrawScanlinePlanes(u32 line, u32* dst)
     static constexpr u8 kinds[8][4] = {{1,1,1,1}, {1,1,1,2}, {1,1,2,2}, {1,1,1,3}, {1,1,2,3}, {1,1,3,3}, {0,0,4,0}, {1,1,0,0}};
     const u32 mode = dispCnt & 7;
     const bool l3d = !GPU2D.Num && (dispCnt & 0x8) && (layers & 1);
+#ifdef LITEV_HYB_PLANES
+    // LITEV_HYB_PLANES: a hybrid descriptor line (as DrawScanline_BGOBJ's layer-push path): the 3D
+    // is a placeholder (record 0x40000000) wherever its window bit is set, the top and second
+    // layers it pushes down become Under3D, and HybridCompositeLine writes the descriptors. The
+    // effect shortcuts below assume a known 3D alpha: off for these lines (both layers kept).
+    const bool hyb = HybridDesc && !GPU2D.Num && (dispCnt & 0x8);
+#else
+    constexpr bool hyb = false;
+#endif
     const bool mosaicOn = GPU2D.BGMosaicSize[0] > 0;
     u32 present = 0;
     for (u32 n = 0; n < 4; n++)
@@ -867,7 +889,7 @@ void SoftRenderer2D::DrawScanlinePlanes(u32 line, u32* dst)
     // effect, so with no translucent 3D pixel the hit only matters if a brightness effect could
     // apply to the 3D layer (first target bit 0).
     bool l3dHit = false;
-    if (l3d && (bc & 0x3F00))
+    if (l3d && !hyb && (bc & 0x3F00))
     {
         if ((ce == 2 || ce == 3) && (bc & 0x01)) l3dHit = true;
         else
@@ -883,7 +905,7 @@ void SoftRenderer2D::DrawScanlinePlanes(u32 line, u32* dst)
             l3dHit = vmaxvq_u32(acc) != 0;
         }
     }
-    const bool second = ((bc & 0x3F00) && objBlend) || l3dHit || (fxPossible && ce == 1);
+    const bool second = hyb || ((bc & 0x3F00) && objBlend) || l3dHit || (fxPossible && ce == 1);
     const bool flat = !second && !fxPossible;
 
     if (flat && !present && !objOn && !l3d)
@@ -946,7 +968,19 @@ void SoftRenderer2D::DrawScanlinePlanes(u32 line, u32* dst)
         {
             if ((bgCnt[n] & 3) != (u32)prio) continue;
             if (n == 0 && l3d)
+            {
+#ifdef LITEV_HYB_PLANES
+                if (hyb)
+                {
+                    // Under3D = the top and second here (read only where the 3D is pushed)
+                    memcpy(UTop16, Top16, sizeof(Top16)); memcpy(UTopTid, TopTid, sizeof(TopTid));
+                    memcpy(USec16, Sec16, sizeof(Sec16)); memcpy(USecTid, SecTid, sizeof(SecTid));
+                    S2D_SEL(Select3D, S2DHybOpaque3D, WindowMask, TID_3D, Top16, TopTid, Sec16, SecTid);
+                }
+                else
+#endif
                 S2D_SEL(Select3D, Cur3DLine, WindowMask, TID_3D, Top16, TopTid, Sec16, SecTid);
+            }
             else if (present & (1u << n))
                 S2D_SEL(SelectBG, PlaneV(n), WindowMask, (u8)(1u << n), (u8)n, Top16, TopTid, Sec16, SecTid);
         }
@@ -967,7 +1001,11 @@ void SoftRenderer2D::DrawScanlinePlanes(u32 line, u32* dst)
     for (u32 n = 0; n < 4; n++) { tab[n] = PlaneTab[n]; flag[n] = 0x01000000u << n; }
     tab[TID_OBJ] = ObjCol; flag[TID_OBJ] = 0;
     tab[TID_BACKDROP] = &backdrop; flag[TID_BACKDROP] = 0;
+#ifdef LITEV_HYB_PLANES
+    tab[TID_3D] = hyb ? S2DHybZero : Cur3DLine; flag[TID_3D] = 0x40000000;
+#else
     tab[TID_3D] = Cur3DLine; flag[TID_3D] = 0x40000000;
+#endif
     tab[TID_NONE] = &zero; flag[TID_NONE] = 0;
     u32 posmask = (1u << TID_3D) | (1u << TID_OBJ);
     for (u32 n = 0; n < 4; n++) if (PlaneTab[n] == DirCol[n]) posmask |= 1u << n;
@@ -983,6 +1021,18 @@ void SoftRenderer2D::DrawScanlinePlanes(u32 line, u32* dst)
         return;
     }
     S2DResolve(Sec16, SecTid, tab, flag, posmask, BGOBJLine + 256);
+#ifdef LITEV_HYB_PLANES
+    if (hyb)
+    {
+        if (l3d)
+        {
+            S2DResolve(UTop16, UTopTid, tab, flag, posmask, Under3D[0]);
+            S2DResolve(USec16, USecTid, tab, flag, posmask, Under3D[1]);
+        }
+        HybridCompositeLine(dst);
+        return;
+    }
+#endif
     GPU2DNeon::ColorCompositeLine(dst, BGOBJLine, WindowMask, bc, GPU2D.EVA, GPU2D.EVB, GPU2D.EVY);
 }
 #undef S2D_SEL
@@ -1582,6 +1632,7 @@ void SoftRenderer2D::HybridCompositeLine(u32* dst)
 #undef CC_TOP
 #undef CC_UNDER
 }
+
 
 // CPU version of the hybrid merge (HybridMergeFS.glsl) for one native pixel: c3d is the
 // 3D pixel in software format (6-bit RGB, 5-bit alpha in bits 24-28). Used for display

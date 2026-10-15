@@ -301,6 +301,9 @@ protected:
     // that differ from the real composite. Must stay 0.
     bool HybridCheck = false;
     std::atomic<u64> HybCheckBad { 0 }, HybCheckLines { 0 };
+#ifdef LITEV_HYB_PLANES
+    u64 HybPlanesLines = 0, HybPlanesBad = 0;   // HybridCheck: plane vs layer-push descriptors
+#endif
 
     void StartAsyncThread();              // lazy-create the persistent render thread
     void StopAsyncThread();               // flush in-flight + join (Stop/dtor)

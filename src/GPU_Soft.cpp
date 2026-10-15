@@ -167,6 +167,10 @@ SoftRenderer::~SoftRenderer()
     if (HybridCheck)
         fprintf(stderr, "hybrid_check: lines=%llu bad_px=%llu\n",
                 (unsigned long long)HybCheckLines.load(), (unsigned long long)HybCheckBad.load());
+#ifdef LITEV_HYB_PLANES
+    if (HybridCheck)
+        fprintf(stderr, "hybplanes_check: 3d_lines=%llu differ=%llu\n", (unsigned long long)HybPlanesLines, (unsigned long long)HybPlanesBad);
+#endif
     for (int i = 0; i < NFB; i++) delete[] HybFB[i];
     for (int i = 0; i < 2; i++) delete[] Hyb3D[i];
     Platform::Semaphore_Free(AsyncStart);
@@ -460,6 +464,10 @@ void SoftRenderer::InitBands()
                 S2DBands[p][b].rend[e] = std::make_unique<SoftRenderer2D>(*S2DBands[p][b].unit[e], *this);
                 static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->Reset();
                 static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->HybridDesc = Hybrid && e == 0;
+#ifdef LITEV_HYB_PLANES
+                static const bool hybPlanes = litevPropInt("debug.litev.hybplanes", 1) != 0;
+                static_cast<SoftRenderer2D*>(S2DBands[p][b].rend[e].get())->HybPlanes = hybPlanes;
+#endif
             }
 #else
     for (int b = 0; b < S2D_NBANDS; b++)
@@ -644,6 +652,7 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
         {
             // self-test: descriptor + CPU resolve must equal the real composite below
             alignas(8) u32 desc[HybStride];
+            memset(desc, 0x5A, sizeof(desc));   // the same stale words as the reference pass below
             rA->Cur3DLine = l3d; rA->CurOAM = oamSnap; rA->CurPalette = palSnap; S2D_PALCONV_SET(rA); S2D_OAMGEN_SET(rA);
             rA->HybridDesc = true;
 #ifdef LITEV_SOFT2D_DEPTH2
@@ -655,6 +664,25 @@ void SoftRenderer::RenderBand(int bi, u32 y0, u32 y1)
 #endif
             rA->HybridDesc = false;
             const bool has3D = rA->LastLineHas3D;
+#if defined(LITEV_HYB_PLANES) && defined(LITEV_SOFT2D_DEPTH2)
+            // the plane pipeline's descriptors must equal the layer-push path's, word for word
+            if (has3D)
+            {
+                alignas(8) u32 desc2[HybStride];
+                memset(desc2, 0x5A, sizeof(desc2));
+                rA->HybridDesc = true; rA->HybPlanes = false;
+                S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);
+                S2DJ_LINE(); rA->DrawScanlineDeferred(mainA->LineSnapR[_ss][line], line, desc2);
+                rA->HybridDesc = false; rA->HybPlanes = true;
+                HybPlanesLines++;
+                if (!rA->LastLineHas3D || memcmp(desc, desc2, 512 * 4))
+                {
+                    if (HybPlanesBad++ < 8)
+                        for (int i = 0; i < 512; i++)
+                            if (desc[i] != desc2[i]) { fprintf(stderr, "hybplanes: line %u word %d planes %08x push %08x\n", line, i, desc[i], desc2[i]); break; }
+                }
+            }
+#endif
             u32 ref[256];
 #ifdef LITEV_SOFT2D_DEPTH2
             S2DJ_SPR(); rA->DrawSpritesDeferred(mainA->SprSnapR[_ss][line], line);

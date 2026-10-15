@@ -180,6 +180,9 @@ public:
     // (removed upstream in ba317e2e), packed into 2 planes instead of 3.
     bool HybridDesc = false;
     bool LastLineHas3D = false;
+#ifdef LITEV_HYB_PLANES
+    bool HybPlanes = true;   // 3D descriptor lines through the plane pipeline (debug.litev.hybplanes)
+#endif
     static u32 HybridResolvePixel(u32 val1, u32 val2, u32 c3d);
 #ifdef S2D_PLANES
     // a new frame: the extended palettes are revalidated on first use
@@ -232,6 +235,11 @@ private:
     bool PlaneAny[4] {};
     alignas(16) u16 Top16[256], Sec16[256];
     alignas(16) u8 TopTid[256], SecTid[256];
+#ifdef LITEV_HYB_PLANES
+    // the top and second layers as the 3D placeholder pushed them down (-> Under3D)
+    alignas(16) u16 UTop16[256], USec16[256];
+    alignas(16) u8 UTopTid[256], USecTid[256];
+#endif
     // extended palettes in the line colour format, revalidated (compared with the copy they were
     // converted from) on first use in a frame
     alignas(16) u32 BGExtConv[4][4096];
