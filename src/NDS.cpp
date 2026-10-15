@@ -828,8 +828,8 @@ bool NDS::DoSavestate(Savestate* file)
     if (!file->Saving)
     {
         // 'dept of redundancy dept'
-        // but we do need to update the mappings
-        MapSharedWRAM(WRAMCnt);
+        // but we do need to update the mappings (forced: WRAMCnt already holds the loaded value)
+        MapSharedWRAM(WRAMCnt, true);
 
         InitTimings();
         SetGBASlotTimings();
@@ -1869,9 +1869,9 @@ void NDS::SetExMemCnt(u32 cpu, u16 val, u16 mask)
 }
 
 
-void NDS::MapSharedWRAM(u8 val)
+void NDS::MapSharedWRAM(u8 val, bool force)
 {
-    if (val == WRAMCnt)
+    if (!force && val == WRAMCnt)
         return;
 
     JIT.Memory.RemapSWRAM();

@@ -461,7 +461,7 @@ public: // TODO: Encapsulate the rest of these members
 
     void Halt();
 
-    void MapSharedWRAM(u8 val);
+    void MapSharedWRAM(u8 val, bool force = false);
 
     void UpdateIRQ(u32 cpu);
     void SetIRQ(u32 cpu, u32 irq);
