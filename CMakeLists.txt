@@ -1246,6 +1246,10 @@ endif()
 
 # Hybrid renderer, with LITEV_HYB_CAPTURE_ASYNC: finish each capture read (wait, map, copy, convert)
 # on the GL 3D thread instead of the emu thread. Runtime: debug.litev.capoff=0 off.
+option(LITEV_GL3D_PRIO "Hybrid: GL 3D thread at nice -15 (debug.litev.gl3dnice), above the other render threads" OFF)
+if (LITEV_GL3D_PRIO)
+    add_compile_definitions(LITEV_GL3D_PRIO=1)
+endif()
 option(LITEV_HYB_CAPTURE_OFFTHREAD "Hybrid: capture readback finished on the GL 3D thread" OFF)
 if (LITEV_HYB_CAPTURE_OFFTHREAD)
     add_compile_definitions(LITEV_HYB_CAPTURE_OFFTHREAD=1)
@@ -1253,6 +1257,10 @@ endif()
 
 # Hybrid renderer: a screen with no 3D is merged at 1x and blitted up to Nx (same pixels; at 3x
 # the 2D-only screen's per-pixel merge was ~2 ms of GPU a frame). Runtime: debug.litev.hybmerge1x=0 off.
+option(LITEV_PRESENT_SAME "Hybrid: per-screen serial of the merged picture (unchanged 2D-only screen keeps its serial) for the frontend's present skip" OFF)
+if (LITEV_PRESENT_SAME)
+    add_compile_definitions(LITEV_PRESENT_SAME=1)
+endif()
 option(LITEV_HYB_MERGE_1X_2D "Hybrid: merge 2D-only screens at 1x, then blit up" OFF)
 if (LITEV_HYB_MERGE_1X_2D)
     add_compile_definitions(LITEV_HYB_MERGE_1X_2D=1)
@@ -1637,6 +1645,14 @@ endif()
 
 # GL 3D: group opaque polygons by state + texture before batching (display only; exact-depth ties
 # and the stencil polygon ID may differ). Runtime: debug.litev.glsortopaque=0 off.
+option(LITEV_GL_LEAN_UPLOAD "GL 3D: upload only the used vertex/index bytes (one call per buffer), no unused edge indices" OFF)
+if (LITEV_GL_LEAN_UPLOAD)
+    add_compile_definitions(LITEV_GL_LEAN_UPLOAD=1)
+endif()
+option(LITEV_GL_SORT_KEYS "GL 3D: opaque sort on keys packed once per polygon (same order)" OFF)
+if (LITEV_GL_SORT_KEYS)
+    add_compile_definitions(LITEV_GL_SORT_KEYS=1)
+endif()
 option(LITEV_GL_OPAQUE_FULLMASK "GL 3D: opaque pass writes every attribute channel (Mali forward pixel kill)" OFF)
 if (LITEV_GL_OPAQUE_FULLMASK)
     add_compile_definitions(LITEV_GL_OPAQUE_FULLMASK=1)

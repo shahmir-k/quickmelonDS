@@ -68,7 +68,7 @@ private:
 #endif
 
 public:
-    void StartThread(const char* name)
+    void StartThread(const char* name, int nice = -10)
     {
 #ifdef __ANDROID__
         Dpy = eglGetCurrentDisplay();
@@ -84,7 +84,7 @@ public:
         if (Ctx == EGL_NO_CONTEXT) return;
 
         bool ok = false, started = false;
-        T = std::thread([this, cfg, name, &ok, &started] {
+        T = std::thread([this, cfg, name, nice, &ok, &started] {
             // surfaceless if supported, else a 1x1 pbuffer
             bool cur = eglMakeCurrent(Dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, Ctx);
             if (!cur)
@@ -103,7 +103,7 @@ public:
 #endif
             // the emu thread waits for this job when it falls a frame behind: let it win
             // cores 0-2 against the 2D thread and the app's background threads
-            setpriority(PRIO_PROCESS, 0, -10);
+            setpriority(PRIO_PROCESS, 0, nice);
             pthread_setname_np(pthread_self(), name);
             {
                 std::lock_guard<std::mutex> l(M);

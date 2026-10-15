@@ -68,6 +68,9 @@ public:
     // render. n = 1 (the default) is the single buffer GLRenderer uses.
     static constexpr int MaxColorRing = 6;
     mutable u32 StatDraws = 0, StatPolys = 0;   // diagnostic counters (LITEV_HYB log)
+    // thread CPU ms per phase of RenderPreparedFrame (debug.litev.prof, LITEV_HYB 3d-phases log):
+    // texcache apply, state/clear/setup+sort, BuildPolygons, buffer upload, RenderSceneChunk
+    double StatPhase[5] {};
     void SetColorRing(int n) noexcept;
     [[nodiscard]] int GetCurColor() const noexcept { return CurColor; }
     [[nodiscard]] GLuint GetColorTex(int i) const noexcept { return ColorBufferTex[i]; }
@@ -96,6 +99,9 @@ private:
 
         GLuint TexID;
         u32 TexRepeat;
+#ifdef LITEV_GL_SORT_KEYS
+        u64 SortHi, SortLo;   // LITEV_GL_SORT_KEYS: the opaque sort key, built once per polygon
+#endif
     };
 
     //GLCompositor CurGLCompositor;
@@ -160,6 +166,9 @@ private:
     float WZ0 = 0;
     static bool WEarlyZ();
     static bool NoDiscard();
+#ifdef LITEV_GL_LEAN_UPLOAD
+    static bool LeanUpload();
+#endif
     static bool FogShaderBlend();
     static std::string FogFetchSource();
 
