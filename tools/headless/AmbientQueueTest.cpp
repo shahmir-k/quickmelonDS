@@ -203,12 +203,13 @@ struct AmbientLANQueueTestAccess
         // The live session: half-second windows of exchanges/frame x the link's round trip + emulation.
         assert(ambient.UpMask());
         // a window: its frames' emulation + link waits (NoteFrameUs), exchanges/frame, the round trip
-        auto window = [&](u32 rttUs, u32 exchPerFrame, u32 frameUs) {
+        auto window = [&](u32 rttUs, u32 exchPerFrame, u32 frameUs, bool settled = true) {
             ambient.LinkRttUs = rttUs;
             ambient.FirstExchUs = NowUs() - 2000000;
             ambient.VT0 = NowUs() - 600000;
             ambient.VFrames = 29; ambient.VExch = 29 * exchPerFrame - exchPerFrame;
             ambient.VRunN = 29; ambient.VRunUs = 29ull * frameUs;
+            if (settled && ambient.VExchFrames < 1000) ambient.VExchFrames = 1000;     // (past the setup bursts)
             ambient.NoteFrameUs(frameUs);
             ambient.Judge(frameUs - 10000, exchPerFrame);     // (10 ms of each frame emulates, the rest waits)
             return ambient.SessionVerdict();
@@ -231,13 +232,25 @@ struct AmbientLANQueueTestAccess
         // the round trips are half the frame but waits time out
         for (int i = 0; i < 4; i++) assert(window(4600, 5, 60000) == AmbientLAN::Verdict_LanOk);
         for (int i = 0; i < 4; i++) { ambient.StHostWaitTimeouts++; assert(window(4800, 5, 44000) == AmbientLAN::Verdict_LanOk); }
-        // Shrek: 3 exchanges a frame at 6.5 ms (+ 1 ms turnaround each): 34 fps, 59 without the round trips (strong)
-        assert(window(6500, 3, 32500) == AmbientLAN::Verdict_LanOk);
+        // Shrek: 3 exchanges a frame at 6.5 ms (+ 1 ms turnaround each): 31 fps, 73 without the round trips (4 windows)
+        for (int i = 0; i < 3; i++) assert(window(6500, 3, 32500) == AmbientLAN::Verdict_LanOk);
         assert(window(6500, 3, 32500) == AmbientLAN::Verdict_LanBad);
         for (int i = 0; i < 4; i++) window(2000, 1, 11000);
-        // ... at 6 ms with a slow partner: 27 fps, the round trips 17 ms of 37, 20 without them (weak: 6 windows)
-        for (int i = 0; i < 5; i++) assert(window(6000, 3, 37000) == AmbientLAN::Verdict_LanOk);
-        assert(window(6000, 3, 37000) == AmbientLAN::Verdict_LanBad);
+        // ... at 6 ms with a slower partner: 24 fps, the round trips 17 ms of 42, 24.6 without them (after 600 frames)
+        for (int i = 0; i < 3; i++) assert(window(6000, 3, 42000) == AmbientLAN::Verdict_LanOk);
+        assert(window(6000, 3, 42000) == AmbientLAN::Verdict_LanBad);
+        for (int i = 0; i < 4; i++) window(2000, 1, 11000);
+        // ... the same in the first 600 frames of exchanges (a setup burst looks like it): not counted
+        ambient.VExchFrames = 0;
+        for (int i = 0; i < 8; i++) { ambient.VExchFrames = 30 * i; assert(window(6000, 3, 42000, false) == AmbientLAN::Verdict_LanOk); }
+        for (int i = 0; i < 4; i++) window(2000, 1, 11000);
+        // a burst window that runs 55 fps without the round trips, between partner timeouts: 3 in a row do not switch
+        for (int i = 0; i < 3; i++) assert(window(2800, 5, 32000) == AmbientLAN::Verdict_LanOk);
+        ambient.StHostWaitTimeouts++;
+        assert(window(2800, 5, 32000) == AmbientLAN::Verdict_LanOk);
+        // an MKDS setup burst at 7 ms: 5 exchanges a frame, 35 ms of round trips in 80 ms frames (45 without them,
+        // as slow at 0 ms): never bad, also with no wait timing out
+        for (int i = 0; i < 8; i++) assert(window(7000, 5, 80000) == AmbientLAN::Verdict_LanOk);
         enet_host_destroy(other);
     }
 };

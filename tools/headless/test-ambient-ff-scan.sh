@@ -25,7 +25,7 @@ echo "ambient ff-scan output: $output (P1 solo ff $ff)"
 
 run() {   # seat, extra env
     mkdir -m 700 -- "$output/p$1"
-    (cd -- "$output/p$1" && env LITEV_AMBIENT_ID="$(printf '00000000e1e1%04x' "$1")" $2 "$binary" --rom "$rom" \
+    (cd -- "$output/p$1" && env LITEV_AMBIENT_ID="$(printf '00000000e1e1%04x' "$1")" LITEV_AMBIENT_PPORT=17065 LITEV_AMBIENT_LPORT=17066 $2 "$binary" --rom "$rom" \
         --input-script "$scripts/p$1.txt" --frames "$frames" --data-dir hd --ambient "P$1" > log.txt 2>&1)
 }
 run 0 "LITEV_AMBIENT_SOLO_FF=1" &

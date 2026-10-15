@@ -8,6 +8,8 @@ channel are not held. LITEV_FRAME_LOAD_MS makes the Mac's frame cost a device's.
 """
 
 import argparse
+import collections
+import struct
 import hashlib
 import json
 import os
@@ -24,8 +26,8 @@ import time
 
 SCENARIOS = {
     "trade": {
-        "black": ["shimmer is in the room", "menu open", "trade requested", "trade screen", "offered", "returned to trade selection"],
-        "white": ["in the room", "offer", "trade screen", "offered", "returned to trade selection"],
+        "black": ["shimmer is in the room", "menu open", "trade requested", "trade screen", "offered", "select one each", "picked", "trade confirmed", "returned to trade selection"],
+        "white": ["in the room", "offer", "trade screen", "offered", "select one each", "picked", "trade confirmed", "returned to trade selection"],
         "frames": 18000,
     },
     "battle": {
@@ -62,48 +64,55 @@ def ppm_evidence(path):
     return {"sha256": sha(path), "bytes": path.stat().st_size, "blank": len(set(pixels[::97])) < 4}
 
 
-def trade_icon_scores(path):
-    """Mean R-B in the two trainer-board icon boxes of these fixed BW savestates.
-
-    The Black trainer initially owns a blue icon and White an orange one. A
-    completed trade swaps them. This is a *visual oracle for these fixtures*,
-    not a general Pokémon save parser. A changed UI or sprite invalidates the
-    case (unknown), never silently turns it into a pass.
-    """
-    with path.open("rb") as f:
-        if f.readline() != b"P6\n" or f.readline() != b"256 384\n" or f.readline() != b"255\n":
-            raise ValueError(f"bad PPM: {path}")
-        pixels = f.read()
-    if len(pixels) != 256 * 384 * 3:
-        raise ValueError(f"truncated PPM: {path}")
-    boxes = ((23, 92, 38, 104), (153, 92, 170, 104))
-    scores = []
-    for x0, y0, x1, y1 in boxes:
-        delta = 0
-        for y in range(y0, y1):
-            for x in range(x0, x1):
-                off = (y * 256 + x) * 3
-                delta += pixels[off] - pixels[off + 2]
-        scores.append(delta / ((x1 - x0) * (y1 - y0)))
-    return scores
+PK5_ORDER = ["ABCD", "ABDC", "ACBD", "ACDB", "ADBC", "ADCB", "BACD", "BADC", "BCAD", "BCDA", "BDAC", "BDCA",
+             "CABD", "CADB", "CBAD", "CBDA", "CDAB", "CDBA", "DABC", "DACB", "DBAC", "DBCA", "DCAB", "DCBA"]
 
 
-def trade_swapped(side, milestones):
-    """Require original → opposite icon colors at the two exact phase captures."""
-    try:
-        before = trade_icon_scores(Path(milestones["offered"]["shot"]))
-        after = trade_icon_scores(Path(milestones["returned_to_trade_selection"]["shot"]))
-    except (KeyError, OSError, ValueError):
-        return {"verified": False, "reason": "missing or invalid before/after frame"}
-    # Thresholds are intentionally well outside grayscale (0): a sprite that
-    # moves/changes cannot be misreported as a trade. Verify both consoles.
-    blue, orange = -7, 25
-    if side == "black":
-        verified = before[0] < blue and before[1] > orange and after[0] > orange and after[1] < blue
-    else:
-        verified = before[0] > orange and before[1] < blue and after[0] < blue and after[1] > orange
-    return {"verified": verified, "before_rb": before, "after_rb": after,
-            "reason": "icon colors did not swap" if not verified else "both trainer icons swapped"}
+def pk5_species(pk):
+    """National dex number of one Gen 5 Pokémon record (PK5), None for an empty or invalid slot."""
+    pid, _, chk = struct.unpack_from("<IHH", pk, 0)
+    if pid == 0 and chk == 0:
+        return None
+    seed, dec = chk, bytearray()
+    for i in range(0, 128, 2):
+        seed = (seed * 0x41C64E6D + 0x6073) & 0xFFFFFFFF
+        dec += struct.pack("<H", struct.unpack_from("<H", pk, 8 + i)[0] ^ (seed >> 16))
+    if sum(struct.unpack("<64H", dec)) & 0xFFFF != chk:
+        return None
+    return struct.unpack_from("<H", dec, PK5_ORDER[((pid >> 13) & 31) % 24].index("A") * 32)[0]
+
+
+def bw_species(path):
+    """Every Pokémon a Black/White save holds (24 boxes + the party), by species."""
+    d = path.read_bytes()
+    c = collections.Counter()
+    for b in range(24):
+        for s in range(30):
+            sp = pk5_species(d[0x400 + b * 0x1000 + s * 136:][:136])
+            if sp:
+                c[sp] += 1
+    for s in range(min(struct.unpack_from("<I", d, 0x18E04)[0], 6)):
+        sp = pk5_species(d[0x18E08 + s * 220:][:136])
+        if sp:
+            c[sp] += 1
+    return c
+
+
+def trade_proven(case):
+    """The trade, from the saves the games wrote: Black gave one Pokémon and got another, White the reverse."""
+    diffs = {}
+    for side in ("black", "white"):
+        try:
+            a, b = bw_species(case / side / "input.sav"), bw_species(case / side / "output.sav")
+        except (OSError, struct.error) as e:
+            return {"verified": False, "reason": f"save unreadable: {e}"}
+        diffs[side] = {k: b[k] - a[k] for k in set(a) | set(b) if b[k] != a[k]}
+    gave = [k for k, v in diffs["black"].items() if v == -1]
+    got = [k for k, v in diffs["black"].items() if v == 1]
+    ok = (len(diffs["black"]) == 2 and len(gave) == 1 and len(got) == 1
+          and diffs["white"] == {gave[0]: 1, got[0]: -1})
+    return {"verified": ok, "black_diff": diffs["black"], "white_diff": diffs["white"],
+            "reason": "Black and White swapped one Pokémon each" if ok else "the saves do not show one swapped Pokémon"}
 
 
 def free_udp_ports(n):
@@ -163,7 +172,7 @@ def run_one(args, root, inputs, delay, repeat):
     name = f"{args.scenario}-rtt{delay:g}-r{repeat}"
     case = root / name
     case.mkdir()
-    ports = free_udp_ports(4)
+    ports = free_udp_ports(6)
     procs = []
     logs = []
     spec = SCENARIOS[args.scenario]
@@ -184,6 +193,7 @@ def run_one(args, root, inputs, delay, repeat):
                 "LITEV_AMBIENT_UPORT": str(ports[i]),
                 "LITEV_AMBIENT_PPORT": str(ports[i + 2]),
                 "LITEV_AMBIENT_PEERS": f"127.0.0.1:{ports[1 - i]}",
+                "LITEV_AMBIENT_LPORT": str(ports[4 + i]),     # (never the default 7066: a device test's)
                 "LITEV_AMBIENT_RTT_MS": str(delay),
                 "LITEV_AMBIENT_JITTER_MS": str(delay * args.jitter_pct / 100),
                 "LITEV_FRAME_LOAD_MS": str(args.frame_load_ms),
@@ -246,7 +256,7 @@ def run_one(args, root, inputs, delay, repeat):
         failed = ("TIMEOUT at step" in log or "Fatal signal" in log or "data abort" in log or
                   "prefetch abort" in log or procs[i].returncode != 0)
         valid = not failed and not missing and ordered == sorted(ordered) and distinct >= 3
-        exchange = trade_swapped(side, got) if args.scenario == "trade" else None
+        exchange = trade_proven(case) if args.scenario == "trade" else None
         if exchange is not None:
             valid = valid and exchange["verified"]
         fps = FPS.search(log)
